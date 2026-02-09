@@ -68,6 +68,23 @@ fn git_succeeds(args: &[&str]) -> Result<bool> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Check whether AI Barometer is enabled for the current repository.
+///
+/// Reads `git config ai.barometer.enabled`. If the value is exactly
+/// `"false"`, returns `false` -- the caller should skip ALL processing
+/// (session scanning, note attachment, pending records, push, retry).
+/// Any other value (including unset) returns `true`.
+///
+/// This is placed in the `git` module (not `push`) because it gates
+/// the entire hook lifecycle, not just the push decision.
+pub fn check_enabled() -> bool {
+    match config_get("ai.barometer.enabled") {
+        Ok(Some(val)) => val != "false",
+        // Unset or error: default to enabled
+        _ => true,
+    }
+}
+
 /// Return the repository root (`git rev-parse --show-toplevel`).
 pub fn repo_root() -> Result<PathBuf> {
     let path = git_output(&["rev-parse", "--show-toplevel"])?;
@@ -201,8 +218,11 @@ pub fn remote_org() -> Result<Option<String>> {
 /// Extract owner/org from ALL remote URLs.
 ///
 /// Returns a deduplicated list of org names extracted from all configured
-/// remotes. This is used for org filtering: "Extract owner from **all** Git
-/// remotes. If **any** remote matches org, allowed." (PLAN.md)
+/// remotes. Deduplication is case-insensitive (e.g., `My-Org` and `my-org`
+/// from different remotes are considered the same org; only the first
+/// encountered variant is kept). This is used for org filtering: "Extract
+/// owner from **all** Git remotes. If **any** remote matches org, allowed."
+/// (PLAN.md)
 ///
 /// Returns an empty Vec if no remotes are configured or no URLs can be parsed.
 pub fn remote_orgs() -> Result<Vec<String>> {
@@ -215,7 +235,9 @@ pub fn remote_orgs() -> Result<Vec<String>> {
         }
         if let Ok(url) = git_output(&["remote", "get-url", remote_name])
             && let Some(org) = parse_org_from_url(&url)
-            && !orgs.contains(&org)
+            && !orgs
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&org))
         {
             orgs.push(org);
         }
@@ -857,6 +879,54 @@ mod tests {
         config_set("ai.barometer.autopush", "true").expect("config_set failed");
         let val = config_get("ai.barometer.autopush").expect("config_get failed");
         assert_eq!(val, Some("true".to_string()));
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // check_enabled
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_check_enabled_default_true() {
+        let (_dir, original_cwd) = enter_temp_repo();
+
+        // No config set -- should default to enabled
+        assert!(check_enabled());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_enabled_explicitly_true() {
+        let (dir, original_cwd) = enter_temp_repo();
+
+        run_git(dir.path(), &["config", "ai.barometer.enabled", "true"]);
+        assert!(check_enabled());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_enabled_explicitly_false() {
+        let (dir, original_cwd) = enter_temp_repo();
+
+        run_git(dir.path(), &["config", "ai.barometer.enabled", "false"]);
+        assert!(!check_enabled());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_enabled_other_value_treated_as_true() {
+        let (dir, original_cwd) = enter_temp_repo();
+
+        run_git(dir.path(), &["config", "ai.barometer.enabled", "yes"]);
+        assert!(check_enabled());
+
         std::env::set_current_dir(original_cwd).unwrap();
     }
 }

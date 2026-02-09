@@ -510,3 +510,37 @@ A code review was conducted after Phase 7 (28 findings: 0 critical, 2 medium, 10
 ### Test Count
 - Total: 187 tests (was 168 before Phase 8). Added 19 new tests:
   - **push module (17 tests):** `test_check_enabled_default_true`, `test_check_enabled_explicitly_true`, `test_check_enabled_explicitly_false`, `test_check_enabled_other_value_treated_as_true`, `test_consent_first_time_grants_and_records`, `test_consent_already_true`, `test_consent_explicitly_false_denies`, `test_consent_second_call_is_silent`, `test_org_filter_no_config_allows_push`, `test_org_filter_matching_org_allows_push`, `test_org_filter_no_remote_denies_push`, `test_should_push_no_remote_returns_false`, `test_should_push_with_remote_and_consent`, `test_should_push_consent_denied_returns_false`, `test_remote_orgs_multiple_remotes`, `test_remote_orgs_deduplicates`, `test_org_filter_case_insensitive_matching`, `test_attempt_push_failure_does_not_panic`, `test_attempt_push_with_unreachable_remote_does_not_panic`.
+
+---
+
+## Phase 8 Review Triage
+
+A code review was conducted after Phase 8 (18 findings: 0 critical, 3 medium, 7 low, 8 informational). The review confirmed 187 tests passing, clippy clean (expected dead-code warnings only), and formatting clean. No critical or commit-blocking bugs were found.
+
+### Fixed
+
+1. **Extracted pure-logic `org_matches` helper (Review #1, Medium).** Created `push::org_matches(configured_org: &str, remote_orgs: &[String]) -> bool` as a pure function that does case-insensitive comparison. `check_org_filter()` now delegates to it. Added 7 new unit tests for `org_matches`: exact match, case-insensitive match, reverse case, no match, empty remotes, multiple remotes one matches, multiple remotes none match. Replaced the previous `test_org_filter_case_insensitive_matching` test (which tested bare `eq_ignore_ascii_case` inline, not the actual function) with these proper tests.
+
+2. **Moved `check_enabled()` from push module to git module (Review #3, Medium).** `check_enabled()` gates ALL processing (not just push), so placing it in `push.rs` was architecturally misleading. Moved to `git.rs` with an updated doc comment explaining it gates the entire hook lifecycle. Updated the call site in `main.rs` from `push::check_enabled()` to `git::check_enabled()`. Moved the 4 `check_enabled` tests to `git.rs` tests section. Updated the push module doc comment to reference `git::check_enabled()`.
+
+3. **Case-insensitive dedup in `remote_orgs()` (Review #6, Low).** Changed the dedup check in `remote_orgs()` from `!orgs.contains(&org)` (case-sensitive) to `!orgs.iter().any(|existing| existing.eq_ignore_ascii_case(&org))` (case-insensitive). This ensures that case-variant duplicates like `My-Org` and `my-org` are properly deduplicated, consistent with the downstream case-insensitive comparison in `org_matches`. Updated the doc comment to note the case-insensitive dedup behavior.
+
+4. **Added `should_push` tests with org filter (Review #8, Low).** Added 3 new tests using `GIT_CONFIG_GLOBAL` env var to isolate global git config:
+   - `test_should_push_org_filter_denies_returns_false`: org filter is set to `required-org` but remote is `actual-org` -- should_push returns false.
+   - `test_should_push_org_filter_allows_matching_org`: org filter matches remote org -- should_push returns true.
+   - `test_check_org_filter_end_to_end_with_global_config`: end-to-end test of `check_org_filter()` with matching and non-matching global org config, including case-insensitive matching.
+
+5. **Fixed environment-dependent org filter tests (Review #1, Medium).** Updated `test_org_filter_no_config_allows_push` to use `GIT_CONFIG_GLOBAL` pointing to an empty config file, removing its dependency on the developer's real global git config. Updated `test_org_filter_matching_org_allows_push` to actually test `check_org_filter()` end-to-end instead of just testing `remote_orgs()`. Updated `test_org_filter_no_remote_denies_push` to test `check_org_filter()` with a global org filter set (not just `remote_orgs()` returning empty).
+
+### Deferred to Phase 12
+
+- **`ssh://` URL parsing (Review #7, Low):** Edge case. Repos using `ssh://` URLs will have org extraction fail, which is fail-safe (notes still attach locally).
+- **O(n^2) dedup in `remote_orgs` (Review #5, Low):** Negligible for expected input size (<10 remotes).
+- **Hardcoded "origin" in `push_notes` (Review #11, Low):** Standard practice. Most repos use `origin`.
+- **Silent success logging in `attempt_push` (Review #9, Low):** Consistent with "calm and non-invasive" design. Can add in Phase 11 status.
+- **Multiple push calls in retry loop (Review #10, Low):** Acceptable. Multiple pending records resolving in a single hook invocation is uncommon.
+- **Consent warning on config write failure (Review #2, Medium):** Known limitation. Config write failures are rare. Documented as expected behavior.
+- **Unused `_repo_root` parameter on `should_push` (Review #4, Low):** Harmless. Can remove when convenient.
+
+### Test Count
+- Total: 196 tests (was 187 before triage). Added 9 new tests (7 for `org_matches`, 3 for org filter end-to-end with `GIT_CONFIG_GLOBAL`). Removed 1 test (`test_org_filter_case_insensitive_matching` replaced by `org_matches` tests). Net: +9.

@@ -103,7 +103,7 @@ fn run_hook_post_commit() -> Result<()> {
 /// catches all errors and panics.
 fn hook_post_commit_inner() -> Result<()> {
     // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
-    if !push::check_enabled() {
+    if !git::check_enabled() {
         return Ok(());
     }
 

@@ -3,15 +3,17 @@
 //! Orchestrates the decision of whether to push notes to the remote after
 //! attaching them locally. The decision depends on several factors:
 //!
-//! 1. **Per-repo enabled**: `git config ai.barometer.enabled` -- if set to
-//!    `false`, skip EVERYTHING (not just push, but the entire hook).
-//! 2. **Has upstream**: repo must have at least one configured remote.
-//! 3. **Org filter**: if `git config --global ai.barometer.org` is set,
+//! 1. **Has upstream**: repo must have at least one configured remote.
+//! 2. **Org filter**: if `git config --global ai.barometer.org` is set,
 //!    at least one remote must belong to that org. Otherwise, notes are
 //!    attached locally only (no push).
-//! 4. **Autopush consent**: `git config ai.barometer.autopush` -- on first
+//! 3. **Autopush consent**: `git config ai.barometer.autopush` -- on first
 //!    push for a repo, print a warning and record consent. After that,
 //!    push silently.
+//!
+//! Note: The per-repo enabled check (`git config ai.barometer.enabled`) is
+//! handled by [`git::check_enabled()`] in the git module, since it gates
+//! ALL processing (not just push).
 //!
 //! Push failures are always non-fatal: logged to stderr, never block the
 //! commit, never retry automatically in the hook.
@@ -23,19 +25,6 @@ use crate::git;
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/// Check whether AI Barometer is enabled for this repository.
-///
-/// Reads `git config ai.barometer.enabled`. If the value is `"false"`,
-/// returns `false` -- the caller should skip ALL processing (not just push).
-/// Any other value (including unset) returns `true`.
-pub fn check_enabled() -> bool {
-    match git::config_get("ai.barometer.enabled") {
-        Ok(Some(val)) => val != "false",
-        // Unset or error: default to enabled
-        _ => true,
-    }
-}
 
 /// Determine whether notes should be pushed for this repository.
 ///
@@ -81,7 +70,7 @@ pub fn attempt_push() {
 ///
 /// Reads `git config --global ai.barometer.org`. If not set, the filter
 /// passes (no org restriction). If set, extracts orgs from ALL remotes
-/// and checks for a match.
+/// and checks for a match via [`org_matches`].
 ///
 /// Returns `true` if push is allowed (no filter, or filter matches).
 /// Returns `false` if the org filter is set and no remote matches.
@@ -99,10 +88,19 @@ pub fn check_org_filter() -> bool {
         Err(_) => return false,
     };
 
-    // Check if any remote org matches the configured org (case-insensitive)
+    org_matches(&configured_org, &remote_orgs)
+}
+
+/// Pure-logic helper: check whether any of the `remote_orgs` matches the
+/// `configured_org` using case-insensitive comparison.
+///
+/// This is extracted from [`check_org_filter`] for testability — the
+/// orchestration function reads from global git config which is hard to
+/// isolate in tests, but this pure function can be tested directly.
+pub fn org_matches(configured_org: &str, remote_orgs: &[String]) -> bool {
     remote_orgs
         .iter()
-        .any(|org| org.eq_ignore_ascii_case(&configured_org))
+        .any(|org| org.eq_ignore_ascii_case(configured_org))
 }
 
 /// Check autopush consent. On first push for a repo, print a warning to
@@ -201,62 +199,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // check_enabled
-    // -----------------------------------------------------------------------
-
-    #[test]
-    #[serial]
-    fn test_check_enabled_default_true() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        // No config set -- should default to enabled
-        assert!(check_enabled());
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_check_enabled_explicitly_true() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        run_git(dir.path(), &["config", "ai.barometer.enabled", "true"]);
-        assert!(check_enabled());
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_check_enabled_explicitly_false() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        run_git(dir.path(), &["config", "ai.barometer.enabled", "false"]);
-        assert!(!check_enabled());
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_check_enabled_other_value_treated_as_true() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        run_git(dir.path(), &["config", "ai.barometer.enabled", "yes"]);
-        assert!(check_enabled());
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    // -----------------------------------------------------------------------
     // check_or_request_consent
     // -----------------------------------------------------------------------
 
@@ -329,13 +271,26 @@ mod tests {
         let original_cwd = safe_cwd();
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
+        // Use an empty global config so we don't depend on the developer's
+        // real global git config (which might have ai.barometer.org set).
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
         // No global org config -- filter should pass
-        // Note: we can't easily unset a global config in tests, but if
-        // ai.barometer.org is not set globally, config_get_global returns None.
-        // This test relies on the test environment not having ai.barometer.org set.
-        // If it is set, this test may fail -- that's acceptable for dev environments.
         assert!(check_org_filter());
 
+        // Restore
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -357,16 +312,25 @@ mod tests {
             ],
         );
 
-        // Set a global config for org filtering. We use repo-local config here
-        // to avoid polluting the real global config. Since check_org_filter
-        // reads global config, we need to test the logic differently.
-        // Instead, we'll test the internal logic by directly calling the
-        // functions.
+        // Create a global config with matching org filter
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = my-org\n").unwrap();
 
-        // For this test, we'll verify that remote_orgs returns the right thing
-        let orgs = git::remote_orgs().unwrap();
-        assert!(orgs.contains(&"my-org".to_string()));
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
 
+        // check_org_filter should pass because the remote org matches
+        assert!(check_org_filter());
+
+        // Restore
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -377,10 +341,29 @@ mod tests {
         let original_cwd = safe_cwd();
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
-        // No remotes configured -- remote_orgs should return empty
-        let orgs = git::remote_orgs().unwrap();
-        assert!(orgs.is_empty());
+        // Create a global config with an org filter set
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(
+            &global_config,
+            "[ai \"barometer\"]\n    org = required-org\n",
+        )
+        .unwrap();
 
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // No remotes configured -- org filter should deny (no remote matches)
+        assert!(!check_org_filter());
+
+        // Restore
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -528,19 +511,186 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Org filter logic (unit-level)
+    // org_matches (pure-logic unit tests)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_org_filter_case_insensitive_matching() {
-        // Test the case-insensitive comparison logic directly
-        let configured = "My-Org";
-        let remote = "my-org";
-        assert!(remote.eq_ignore_ascii_case(configured));
+    fn test_org_matches_exact() {
+        let orgs = vec!["my-org".to_string()];
+        assert!(org_matches("my-org", &orgs));
+    }
 
-        let configured2 = "ACME";
-        let remote2 = "acme";
-        assert!(remote2.eq_ignore_ascii_case(configured2));
+    #[test]
+    fn test_org_matches_case_insensitive() {
+        let orgs = vec!["my-org".to_string()];
+        assert!(org_matches("My-Org", &orgs));
+        assert!(org_matches("MY-ORG", &orgs));
+    }
+
+    #[test]
+    fn test_org_matches_reverse_case() {
+        // Configured is lowercase, remote is mixed case
+        let orgs = vec!["My-Org".to_string()];
+        assert!(org_matches("my-org", &orgs));
+    }
+
+    #[test]
+    fn test_org_matches_no_match() {
+        let orgs = vec!["other-org".to_string()];
+        assert!(!org_matches("my-org", &orgs));
+    }
+
+    #[test]
+    fn test_org_matches_empty_remotes() {
+        let orgs: Vec<String> = vec![];
+        assert!(!org_matches("my-org", &orgs));
+    }
+
+    #[test]
+    fn test_org_matches_multiple_remotes_one_matches() {
+        let orgs = vec!["unrelated".to_string(), "my-org".to_string()];
+        assert!(org_matches("my-org", &orgs));
+    }
+
+    #[test]
+    fn test_org_matches_multiple_remotes_none_match() {
+        let orgs = vec!["org-a".to_string(), "org-b".to_string()];
+        assert!(!org_matches("my-org", &orgs));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_push with org filter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_should_push_org_filter_denies_returns_false() {
+        let dir = init_temp_repo();
+        let original_cwd = safe_cwd();
+        std::env::set_current_dir(dir.path()).expect("failed to chdir");
+
+        // Add a remote with org "actual-org"
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:actual-org/repo.git",
+            ],
+        );
+
+        // Pre-set consent so we isolate the org filter behavior
+        run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
+
+        // Create a temp global config file with a different org filter
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(
+            &global_config,
+            "[ai \"barometer\"]\n    org = required-org\n",
+        )
+        .unwrap();
+
+        // Point GIT_CONFIG_GLOBAL to our fake global config
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // should_push should return false because "actual-org" != "required-org"
+        assert!(!should_push(dir.path()));
+
+        // Restore GIT_CONFIG_GLOBAL
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_should_push_org_filter_allows_matching_org() {
+        let dir = init_temp_repo();
+        let original_cwd = safe_cwd();
+        std::env::set_current_dir(dir.path()).expect("failed to chdir");
+
+        // Add a remote with org "my-org"
+        run_git(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:my-org/repo.git"],
+        );
+
+        // Pre-set consent
+        run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
+
+        // Create a global config file with matching org filter
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = my-org\n").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // should_push should return true because "my-org" matches
+        assert!(should_push(dir.path()));
+
+        // Restore
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_org_filter_end_to_end_with_global_config() {
+        let dir = init_temp_repo();
+        let original_cwd = safe_cwd();
+        std::env::set_current_dir(dir.path()).expect("failed to chdir");
+
+        // Add a remote with org "test-org"
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/repo.git",
+            ],
+        );
+
+        // Create a global config with matching org
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = Test-Org\n").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // Case-insensitive match: "Test-Org" should match "test-org"
+        assert!(check_org_filter());
+
+        // Now test with non-matching org
+        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = other-org\n").unwrap();
+
+        assert!(!check_org_filter());
+
+        // Restore
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
     }
 
     // -----------------------------------------------------------------------
