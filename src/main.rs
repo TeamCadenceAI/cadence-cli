@@ -63,11 +63,161 @@ enum HookCommand {
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
+/// The install subcommand: set up global git hooks and run initial hydration.
+///
+/// Steps:
+/// 1. Set `git config --global core.hooksPath ~/.git-hooks`
+/// 2. Create `~/.git-hooks/` directory if missing
+/// 3. Write `~/.git-hooks/post-commit` shim script
+/// 4. Make shim executable (chmod +x)
+/// 5. If `--org` provided, persist org filter to global git config
+/// 6. Run hydration for the last 7 days
+///
+/// Errors at each step are reported but do not prevent subsequent steps
+/// from being attempted.
 fn run_install(org: Option<String>) -> Result<()> {
-    eprintln!(
-        "[ai-barometer] install: org={:?} (not yet implemented)",
-        org
-    );
+    run_install_inner(org, None)
+}
+
+/// Inner implementation of install, accepting an optional home directory override
+/// for testability. If `home_override` is `None`, uses the real home directory.
+fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
+    eprintln!("[ai-barometer] Installing...");
+
+    let home = match home_override {
+        Some(h) => h.to_path_buf(),
+        None => agents::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?,
+    };
+
+    let hooks_dir = home.join(".git-hooks");
+    let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
+
+    // Track whether any step failed (but continue regardless)
+    let mut had_errors = false;
+
+    // Step 1: Set git config --global core.hooksPath ~/.git-hooks
+    match git::config_set_global("core.hooksPath", &hooks_dir_str) {
+        Ok(()) => {
+            eprintln!("[ai-barometer] Set core.hooksPath = {}", hooks_dir_str);
+        }
+        Err(e) => {
+            eprintln!("[ai-barometer] error: failed to set core.hooksPath: {}", e);
+            had_errors = true;
+        }
+    }
+
+    // Step 2: Create ~/.git-hooks/ directory if missing
+    if !hooks_dir.exists() {
+        match std::fs::create_dir_all(&hooks_dir) {
+            Ok(()) => {
+                eprintln!("[ai-barometer] Created {}", hooks_dir_str);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ai-barometer] error: failed to create {}: {}",
+                    hooks_dir_str, e
+                );
+                had_errors = true;
+            }
+        }
+    } else {
+        eprintln!("[ai-barometer] {} already exists", hooks_dir_str);
+    }
+
+    // Step 3 & 4: Write post-commit shim and make it executable
+    let shim_path = hooks_dir.join("post-commit");
+    let shim_content = "#!/bin/sh\nexec ai-barometer hook post-commit\n";
+
+    // Check if hook already exists
+    let should_write = if shim_path.exists() {
+        match std::fs::read_to_string(&shim_path) {
+            Ok(existing) => {
+                if existing.contains("ai-barometer") {
+                    eprintln!("[ai-barometer] post-commit hook already installed, updating");
+                    true
+                } else {
+                    eprintln!(
+                        "[ai-barometer] warning: {} exists but was not created by ai-barometer; overwriting",
+                        shim_path.display()
+                    );
+                    true
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "[ai-barometer] warning: could not read existing {}; overwriting",
+                    shim_path.display()
+                );
+                true
+            }
+        }
+    } else {
+        true
+    };
+
+    if should_write {
+        match std::fs::write(&shim_path, shim_content) {
+            Ok(()) => {
+                eprintln!("[ai-barometer] Wrote {}", shim_path.display());
+
+                // Make executable (Unix only)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o755);
+                    match std::fs::set_permissions(&shim_path, perms) {
+                        Ok(()) => {
+                            eprintln!("[ai-barometer] Made {} executable", shim_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ai-barometer] error: failed to chmod {}: {}",
+                                shim_path.display(),
+                                e
+                            );
+                            had_errors = true;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ai-barometer] error: failed to write {}: {}",
+                    shim_path.display(),
+                    e
+                );
+                had_errors = true;
+            }
+        }
+    }
+
+    // Step 5: Persist org filter if provided
+    if let Some(ref org_value) = org {
+        match git::config_set_global("ai.barometer.org", org_value) {
+            Ok(()) => {
+                eprintln!("[ai-barometer] Set org filter: {}", org_value);
+            }
+            Err(e) => {
+                eprintln!("[ai-barometer] error: failed to set org filter: {}", e);
+                had_errors = true;
+            }
+        }
+    }
+
+    // Step 6: Run hydration for the last 7 days
+    eprintln!("[ai-barometer] Running initial hydration (last 7 days)...");
+    if let Err(e) = run_hydrate("7d", false) {
+        eprintln!("[ai-barometer] error: hydration failed: {}", e);
+        had_errors = true;
+    }
+
+    if had_errors {
+        eprintln!("[ai-barometer] Installation completed with errors (see above)");
+    } else {
+        eprintln!("[ai-barometer] Installation complete!");
+    }
+
     Ok(())
 }
 
@@ -678,8 +828,38 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn run_install_returns_ok() {
-        assert!(run_install(None).is_ok());
+        // run_install now does real work but with a fake home it should
+        // succeed. We need to redirect HOME and GIT_CONFIG_GLOBAL to
+        // isolate from the real environment.
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        // Create a fake global git config so we don't pollute the real one
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let result = run_install_inner(None, Some(fake_home.path()));
+        assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
     }
 
     #[test]
@@ -1541,6 +1721,246 @@ mod tests {
             }
         }
         std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: install subcommand
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_install_creates_hooks_dir_and_shim() {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        // Create a fake global git config so we don't pollute the real one
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let result = run_install_inner(None, Some(fake_home.path()));
+        assert!(result.is_ok());
+
+        // Verify hooks directory was created
+        let hooks_dir = fake_home.path().join(".git-hooks");
+        assert!(hooks_dir.exists(), "~/.git-hooks should be created");
+
+        // Verify post-commit shim was written
+        let shim_path = hooks_dir.join("post-commit");
+        assert!(shim_path.exists(), "post-commit shim should exist");
+
+        let shim_content = std::fs::read_to_string(&shim_path).unwrap();
+        assert_eq!(
+            shim_content, "#!/bin/sh\nexec ai-barometer hook post-commit\n",
+            "shim content should match exactly"
+        );
+
+        // Verify shim is executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&shim_path).unwrap().permissions();
+            let mode = perms.mode();
+            assert!(
+                mode & 0o111 != 0,
+                "shim should be executable, got mode {:o}",
+                mode
+            );
+        }
+
+        // Verify core.hooksPath was set in global config
+        let config_content = std::fs::read_to_string(&global_config).unwrap();
+        assert!(
+            config_content.contains("hooksPath"),
+            "global config should contain hooksPath"
+        );
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_install_with_org_sets_global_config() {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let result = run_install_inner(Some("my-org".to_string()), Some(fake_home.path()));
+        assert!(result.is_ok());
+
+        // Verify org was persisted to global config
+        let config_content = std::fs::read_to_string(&global_config).unwrap();
+        assert!(
+            config_content.contains("my-org"),
+            "global config should contain org filter value"
+        );
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_install_idempotent() {
+        // Running install twice should succeed without errors
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // First install
+        let result1 = run_install_inner(None, Some(fake_home.path()));
+        assert!(result1.is_ok());
+
+        // Second install
+        let result2 = run_install_inner(None, Some(fake_home.path()));
+        assert!(result2.is_ok());
+
+        // Shim should still be correct
+        let shim_path = fake_home.path().join(".git-hooks").join("post-commit");
+        let content = std::fs::read_to_string(&shim_path).unwrap();
+        assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_install_detects_existing_non_barometer_hook() {
+        // If a post-commit hook exists that was NOT created by ai-barometer,
+        // install should still overwrite it (with a warning).
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // Pre-create hooks dir and a non-barometer hook
+        let hooks_dir = fake_home.path().join(".git-hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let shim_path = hooks_dir.join("post-commit");
+        std::fs::write(&shim_path, "#!/bin/sh\necho 'custom hook'\n").unwrap();
+
+        let result = run_install_inner(None, Some(fake_home.path()));
+        assert!(result.is_ok());
+
+        // The shim should now be the ai-barometer one (overwritten)
+        let content = std::fs::read_to_string(&shim_path).unwrap();
+        assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_install_detects_existing_barometer_hook() {
+        // If a post-commit hook exists that WAS created by ai-barometer,
+        // install should update it silently.
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // Pre-create hooks dir with an existing ai-barometer hook
+        let hooks_dir = fake_home.path().join(".git-hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let shim_path = hooks_dir.join("post-commit");
+        std::fs::write(
+            &shim_path,
+            "#!/bin/sh\nexec ai-barometer hook post-commit\n",
+        )
+        .unwrap();
+
+        let result = run_install_inner(None, Some(fake_home.path()));
+        assert!(result.is_ok());
+
+        // The shim should still be correct
+        let content = std::fs::read_to_string(&shim_path).unwrap();
+        assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
     }
 
     #[test]

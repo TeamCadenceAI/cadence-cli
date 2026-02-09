@@ -122,14 +122,14 @@ This is the critical hot path. Must be fast and never fail the commit.
 
 ## Phase 10: `install` Subcommand
 
-- [ ] Accept `--org <github-org>` optional flag
-- [ ] Set `git config --global core.hooksPath ~/.git-hooks`
-- [ ] Create `~/.git-hooks/` directory if missing
-- [ ] Write `~/.git-hooks/post-commit` shim: `#!/bin/sh\nexec ai-barometer hook post-commit`
-- [ ] Make shim executable (`chmod +x`)
-- [ ] Persist org filter to config if provided
-- [ ] Run `hydrate --since 7d` as final step
-- [ ] Print clear confirmation output at each step
+- [x] Accept `--org <github-org>` optional flag
+- [x] Set `git config --global core.hooksPath ~/.git-hooks`
+- [x] Create `~/.git-hooks/` directory if missing
+- [x] Write `~/.git-hooks/post-commit` shim: `#!/bin/sh\nexec ai-barometer hook post-commit`
+- [x] Make shim executable (`chmod +x`)
+- [x] Persist org filter to config if provided
+- [x] Run `hydrate --since 7d` as final step
+- [x] Print clear confirmation output at each step
 
 ---
 

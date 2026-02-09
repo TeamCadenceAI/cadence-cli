@@ -632,3 +632,52 @@ A code review was conducted after Phase 9 (19 findings: 0 critical, 2 medium, 7 
 
 ### Test Count
 - Total: 226 tests (unchanged). No new tests added; existing tests cover the changes (the agent type change is a refactor, and the enabled check is a simple gate).
+
+---
+
+## Phase 10 Decisions
+
+### Install Architecture
+- The `run_install` function is a thin wrapper around `run_install_inner(org, home_override)`. The inner function accepts an optional home directory override for testability, following the same pattern established in Phases 3 and 7 where `_in` variants accept directory parameters.
+- When `home_override` is `None`, the real home directory is resolved via `agents::home_dir()` (which reads `$HOME`). This reuses the existing home directory resolution rather than adding a new dependency.
+
+### Error Handling: Best-Effort Completion
+- The install function tracks `had_errors` but does not short-circuit on failure. Each step is attempted regardless of whether previous steps failed. This ensures that, for example, a failure to set `core.hooksPath` does not prevent the shim from being written.
+- The function always returns `Ok(())` so the process does not exit with an error code, since partial installation is better than no installation. The user is informed of any errors via the confirmation messages.
+
+### Global Git Config
+- Added `git::config_set_global(key, value)` that uses `git config --global` to write values. This is used for both `core.hooksPath` and `ai.barometer.org`.
+- The `core.hooksPath` value is set to the absolute path of `~/.git-hooks`. Using an absolute path avoids ambiguity across different working directories.
+
+### Hook Shim Content
+- The shim is exactly:
+  ```
+  #!/bin/sh
+  exec ai-barometer hook post-commit
+  ```
+  (with a trailing newline). No logic in shell, matching the PLAN.md specification.
+
+### Existing Hook Detection
+- Before writing the shim, the installer checks if `~/.git-hooks/post-commit` already exists.
+- If it exists and contains "ai-barometer" (our hook), it is silently overwritten (with an "already installed, updating" message).
+- If it exists and does NOT contain "ai-barometer" (a third-party hook), it is overwritten with a warning. The decision to overwrite rather than skip is deliberate: `core.hooksPath` is already set globally, so a non-barometer hook at that path is likely orphaned or conflicting. The warning ensures the user is informed.
+- If the file cannot be read, it is overwritten with a warning.
+
+### Shim Permissions
+- On Unix, the shim is set to mode 0755 (rwxr-xr-x) using `std::os::unix::fs::PermissionsExt`. The permission setting is gated behind `#[cfg(unix)]` for cross-platform compatibility, though the project targets macOS/Linux only.
+
+### Hydration as Final Step
+- The installer calls `run_hydrate("7d", false)` as its final step. The `false` argument ensures no auto-push during installation, matching the PLAN.md requirement that hydration "must not auto-push by default".
+- Hydration errors are non-fatal: the installer reports the error but still prints the completion message.
+
+### Dead Code Warnings
+- Same as Phase 9: `remote_org` and `matched_line` remain unused. These are expected.
+
+### Test Count
+- Total: 231 tests (was 226 before Phase 10). Added 5 new tests:
+  - **`run_install_returns_ok`:** Updated from a trivial stub test to a proper test that redirects `$HOME` and `GIT_CONFIG_GLOBAL` to temp dirs and calls `run_install_inner`.
+  - **`test_install_creates_hooks_dir_and_shim`:** Verifies that the hooks directory, shim file, shim content, shim executable permissions, and global config are all set correctly.
+  - **`test_install_with_org_sets_global_config`:** Verifies that `--org my-org` persists the org filter to the global git config.
+  - **`test_install_idempotent`:** Running install twice succeeds and leaves the shim in the correct state.
+  - **`test_install_detects_existing_non_barometer_hook`:** A pre-existing non-barometer hook is overwritten by install.
+  - **`test_install_detects_existing_barometer_hook`:** A pre-existing barometer hook is updated by install.

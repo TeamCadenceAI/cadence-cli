@@ -420,6 +420,23 @@ pub fn config_set(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a git config value in global scope (`--global`).
+///
+/// Used by the `install` subcommand to persist settings like
+/// `core.hooksPath` and `ai.barometer.org` globally.
+pub fn config_set_global(key: &str, value: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["config", "--global", key, value])
+        .output()
+        .context("failed to execute git config --global set")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git config --global set failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
