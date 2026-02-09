@@ -18,6 +18,7 @@ cargo fmt                      # Auto-format
 ## Dev Workflow
 
 - Add tests to cover core functionality and to avoid regressions.
+- Always run `cargo fmt` and `cargo clippy` before committing.
 - Always run tests after changes.
 - Always commit once tests are passing.
 - Commit messages should be detailed so future readers can understand the full intent.
