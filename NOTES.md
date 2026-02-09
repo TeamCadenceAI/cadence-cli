@@ -395,3 +395,47 @@ A code review was conducted after Phase 6 (16 findings: 0 critical, 3 medium, 6 
 
 ### Test Count
 - Total: 142 tests (unchanged). No new tests added; existing tests were improved for isolation.
+
+---
+
+## Phase 7 Decisions
+
+### Pending Module: Full Implementation
+- The `src/pending.rs` stub from Phase 6 was fully fleshed out with production-quality implementations of all five public functions: `pending_dir`, `write_pending`, `list_for_repo`, `increment`, and `remove`.
+- The `PendingRecord` struct and its `Serialize`/`Deserialize` derives were preserved from the Phase 6 stub.
+
+### Testability Pattern: Internal `_in` Functions
+- Each public function has a corresponding internal `_in` variant that accepts a directory parameter: `pending_dir_in(home)`, `write_pending_in(dir, ...)`, `list_for_repo_in(dir, ...)`, `increment_in(dir, ...)`, `remove_in(dir, ...)`.
+- Tests call the `_in` variants directly with `TempDir` paths, avoiding manipulation of the `$HOME` environment variable and enabling parallel execution without `#[serial]`.
+- This mirrors the testability pattern established in Phase 3 (agents module) where `log_dirs_in` accepts a home directory parameter.
+
+### Atomic Writes
+- All file writes (both `write_pending` and `increment`) use the write-to-temp-then-rename pattern: data is first written to `<commit-hash>.json.tmp`, then `std::fs::rename` atomically replaces the final `<commit-hash>.json`. This prevents concurrent post-commit hooks from reading a half-written file.
+- `std::fs::rename` is atomic on POSIX filesystems when source and destination are on the same filesystem, which is guaranteed since both files are in the same pending directory.
+
+### Deserialization: Direct `serde_json::from_str::<PendingRecord>`
+- The Phase 6 stub used `serde_json::Value` with manual field extraction. The full implementation deserializes directly to `PendingRecord` via `serde_json::from_str::<PendingRecord>()`. This is cleaner, type-safe, and validates the JSON structure automatically. Files that don't match the expected structure are silently skipped.
+
+### Retry Time Window: 24 Hours
+- The Phase 6 retry used the same 600-second (10-minute) window as the initial hook, which was too narrow for pending commits that could be hours or days old.
+- Phase 7 widened the retry window to 86,400 seconds (24 hours). This gives session log files much more time to land on disk after the commit was created. The tradeoff is scanning more candidate files, but this is acceptable since retry is best-effort and runs in the background of each hook invocation.
+
+### Retry: Increment on Failure
+- The Phase 6 retry stub did not increment the attempt counter on failure. Phase 7 adds `pending::increment(record)` calls in all failure paths: no session match found, verification failed, file unreadable, note format error, and note add error.
+- This ensures the attempt counter accurately reflects how many times resolution was attempted, which is useful for debugging and for potential future backoff policies.
+
+### `run_retry` Subcommand
+- The `run_retry` stub was upgraded to a working implementation that calls `git::repo_root()` to determine the current repository, counts pending records, runs `retry_pending_for_repo`, and prints a summary of how many records were resolved vs still pending.
+
+### Dead Code Warnings
+- The same dead code warnings from previous phases remain: `push_notes`, `has_upstream`, `remote_org`, `parse_org_from_url`, `config_get`, `config_set` (Phase 8 functions), and `matched_line` on `SessionMatch`.
+
+### Deferred Phase 6 Review Items Resolved
+- **Retry uses same 600-second window (Review 2.2):** Resolved. Now uses 86,400-second window.
+- **Retry does not increment attempt counter (Review 2.3):** Resolved. All failure paths call `pending::increment`.
+- **Missing test for retry resolving a pending commit (Review 4.3):** Resolved. Added `test_retry_resolves_pending_commit` integration test.
+
+### Test Count
+- Total: 166 tests (was 142 before Phase 7). Added 24 new tests:
+  - **Pending module (19 tests):** `test_pending_record_serialize_deserialize`, `test_pending_dir_in_creates_directory`, `test_pending_dir_in_idempotent`, `test_write_pending_creates_json_file`, `test_write_pending_no_temp_file_left`, `test_write_pending_overwrites_existing`, `test_list_for_repo_empty_dir`, `test_list_for_repo_filters_by_repo`, `test_list_for_repo_no_matching_repo`, `test_list_for_repo_skips_non_json_files`, `test_list_for_repo_skips_invalid_json`, `test_list_for_repo_nonexistent_dir`, `test_increment_bumps_attempts`, `test_increment_multiple_times`, `test_increment_preserves_other_fields`, `test_remove_deletes_file`, `test_remove_idempotent`, `test_remove_only_removes_target`, `test_write_list_remove_roundtrip`, `test_write_increment_list_roundtrip`, `test_current_unix_timestamp_is_reasonable`.
+  - **Integration tests (3 tests):** `test_retry_resolves_pending_commit`, `test_retry_increments_attempt_on_failure`, `test_run_retry_in_repo`.

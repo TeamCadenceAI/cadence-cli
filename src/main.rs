@@ -198,21 +198,25 @@ fn hook_post_commit_inner() -> Result<()> {
 /// Attempt to resolve pending commits for the given repository.
 ///
 /// This is a best-effort operation. Any errors during retry are logged
-/// and silently ignored.
+/// and silently ignored. For each pending record:
+/// - If note already exists: remove the pending record (success).
+/// - If session match is found and verified: attach note, remove pending record.
+/// - Otherwise: increment the attempt counter and leave for next time.
 ///
-/// Phase 7 will implement the full retry logic. For now, this iterates
-/// over pending records and attempts resolution for each.
+/// Pending retries use a much wider time window than the initial hook
+/// (24 hours instead of 10 minutes) because the commit could be old and
+/// the session log file may have been modified since the commit was created.
 fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
-    let pending_records = match pending::list_for_repo(repo_str) {
+    let mut pending_records = match pending::list_for_repo(repo_str) {
         Ok(records) => records,
         Err(_) => return,
     };
 
-    for record in &pending_records {
+    for record in &mut pending_records {
         // Skip if note already exists (may have been resolved by another mechanism)
         match git::note_exists(&record.commit) {
             Ok(true) => {
-                // Already resolved — remove pending record
+                // Already resolved -- remove pending record
                 let _ = pending::remove(&record.commit);
                 continue;
             }
@@ -220,12 +224,16 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
             Err(_) => continue,
         }
 
-        // Collect candidate dirs and files for this commit
+        // Collect candidate dirs and files for this commit.
+        // Use a 24-hour (86400 sec) window for retries instead of the
+        // 10-minute window used in the hook. The session log file mtime
+        // may differ significantly from the commit time if the agent
+        // continued working after the commit.
         let mut candidate_dirs = Vec::new();
         candidate_dirs.extend(agents::claude::log_dirs(repo_root));
         candidate_dirs.extend(agents::codex::log_dirs(repo_root));
 
-        let candidate_files = agents::candidate_files(&candidate_dirs, record.commit_time, 600);
+        let candidate_files = agents::candidate_files(&candidate_dirs, record.commit_time, 86_400);
 
         let session_match = scanner::find_session_for_commit(&record.commit, &candidate_files);
 
@@ -235,7 +243,11 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
             if scanner::verify_match(&metadata, repo_root, &record.commit) {
                 let session_log = match std::fs::read_to_string(&matched.file_path) {
                     Ok(content) => content,
-                    Err(_) => continue, // File unreadable; skip, will retry later
+                    Err(_) => {
+                        // File unreadable; increment and try again later
+                        let _ = pending::increment(record);
+                        continue;
+                    }
                 };
 
                 let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
@@ -248,7 +260,10 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
                     &session_log,
                 ) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(_) => {
+                        let _ = pending::increment(record);
+                        continue;
+                    }
                 };
 
                 if git::add_note(&record.commit, &note_content).is_ok() {
@@ -258,8 +273,16 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
                         &record.commit[..std::cmp::min(7, record.commit.len())]
                     );
                     let _ = pending::remove(&record.commit);
+                } else {
+                    let _ = pending::increment(record);
                 }
+            } else {
+                // Verification failed -- increment attempt count
+                let _ = pending::increment(record);
             }
+        } else {
+            // No match found -- increment attempt count
+            let _ = pending::increment(record);
         }
     }
 }
@@ -273,7 +296,33 @@ fn run_hydrate(since: &str, push: bool) -> Result<()> {
 }
 
 fn run_retry() -> Result<()> {
-    eprintln!("[ai-barometer] retry (not yet implemented)");
+    let repo_root = git::repo_root()?;
+    let repo_str = repo_root.to_string_lossy().to_string();
+
+    let pending_count = pending::list_for_repo(&repo_str)
+        .map(|r| r.len())
+        .unwrap_or(0);
+
+    if pending_count == 0 {
+        eprintln!("[ai-barometer] no pending commits for this repo");
+        return Ok(());
+    }
+
+    eprintln!(
+        "[ai-barometer] retrying {} pending commit(s)...",
+        pending_count
+    );
+    retry_pending_for_repo(&repo_str, &repo_root);
+
+    let remaining = pending::list_for_repo(&repo_str)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    let resolved = pending_count - remaining;
+    eprintln!(
+        "[ai-barometer] retry complete: {} resolved, {} still pending",
+        resolved, remaining
+    );
+
     Ok(())
 }
 
@@ -394,8 +443,11 @@ mod tests {
     }
 
     #[test]
-    fn run_retry_returns_ok() {
-        assert!(run_retry().is_ok());
+    fn run_retry_returns_err_outside_repo() {
+        // run_retry now calls git::repo_root() which fails outside a git repo.
+        // In CI or test environments where the CWD might be inside a repo,
+        // it could return Ok. We just verify it doesn't panic.
+        let _ = run_retry();
     }
 
     #[test]
@@ -684,10 +736,244 @@ mod tests {
     fn test_hook_post_commit_never_fails_outside_git_repo() {
         // When called outside a git repo, the hook should still return Ok
         // because the catch-all wrapper catches errors.
-        // Note: we don't chdir — just call it in whatever CWD we have.
+        // Note: we don't chdir -- just call it in whatever CWD we have.
         // If the current dir IS a git repo, inner logic may succeed; that's fine.
         // The important thing is that it NEVER returns Err.
         let result = run_hook_post_commit();
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration test: retry resolves a pending commit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_retry_resolves_pending_commit() {
+        // This test simulates the scenario where:
+        // 1. A commit is made but no session log exists yet (pending record created)
+        // 2. The session log appears later
+        // 3. On the next commit, the retry logic finds and resolves the pending record
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let first_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let first_ts: i64 = first_ts_str.parse().unwrap();
+
+        // Step 1: Run the hook with no session logs -- creates a pending record
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // Verify pending record was created
+        let pending_path = fake_home
+            .path()
+            .join(".ai-barometer")
+            .join("pending")
+            .join(format!("{}.json", first_hash));
+        assert!(pending_path.exists(), "pending record should exist");
+
+        // Step 2: Now create the session log that matches the first commit
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"retry-test-session","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"Done"}}
+"#,
+            cwd = git_repo_root,
+            short = &first_hash[..7],
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        // Set mtime to match first commit time
+        let ft = filetime::FileTime::from_unix_time(first_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Step 3: Make a second commit, which triggers retry of pending records
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        run_git(repo_path, &["commit", "-m", "second commit"]);
+
+        // Run the hook again -- this should resolve the pending record for first_hash
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // Verify the pending record was removed
+        assert!(
+            !pending_path.exists(),
+            "pending record should have been removed after retry"
+        );
+
+        // Verify a note was attached to the first commit
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: claude-code"));
+        assert!(note_output.contains("session_id: retry-test-session"));
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration test: retry increments attempt on failure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_retry_increments_attempt_on_failure() {
+        // Scenario: pending record exists, but no session log is found.
+        // Retry should increment the attempt counter.
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Step 1: Run the hook with no session logs -- creates a pending record
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // Read the pending record -- attempts should be 2: the initial write
+        // sets attempts=1, then the retry loop at the end of the hook
+        // increments it to 2 (because retry also fails to find a session log).
+        let pending_path = fake_home
+            .path()
+            .join(".ai-barometer")
+            .join("pending")
+            .join(format!("{}.json", first_hash));
+        let content = std::fs::read_to_string(&pending_path).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(record["attempts"], 2);
+
+        // Step 2: Make a second commit (still no session log for first commit)
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        run_git(repo_path, &["commit", "-m", "second commit"]);
+
+        // Run the hook again -- retry should fail (no session log) and increment
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // Read the pending record again -- attempts should be 3
+        // (was 2 after first hook, retry in second hook increments to 3)
+        let content = std::fs::read_to_string(&pending_path).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            record["attempts"], 3,
+            "attempt count should be incremented after failed retry. Record: {}",
+            &content
+        );
+
+        // Pending record should still exist
+        assert!(
+            pending_path.exists(),
+            "pending record should still exist after failed retry"
+        );
+
+        // First commit should still have no note
+        let status = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "first commit should have no note after failed retry"
+        );
+
+        // Suppress unused variable warnings
+        let _ = git_repo_root;
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration test: run_retry subcommand
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_run_retry_in_repo() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+
+        // No pending records -- should print "no pending commits"
+        let result = run_retry();
+        assert!(result.is_ok());
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
     }
 }

@@ -79,14 +79,14 @@ This is the critical hot path. Must be fast and never fail the commit.
 
 ## Phase 7: Pending Retry System
 
-- [ ] `pending::pending_dir() -> PathBuf` — return `~/.ai-barometer/pending/`, create if missing
-- [ ] `pending::write(commit: &str, repo: &str, commit_time: i64)` — write `<commit-hash>.json` with fields: commit, repo, commit_time, attempts (1), last_attempt (now)
-- [ ] `pending::list_for_repo(repo: &str) -> Vec<PendingRecord>` — read all pending JSON files, filter by repo path
-- [ ] `pending::increment(record: &mut PendingRecord)` — bump attempts + last_attempt, rewrite file
-- [ ] `pending::remove(commit: &str)` — delete the pending file
-- [ ] `pending::PendingRecord` struct — fields: commit, repo, commit_time, attempts, last_attempt
-- [ ] `retry::run(repo: &str)` — load all pending for repo, attempt resolution for each, remove on success, increment on failure
-- [ ] Unit tests: write/read/delete pending records, verify retry logic
+- [x] `pending::pending_dir() -> PathBuf` — return `~/.ai-barometer/pending/`, create if missing
+- [x] `pending::write(commit: &str, repo: &str, commit_time: i64)` — write `<commit-hash>.json` with fields: commit, repo, commit_time, attempts (1), last_attempt (now)
+- [x] `pending::list_for_repo(repo: &str) -> Vec<PendingRecord>` — read all pending JSON files, filter by repo path
+- [x] `pending::increment(record: &mut PendingRecord)` — bump attempts + last_attempt, rewrite file
+- [x] `pending::remove(commit: &str)` — delete the pending file
+- [x] `pending::PendingRecord` struct — fields: commit, repo, commit_time, attempts, last_attempt
+- [x] `retry::run(repo: &str)` — load all pending for repo, attempt resolution for each, remove on success, increment on failure
+- [x] Unit tests: write/read/delete pending records, verify retry logic
 
 ---
 
