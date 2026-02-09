@@ -439,3 +439,27 @@ A code review was conducted after Phase 6 (16 findings: 0 critical, 3 medium, 6 
 - Total: 166 tests (was 142 before Phase 7). Added 24 new tests:
   - **Pending module (19 tests):** `test_pending_record_serialize_deserialize`, `test_pending_dir_in_creates_directory`, `test_pending_dir_in_idempotent`, `test_write_pending_creates_json_file`, `test_write_pending_no_temp_file_left`, `test_write_pending_overwrites_existing`, `test_list_for_repo_empty_dir`, `test_list_for_repo_filters_by_repo`, `test_list_for_repo_no_matching_repo`, `test_list_for_repo_skips_non_json_files`, `test_list_for_repo_skips_invalid_json`, `test_list_for_repo_nonexistent_dir`, `test_increment_bumps_attempts`, `test_increment_multiple_times`, `test_increment_preserves_other_fields`, `test_remove_deletes_file`, `test_remove_idempotent`, `test_remove_only_removes_target`, `test_write_list_remove_roundtrip`, `test_write_increment_list_roundtrip`, `test_current_unix_timestamp_is_reasonable`.
   - **Integration tests (3 tests):** `test_retry_resolves_pending_commit`, `test_retry_increments_attempt_on_failure`, `test_run_retry_in_repo`.
+
+---
+
+## Phase 7 Review Triage
+
+A code review was conducted after Phase 7 (28 findings: 0 critical, 2 medium, 10 low, 16 informational). The review confirmed 166 tests passing, clippy clean (expected dead-code warnings only), and formatting clean. No critical or commit-blocking bugs were found.
+
+### Fixed
+
+1. **Test for `increment` on nonexistent file (Review 6.3, Low).** Added `test_increment_on_nonexistent_file_creates_it` which calls `increment_in` with a `PendingRecord` whose file was never written to disk. Verifies that `increment` handles this gracefully (creates the file rather than panicking) and that the in-memory record and on-disk file both reflect the incremented state.
+
+2. **Orphaned `.json.tmp` cleanup in `list_for_repo_in` (Review 1.2, Low).** Added cleanup logic in `list_for_repo_in` that deletes any `.json.tmp` files encountered during directory iteration. These files indicate crashed writes (the process died between `std::fs::write` to the temp file and `std::fs::rename` to the final path). The cleanup uses `let _ = std::fs::remove_file(...)` so a failed cleanup (e.g., permissions) does not affect the listing operation. Added `test_list_for_repo_cleans_up_orphaned_tmp_files` and updated the existing `test_list_for_repo_skips_non_json_files` to verify cleanup behavior.
+
+3. **Doc comment on `list_for_repo` noting canonical path requirement (Review 3.1, Medium).** Added documentation that the `repo` parameter must be a canonical absolute path as returned by `git rev-parse --show-toplevel`, and that filtering uses exact string equality. This documents the known limitation where symlinked or non-canonical paths would fail to match.
+
+### Deferred to Phase 12
+
+- **Maximum retry count (Review 4.7, Low):** A pending record for an unresolvable commit will be retried forever. Phase 12 should add a max attempt count (e.g., remove after 100 attempts or 30 days).
+- **Schema versioning on `PendingRecord` (Review 2.2, Low):** No version field on the struct. Future phases that add fields should use `#[serde(default)]` to maintain backward compatibility.
+- **fsync before rename (Review 1.3, Low):** Acceptable tradeoff for a best-effort pending system. Power failure could theoretically lose a pending record.
+- **Concurrent write testing (Review 6.2, Low):** No test for truly concurrent `write_pending` calls. Atomic rename ensures safety, so this is low risk.
+
+### Test Count
+- Total: 168 tests (was 166 before triage). Added 2 new tests: `test_increment_on_nonexistent_file_creates_it`, `test_list_for_repo_cleans_up_orphaned_tmp_files`.

@@ -95,7 +95,13 @@ fn write_pending_in(dir: &Path, commit: &str, repo: &str, commit_time: i64) -> a
 ///
 /// Reads all `.json` files in the pending directory, deserializes them
 /// as `PendingRecord`, and filters by repo path. Files that cannot be
-/// read or parsed are silently skipped.
+/// read or parsed are silently skipped. Orphaned `.json.tmp` files
+/// (left behind by crashed writes) are cleaned up automatically.
+///
+/// The `repo` parameter must be a canonical absolute path as returned by
+/// `git rev-parse --show-toplevel`. Filtering uses exact string equality,
+/// so paths with trailing slashes, symlinks, or other non-canonical
+/// representations will not match records written with the canonical form.
 pub fn list_for_repo(repo: &str) -> anyhow::Result<Vec<PendingRecord>> {
     let dir = match pending_dir() {
         Ok(d) => d,
@@ -126,6 +132,14 @@ fn list_for_repo_in(dir: &Path, repo: &str) -> anyhow::Result<Vec<PendingRecord>
 
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            // Clean up orphaned .json.tmp files left behind by crashed writes.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".json.tmp"))
+            {
+                let _ = std::fs::remove_file(&path);
+            }
             continue;
         }
 
@@ -424,11 +438,43 @@ mod tests {
         // Write a non-json file
         std::fs::write(dir.join("notes.txt"), "not a record").unwrap();
 
-        // Write a .json.tmp file (should be ignored)
-        std::fs::write(dir.join("leftover.json.tmp"), "{}").unwrap();
+        // Write a .json.tmp file (should be ignored and cleaned up)
+        let tmp_path = dir.join("leftover.json.tmp");
+        std::fs::write(&tmp_path, "{}").unwrap();
 
         let records = list_for_repo_in(&dir, "/repo").unwrap();
         assert_eq!(records.len(), 1);
+
+        // The .json.tmp file should have been cleaned up
+        assert!(
+            !tmp_path.exists(),
+            "orphaned .json.tmp file should be cleaned up"
+        );
+
+        // The .txt file should NOT be cleaned up (only .json.tmp files)
+        assert!(dir.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn test_list_for_repo_cleans_up_orphaned_tmp_files() {
+        let home = TempDir::new().unwrap();
+        let dir = pending_dir_in(home.path()).unwrap();
+
+        // Create multiple orphaned .json.tmp files
+        let tmp1 = dir.join("abc1234.json.tmp");
+        let tmp2 = dir.join("def5678.json.tmp");
+        std::fs::write(&tmp1, r#"{"partial":"write"}"#).unwrap();
+        std::fs::write(&tmp2, "corrupted data").unwrap();
+
+        assert!(tmp1.exists());
+        assert!(tmp2.exists());
+
+        // Listing should clean them up
+        let records = list_for_repo_in(&dir, "/repo").unwrap();
+        assert!(records.is_empty());
+
+        assert!(!tmp1.exists(), "first orphaned tmp should be removed");
+        assert!(!tmp2.exists(), "second orphaned tmp should be removed");
     }
 
     #[test]
@@ -513,6 +559,43 @@ mod tests {
         let content2 = std::fs::read_to_string(&file_path).unwrap();
         let record2: PendingRecord = serde_json::from_str(&content2).unwrap();
         assert_eq!(record2.attempts, 4);
+    }
+
+    #[test]
+    fn test_increment_on_nonexistent_file_creates_it() {
+        // If the on-disk file was deleted (e.g. by a concurrent remove) but
+        // the in-memory record is still being iterated, increment should
+        // handle this gracefully by creating the file anew rather than
+        // panicking.
+        let home = TempDir::new().unwrap();
+        let dir = pending_dir_in(home.path()).unwrap();
+        let commit = "abcdef0123456789abcdef0123456789abcdef01";
+
+        // Create a record in memory without writing it to disk first
+        let mut record = PendingRecord {
+            commit: commit.to_string(),
+            repo: "/repo".to_string(),
+            commit_time: 1_700_000_000,
+            attempts: 1,
+            last_attempt: 1_700_000_000,
+        };
+
+        // The file does not exist on disk -- increment should still succeed
+        let file_path = dir.join(format!("{}.json", commit));
+        assert!(!file_path.exists());
+
+        increment_in(&dir, &mut record).unwrap();
+
+        // The in-memory record should be updated
+        assert_eq!(record.attempts, 2);
+
+        // A file should now exist on disk with the updated record
+        assert!(file_path.exists());
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let disk_record: PendingRecord = serde_json::from_str(&content).unwrap();
+        assert_eq!(disk_record.attempts, 2);
+        assert_eq!(disk_record.commit, commit);
+        assert_eq!(disk_record.repo, "/repo");
     }
 
     #[test]
