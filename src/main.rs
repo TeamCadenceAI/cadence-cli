@@ -1,3 +1,4 @@
+mod agents;
 mod git;
 
 use anyhow::Result;

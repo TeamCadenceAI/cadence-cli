@@ -120,3 +120,39 @@ A code review was conducted after Phase 2 (21 findings). The following issues we
 
 ### Dev-Dependencies Added
 - `serial_test = "3"` for serializing tests that use `set_current_dir`.
+
+---
+
+## Phase 3 Decisions
+
+### Module Layout
+- The agents module uses a directory structure: `src/agents/mod.rs`, `src/agents/claude.rs`, `src/agents/codex.rs`. This keeps the agent-specific logic isolated and allows each agent to be extended independently in future phases.
+- Wired into the crate via `mod agents;` in `main.rs`.
+
+### Testability Pattern: Internal Functions with Home Parameter
+- The `claude::log_dirs` and `codex::log_dirs` public functions resolve the home directory via `home_dir()` (which reads `$HOME`), then delegate to internal `log_dirs_in` functions that accept a `home: &Path` parameter.
+- Tests call the `_in` variants directly with a temp directory, avoiding the need to modify environment variables. This is important because Rust 2024 edition makes `std::env::set_var` and `std::env::remove_var` **unsafe** (they can cause data races in multi-threaded programs). Rather than wrapping env var mutations in `unsafe` blocks, the testability-via-parameter approach is cleaner and avoids the issue entirely.
+- This pattern could be generalized to a `Config` or `Context` struct in a later phase if needed, but for now the simple function parameter is sufficient.
+
+### File Mtime in Tests
+- Initially used `touch -t` with `chrono` to format timestamps, but this produced incorrect results because `chrono::DateTime::from_timestamp` creates UTC datetimes while macOS `touch -t` interprets timestamps in local time. The timezone offset caused mtime to be set to the wrong epoch value.
+- Switched to the `filetime` crate (added as dev-dependency `filetime = "0.2"`) which correctly sets file mtimes using the Unix epoch directly via `utimensat`/equivalent syscalls. This is cross-platform and timezone-safe.
+
+### encode_repo_path
+- Simple string replacement: every `/` becomes `-`. The leading `/` in an absolute path becomes a leading `-`.
+- This matches the Claude Code convention observed in `~/.claude/projects/` directory names.
+- No special handling for relative paths, trailing slashes, or non-UTF-8 paths. These are not expected in practice (repo paths from `git rev-parse --show-toplevel` are always absolute and UTF-8).
+
+### candidate_files
+- Filters by file extension (`.jsonl`), file type (regular file, not directory), and modification time window.
+- Uses `abs(file_mtime - commit_time) <= window_secs` as specified.
+- Silently skips files with unreadable metadata or mtimes before the Unix epoch. This matches the design principle that errors in the hook path should be non-fatal.
+
+### Codex log_dirs API
+- The `codex::log_dirs` function accepts a `_repo_path` parameter for API symmetry with `claude::log_dirs`, but does not use it for filtering. Codex sessions are not scoped to a repo path in the filesystem. The caller (Phase 6's post-commit handler) will filter by time window and content.
+
+### Dead Code Warnings
+- As with Phase 2, all new `pub fn` items generate "never used" warnings because they are not called from `main.rs` yet. These will resolve when Phase 6 wires up the hook handler.
+
+### Dev-Dependencies Added
+- `filetime = "0.2"` for setting file modification times in tests.

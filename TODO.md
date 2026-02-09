@@ -34,11 +34,11 @@ Shared helpers that multiple subcommands depend on.
 
 ## Phase 3: Agent Log Discovery Module
 
-- [ ] `agents::encode_repo_path(path: &Path) -> String` — encode `/Users/foo/bar` → `-Users-foo-bar`
-- [ ] `agents::claude::log_dirs(repo_path: &Path) -> Vec<PathBuf>` — glob `~/.claude/projects/*<encoded-repo>*`
-- [ ] `agents::codex::log_dirs(repo_path: &Path) -> Vec<PathBuf>` — glob `~/.codex/sessions/*`
-- [ ] `agents::candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> Vec<PathBuf>` — filter `.jsonl` files with mtime within ±window of commit time
-- [ ] Unit tests: create temp dirs with fake JSONL files, verify filtering by mtime and path encoding
+- [x] `agents::encode_repo_path(path: &Path) -> String` — encode `/Users/foo/bar` → `-Users-foo-bar`
+- [x] `agents::claude::log_dirs(repo_path: &Path) -> Vec<PathBuf>` — glob `~/.claude/projects/*<encoded-repo>*`
+- [x] `agents::codex::log_dirs(repo_path: &Path) -> Vec<PathBuf>` — glob `~/.codex/sessions/*`
+- [x] `agents::candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> Vec<PathBuf>` — filter `.jsonl` files with mtime within ±window of commit time
+- [x] Unit tests: create temp dirs with fake JSONL files, verify filtering by mtime and path encoding
 
 ---
 
