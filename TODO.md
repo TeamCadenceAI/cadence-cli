@@ -18,17 +18,17 @@ Ordered by dependency. Complete each phase before starting the next.
 
 Shared helpers that multiple subcommands depend on.
 
-- [ ] `git::repo_root()` — run `git rev-parse --show-toplevel`, return `PathBuf`
-- [ ] `git::head_hash()` — run `git rev-parse HEAD`, return full 40-char hash
-- [ ] `git::head_timestamp()` — run `git show -s --format=%ct HEAD`, return `i64` unix timestamp
-- [ ] `git::note_exists(commit: &str)` — run `git notes --ref=refs/notes/ai-sessions show <commit>`, return `bool`
-- [ ] `git::add_note(commit: &str, content: &str)` — run `git notes --ref=refs/notes/ai-sessions add -m <content> <commit>`
-- [ ] `git::push_notes()` — run `git push origin refs/notes/ai-sessions`
-- [ ] `git::has_upstream()` — check if repo has a configured remote
-- [ ] `git::remote_org()` — extract owner/org from remote URLs
-- [ ] `git::config_get(key: &str)` — read a git config value
-- [ ] `git::config_set(key: &str, value: &str)` — write a git config value
-- [ ] Unit tests: mock or integration-test each helper against a temp git repo
+- [x] `git::repo_root()` — run `git rev-parse --show-toplevel`, return `PathBuf`
+- [x] `git::head_hash()` — run `git rev-parse HEAD`, return full 40-char hash
+- [x] `git::head_timestamp()` — run `git show -s --format=%ct HEAD`, return `i64` unix timestamp
+- [x] `git::note_exists(commit: &str)` — run `git notes --ref=refs/notes/ai-sessions show <commit>`, return `bool`
+- [x] `git::add_note(commit: &str, content: &str)` — run `git notes --ref=refs/notes/ai-sessions add -m <content> <commit>`
+- [x] `git::push_notes()` — run `git push origin refs/notes/ai-sessions`
+- [x] `git::has_upstream()` — check if repo has a configured remote
+- [x] `git::remote_org()` — extract owner/org from remote URLs
+- [x] `git::config_get(key: &str)` — read a git config value
+- [x] `git::config_set(key: &str, value: &str)` — write a git config value
+- [x] Unit tests: mock or integration-test each helper against a temp git repo
 
 ---
 
