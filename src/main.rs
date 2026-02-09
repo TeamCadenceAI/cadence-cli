@@ -591,10 +591,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         };
 
         // Build the header (printed later, possibly combined with a single status)
-        let header = format!(
-            "[ai-barometer] -> {} | {}",
-            session_display, repo_display
-        );
+        let header = format!("[ai-barometer] -> {} | {}", session_display, repo_display);
 
         // Step 4: Extract all commit hashes from the session log
         let commit_hashes = scanner::extract_commit_hashes(file);
@@ -728,7 +725,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
         // Print: combine header + single message on one line, or multi-line
         if messages.len() <= 1 {
-            let status = messages.first().map(|s| s.as_str()).unwrap_or("nothing to do");
+            let status = messages
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("nothing to do");
             eprintln!("{} | {}", header, status);
         } else {
             eprintln!("{}", header);
