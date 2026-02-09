@@ -105,18 +105,18 @@ This is the critical hot path. Must be fast and never fail the commit.
 
 ## Phase 9: `hydrate` Subcommand
 
-- [ ] Accept `--since` flag (e.g. `7d`, `30d`) — parse duration string
-- [ ] Scan all Claude + Codex log root directories (not scoped to one repo)
-- [ ] Filter log files by mtime within `--since` window
-- [ ] For each log file: stream lines, extract all commit hashes found
-- [ ] For each commit hash: resolve repo from session cwd/workdir
-- [ ] Check dedup: skip if note already exists
-- [ ] Attach note if missing
-- [ ] Print verbose progress throughout: `[ai-barometer] → session <id> (repo: <name>)`
-- [ ] Print final summary: `Done. N attached, N skipped, N errors.`
-- [ ] All errors are non-fatal — log and continue
-- [ ] Do NOT auto-push by default (add `--push` flag to opt in)
-- [ ] Integration test: fake log directory with multiple sessions, verify hydration attaches correct notes
+- [x] Accept `--since` flag (e.g. `7d`, `30d`) — parse duration string
+- [x] Scan all Claude + Codex log root directories (not scoped to one repo)
+- [x] Filter log files by mtime within `--since` window
+- [x] For each log file: stream lines, extract all commit hashes found
+- [x] For each commit hash: resolve repo from session cwd/workdir
+- [x] Check dedup: skip if note already exists
+- [x] Attach note if missing
+- [x] Print verbose progress throughout: `[ai-barometer] → session <id> (repo: <name>)`
+- [x] Print final summary: `Done. N attached, N skipped, N errors.`
+- [x] All errors are non-fatal — log and continue
+- [x] Do NOT auto-push by default (add `--push` flag to opt in)
+- [x] Integration test: fake log directory with multiple sessions, verify hydration attaches correct notes
 
 ---
 

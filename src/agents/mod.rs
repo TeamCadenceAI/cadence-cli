@@ -85,6 +85,67 @@ pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> 
     results
 }
 
+/// Find all `.jsonl` files in the given directories whose modification time
+/// is within `since_secs` seconds of `now`.
+///
+/// This is used by the `hydrate` command to find recently-modified session
+/// logs regardless of any specific commit time. Unlike `candidate_files`,
+/// which filters by a symmetric window around a commit timestamp, this
+/// filters by `mtime >= now - since_secs`.
+///
+/// Files that cannot be read or whose metadata is unavailable are silently skipped.
+pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf> {
+    let cutoff = now - since_secs;
+    let mut results = Vec::new();
+
+    for dir in dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+
+            // Only consider .jsonl files
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            // Only consider regular files (follow symlinks)
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+
+            // Check modification time
+            let mtime = match metadata.modified() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let mtime_epoch = match mtime.duration_since(UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(_) => continue,
+            };
+
+            if mtime_epoch >= cutoff {
+                results.push(path);
+            }
+        }
+    }
+
+    results
+}
+
 /// Resolve the user's home directory.
 ///
 /// Returns `None` if the home directory cannot be determined.
@@ -306,6 +367,81 @@ mod tests {
         fs::create_dir(&fake_dir).unwrap();
 
         let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // recent_files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_recent_files_within_window() {
+        let dir = TempDir::new().unwrap();
+        let now: i64 = 1_700_000_000;
+        let since_secs: i64 = 7 * 86_400; // 7 days
+
+        // File modified recently (within window)
+        let file = dir.path().join("recent.jsonl");
+        fs::write(&file, "{}").unwrap();
+        set_file_mtime(&file, now - 3 * 86_400); // 3 days ago
+
+        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], file);
+    }
+
+    #[test]
+    fn test_recent_files_outside_window() {
+        let dir = TempDir::new().unwrap();
+        let now: i64 = 1_700_000_000;
+        let since_secs: i64 = 7 * 86_400; // 7 days
+
+        // File modified too long ago
+        let file = dir.path().join("old.jsonl");
+        fs::write(&file, "{}").unwrap();
+        set_file_mtime(&file, now - 10 * 86_400); // 10 days ago
+
+        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_recent_files_at_boundary() {
+        let dir = TempDir::new().unwrap();
+        let now: i64 = 1_700_000_000;
+        let since_secs: i64 = 7 * 86_400;
+
+        // File at exact cutoff (mtime == now - since_secs)
+        let file = dir.path().join("boundary.jsonl");
+        fs::write(&file, "{}").unwrap();
+        set_file_mtime(&file, now - since_secs); // exactly at the cutoff
+
+        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        assert_eq!(result.len(), 1, "file at exact cutoff should be included");
+    }
+
+    #[test]
+    fn test_recent_files_ignores_non_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let now: i64 = 1_700_000_000;
+
+        let txt_file = dir.path().join("session.txt");
+        fs::write(&txt_file, "{}").unwrap();
+        set_file_mtime(&txt_file, now);
+
+        let result = recent_files(&[dir.path().to_path_buf()], now, 86_400);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_recent_files_empty_dirs() {
+        let result = recent_files(&[], 1_700_000_000, 86_400);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_recent_files_nonexistent_dir() {
+        let result = recent_files(&[PathBuf::from("/nonexistent/dir")], 1_700_000_000, 86_400);
         assert!(result.is_empty());
     }
 

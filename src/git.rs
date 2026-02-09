@@ -111,6 +111,49 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(stdout.trim()))
 }
 
+/// Check whether an AI-session note already exists for the given commit,
+/// in a specific repository directory.
+///
+/// This is the directory-parameterised version of [`note_exists`], for use
+/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
+    validate_commit_hash(commit)?;
+    let repo_str = repo.to_string_lossy();
+    let status = Command::new("git")
+        .args([
+            "-C", &repo_str, "notes", "--ref", NOTES_REF, "show", "--", commit,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("failed to execute git notes show")?;
+    Ok(status.success())
+}
+
+/// Attach an AI-session note to a commit in a specific repository directory.
+///
+/// This is the directory-parameterised version of [`add_note`], for use
+/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+///
+/// **Precondition:** Callers must check [`note_exists_at`] first and skip if
+/// a note is already present.
+pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()> {
+    validate_commit_hash(commit)?;
+    let repo_str = repo.to_string_lossy();
+    let output = Command::new("git")
+        .args([
+            "-C", &repo_str, "notes", "--ref", NOTES_REF, "add", "-m", content, "--", commit,
+        ])
+        .output()
+        .context("failed to execute git notes add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git notes add failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 /// Check whether a commit exists in a given repository.
 ///
 /// Runs `git -C <repo> cat-file -t -- <commit>` and checks for success.

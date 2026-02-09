@@ -544,3 +544,64 @@ A code review was conducted after Phase 8 (18 findings: 0 critical, 3 medium, 7 
 
 ### Test Count
 - Total: 196 tests (was 187 before triage). Added 9 new tests (7 for `org_matches`, 3 for org filter end-to-end with `GIT_CONFIG_GLOBAL`). Removed 1 test (`test_org_filter_case_insensitive_matching` replaced by `org_matches` tests). Net: +9.
+
+---
+
+## Phase 9 Decisions
+
+### Hydrate Architecture: Repo-Agnostic Scanning
+- The `hydrate` command is fundamentally different from the `hook post-commit` path: it scans ALL session logs globally, not just logs matching the current repo. This required new "all log dirs" functions and a different file filtering approach.
+- The hook path uses `agents::claude::log_dirs(repo_path)` (scoped to one repo) and `agents::candidate_files(dirs, commit_time, ±600s)` (symmetric window around commit time). The hydrate path uses `agents::claude::all_log_dirs()` (all repos) and `agents::recent_files(dirs, now, since_secs)` (one-sided cutoff from now).
+
+### Duration Parsing
+- `parse_since_duration` supports the `<N>d` format only (number of days). This is sufficient for all use cases mentioned in the PLAN.md (`7d`, `30d`). Hours, minutes, or other units are not supported -- the function returns a clear error for unrecognized formats.
+- Zero and negative values are rejected.
+
+### All Log Dirs Functions
+- Added `agents::claude::all_log_dirs()` and `agents::codex::all_log_dirs()` that return ALL directories (not filtered by repo path).
+- For Claude, this returns every subdirectory under `~/.claude/projects/`. For Codex, `all_log_dirs()` is functionally identical to `log_dirs()` since Codex sessions are already not scoped to a repo.
+- Both follow the testability pattern from Phase 3: public functions resolve `$HOME`, internal `_in` variants accept a home parameter for testing.
+
+### Recent Files Function
+- Added `agents::recent_files(dirs, now, since_secs)` that filters `.jsonl` files by `mtime >= now - since_secs`. This is a one-sided cutoff (not a symmetric window), appropriate for hydration where we want all files modified within the last N days regardless of any specific commit time.
+
+### Commit Hash Extraction
+- Added `scanner::extract_commit_hashes(file)` that scans all lines for 40-character hex strings bounded by non-hex characters. This extracts all potential commit hashes from a session log.
+- The extraction uses a manual scan (not regex) for simplicity and to avoid adding a regex dependency. Walks through each line byte-by-byte, identifying runs of hex digits. Only runs of exactly 40 characters are extracted (shorter or longer hex runs are ignored).
+- Results are deduplicated (same hash appearing multiple times in a file is returned once) and lowercased (uppercase hex is normalised).
+- This approach may produce false positives (e.g., a SHA-256 hash truncated to 40 chars), but these are filtered out downstream by `commit_exists_at` which verifies the hash actually exists in the resolved repo.
+
+### Git Helpers: note_exists_at and add_note_at
+- Added `git::note_exists_at(repo, commit)` and `git::add_note_at(repo, commit, content)` that run in a specific repository directory using `git -C <repo>`. These are the directory-parameterised versions of `note_exists` and `add_note`, needed because hydrate operates on arbitrary repos (not the CWD).
+- Both follow the same validation and error handling patterns as their CWD-based counterparts.
+
+### Hydrate Algorithm
+The `run_hydrate` function follows the PLAN.md algorithm:
+1. Parse `--since` duration string into seconds.
+2. Collect all log directories from both Claude and Codex.
+3. Find all `.jsonl` files modified within the `--since` window using `recent_files`.
+4. For each file: parse session metadata (session_id, cwd), extract all commit hashes.
+5. For each hash: resolve the repo from the session's cwd, verify the commit exists in that repo, check dedup (skip if note already exists), read the session log, format the note, and attach it.
+6. Print verbose progress throughout with `[ai-barometer]` prefix.
+7. Print final summary: `Done. N attached, N skipped, N errors.`
+8. If `--push` flag is set, call `push::attempt_push()` after hydration.
+
+### Error Handling
+- All errors in the hydrate loop are non-fatal. Each error increments the `errors` counter, prints a message, and continues to the next hash/file. The function itself returns `Ok(())` even if some operations failed.
+- The only fatal error is an invalid `--since` format, which returns `Err` before scanning begins.
+
+### Push Behaviour
+- Hydrate does NOT auto-push by default, consistent with PLAN.md: "Must not auto-push by default."
+- The `--push` flag triggers a single `push::attempt_push()` after all hydration is complete. Note that this pushes from the CWD repo's context, which may not cover all repos that had notes attached. This is acceptable for v1 -- the push is best-effort.
+
+### Session Log Caching
+- When a single session log contains multiple commit hashes, the full log content is re-read for each hash via `std::fs::read_to_string`. This is intentionally simple and relies on the OS page cache for performance. A future optimisation could read the file once and reuse it, but this is premature for v1.
+
+### Dead Code Warnings
+- Same as Phase 8: `remote_org` and `matched_line` remain unused. These are expected.
+
+### Test Count
+- Total: 226 tests (was 196 before Phase 9). Added 30 new tests:
+  - **agents module (9 tests):** `test_all_log_dirs_returns_all_directories`, `test_all_log_dirs_returns_empty_when_no_projects_dir`, `test_all_log_dirs_ignores_files`, `test_recent_files_within_window`, `test_recent_files_outside_window`, `test_recent_files_at_boundary`, `test_recent_files_ignores_non_jsonl`, `test_recent_files_empty_dirs`, `test_recent_files_nonexistent_dir`.
+  - **scanner module (10 tests):** `test_extract_commit_hashes_finds_full_hash`, `test_extract_commit_hashes_finds_multiple`, `test_extract_commit_hashes_deduplicates`, `test_extract_commit_hashes_no_hashes`, `test_extract_commit_hashes_ignores_short_hex`, `test_extract_commit_hashes_ignores_longer_hex`, `test_extract_commit_hashes_uppercase_lowered`, `test_extract_commit_hashes_nonexistent_file`, `test_extract_commit_hashes_empty_file`, `test_extract_commit_hashes_realistic_session_log`.
+  - **main module (11 tests):** `test_parse_since_duration_7d`, `test_parse_since_duration_30d`, `test_parse_since_duration_1d`, `test_parse_since_duration_invalid_format`, `test_parse_since_duration_zero_rejected`, `test_parse_since_duration_negative_rejected`, `test_hydrate_attaches_note_from_session_log`, `test_hydrate_skips_if_note_already_exists`, `test_hydrate_multiple_commits_in_one_session`, `test_hydrate_no_logs_returns_ok`, `test_hydrate_invalid_since_returns_error`.

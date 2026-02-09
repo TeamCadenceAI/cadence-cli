@@ -300,11 +300,245 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
     }
 }
 
-fn run_hydrate(since: &str, push: bool) -> Result<()> {
+/// Parse a duration string like "7d", "30d", "1d" into seconds.
+///
+/// Currently only supports the `<N>d` format (number of days).
+/// Returns an error for unrecognized formats.
+fn parse_since_duration(since: &str) -> Result<i64> {
+    let since = since.trim();
+    if let Some(days_str) = since.strip_suffix('d') {
+        let days: i64 = days_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid --since value: {:?}", since))?;
+        if days <= 0 {
+            anyhow::bail!("--since value must be positive: {:?}", since);
+        }
+        Ok(days * 86_400)
+    } else {
+        anyhow::bail!(
+            "unsupported --since format {:?}: expected e.g. \"7d\", \"30d\"",
+            since
+        );
+    }
+}
+
+/// The hydrate subcommand: backfill AI session notes for recent commits.
+///
+/// This scans ALL Claude and Codex log directories (not scoped to any
+/// single repo), finds commit hashes in session logs, resolves repos
+/// from session metadata, and attaches notes where missing.
+///
+/// Properties:
+/// - Can take minutes for large log directories
+/// - Prints verbose progress throughout
+/// - All errors are non-fatal (logged and continued)
+/// - Does NOT auto-push by default (use `--push` flag)
+fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
+    let since_secs = parse_since_duration(since)?;
+    let since_days = since_secs / 86_400;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Step 1: Collect all log directories (repo-agnostic)
     eprintln!(
-        "[ai-barometer] hydrate: since={}, push={} (not yet implemented)",
-        since, push
+        "[ai-barometer] Scanning Claude logs (last {} days)...",
+        since_days
     );
+    let claude_dirs = agents::claude::all_log_dirs();
+
+    eprintln!(
+        "[ai-barometer] Scanning Codex logs (last {} days)...",
+        since_days
+    );
+    let codex_dirs = agents::codex::all_log_dirs();
+
+    let mut all_dirs = Vec::new();
+    all_dirs.extend(claude_dirs);
+    all_dirs.extend(codex_dirs);
+
+    // Step 2: Find all .jsonl files modified within the --since window
+    let files = agents::recent_files(&all_dirs, now, since_secs);
+    eprintln!("[ai-barometer] Found {} session logs", files.len());
+
+    // Counters for final summary
+    let mut attached = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+
+    // Step 3: Process each file
+    for file in &files {
+        // Parse metadata to get session_id and cwd
+        let metadata = scanner::parse_session_metadata(file);
+        let session_id = metadata
+            .session_id
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Determine repo name for display (last path component of cwd)
+        let repo_display = metadata
+            .cwd
+            .as_ref()
+            .and_then(|c| {
+                std::path::Path::new(c)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Show short session_id for display (first 8 chars or full if shorter)
+        let session_display = if session_id.len() > 8 {
+            &session_id[..8]
+        } else {
+            &session_id
+        };
+
+        eprintln!(
+            "[ai-barometer] -> session {} (repo: {})",
+            session_display, repo_display
+        );
+
+        // Step 4: Extract all commit hashes from the session log
+        let commit_hashes = scanner::extract_commit_hashes(file);
+
+        if commit_hashes.is_empty() {
+            eprintln!("[ai-barometer]   no commit hashes found, skipping");
+            skipped += 1;
+            continue;
+        }
+
+        // Step 5: For each hash, resolve repo and attach note if missing
+        for hash in &commit_hashes {
+            // Resolve repo from session cwd
+            let cwd = match &metadata.cwd {
+                Some(c) => c.clone(),
+                None => {
+                    eprintln!(
+                        "[ai-barometer]   no cwd in session metadata, skipping commit {}",
+                        &hash[..7]
+                    );
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            let cwd_path = std::path::Path::new(&cwd);
+
+            // Resolve the repo root from the session's cwd
+            let repo_root = match git::repo_root_at(cwd_path) {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("[ai-barometer]   repo missing for cwd {}, skipped", cwd);
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            // Verify the commit exists in the resolved repo
+            match git::commit_exists_at(&repo_root, hash) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Commit does not exist in this repo -- could be from a
+                    // different repo or could be rebased away. Skip silently.
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ai-barometer]   error checking commit {}: {}",
+                        &hash[..7],
+                        e
+                    );
+                    errors += 1;
+                    continue;
+                }
+            }
+
+            // Check dedup: skip if note already exists
+            match git::note_exists_at(&repo_root, hash) {
+                Ok(true) => {
+                    // Note already exists -- skip
+                    skipped += 1;
+                    continue;
+                }
+                Ok(false) => {} // Need to attach
+                Err(e) => {
+                    eprintln!(
+                        "[ai-barometer]   error checking note for {}: {}",
+                        &hash[..7],
+                        e
+                    );
+                    errors += 1;
+                    continue;
+                }
+            }
+
+            // Read the full session log
+            let session_log = match std::fs::read_to_string(file) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("[ai-barometer]   failed to read session log: {}", e);
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            // Infer agent type from file path
+            let agent_type = if file.to_string_lossy().contains(".codex") {
+                scanner::AgentType::Codex
+            } else {
+                scanner::AgentType::Claude
+            };
+
+            let repo_str = repo_root.to_string_lossy().to_string();
+
+            // Format the note
+            let note_content =
+                match note::format(&agent_type, &session_id, &repo_str, hash, &session_log) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "[ai-barometer]   failed to format note for {}: {}",
+                            &hash[..7],
+                            e
+                        );
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+            // Attach the note
+            match git::add_note_at(&repo_root, hash, &note_content) {
+                Ok(()) => {
+                    eprintln!("[ai-barometer]   commit {} attached", &hash[..7]);
+                    attached += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ai-barometer]   failed to attach note to {}: {}",
+                        &hash[..7],
+                        e
+                    );
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    // Step 6: Print summary
+    eprintln!(
+        "[ai-barometer] Done. {} attached, {} skipped, {} errors.",
+        attached, skipped, errors
+    );
+
+    // Step 7: Push if requested
+    if do_push {
+        eprintln!("[ai-barometer] Pushing notes...");
+        push::attempt_push();
+    }
+
     Ok(())
 }
 
@@ -452,7 +686,42 @@ mod tests {
 
     #[test]
     fn run_hydrate_returns_ok() {
+        // run_hydrate now does real work: parses --since, scans log dirs.
+        // With a valid duration string and no session logs on disk, it should
+        // succeed and print a "Done. 0 attached, 0 skipped, 0 errors." summary.
         assert!(run_hydrate("7d", false).is_ok());
+    }
+
+    #[test]
+    fn test_parse_since_duration_7d() {
+        assert_eq!(parse_since_duration("7d").unwrap(), 7 * 86_400);
+    }
+
+    #[test]
+    fn test_parse_since_duration_30d() {
+        assert_eq!(parse_since_duration("30d").unwrap(), 30 * 86_400);
+    }
+
+    #[test]
+    fn test_parse_since_duration_1d() {
+        assert_eq!(parse_since_duration("1d").unwrap(), 86_400);
+    }
+
+    #[test]
+    fn test_parse_since_duration_invalid_format() {
+        assert!(parse_since_duration("7h").is_err());
+        assert!(parse_since_duration("abc").is_err());
+        assert!(parse_since_duration("").is_err());
+    }
+
+    #[test]
+    fn test_parse_since_duration_zero_rejected() {
+        assert!(parse_since_duration("0d").is_err());
+    }
+
+    #[test]
+    fn test_parse_since_duration_negative_rejected() {
+        assert!(parse_since_duration("-1d").is_err());
     }
 
     #[test]
@@ -988,5 +1257,298 @@ mod tests {
             }
         }
         std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: hydrate subcommand
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_hydrate_attaches_note_from_session_log() {
+        // This test simulates hydration:
+        // 1. Create a repo with a commit
+        // 2. Create a fake Claude session log containing the commit hash
+        // 3. Run hydrate
+        // 4. Verify the note was attached
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Create a fake Claude session log directory
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        // Create a session log with the full commit hash and metadata
+        let session_content = format!(
+            r#"{{"session_id":"hydrate-test-session","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"Done! Full hash: {hash}"}}
+"#,
+            cwd = git_repo_root,
+            short = &head_hash[..7],
+            hash = head_hash,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        // Set the mtime to "now" so it falls within the --since window
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Run hydrate (no need to chdir -- hydrate is repo-agnostic)
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        // Verify a note was attached to the commit
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: claude-code"));
+        assert!(note_output.contains("session_id: hydrate-test-session"));
+        assert!(note_output.contains(&head_hash));
+        assert!(note_output.contains("confidence: exact_hash_match"));
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_skips_if_note_already_exists() {
+        // Hydrate should skip commits that already have notes (dedup)
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Manually attach a note first
+        run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "add",
+                "-m",
+                "pre-existing note",
+                &head_hash,
+            ],
+        );
+
+        // Create a fake session log with the commit hash
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"should-be-skipped","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"commit {hash}"}}
+"#,
+            cwd = git_repo_root,
+            hash = head_hash,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Run hydrate
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        // The note should still be the pre-existing one (not overwritten)
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert_eq!(note_output, "pre-existing note");
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_multiple_commits_in_one_session() {
+        // A single session may contain multiple commits. Hydrate should
+        // attach notes to all of them.
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Make a second commit
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        run_git(repo_path, &["commit", "-m", "second commit"]);
+        let second_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        // Create a session log containing both commit hashes
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"multi-commit-session","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {s1}] initial commit"}}
+{{"type":"tool_result","content":"commit {h1}"}}
+{{"type":"tool_result","content":"[main {s2}] second commit"}}
+{{"type":"tool_result","content":"commit {h2}"}}
+"#,
+            cwd = git_repo_root,
+            s1 = &first_hash[..7],
+            h1 = first_hash,
+            s2 = &second_hash[..7],
+            h2 = second_hash,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Run hydrate
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        // Both commits should have notes
+        let note1 = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ],
+        );
+        assert!(
+            note1.contains("agent: claude-code"),
+            "first commit should have a note"
+        );
+        assert!(note1.contains("session_id: multi-commit-session"));
+
+        let note2 = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &second_hash,
+            ],
+        );
+        assert!(
+            note2.contains("agent: claude-code"),
+            "second commit should have a note"
+        );
+        assert!(note2.contains("session_id: multi-commit-session"));
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_hydrate_no_logs_returns_ok() {
+        // Hydrate with no log directories should succeed gracefully
+        // (we don't need to redirect HOME here -- if HOME exists but
+        // has no .claude or .codex dirs, hydrate still succeeds)
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_hydrate_invalid_since_returns_error() {
+        let result = run_hydrate("invalid", false);
+        assert!(result.is_err());
     }
 }

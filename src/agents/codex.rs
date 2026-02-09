@@ -9,6 +9,19 @@ use std::path::{Path, PathBuf};
 
 use super::home_dir;
 
+/// Return ALL subdirectories under `~/.codex/sessions/`.
+///
+/// This function is identical to `log_dirs` for Codex (since Codex sessions
+/// are already not scoped to a repo), but is provided for API symmetry with
+/// `claude::all_log_dirs`. Used by the `hydrate` command.
+pub fn all_log_dirs() -> Vec<PathBuf> {
+    let home = match home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    log_dirs_in(&home)
+}
+
 /// Return all subdirectories under `~/.codex/sessions/`.
 ///
 /// Codex does not encode the repo path into the directory name, so all
