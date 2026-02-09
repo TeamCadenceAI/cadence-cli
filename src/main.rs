@@ -560,6 +560,12 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     for file in &files {
         // Parse metadata to get session_id and cwd
         let metadata = scanner::parse_session_metadata(file);
+
+        // Skip files with no session metadata (e.g., file-history-snapshot files)
+        if metadata.session_id.is_none() && metadata.cwd.is_none() {
+            continue;
+        }
+
         let session_id = metadata
             .session_id
             .as_deref()
@@ -584,8 +590,9 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             &session_id
         };
 
-        eprintln!(
-            "[ai-barometer] -> session {} (repo: {})",
+        // Build the header (printed later, possibly combined with a single status)
+        let header = format!(
+            "[ai-barometer] -> {} | {}",
             session_display, repo_display
         );
 
@@ -593,7 +600,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         let commit_hashes = scanner::extract_commit_hashes(file);
 
         if commit_hashes.is_empty() {
-            eprintln!("[ai-barometer]   no commit hashes found, skipping");
+            eprintln!("{} | no commits found", header);
             skipped += 1;
             continue;
         }
@@ -603,7 +610,8 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             Some(c) => c.clone(),
             None => {
                 eprintln!(
-                    "[ai-barometer]   no cwd in session metadata, skipping {} commits",
+                    "{} | no cwd, skipping {} commits",
+                    header,
                     commit_hashes.len()
                 );
                 errors += commit_hashes.len();
@@ -617,7 +625,8 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             Ok(r) => r,
             Err(_) => {
                 eprintln!(
-                    "[ai-barometer]   repo missing for cwd {}, skipping {} commits",
+                    "{} | repo missing for {}, skipping {} commits",
+                    header,
                     cwd,
                     commit_hashes.len()
                 );
@@ -630,9 +639,11 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             continue;
         }
 
-        // Step 6: For each hash, attach note if missing
+        // Step 6: For each hash, attach note if missing.
+        // Buffer messages so we can combine a single status with the header.
         let mut session_attached = 0usize;
         let mut session_skipped = 0usize;
+        let mut messages: Vec<String> = Vec::new();
 
         for hash in &commit_hashes {
             // Verify the commit exists in the resolved repo
@@ -644,11 +655,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[ai-barometer]   error checking commit {}: {}",
-                        &hash[..7],
-                        e
-                    );
+                    messages.push(format!("error checking commit {}: {}", &hash[..7], e));
                     errors += 1;
                     continue;
                 }
@@ -663,11 +670,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 }
                 Ok(false) => {} // Need to attach
                 Err(e) => {
-                    eprintln!(
-                        "[ai-barometer]   error checking note for {}: {}",
-                        &hash[..7],
-                        e
-                    );
+                    messages.push(format!("error checking note for {}: {}", &hash[..7], e));
                     errors += 1;
                     continue;
                 }
@@ -677,7 +680,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             let session_log = match std::fs::read_to_string(file) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!("[ai-barometer]   failed to read session log: {}", e);
+                    messages.push(format!("failed to read session log: {}", e));
                     errors += 1;
                     continue;
                 }
@@ -698,11 +701,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 match note::format(&agent_type, &session_id, &repo_str, hash, &session_log) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!(
-                            "[ai-barometer]   failed to format note for {}: {}",
-                            &hash[..7],
-                            e
-                        );
+                        messages.push(format!("failed to format note for {}: {}", &hash[..7], e));
                         errors += 1;
                         continue;
                     }
@@ -711,27 +710,31 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             // Attach the note
             match git::add_note_at(&repo_root, hash, &note_content) {
                 Ok(()) => {
-                    eprintln!("[ai-barometer]   commit {} attached", &hash[..7]);
+                    messages.push(format!("commit {} attached", &hash[..7]));
                     session_attached += 1;
                     attached += 1;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[ai-barometer]   failed to attach note to {}: {}",
-                        &hash[..7],
-                        e
-                    );
+                    messages.push(format!("failed to attach note to {}: {}", &hash[..7], e));
                     errors += 1;
                 }
             }
         }
 
-        // Print summary for sessions where all commits were already handled
+        // Summarise skipped commits as a single message
         if session_attached == 0 && session_skipped > 0 {
-            eprintln!(
-                "[ai-barometer]   {} already attached, skipping",
-                session_skipped
-            );
+            messages.push(format!("{} already attached", session_skipped));
+        }
+
+        // Print: combine header + single message on one line, or multi-line
+        if messages.len() <= 1 {
+            let status = messages.first().map(|s| s.as_str()).unwrap_or("nothing to do");
+            eprintln!("{} | {}", header, status);
+        } else {
+            eprintln!("{}", header);
+            for msg in &messages {
+                eprintln!("[ai-barometer]   {}", msg);
+            }
         }
     }
 
