@@ -437,6 +437,11 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 }
             };
 
+            // Check if AI Barometer is enabled for this repo
+            if !git::check_enabled_at(&repo_root) {
+                continue;
+            }
+
             // Verify the commit exists in the resolved repo
             match git::commit_exists_at(&repo_root, hash) {
                 Ok(true) => {}
@@ -485,12 +490,13 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 }
             };
 
-            // Infer agent type from file path
-            let agent_type = if file.to_string_lossy().contains(".codex") {
-                scanner::AgentType::Codex
-            } else {
-                scanner::AgentType::Claude
-            };
+            // Use agent type from parsed metadata (already inferred by
+            // parse_session_metadata via infer_agent_type). Fall back to
+            // Claude if metadata didn't determine it.
+            let agent_type = metadata
+                .agent_type
+                .clone()
+                .unwrap_or(scanner::AgentType::Claude);
 
             let repo_str = repo_root.to_string_lossy().to_string();
 

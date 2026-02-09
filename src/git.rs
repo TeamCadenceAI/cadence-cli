@@ -85,6 +85,29 @@ pub fn check_enabled() -> bool {
     }
 }
 
+/// Check whether AI Barometer is enabled for a specific repository directory.
+///
+/// This is the directory-parameterised version of [`check_enabled`], for use
+/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+///
+/// Reads `git -C <repo> config ai.barometer.enabled`. If the value is exactly
+/// `"false"`, returns `false`. Any other value (including unset) returns `true`.
+pub(crate) fn check_enabled_at(repo: &Path) -> bool {
+    let repo_str = repo.to_string_lossy();
+    let output = Command::new("git")
+        .args(["-C", &repo_str, "config", "--get", "ai.barometer.enabled"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let value = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            value != "false"
+        }
+        // Unset (exit code 1) or error: default to enabled
+        _ => true,
+    }
+}
+
 /// Return the repository root (`git rev-parse --show-toplevel`).
 pub fn repo_root() -> Result<PathBuf> {
     let path = git_output(&["rev-parse", "--show-toplevel"])?;

@@ -605,3 +605,30 @@ The `run_hydrate` function follows the PLAN.md algorithm:
   - **agents module (9 tests):** `test_all_log_dirs_returns_all_directories`, `test_all_log_dirs_returns_empty_when_no_projects_dir`, `test_all_log_dirs_ignores_files`, `test_recent_files_within_window`, `test_recent_files_outside_window`, `test_recent_files_at_boundary`, `test_recent_files_ignores_non_jsonl`, `test_recent_files_empty_dirs`, `test_recent_files_nonexistent_dir`.
   - **scanner module (10 tests):** `test_extract_commit_hashes_finds_full_hash`, `test_extract_commit_hashes_finds_multiple`, `test_extract_commit_hashes_deduplicates`, `test_extract_commit_hashes_no_hashes`, `test_extract_commit_hashes_ignores_short_hex`, `test_extract_commit_hashes_ignores_longer_hex`, `test_extract_commit_hashes_uppercase_lowered`, `test_extract_commit_hashes_nonexistent_file`, `test_extract_commit_hashes_empty_file`, `test_extract_commit_hashes_realistic_session_log`.
   - **main module (11 tests):** `test_parse_since_duration_7d`, `test_parse_since_duration_30d`, `test_parse_since_duration_1d`, `test_parse_since_duration_invalid_format`, `test_parse_since_duration_zero_rejected`, `test_parse_since_duration_negative_rejected`, `test_hydrate_attaches_note_from_session_log`, `test_hydrate_skips_if_note_already_exists`, `test_hydrate_multiple_commits_in_one_session`, `test_hydrate_no_logs_returns_ok`, `test_hydrate_invalid_since_returns_error`.
+
+---
+
+## Phase 9 Review Triage
+
+A code review was conducted after Phase 9 (19 findings: 0 critical, 2 medium, 7 low, 7 informational, 3 positive). The review confirmed 226 tests passing, clippy clean (2 expected dead-code warnings: `remote_org`, `matched_line`), and formatting clean.
+
+### Fixed
+
+1. **Agent type inference duplication (Review #9, Low).** Replaced the inline agent type inference in `run_hydrate` (which duplicated `scanner::infer_agent_type`) with `metadata.agent_type.clone().unwrap_or(AgentType::Claude)`. The `parse_session_metadata` function already populates `agent_type` via `infer_agent_type`, so this eliminates the duplication and ensures any future changes to agent type inference logic only need to happen in one place.
+
+2. **Per-repo enabled check in hydrate (Review #3, Low).** Added `git::check_enabled_at(repo: &Path) -> bool` that runs `git -C <repo> config ai.barometer.enabled` and returns `false` only if the value is exactly `"false"`. Called in the hydrate loop after resolving `repo_root` and before checking commit existence. This ensures that repos with `ai.barometer.enabled = false` are respected during hydration, matching the per-repo opt-out behavior already present in the hook path.
+
+3. **Confirmed `note_exists_at` usage (Review #13, Positive).** Verified that the hydrate dedup check at line 460 already uses `git::note_exists_at(&repo_root, hash)` (the repo-at-path version), not `note_exists` (the CWD version). No change needed.
+
+### Deferred
+
+- **Session log re-read optimization (Review #1, Medium):** Acknowledged trade-off. OS page cache mitigates performance impact. Will address in Phase 12.
+- **`--push` only pushes from CWD repo (Review #2, Medium):** Acceptable for v1. Phase 12 could accumulate repos and push for each.
+- **Skipped counter semantics (Review #7, Low):** Matches PLAN.md example output. Acceptable for v1.
+- **No test for `--push` flag (Review #16, Low):** Would need remote setup. Low risk since wiring is trivial.
+- **No Codex integration test through hydrate (Review #17, Low):** Codex path tested at unit level. Nice to have.
+- **`parse_since_duration` only supports days (Review #5, Low):** Sufficient for PLAN.md spec.
+- **Uncounted non-existent commits (Review #8, Low):** Acceptable; false-positive hash extraction is expected.
+
+### Test Count
+- Total: 226 tests (unchanged). No new tests added; existing tests cover the changes (the agent type change is a refactor, and the enabled check is a simple gate).
