@@ -669,9 +669,18 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     let mut skipped = 0usize;
     let mut errors = 0usize;
 
-    // Step 3: Process each file
+    // Step 3: Pre-process each file to resolve repo and group by repo display
+    struct SessionInfo {
+        file: std::path::PathBuf,
+        session_id: String,
+        repo_root: std::path::PathBuf,
+        metadata: scanner::SessionMetadata,
+    }
+
+    let mut sessions_by_repo: std::collections::BTreeMap<String, Vec<SessionInfo>> =
+        std::collections::BTreeMap::new();
+
     for file in &files {
-        // Parse metadata to get session_id and cwd
         let metadata = scanner::parse_session_metadata(file);
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
@@ -708,89 +717,116 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 .unwrap_or_else(|| "unknown".to_string()),
         };
 
-        // Show short session_id for display (first 8 chars or full if shorter)
-        let session_display = if session_id.len() > 8 {
-            &session_id[..8]
-        } else {
-            &session_id
-        };
+        sessions_by_repo
+            .entry(repo_display.clone())
+            .or_default()
+            .push(SessionInfo {
+                file: file.clone(),
+                session_id,
+                repo_root,
+                metadata,
+            });
+    }
 
-        // Build the header (printed later, possibly combined with a single status)
-        let header = format!("[ai-barometer] -> {} | {}", session_display, repo_display);
+    // Step 4: Process sessions grouped by repo
+    for (repo_display, sessions) in &sessions_by_repo {
+        eprintln!("[ai-barometer] {}", repo_display);
 
-        // Step 4: Extract all commit hashes from the session log
-        let commit_hashes = scanner::extract_commit_hashes(file);
+        let mut repo_total = 0usize;
+        let mut repo_with_commits = 0usize;
+        let mut repo_without_commits = 0usize;
 
-        if commit_hashes.is_empty() {
-            eprintln!("{} | no commits found", header);
-            skipped += 1;
-            continue;
-        }
+        for session in sessions {
+            repo_total += 1;
 
-        if !git::check_enabled_at(&repo_root) {
-            continue;
-        }
-
-        // Step 6: For each hash, attach note if missing.
-        // Buffer messages so we can combine a single status with the header.
-        let mut session_attached = 0usize;
-        let mut session_skipped = 0usize;
-        let mut messages: Vec<String> = Vec::new();
-
-        for hash in &commit_hashes {
-            // Verify the commit exists in the resolved repo
-            match git::commit_exists_at(&repo_root, hash) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Commit does not exist in this repo -- could be from a
-                    // different repo or could be rebased away. Skip silently.
-                    continue;
-                }
-                Err(e) => {
-                    messages.push(format!("error checking commit {}: {}", &hash[..7], e));
-                    errors += 1;
-                    continue;
-                }
-            }
-
-            // Check dedup: skip if note already exists
-            match git::note_exists_at(&repo_root, hash) {
-                Ok(true) => {
-                    session_skipped += 1;
-                    skipped += 1;
-                    continue;
-                }
-                Ok(false) => {} // Need to attach
-                Err(e) => {
-                    messages.push(format!("error checking note for {}: {}", &hash[..7], e));
-                    errors += 1;
-                    continue;
-                }
-            }
-
-            // Read the full session log
-            let session_log = match std::fs::read_to_string(file) {
-                Ok(content) => content,
-                Err(e) => {
-                    messages.push(format!("failed to read session log: {}", e));
-                    errors += 1;
-                    continue;
-                }
+            let session_display = if session.session_id.len() > 8 {
+                &session.session_id[..8]
+            } else {
+                &session.session_id
             };
 
-            // Use agent type from parsed metadata (already inferred by
-            // parse_session_metadata via infer_agent_type). Fall back to
-            // Claude if metadata didn't determine it.
-            let agent_type = metadata
-                .agent_type
-                .clone()
-                .unwrap_or(scanner::AgentType::Claude);
+            // Extract all commit hashes from the session log
+            let commit_hashes = scanner::extract_commit_hashes(&session.file);
 
-            let repo_str = repo_root.to_string_lossy().to_string();
+            if commit_hashes.is_empty() {
+                repo_without_commits += 1;
+                continue;
+            }
 
-            // Format the note
-            let note_content =
-                match note::format(&agent_type, &session_id, &repo_str, hash, &session_log) {
+            repo_with_commits += 1;
+
+            if !git::check_enabled_at(&session.repo_root) {
+                continue;
+            }
+
+            // For each hash, attach note if missing.
+            // Buffer messages so we can combine a single status with the header.
+            let mut session_attached = 0usize;
+            let mut session_skipped = 0usize;
+            let mut messages: Vec<String> = Vec::new();
+
+            let header = format!("[ai-barometer]   {} |", session_display);
+
+            for hash in &commit_hashes {
+                // Verify the commit exists in the resolved repo
+                match git::commit_exists_at(&session.repo_root, hash) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Commit does not exist in this repo -- could be from a
+                        // different repo or could be rebased away. Skip silently.
+                        continue;
+                    }
+                    Err(e) => {
+                        messages.push(format!("error checking commit {}: {}", &hash[..7], e));
+                        errors += 1;
+                        continue;
+                    }
+                }
+
+                // Check dedup: skip if note already exists
+                match git::note_exists_at(&session.repo_root, hash) {
+                    Ok(true) => {
+                        session_skipped += 1;
+                        skipped += 1;
+                        continue;
+                    }
+                    Ok(false) => {} // Need to attach
+                    Err(e) => {
+                        messages.push(format!("error checking note for {}: {}", &hash[..7], e));
+                        errors += 1;
+                        continue;
+                    }
+                }
+
+                // Read the full session log
+                let session_log = match std::fs::read_to_string(&session.file) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        messages.push(format!("failed to read session log: {}", e));
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                // Use agent type from parsed metadata (already inferred by
+                // parse_session_metadata via infer_agent_type). Fall back to
+                // Claude if metadata didn't determine it.
+                let agent_type = session
+                    .metadata
+                    .agent_type
+                    .clone()
+                    .unwrap_or(scanner::AgentType::Claude);
+
+                let repo_str = session.repo_root.to_string_lossy().to_string();
+
+                // Format the note
+                let note_content = match note::format(
+                    &agent_type,
+                    &session.session_id,
+                    &repo_str,
+                    hash,
+                    &session_log,
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         messages.push(format!("failed to format note for {}: {}", &hash[..7], e));
@@ -799,41 +835,48 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     }
                 };
 
-            // Attach the note
-            match git::add_note_at(&repo_root, hash, &note_content) {
-                Ok(()) => {
-                    messages.push(format!("commit {} attached", &hash[..7]));
-                    session_attached += 1;
-                    attached += 1;
+                // Attach the note
+                match git::add_note_at(&session.repo_root, hash, &note_content) {
+                    Ok(()) => {
+                        messages.push(format!("commit {} attached", &hash[..7]));
+                        session_attached += 1;
+                        attached += 1;
+                    }
+                    Err(e) => {
+                        messages.push(format!("failed to attach note to {}: {}", &hash[..7], e));
+                        errors += 1;
+                    }
                 }
-                Err(e) => {
-                    messages.push(format!("failed to attach note to {}: {}", &hash[..7], e));
-                    errors += 1;
+            }
+
+            // Summarise skipped commits as a single message
+            if session_attached == 0 && session_skipped > 0 {
+                messages.push(format!("{} already attached", session_skipped));
+            }
+
+            // Print: combine header + single message on one line, or multi-line
+            if messages.len() <= 1 {
+                let status = messages
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("nothing to do");
+                eprintln!("{} {}", header, status);
+            } else {
+                eprintln!("{}", header);
+                for msg in &messages {
+                    eprintln!("[ai-barometer]     {}", msg);
                 }
             }
         }
 
-        // Summarise skipped commits as a single message
-        if session_attached == 0 && session_skipped > 0 {
-            messages.push(format!("{} already attached", session_skipped));
-        }
-
-        // Print: combine header + single message on one line, or multi-line
-        if messages.len() <= 1 {
-            let status = messages
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("nothing to do");
-            eprintln!("{} | {}", header, status);
-        } else {
-            eprintln!("{}", header);
-            for msg in &messages {
-                eprintln!("[ai-barometer]   {}", msg);
-            }
-        }
+        // Per-repo summary
+        eprintln!(
+            "[ai-barometer]   {} sessions, {} with commits, {} without",
+            repo_total, repo_with_commits, repo_without_commits
+        );
     }
 
-    // Step 6: Print summary
+    // Final summary
     eprintln!(
         "[ai-barometer] Done. {} attached, {} skipped, {} errors.",
         attached, skipped, errors
