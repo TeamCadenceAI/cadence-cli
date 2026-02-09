@@ -2,16 +2,16 @@
 //!
 //! Claude Code stores session logs under `~/.claude/projects/<encoded-path>/`.
 //! The encoded path replaces `/` with `-` in the absolute repo path.
-//! For example, a repo at `/Users/foo/bar` produces directories matching
-//! `~/.claude/projects/*-Users-foo-bar*`.
+//! For example, a repo at `/Users/foo/bar` produces a directory named
+//! `-Users-foo-bar` under `~/.claude/projects/`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{encode_repo_path, home_dir};
 
-/// Return directories under `~/.claude/projects/` whose names contain
-/// the encoded form of `repo_path`.
+/// Return directories under `~/.claude/projects/` whose names exactly
+/// match the encoded form of `repo_path`.
 ///
 /// Returns an empty `Vec` if:
 /// - The home directory cannot be resolved
@@ -50,13 +50,17 @@ fn log_dirs_in(repo_path: &Path, home: &Path) -> Vec<PathBuf> {
             continue;
         }
 
-        // Check if the directory name contains the encoded repo path
+        // Check if the directory name matches the encoded repo path.
+        // We require the encoded path to be the complete directory name to
+        // avoid false positives: e.g., searching for `/Users/foo/bar`
+        // (encoded as `-Users-foo-bar`) should NOT match a directory for
+        // `/Users/foo/bar-extra` (encoded as `-Users-foo-bar-extra`).
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => continue,
         };
 
-        if name.contains(&encoded) {
+        if name == encoded {
             dirs.push(path);
         }
     }
@@ -80,9 +84,9 @@ mod tests {
         let projects_dir = home.path().join(".claude").join("projects");
         fs::create_dir_all(&projects_dir).unwrap();
 
-        // Create a matching directory
+        // Create a directory with the exact encoded name
         let encoded = encode_repo_path(Path::new("/Users/foo/bar"));
-        let matching_dir = projects_dir.join(format!("abc{encoded}xyz"));
+        let matching_dir = projects_dir.join(&encoded);
         fs::create_dir(&matching_dir).unwrap();
 
         // Create a non-matching directory
@@ -120,21 +124,23 @@ mod tests {
     }
 
     #[test]
-    fn test_log_dirs_finds_multiple_matching_directories() {
+    fn test_log_dirs_does_not_match_longer_paths() {
         let home = TempDir::new().unwrap();
         let projects_dir = home.path().join(".claude").join("projects");
         fs::create_dir_all(&projects_dir).unwrap();
 
         let encoded = encode_repo_path(Path::new("/Users/foo/bar"));
-        // Claude may have multiple directories for the same repo (e.g. with suffixes)
+        // Exact match should be found
         let dir1 = projects_dir.join(encoded.clone());
-        let dir2 = projects_dir.join(format!("{encoded}-v2"));
+        // A longer encoded path (e.g. for /Users/foo/bar-extra) should NOT match
+        let dir2 = projects_dir.join(format!("{encoded}-extra"));
         fs::create_dir(&dir1).unwrap();
         fs::create_dir(&dir2).unwrap();
 
         let result = log_dirs_in(Path::new("/Users/foo/bar"), home.path());
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], dir1);
     }
 
     #[test]
@@ -168,5 +174,27 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], dir);
+    }
+
+    #[test]
+    fn test_log_dirs_hardcoded_roundtrip() {
+        // This test uses a hardcoded directory name (not computed via
+        // encode_repo_path) to catch encoding bugs. If encode_repo_path
+        // has a bug, the other tests that use it to compute both the
+        // directory name and the search term would still pass. This test
+        // breaks that circularity.
+        let home = TempDir::new().unwrap();
+        let projects_dir = home.path().join(".claude").join("projects");
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        // Hardcoded: the encoding of "/Users/dave/dev/my-project" must be
+        // "-Users-dave-dev-my-project" (every / replaced with -)
+        let hardcoded_dir = projects_dir.join("-Users-dave-dev-my-project");
+        fs::create_dir(&hardcoded_dir).unwrap();
+
+        let result = log_dirs_in(Path::new("/Users/dave/dev/my-project"), home.path());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], hardcoded_dir);
     }
 }

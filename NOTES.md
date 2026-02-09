@@ -156,3 +156,29 @@ A code review was conducted after Phase 2 (21 findings). The following issues we
 
 ### Dev-Dependencies Added
 - `filetime = "0.2"` for setting file modification times in tests.
+
+---
+
+## Phase 3 Review Triage
+
+A code review was conducted after Phase 3 (16 findings). The following issues were triaged and addressed:
+
+### Fixed
+
+1. **Substring match false positives in `claude::log_dirs_in` (Review #1, Medium).** Changed from `name.contains(&encoded)` to `name == encoded` (exact match). The previous substring check would cause `/Users/foo/bar` (encoded as `-Users-foo-bar`) to false-positive match directories for `/Users/foo/bar-extra` (encoded as `-Users-foo-bar-extra`). Updated tests: renamed `test_log_dirs_finds_multiple_matching_directories` to `test_log_dirs_does_not_match_longer_paths` which verifies that longer encoded paths are not matched. Updated doc comments to reflect exact-match semantics.
+
+2. **`DirEntry::metadata()` does not follow symlinks (Review #6, Medium).** Replaced `entry.metadata()` with `std::fs::metadata(entry.path())` in `candidate_files`. The `DirEntry::metadata()` method uses `lstat` on Unix which does not follow symlinks, causing symlinked `.jsonl` files to be skipped. The `std::fs::metadata()` function follows symlinks.
+
+3. **Added hardcoded roundtrip test for Claude directory matching (Review #9, Medium).** Added `test_log_dirs_hardcoded_roundtrip` which uses a known hardcoded directory name (`-Users-dave-dev-my-project`) rather than computing it via `encode_repo_path`. This breaks the circularity where all other tests use `encode_repo_path` for both creating and searching for directories, meaning an encoding bug could go undetected.
+
+### Deferred
+
+- **Trailing slash handling (Review #2, Low):** Edge case, not blocking. `git rev-parse --show-toplevel` never returns trailing slashes.
+- **`to_string_lossy` for non-UTF-8 paths (Review #3, Low):** Acceptable for v1. Repo paths from git are always UTF-8.
+- **Sorting results by mtime (Review #10, Info):** Not required by design. Phase 4 scans for commit hash matches regardless of order.
+- **Unix-only `home_dir` (Review #7, Low):** Project targets macOS/Linux only.
+- **Codex `_repo_path` unused parameter (Review #8, Low):** Documented, kept for API symmetry.
+- **`window_secs` negative value / `window_secs = 0` tests (Review #14, Low):** Harmless behavior (returns empty Vec). Can add edge case tests opportunistically.
+
+### Test Count
+- Total: 84 tests (was 83 before triage). Added 1 new test, renamed 1 test.

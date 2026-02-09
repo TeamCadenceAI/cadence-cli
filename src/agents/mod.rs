@@ -52,8 +52,11 @@ pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> 
                 continue;
             }
 
-            // Only consider regular files (not directories or symlinks)
-            let metadata = match entry.metadata() {
+            // Only consider regular files (not directories).
+            // Use fs::metadata instead of entry.metadata() so that symlinks
+            // are followed -- entry.metadata() uses lstat on Unix, which
+            // would cause symlinked .jsonl files to be skipped.
+            let metadata = match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
