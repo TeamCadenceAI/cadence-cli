@@ -4,6 +4,7 @@
 //! The notes ref used throughout is `refs/notes/ai-sessions`.
 
 use anyhow::{Context, Result, bail};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -162,10 +163,18 @@ pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
 /// a note is already present.
 pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()> {
     validate_commit_hash(commit)?;
+
+    // Write content to a temp file to avoid ARG_MAX limits on large notes.
+    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
+    tmp.write_all(content.as_bytes())
+        .context("failed to write note to temp file")?;
+    tmp.flush().context("failed to flush note temp file")?;
+    let tmp_path = tmp.path().to_string_lossy().to_string();
+
     let repo_str = repo.to_string_lossy();
     let output = Command::new("git")
         .args([
-            "-C", &repo_str, "notes", "--ref", NOTES_REF, "add", "-m", content, "--", commit,
+            "-C", &repo_str, "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
         ])
         .output()
         .context("failed to execute git notes add")?;
@@ -220,9 +229,17 @@ pub fn note_exists(commit: &str) -> Result<bool> {
 /// "if a note already exists, treat as success, do nothing."
 pub fn add_note(commit: &str, content: &str) -> Result<()> {
     validate_commit_hash(commit)?;
+
+    // Write content to a temp file to avoid ARG_MAX limits on large notes.
+    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
+    tmp.write_all(content.as_bytes())
+        .context("failed to write note to temp file")?;
+    tmp.flush().context("failed to flush note temp file")?;
+    let tmp_path = tmp.path().to_string_lossy().to_string();
+
     let output = Command::new("git")
         .args([
-            "notes", "--ref", NOTES_REF, "add", "-m", content, "--", commit,
+            "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
         ])
         .output()
         .context("failed to execute git notes add")?;

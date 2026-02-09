@@ -304,9 +304,7 @@ fn hook_post_commit_inner() -> Result<()> {
             //
             // Note: `read_to_string` loads the entire file into memory.
             // This is acceptable because session logs are typically small
-            // (tens of KB to a few MB). For very large session logs, a
-            // future improvement could use `git notes add -F <file>` with
-            // a temp file to avoid both memory pressure and ARG_MAX limits.
+            // (tens of KB to a few MB).
             let session_log = match std::fs::read_to_string(&matched.file_path) {
                 Ok(content) => content,
                 Err(e) => {
@@ -1814,10 +1812,10 @@ mod tests {
 
         let session_content = format!(
             r#"{{"session_id":"should-be-skipped","cwd":"{cwd}"}}
-{{"type":"tool_result","content":"commit {hash}"}}
+{{"type":"tool_result","content":"[main {short_hash}] some commit\n 1 file changed"}}
 "#,
             cwd = git_repo_root,
-            hash = head_hash,
+            short_hash = &head_hash[..7],
         );
         let session_file = claude_project_dir.join("session.jsonl");
         std::fs::write(&session_file, &session_content).unwrap();
@@ -2250,11 +2248,11 @@ mod tests {
 
         let session_content = format!(
             r#"{{"session_id":"install-hydrate-test","cwd":"{cwd}"}}
-{{"type":"tool_result","content":"commit {hash}"}}
+{{"type":"tool_result","content":"[main {short_hash}] fix bug\n 1 file changed"}}
 {{"type":"assistant","message":"Done"}}
 "#,
             cwd = git_repo_root,
-            hash = head_hash,
+            short_hash = &head_hash[..7],
         );
         let session_file = claude_project_dir.join("session.jsonl");
         std::fs::write(&session_file, &session_content).unwrap();
@@ -2416,8 +2414,17 @@ mod tests {
         }
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_status();
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("shim installed: yes"),
+            "should show shim installed, got: {}",
+            output
+        );
 
         // Restore
         unsafe {
@@ -2516,8 +2523,17 @@ mod tests {
         }
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_status();
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Org filter: my-test-org"),
+            "should show org filter, got: {}",
+            output
+        );
 
         // Restore
         unsafe {
@@ -2550,8 +2566,17 @@ mod tests {
         run_git(repo_path, &["config", "ai.barometer.autopush", "true"]);
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_status();
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Auto-push: enabled"),
+            "should show autopush enabled, got: {}",
+            output
+        );
 
         // Restore
         unsafe {

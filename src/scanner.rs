@@ -229,22 +229,15 @@ pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) 
     crate::git::commit_exists_at(repo_root, commit).unwrap_or_default()
 }
 
-/// Extract all potential commit hashes (7-40 hex characters) from a file.
+/// Extract commit hashes from git commit confirmation output in a session log.
 ///
-/// Scans every line of the file for substrings that look like Git commit
-/// hashes: 7 to 40 consecutive lowercase or uppercase hex characters.
-/// A hex substring is only considered a match if it is not preceded or
-/// followed by another hex character (i.e., it must be a bounded run of
-/// hex digits, not embedded in a longer hex string).
+/// Looks specifically for the `[branch HASH]` pattern that git outputs when
+/// a commit is created (e.g., `[main abcdef0] Fix bug`). This targets only
+/// commits actually made during the session, avoiding false positives from
+/// git log, git diff, UUIDs, and other hex strings.
 ///
 /// Returns a deduplicated `Vec<String>` of extracted hashes (lowercased).
 /// Returns an empty Vec on any I/O error.
-///
-/// This is used by the `hydrate` command, which needs to find ALL commit
-/// hashes in a session log (not just check for a specific hash).
-/// Short hashes (7 chars) are included because Claude Code logs typically
-/// contain short hashes from `git commit` output (e.g., `[main bb6ccaa]`).
-/// False positives are filtered downstream by `commit_exists_at`.
 pub fn extract_commit_hashes(file: &Path) -> Vec<String> {
     let file_handle = match File::open(file) {
         Ok(f) => f,
@@ -267,36 +260,75 @@ pub fn extract_commit_hashes(file: &Path) -> Vec<String> {
     hashes
 }
 
-/// Extract 7-40 char hex strings from a single line.
+/// Extract commit hashes from `[branch HASH]` patterns in a single line.
 ///
-/// Walks through the line looking for runs of hex digits. When a run of
-/// 7 to 40 characters is found (bounded by non-hex chars or string
-/// boundaries), it is added to the results.
+/// Matches the git commit confirmation format: `[branch_name hash]` where
+/// `branch_name` can contain word chars, `/`, `.`, and `-`, and `hash` is
+/// 7-40 hex characters.
 fn extract_hashes_from_line(
     line: &str,
     hashes: &mut Vec<String>,
     seen: &mut std::collections::HashSet<String>,
 ) {
+    // Match `[branch hash]` pattern from git commit output.
+    // The branch name can contain word chars, /, ., - (e.g., feature/foo-bar).
+    // The hash is 7-40 hex characters.
     let bytes = line.as_bytes();
     let len = bytes.len();
     let mut i = 0;
 
     while i < len {
-        if bytes[i].is_ascii_hexdigit() {
-            let start = i;
-            while i < len && bytes[i].is_ascii_hexdigit() {
-                i += 1;
-            }
-            let run_len = i - start;
-            if run_len >= 7 && run_len <= 40 {
-                let hash = line[start..i].to_ascii_lowercase();
-                if seen.insert(hash.clone()) {
-                    hashes.push(hash);
-                }
-            }
-        } else {
+        // Look for '['
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        i += 1; // skip '['
+
+        // Parse branch name: [\w/.#-]+ (at least 1 char)
+        let branch_start = i;
+        while i < len
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'/'
+                || bytes[i] == b'.'
+                || bytes[i] == b'-'
+                || bytes[i] == b'_'
+                || bytes[i] == b'#')
+        {
             i += 1;
         }
+        if i == branch_start {
+            // No branch name chars found
+            continue;
+        }
+
+        // Expect a space between branch name and hash
+        if i >= len || bytes[i] != b' ' {
+            continue;
+        }
+        i += 1; // skip space
+
+        // Parse hex hash: 7-40 hex chars
+        let hash_start = i;
+        while i < len && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        let hash_len = i - hash_start;
+        if !(7..=40).contains(&hash_len) {
+            continue;
+        }
+
+        // Expect ']' after hash
+        if i >= len || bytes[i] != b']' {
+            continue;
+        }
+
+        let hash = line[hash_start..hash_start + hash_len].to_ascii_lowercase();
+        if seen.insert(hash.clone()) {
+            hashes.push(hash);
+        }
+
+        i += 1; // skip ']'
     }
 }
 
@@ -933,10 +965,21 @@ also not json {{{{
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_extract_commit_hashes_finds_short_hash() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"content":"[main abcdef0] fix bug"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+
+        let hashes = extract_commit_hashes(&file);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], "abcdef0");
+    }
+
+    #[test]
     fn test_extract_commit_hashes_finds_full_hash() {
         let dir = TempDir::new().unwrap();
         let hash = "abcdef0123456789abcdef0123456789abcdef01";
-        let content = format!(r#"{{"content":"Created commit {hash}"}}"#);
+        let content = format!(r#"{{"content":"[main {hash}] fix bug"}}"#);
         let file = write_temp_file(dir.path(), "session.jsonl", &content);
 
         let hashes = extract_commit_hashes(&file);
@@ -947,30 +990,23 @@ also not json {{{{
     #[test]
     fn test_extract_commit_hashes_finds_multiple() {
         let dir = TempDir::new().unwrap();
-        let hash1 = "abcdef0123456789abcdef0123456789abcdef01";
-        let hash2 = "1234567890abcdef1234567890abcdef12345678";
-        let content = format!(
-            r#"{{"content":"commit {hash1}"}}
-{{"content":"commit {hash2}"}}
-"#
-        );
+        let content = r#"{"content":"[main abcdef0] first commit"}
+{"content":"[main 1234567] second commit"}
+"#;
         let file = write_temp_file(dir.path(), "session.jsonl", &content);
 
         let hashes = extract_commit_hashes(&file);
         assert_eq!(hashes.len(), 2);
-        assert!(hashes.contains(&hash1.to_string()));
-        assert!(hashes.contains(&hash2.to_string()));
+        assert!(hashes.contains(&"abcdef0".to_string()));
+        assert!(hashes.contains(&"1234567".to_string()));
     }
 
     #[test]
     fn test_extract_commit_hashes_deduplicates() {
         let dir = TempDir::new().unwrap();
-        let hash = "abcdef0123456789abcdef0123456789abcdef01";
-        let content = format!(
-            r#"{{"content":"commit {hash}"}}
-{{"content":"again {hash}"}}
-"#
-        );
+        let content = r#"{"content":"[main abcdef0] fix bug"}
+{"content":"[main abcdef0] fix bug"}
+"#;
         let file = write_temp_file(dir.path(), "session.jsonl", &content);
 
         let hashes = extract_commit_hashes(&file);
@@ -988,22 +1024,10 @@ also not json {{{{
     }
 
     #[test]
-    fn test_extract_commit_hashes_finds_short_hash() {
+    fn test_extract_commit_hashes_ignores_bare_hex() {
         let dir = TempDir::new().unwrap();
-        // 7-char hex string -- should be extracted (minimum length)
-        let content = r#"{"content":"[main abcdef0] fix bug"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", content);
-
-        let hashes = extract_commit_hashes(&file);
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(hashes[0], "abcdef0");
-    }
-
-    #[test]
-    fn test_extract_commit_hashes_ignores_too_short_hex() {
-        let dir = TempDir::new().unwrap();
-        // 6-char hex string -- should NOT be extracted (below minimum)
-        let content = r#"{"content":"short hex abcdef"}"#;
+        // Bare hex strings (e.g., from git log) should NOT be extracted
+        let content = r#"{"content":"abcdef0 Fix something"}"#;
         let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
@@ -1011,10 +1035,21 @@ also not json {{{{
     }
 
     #[test]
-    fn test_extract_commit_hashes_ignores_longer_hex() {
+    fn test_extract_commit_hashes_ignores_diff_blob_hashes() {
         let dir = TempDir::new().unwrap();
-        // 41-char hex string -- should NOT be extracted
-        let content = r#"{"content":"long hex abcdef0123456789abcdef0123456789abcdef012"}"#;
+        // Diff index lines should NOT match
+        let content = r#"{"content":"index c84f8ba..b145f18 100644"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let hashes = extract_commit_hashes(&file);
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn test_extract_commit_hashes_ignores_too_short_hex() {
+        let dir = TempDir::new().unwrap();
+        // 6-char hash in bracket pattern -- below minimum
+        let content = r#"{"content":"[main abcdef] fix bug"}"#;
         let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
@@ -1024,12 +1059,24 @@ also not json {{{{
     #[test]
     fn test_extract_commit_hashes_uppercase_lowered() {
         let dir = TempDir::new().unwrap();
-        let content = r#"{"content":"commit ABCDEF0123456789ABCDEF0123456789ABCDEF01"}"#;
+        let content = r#"{"content":"[main ABCDEF0] fix bug"}"#;
         let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
         assert_eq!(hashes.len(), 1);
-        assert_eq!(hashes[0], "abcdef0123456789abcdef0123456789abcdef01");
+        assert_eq!(hashes[0], "abcdef0");
+    }
+
+    #[test]
+    fn test_extract_commit_hashes_feature_branch() {
+        let dir = TempDir::new().unwrap();
+        // Branch names with slashes and dashes
+        let content = r#"{"content":"[feature/foo-bar abcdef0] fix bug"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let hashes = extract_commit_hashes(&file);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], "abcdef0");
     }
 
     #[test]
@@ -1051,20 +1098,18 @@ also not json {{{{
     #[test]
     fn test_extract_commit_hashes_realistic_session_log() {
         let dir = TempDir::new().unwrap();
-        let hash = "655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e";
-        let content = format!(
-            r#"{{"type":"assistant","message":"I'll commit now"}}
-{{"type":"tool_use","name":"Bash","input":{{"command":"git commit -m fix"}}}}
-{{"type":"tool_result","content":"[main 655dd38] fix\n 1 file changed"}}
-{{"type":"assistant","message":"Done! Commit {hash}"}}
-"#
-        );
-        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+        let content = r#"{"type":"assistant","message":"I'll commit now"}
+{"type":"tool_use","name":"Bash","input":{"command":"git commit -m fix"}}
+{"type":"tool_result","content":"[main 655dd38] fix\n 1 file changed"}
+{"type":"assistant","message":"Done! Commit 655dd38"}
+"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
-        // Should find both the short hash "655dd38" and the full hash
-        assert!(hashes.contains(&"655dd38".to_string()));
-        assert!(hashes.contains(&hash.to_string()));
+        // Should find 655dd38 from the [main 655dd38] pattern
+        // but NOT from the bare "Commit 655dd38" mention
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], "655dd38");
     }
 
     // -----------------------------------------------------------------------
