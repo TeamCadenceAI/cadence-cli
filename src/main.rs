@@ -598,38 +598,43 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             continue;
         }
 
-        // Step 5: For each hash, resolve repo and attach note if missing
-        for hash in &commit_hashes {
-            // Resolve repo from session cwd
-            let cwd = match &metadata.cwd {
-                Some(c) => c.clone(),
-                None => {
-                    eprintln!(
-                        "[ai-barometer]   no cwd in session metadata, skipping commit {}",
-                        &hash[..7]
-                    );
-                    errors += 1;
-                    continue;
-                }
-            };
-
-            let cwd_path = std::path::Path::new(&cwd);
-
-            // Resolve the repo root from the session's cwd
-            let repo_root = match git::repo_root_at(cwd_path) {
-                Ok(r) => r,
-                Err(_) => {
-                    eprintln!("[ai-barometer]   repo missing for cwd {}, skipped", cwd);
-                    errors += 1;
-                    continue;
-                }
-            };
-
-            // Check if AI Barometer is enabled for this repo
-            if !git::check_enabled_at(&repo_root) {
+        // Step 5: Resolve repo once for the whole session (cwd is per-session)
+        let cwd = match &metadata.cwd {
+            Some(c) => c.clone(),
+            None => {
+                eprintln!(
+                    "[ai-barometer]   no cwd in session metadata, skipping {} commits",
+                    commit_hashes.len()
+                );
+                errors += commit_hashes.len();
                 continue;
             }
+        };
 
+        let cwd_path = std::path::Path::new(&cwd);
+
+        let repo_root = match git::repo_root_at(cwd_path) {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!(
+                    "[ai-barometer]   repo missing for cwd {}, skipping {} commits",
+                    cwd,
+                    commit_hashes.len()
+                );
+                errors += commit_hashes.len();
+                continue;
+            }
+        };
+
+        if !git::check_enabled_at(&repo_root) {
+            continue;
+        }
+
+        // Step 6: For each hash, attach note if missing
+        let mut session_attached = 0usize;
+        let mut session_skipped = 0usize;
+
+        for hash in &commit_hashes {
             // Verify the commit exists in the resolved repo
             match git::commit_exists_at(&repo_root, hash) {
                 Ok(true) => {}
@@ -652,7 +657,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             // Check dedup: skip if note already exists
             match git::note_exists_at(&repo_root, hash) {
                 Ok(true) => {
-                    // Note already exists -- skip
+                    session_skipped += 1;
                     skipped += 1;
                     continue;
                 }
@@ -707,6 +712,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             match git::add_note_at(&repo_root, hash, &note_content) {
                 Ok(()) => {
                     eprintln!("[ai-barometer]   commit {} attached", &hash[..7]);
+                    session_attached += 1;
                     attached += 1;
                 }
                 Err(e) => {
@@ -718,6 +724,14 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     errors += 1;
                 }
             }
+        }
+
+        // Print summary for sessions where all commits were already handled
+        if session_attached == 0 && session_skipped > 0 {
+            eprintln!(
+                "[ai-barometer]   {} already attached, skipping",
+                session_skipped
+            );
         }
     }
 
