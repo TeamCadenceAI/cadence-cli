@@ -57,6 +57,16 @@ enum Command {
 enum HookCommand {
     /// Post-commit hook: attempt to attach AI session note to HEAD.
     PostCommit,
+    /// Background retry with exponential backoff (hidden, internal use only).
+    #[command(hide = true)]
+    PostCommitRetry {
+        /// Full commit hash to resolve.
+        commit: String,
+        /// Absolute path to the repository root.
+        repo: String,
+        /// Unix epoch timestamp of the commit.
+        timestamp: i64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +289,8 @@ fn hook_post_commit_inner() -> Result<()> {
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
+        // Note already attached (e.g., by hydrate). Clean up stale pending record.
+        let _ = pending::remove(&head_hash);
         return Ok(());
     }
 
@@ -317,6 +329,7 @@ fn hook_post_commit_inner() -> Result<()> {
                             e
                         );
                     }
+                    spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
                     // Skip note attachment; retry will pick this up later
                     return Ok(());
                 }
@@ -354,6 +367,7 @@ fn hook_post_commit_inner() -> Result<()> {
                     e
                 );
             }
+            spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
         }
     } else {
         // Step 6b: No match found — write pending record
@@ -363,6 +377,7 @@ fn hook_post_commit_inner() -> Result<()> {
                 e
             );
         }
+        spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
     }
 
     // Step 7: Retry pending commits for this repo
@@ -378,6 +393,161 @@ fn hook_post_commit_inner() -> Result<()> {
 /// be resolved (e.g., the session log was deleted or the commit was from
 /// a different machine).
 const MAX_RETRY_ATTEMPTS: u32 = 20;
+
+/// Backoff schedule for background retry (in seconds).
+/// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
+const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
+
+/// Spawn a detached background process that retries resolving a commit
+/// with exponential backoff over ~1 minute.
+///
+/// Uses `spawn()` (non-blocking) — parent returns immediately, child is
+/// reparented to init/launchd when parent exits. stdio is null so the
+/// child has no terminal association.
+///
+/// Failures to spawn are silently ignored — the pending system handles
+/// long-term retry as a fallback.
+fn spawn_background_retry(commit: &str, repo: &str, timestamp: i64) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let _ = std::process::Command::new(&exe)
+        .args([
+            "hook",
+            "post-commit-retry",
+            commit,
+            repo,
+            &timestamp.to_string(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Background retry handler: retries resolving a single commit with
+/// exponential backoff.
+///
+/// This runs as a detached background process spawned by `spawn_background_retry`.
+/// It sleeps between attempts and exits silently on success, exhaustion, or error.
+/// The pending system handles long-term retry if this process fails.
+fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Result<()> {
+    let repo_root = std::path::Path::new(repo);
+
+    for delay in BACKGROUND_RETRY_DELAYS {
+        std::thread::sleep(std::time::Duration::from_secs(*delay));
+
+        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600) {
+            ResolveResult::Attached => {
+                let _ = pending::remove(commit);
+                return Ok(());
+            }
+            ResolveResult::AlreadyExists => {
+                let _ = pending::remove(commit);
+                return Ok(());
+            }
+            ResolveResult::NotFound | ResolveResult::TransientError => {
+                // Continue to next backoff step
+            }
+        }
+    }
+
+    // Exhausted all retries — exit silently. The pending system handles
+    // long-term retry on the next commit.
+    Ok(())
+}
+
+/// Result of attempting to resolve a single pending commit.
+enum ResolveResult {
+    /// Note was successfully attached.
+    Attached,
+    /// Note already existed (resolved by another mechanism).
+    AlreadyExists,
+    /// No session match found.
+    NotFound,
+    /// A transient error occurred (file unreadable, format error, git error).
+    TransientError,
+}
+
+/// Try to resolve a single commit by scanning session logs and attaching a note.
+///
+/// This is the shared resolution logic used by both `retry_pending_for_repo`
+/// (synchronous retry on next commit) and `run_hook_post_commit_retry`
+/// (background retry with exponential backoff).
+///
+/// The `time_window` parameter controls how wide the candidate file mtime
+/// window is (in seconds). The initial hook uses 600s (±10 min), retries
+/// use 86400s (±24 hours).
+fn try_resolve_single_commit(
+    commit: &str,
+    repo_str: &str,
+    repo_root: &std::path::Path,
+    commit_time: i64,
+    time_window: i64,
+) -> ResolveResult {
+    // Check if note already exists
+    match git::note_exists(commit) {
+        Ok(true) => return ResolveResult::AlreadyExists,
+        Ok(false) => {}
+        Err(_) => return ResolveResult::TransientError,
+    }
+
+    // Collect candidate dirs and files
+    let mut candidate_dirs = Vec::new();
+    candidate_dirs.extend(agents::claude::log_dirs(repo_root));
+    candidate_dirs.extend(agents::codex::log_dirs());
+
+    let candidate_files = agents::candidate_files(&candidate_dirs, commit_time, time_window);
+
+    let session_match = scanner::find_session_for_commit(commit, &candidate_files);
+
+    let matched = match session_match {
+        Some(m) => m,
+        None => return ResolveResult::NotFound,
+    };
+
+    let metadata = scanner::parse_session_metadata(&matched.file_path);
+
+    if !scanner::verify_match(&metadata, repo_root, commit) {
+        return ResolveResult::NotFound;
+    }
+
+    let session_log = match std::fs::read_to_string(&matched.file_path) {
+        Ok(content) => content,
+        Err(_) => return ResolveResult::TransientError,
+    };
+
+    let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
+
+    let note_content = match note::format(
+        &matched.agent_type,
+        session_id,
+        repo_str,
+        commit,
+        &session_log,
+    ) {
+        Ok(c) => c,
+        Err(_) => return ResolveResult::TransientError,
+    };
+
+    if git::add_note(commit, &note_content).is_ok() {
+        eprintln!(
+            "[ai-barometer] retry: attached session {} to commit {}",
+            session_id,
+            &commit[..std::cmp::min(7, commit.len())]
+        );
+
+        // Push if conditions are met
+        if push::should_push() {
+            push::attempt_push();
+        }
+
+        ResolveResult::Attached
+    } else {
+        ResolveResult::TransientError
+    }
+}
 
 /// Attempt to resolve pending commits for the given repository.
 ///
@@ -409,81 +579,19 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
             continue;
         }
 
-        // Skip if note already exists (may have been resolved by another mechanism)
-        match git::note_exists(&record.commit) {
-            Ok(true) => {
-                // Already resolved -- remove pending record
+        match try_resolve_single_commit(
+            &record.commit,
+            repo_str,
+            repo_root,
+            record.commit_time,
+            86_400,
+        ) {
+            ResolveResult::Attached | ResolveResult::AlreadyExists => {
                 let _ = pending::remove(&record.commit);
-                continue;
             }
-            Ok(false) => {} // Still pending, try to resolve
-            Err(_) => continue,
-        }
-
-        // Collect candidate dirs and files for this commit.
-        // Use a 24-hour (86400 sec) window for retries instead of the
-        // 10-minute window used in the hook. The session log file mtime
-        // may differ significantly from the commit time if the agent
-        // continued working after the commit.
-        let mut candidate_dirs = Vec::new();
-        candidate_dirs.extend(agents::claude::log_dirs(repo_root));
-        candidate_dirs.extend(agents::codex::log_dirs());
-
-        let candidate_files = agents::candidate_files(&candidate_dirs, record.commit_time, 86_400);
-
-        let session_match = scanner::find_session_for_commit(&record.commit, &candidate_files);
-
-        if let Some(ref matched) = session_match {
-            let metadata = scanner::parse_session_metadata(&matched.file_path);
-
-            if scanner::verify_match(&metadata, repo_root, &record.commit) {
-                let session_log = match std::fs::read_to_string(&matched.file_path) {
-                    Ok(content) => content,
-                    Err(_) => {
-                        // File unreadable; increment and try again later
-                        let _ = pending::increment(record);
-                        continue;
-                    }
-                };
-
-                let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
-
-                let note_content = match note::format(
-                    &matched.agent_type,
-                    session_id,
-                    repo_str,
-                    &record.commit,
-                    &session_log,
-                ) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        let _ = pending::increment(record);
-                        continue;
-                    }
-                };
-
-                if git::add_note(&record.commit, &note_content).is_ok() {
-                    eprintln!(
-                        "[ai-barometer] retry: attached session {} to commit {}",
-                        session_id,
-                        &record.commit[..std::cmp::min(7, record.commit.len())]
-                    );
-                    let _ = pending::remove(&record.commit);
-
-                    // Push if conditions are met
-                    if push::should_push() {
-                        push::attempt_push();
-                    }
-                } else {
-                    let _ = pending::increment(record);
-                }
-            } else {
-                // Verification failed -- increment attempt count
+            ResolveResult::NotFound | ResolveResult::TransientError => {
                 let _ = pending::increment(record);
             }
-        } else {
-            // No match found -- increment attempt count
-            let _ = pending::increment(record);
         }
     }
 }
@@ -906,6 +1014,11 @@ fn main() {
         Command::Install { org } => run_install(org),
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit(),
+            HookCommand::PostCommitRetry {
+                commit,
+                repo,
+                timestamp,
+            } => run_hook_post_commit_retry(&commit, &repo, timestamp),
         },
         Command::Hydrate { since, push } => run_hydrate(&since, push),
         Command::Retry => run_retry(),
@@ -950,6 +1063,33 @@ mod tests {
                 hook_command: HookCommand::PostCommit
             }
         ));
+    }
+
+    #[test]
+    fn cli_parses_hook_post_commit_retry() {
+        let cli = Cli::parse_from([
+            "ai-barometer",
+            "hook",
+            "post-commit-retry",
+            "abcdef0123456789abcdef0123456789abcdef01",
+            "/Users/foo/repo",
+            "1700000000",
+        ]);
+        match cli.command {
+            Command::Hook {
+                hook_command:
+                    HookCommand::PostCommitRetry {
+                        commit,
+                        repo,
+                        timestamp,
+                    },
+            } => {
+                assert_eq!(commit, "abcdef0123456789abcdef0123456789abcdef01");
+                assert_eq!(repo, "/Users/foo/repo");
+                assert_eq!(timestamp, 1_700_000_000);
+            }
+            _ => panic!("expected Hook PostCommitRetry command"),
+        }
     }
 
     #[test]
