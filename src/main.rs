@@ -756,22 +756,28 @@ fn run_retry() -> Result<()> {
 /// All output uses the `[ai-barometer]` prefix on stderr.
 /// Handles being called outside a git repo gracefully.
 fn run_status() -> Result<()> {
-    eprintln!("[ai-barometer] Status");
+    run_status_inner(&mut std::io::stderr())
+}
+
+/// Inner implementation of `run_status` that writes to a `Write` impl.
+/// This allows tests to capture the output for verification.
+fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
+    writeln!(w, "[ai-barometer] Status").ok();
 
     // --- Repo root ---
     let repo_root = match git::repo_root() {
         Ok(root) => {
-            eprintln!("[ai-barometer]   Repo: {}", root.to_string_lossy());
+            writeln!(w, "[ai-barometer]   Repo: {}", root.to_string_lossy()).ok();
             Some(root)
         }
         Err(_) => {
-            eprintln!("[ai-barometer]   Repo: (not in a git repository)");
+            writeln!(w, "[ai-barometer]   Repo: (not in a git repository)").ok();
             None
         }
     };
 
     // --- Hooks path and shim status ---
-    let hooks_path = match git::config_get_global("core.hooksPath") {
+    match git::config_get_global("core.hooksPath") {
         Ok(Some(path)) => {
             let shim_path = std::path::Path::new(&path).join("post-commit");
             let shim_installed = match std::fs::read_to_string(&shim_path) {
@@ -779,18 +785,17 @@ fn run_status() -> Result<()> {
                 Err(_) => false,
             };
             let installed_str = if shim_installed { "yes" } else { "no" };
-            eprintln!(
+            writeln!(
+                w,
                 "[ai-barometer]   Hooks path: {} (shim installed: {})",
                 path, installed_str
-            );
-            Some(path)
+            )
+            .ok();
         }
         _ => {
-            eprintln!("[ai-barometer]   Hooks path: (not configured)");
-            None
+            writeln!(w, "[ai-barometer]   Hooks path: (not configured)").ok();
         }
-    };
-    let _ = hooks_path; // suppress unused warning
+    }
 
     // --- Pending retries ---
     if let Some(ref root) = repo_root {
@@ -798,18 +803,18 @@ fn run_status() -> Result<()> {
         let pending_count = pending::list_for_repo(&repo_str)
             .map(|r| r.len())
             .unwrap_or(0);
-        eprintln!("[ai-barometer]   Pending retries: {}", pending_count);
+        writeln!(w, "[ai-barometer]   Pending retries: {}", pending_count).ok();
     } else {
-        eprintln!("[ai-barometer]   Pending retries: (n/a - not in a repo)");
+        writeln!(w, "[ai-barometer]   Pending retries: (n/a - not in a repo)").ok();
     }
 
     // --- Org filter ---
     match git::config_get_global("ai.barometer.org") {
         Ok(Some(org)) => {
-            eprintln!("[ai-barometer]   Org filter: {}", org);
+            writeln!(w, "[ai-barometer]   Org filter: {}", org).ok();
         }
         _ => {
-            eprintln!("[ai-barometer]   Org filter: (none)");
+            writeln!(w, "[ai-barometer]   Org filter: (none)").ok();
         }
     }
 
@@ -817,31 +822,33 @@ fn run_status() -> Result<()> {
     if repo_root.is_some() {
         match git::config_get("ai.barometer.autopush") {
             Ok(Some(val)) if val == "true" => {
-                eprintln!("[ai-barometer]   Auto-push: enabled (consented)");
+                writeln!(w, "[ai-barometer]   Auto-push: enabled (consented)").ok();
             }
             Ok(Some(val)) if val == "false" => {
-                eprintln!("[ai-barometer]   Auto-push: disabled (opted out)");
+                writeln!(w, "[ai-barometer]   Auto-push: disabled (opted out)").ok();
             }
             _ => {
-                eprintln!(
+                writeln!(
+                    w,
                     "[ai-barometer]   Auto-push: not yet configured (will prompt on first push)"
-                );
+                )
+                .ok();
             }
         }
     } else {
-        eprintln!("[ai-barometer]   Auto-push: (n/a - not in a repo)");
+        writeln!(w, "[ai-barometer]   Auto-push: (n/a - not in a repo)").ok();
     }
 
     // --- Per-repo enabled/disabled ---
     if repo_root.is_some() {
         let enabled = git::check_enabled();
         if enabled {
-            eprintln!("[ai-barometer]   Repo enabled: yes");
+            writeln!(w, "[ai-barometer]   Repo enabled: yes").ok();
         } else {
-            eprintln!("[ai-barometer]   Repo enabled: no");
+            writeln!(w, "[ai-barometer]   Repo enabled: no").ok();
         }
     } else {
-        eprintln!("[ai-barometer]   Repo enabled: (n/a - not in a repo)");
+        writeln!(w, "[ai-barometer]   Repo enabled: (n/a - not in a repo)").ok();
     }
 
     Ok(())
@@ -1032,11 +1039,67 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn run_status_returns_ok_outside_repo() {
         // run_status should always return Ok even outside a git repo --
         // it gracefully handles the case where git::repo_root() fails.
-        let result = run_status();
+        // We chdir to a temp dir that has no .git to actually exercise
+        // the outside-repo code path.
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        // Create an empty global config to isolate from developer's environment
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        std::env::set_current_dir(tmp.path()).expect("failed to chdir to temp dir");
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("not in a git repository"),
+            "should show outside-repo message, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Pending retries: (n/a - not in a repo)"),
+            "pending should show n/a outside repo, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Auto-push: (n/a - not in a repo)"),
+            "autopush should show n/a outside repo, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Repo enabled: (n/a - not in a repo)"),
+            "repo enabled should show n/a outside repo, got: {}",
+            output
+        );
+
+        // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -2213,9 +2276,25 @@ mod tests {
             std::env::set_var("HOME", fake_home.path());
         }
 
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_status();
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains(&format!("Repo: {}", git_repo_root)),
+            "should show repo root path, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Pending retries: 0"),
+            "should show zero pending retries, got: {}",
+            output
+        );
 
         // Restore
         unsafe {
@@ -2317,14 +2396,17 @@ mod tests {
         }
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_status();
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
 
-        // Verify the pending count matches by reading it ourselves
-        let count = pending::list_for_repo(&git_repo_root)
-            .map(|r| r.len())
-            .unwrap_or(0);
-        assert_eq!(count, 3);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Pending retries: 3"),
+            "should show 3 pending retries, got: {}",
+            output
+        );
 
         // Restore
         unsafe {
@@ -2425,11 +2507,17 @@ mod tests {
         run_git(repo_path, &["config", "ai.barometer.enabled", "false"]);
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        let result = run_status();
+
+        let mut buf = Vec::new();
+        let result = run_status_inner(&mut buf);
         assert!(result.is_ok());
 
-        // Verify the enabled check sees it as disabled
-        assert!(!git::check_enabled());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Repo enabled: no"),
+            "should show repo as disabled, got: {}",
+            output
+        );
 
         // Restore
         unsafe {

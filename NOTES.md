@@ -743,3 +743,30 @@ A code review was conducted after Phase 10 (18 findings: 0 critical, 2 medium, 8
   - **`test_status_shows_org_filter`:** Sets up a global config with `ai.barometer.org` and verifies status succeeds.
   - **`test_status_shows_autopush_status`:** Sets `ai.barometer.autopush = true` in a repo and verifies status succeeds.
   - **`test_status_shows_repo_disabled`:** Disables a repo via `ai.barometer.enabled = false`, runs status, and verifies `check_enabled()` returns `false`.
+
+---
+
+## Phase 11 Review Triage
+
+A code review was conducted after Phase 11 (11 findings: 0 critical, 2 medium, 5 low, 4 informational/positive). The review confirmed 238 tests passing, clippy clean (2 expected dead-code warnings), and formatting clean. No critical or commit-blocking bugs were found.
+
+### Fixed
+
+1. **Outside-repo test now actually exercises the outside-repo code path (Review #1, Medium).** The `run_status_returns_ok_outside_repo` test was not actually testing the outside-repo path because it ran in the project's own git repo. Fixed by: adding `#[serial]`, using `std::env::set_current_dir` to change CWD to a temp dir with no `.git`, isolating `$HOME` and `GIT_CONFIG_GLOBAL` to prevent reading the developer's real config, and verifying the output contains the expected outside-repo messages ("not in a git repository", "n/a - not in a repo" for pending/autopush/enabled).
+
+2. **Tests now capture and verify output content (Review #3, Medium).** Refactored `run_status()` into a thin wrapper that calls `run_status_inner(w: &mut dyn Write)`. The inner function writes to any `Write` impl instead of directly to stderr via `eprintln!`. Four tests now capture output into a `Vec<u8>` buffer and assert on specific output strings:
+   - `run_status_returns_ok_outside_repo`: verifies "not in a git repository", "Pending retries: (n/a - not in a repo)", "Auto-push: (n/a - not in a repo)", "Repo enabled: (n/a - not in a repo)".
+   - `test_status_in_repo_shows_repo_root`: verifies the repo root path appears in output and "Pending retries: 0".
+   - `test_status_shows_pending_count`: verifies "Pending retries: 3".
+   - `test_status_shows_repo_disabled`: verifies "Repo enabled: no".
+
+3. **Removed unused `hooks_path` binding (Review #2, Low).** The match block for `core.hooksPath` previously bound the result to `hooks_path`, which was then immediately suppressed with `let _ = hooks_path;`. Restructured the match to not bind the variable at all -- the match arms print output as side effects and no return value is needed.
+
+### Deferred
+
+- **Missing autopush variant tests (Review #4, Low):** The `autopush = false` (opted out) and unset cases are not tested. The match arms are simple string prints and unlikely to regress.
+- **Doc comment on `run_status` (Review #10, Low):** Trivial documentation gap. A doc comment was added during this triage as part of the `run_status_inner` refactoring.
+- **Env var ordering pattern (Review #11, Low):** Pre-existing pattern used throughout the test suite. Not unique to Phase 11.
+
+### Test Count
+- Total: 238 tests (unchanged). No new tests added; 4 existing tests were improved to capture and verify output content.
