@@ -288,3 +288,29 @@ A code review was conducted after Phase 4 (21 findings across 8 sections). The r
 
 ### Dead Code Warnings
 - As with Phases 2-4, all new `pub` items generate "never used" warnings because they are not called from production code yet. These will resolve when Phase 6 wires up the hook handler.
+
+---
+
+## Phase 5 Review Triage
+
+A code review was conducted after Phase 5 (12 findings). The review confirmed 133 tests passing, clippy clean (only expected dead-code warnings), and formatting clean.
+
+### Fixed
+
+1. **`agent` parameter now uses `AgentType` enum (Review #5, Medium).** Changed `note::format()` signature from `agent: &str` to `agent: &AgentType`, importing `crate::scanner::AgentType`. This provides type safety and eliminates the possibility of passing misspelled or unknown agent strings. The `Display` impl on `AgentType` is used automatically when formatting the header. All tests updated to pass `&AgentType::Claude` or `&AgentType::Codex` instead of string literals.
+
+2. **Added test for payload containing `---` delimiter (Review #6, Medium).** New test `test_format_payload_containing_delimiter` uses a payload with `"line one\n---\nline two\n"` and verifies that `splitn(3, "---\n")` correctly extracts the payload and the SHA matches. This documents the expected parsing strategy and guards against regressions.
+
+3. **Added doc comment noting `---` injection risk (Review #1, Medium).** Added a "Parsing caveat" section to the `format` function's doc comment explaining that payloads containing `---` on their own line will confuse naive parsers, and recommending `splitn(3, "---\n")` plus `payload_sha256` verification.
+
+4. **Added commit hash validation in `format()` (Review #3, Medium).** The `format` function now calls `crate::git::validate_commit_hash(commit)?` at the top, rejecting invalid hashes early. The return type changed from `String` to `anyhow::Result<String>`. Added 3 new tests: `test_format_rejects_invalid_commit_hash`, `test_format_rejects_empty_commit_hash`, `test_format_rejects_short_commit_hash`.
+
+### Deferred
+
+- **Input validation on all parameters (Review #3, Medium):** Over-engineering for now. The `commit` parameter is the most important and is now validated. Other parameters (session_id, repo) come from trusted internal sources.
+- **Renaming `format` function (Review #2, Low):** Works fine with module qualification (`note::format`). Not worth the churn.
+- **Performance of string building (Review #4, Low):** Negligible for typical use. The header is ~200 bytes.
+- **Special characters in header values (Review #7, Low):** Not a real concern for our use case. Session IDs and repo paths do not contain colons in practice.
+
+### Test Count
+- Total: 137 tests (was 133 before triage). Added 4 new tests (1 for `---` delimiter edge case, 3 for commit hash validation).

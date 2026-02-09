@@ -5,6 +5,7 @@
 //! metadata fields: agent, session_id, repo, commit, confidence, and
 //! payload_sha256.
 
+use crate::scanner::AgentType;
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -28,13 +29,26 @@ use sha2::{Digest, Sha256};
 ///
 /// The `confidence` field is always `exact_hash_match` for now.
 /// The `payload_sha256` is computed from `session_log`.
+///
+/// The `commit` parameter is validated via [`crate::git::validate_commit_hash`]
+/// and must be 7-40 hex characters. Returns an error if validation fails.
+///
+/// # Parsing caveat
+///
+/// The payload is appended verbatim after the closing `---` delimiter. If the
+/// payload itself contains a line that is exactly `---\n`, a naive parser that
+/// scans for `---` delimiters will misparse the note. Parsers should use
+/// `splitn(3, "---\n")` (splitting on at most 3 occurrences) to correctly
+/// separate the header from the payload, and verify integrity using the
+/// `payload_sha256` field.
 pub fn format(
-    agent: &str,
+    agent: &AgentType,
     session_id: &str,
     repo: &str,
     commit: &str,
     session_log: &str,
-) -> String {
+) -> anyhow::Result<String> {
+    crate::git::validate_commit_hash(commit)?;
     let sha = payload_sha256(session_log);
 
     let mut note = String::new();
@@ -48,7 +62,7 @@ pub fn format(
     note.push_str("---\n");
     note.push_str(session_log);
 
-    note
+    Ok(note)
 }
 
 /// Compute the SHA-256 hash of the session log payload.
@@ -115,7 +129,6 @@ mod tests {
 
     #[test]
     fn test_format_produces_correct_structure() {
-        let agent = "claude-code";
         let session_id = "abc-123-def-456";
         let repo = "/Users/foo/dev/my-repo";
         let commit = "655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e";
@@ -123,7 +136,7 @@ mod tests {
 {"type":"tool_result","content":"done"}
 "#;
 
-        let note = format(agent, session_id, repo, commit, session_log);
+        let note = format(&AgentType::Claude, session_id, repo, commit, session_log).unwrap();
 
         // Verify the note starts with ---
         assert!(note.starts_with("---\n"));
@@ -153,7 +166,14 @@ mod tests {
 
     #[test]
     fn test_format_header_field_order() {
-        let note = format("codex", "sid", "/repo", "aabbccdd00112233", "payload");
+        let note = format(
+            &AgentType::Codex,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "payload",
+        )
+        .unwrap();
 
         // Extract lines between the two --- delimiters
         let lines: Vec<&str> = note.lines().collect();
@@ -170,12 +190,13 @@ mod tests {
     #[test]
     fn test_format_with_empty_payload() {
         let note = format(
-            "claude-code",
+            &AgentType::Claude,
             "empty-session",
             "/repo",
             "0000000000000000000000000000000000000000",
             "",
-        );
+        )
+        .unwrap();
 
         // Should still have the header
         assert!(note.starts_with("---\n"));
@@ -198,12 +219,13 @@ mod tests {
 {"line":5}
 "#;
         let note = format(
-            "claude-code",
+            &AgentType::Claude,
             "multi",
             "/repo",
             "aabbccdd00112233",
             session_log,
-        );
+        )
+        .unwrap();
 
         // Payload should be verbatim after the closing ---
         let closing_marker = "---\n";
@@ -219,7 +241,14 @@ mod tests {
     fn test_format_payload_is_verbatim() {
         // Verify the session log is not modified in any way
         let session_log = "  leading spaces\ttabs\nnewlines\n\n  trailing spaces  \n";
-        let note = format("codex", "sid", "/repo", "aabbccdd00112233", session_log);
+        let note = format(
+            &AgentType::Codex,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            session_log,
+        )
+        .unwrap();
 
         // The note should end with the verbatim session log
         assert!(note.ends_with(session_log));
@@ -227,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_format_codex_agent() {
-        let note = format("codex", "sid", "/repo", "aabbccdd00112233", "log");
+        let note = format(&AgentType::Codex, "sid", "/repo", "aabbccdd00112233", "log").unwrap();
         assert!(note.contains("agent: codex\n"));
     }
 
@@ -235,12 +264,13 @@ mod tests {
     fn test_format_sha256_matches_payload() {
         let session_log = "some session log content\nwith multiple lines\n";
         let note = format(
-            "claude-code",
+            &AgentType::Claude,
             "sid",
             "/repo",
             "aabbccdd00112233",
             session_log,
-        );
+        )
+        .unwrap();
 
         let expected_sha = payload_sha256(session_log);
         assert!(note.contains(&format!("payload_sha256: {}\n", expected_sha)));
@@ -257,12 +287,13 @@ mod tests {
 {"type":"assistant","message":"Done!"}
 "#;
         let note = format(
-            "claude-code",
+            &AgentType::Claude,
             "abc",
             "/foo",
             "655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e",
             session_log,
-        );
+        )
+        .unwrap();
 
         // Split on "---\n" to extract payload
         let parts: Vec<&str> = note.splitn(3, "---\n").collect();
@@ -274,5 +305,59 @@ mod tests {
         // Verify the SHA in the header matches the extracted payload
         let sha_from_extraction = payload_sha256(extracted_payload);
         assert!(parts[1].contains(&format!("payload_sha256: {}\n", sha_from_extraction)));
+    }
+
+    // -----------------------------------------------------------------------
+    // format — payload containing `---` delimiter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_payload_containing_delimiter() {
+        // Payload that contains `---` on its own line — this is the edge case
+        // where a naive parser scanning for `---` delimiters would misparse.
+        let session_log = "line one\n---\nline two\n";
+        let note = format(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            session_log,
+        )
+        .unwrap();
+
+        // Using splitn(3, "---\n") should still correctly extract the payload,
+        // because it splits on at most 3 occurrences: empty prefix, header, rest.
+        let parts: Vec<&str> = note.splitn(3, "---\n").collect();
+        assert_eq!(parts.len(), 3);
+        let extracted_payload = parts[2];
+
+        // The extracted payload must be identical to the original session log
+        assert_eq!(extracted_payload, session_log);
+
+        // Verify the SHA in the header matches the extracted payload
+        let sha_from_extraction = payload_sha256(extracted_payload);
+        assert!(parts[1].contains(&format!("payload_sha256: {}\n", sha_from_extraction)));
+    }
+
+    // -----------------------------------------------------------------------
+    // format — commit hash validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_rejects_invalid_commit_hash() {
+        let result = format(&AgentType::Claude, "sid", "/repo", "not-a-hash", "log");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_rejects_empty_commit_hash() {
+        let result = format(&AgentType::Claude, "sid", "/repo", "", "log");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_rejects_short_commit_hash() {
+        let result = format(&AgentType::Claude, "sid", "/repo", "abcdef", "log");
+        assert!(result.is_err());
     }
 }
