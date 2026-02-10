@@ -30,14 +30,14 @@ jobs:
       - name: Package
         run: |
           cd target/release
-          tar czf ../../ai-barometer-${{ matrix.target }}.tar.gz ai-barometer
+          tar czf ../../ai-session-commit-linker-${{ matrix.target }}.tar.gz ai-session-commit-linker
           cd ../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ai-barometer-${{ matrix.target }}
-          path: ai-barometer-${{ matrix.target }}.tar.gz
+          name: ai-session-commit-linker-${{ matrix.target }}
+          path: ai-session-commit-linker-${{ matrix.target }}.tar.gz
 
   release:
     name: Create Release

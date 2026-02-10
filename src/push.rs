@@ -4,14 +4,14 @@
 //! attaching them locally. The decision depends on several factors:
 //!
 //! 1. **Has upstream**: repo must have at least one configured remote.
-//! 2. **Org filter**: if `git config --global ai.barometer.org` is set,
+//! 2. **Org filter**: if `git config --global ai.session-commit-linker.org` is set,
 //!    at least one remote must belong to that org. Otherwise, notes are
 //!    attached locally only (no push).
-//! 3. **Autopush consent**: `git config ai.barometer.autopush` -- on first
+//! 3. **Autopush consent**: `git config ai.session-commit-linker.autopush` -- on first
 //!    push for a repo, print a warning and record consent. After that,
 //!    push silently.
 //!
-//! Note: The per-repo enabled check (`git config ai.barometer.enabled`) is
+//! Note: The per-repo enabled check (`git config ai.session-commit-linker.enabled`) is
 //! handled by [`git::check_enabled()`] in the git module, since it gates
 //! ALL processing (not just push).
 //!
@@ -57,21 +57,24 @@ pub fn should_push() -> bool {
 /// On failure: logs a warning to stderr. Never blocks, never retries.
 pub fn attempt_push() {
     if let Err(e) = git::push_notes() {
-        eprintln!("[ai-barometer] warning: failed to push notes: {}", e);
+        eprintln!(
+            "[ai-session-commit-linker] warning: failed to push notes: {}",
+            e
+        );
     }
 }
 
 /// Check the org filter: if a global org is configured, verify that at least
 /// one remote belongs to that org.
 ///
-/// Reads `git config --global ai.barometer.org`. If not set, the filter
+/// Reads `git config --global ai.session-commit-linker.org`. If not set, the filter
 /// passes (no org restriction). If set, extracts orgs from ALL remotes
 /// and checks for a match via [`org_matches`].
 ///
 /// Returns `true` if push is allowed (no filter, or filter matches).
 /// Returns `false` if the org filter is set and no remote matches.
 pub fn check_org_filter() -> bool {
-    let configured_org = match git::config_get_global("ai.barometer.org") {
+    let configured_org = match git::config_get_global("ai.session-commit-linker.org") {
         Ok(Some(org)) => org,
         // No org filter configured: allow push
         _ => return true,
@@ -100,12 +103,12 @@ pub fn org_matches(configured_org: &str, remote_orgs: &[String]) -> bool {
 }
 
 /// Check autopush consent. On first push for a repo, print a warning to
-/// stderr and record consent by setting `git config ai.barometer.autopush true`.
+/// stderr and record consent by setting `git config ai.session-commit-linker.autopush true`.
 ///
 /// Returns `true` if consent is granted (either already recorded or just granted).
 /// Returns `false` if consent cannot be recorded (config write failure).
 pub fn check_or_request_consent() -> bool {
-    match git::config_get("ai.barometer.autopush") {
+    match git::config_get("ai.session-commit-linker.autopush") {
         Ok(Some(val)) if val == "true" => {
             // Consent already recorded, push silently
             return true;
@@ -122,16 +125,18 @@ pub fn check_or_request_consent() -> bool {
 
     // First push for this repo: print informational warning
     eprintln!(
-        "[ai-barometer] This is the first time AI Barometer will push notes for this repository."
+        "[ai-session-commit-linker] This is the first time AI Session Commit Linker will push notes for this repository."
     );
-    eprintln!("[ai-barometer] AI session notes will be pushed to the remote via:");
-    eprintln!("[ai-barometer]   git push origin refs/notes/ai-sessions");
-    eprintln!("[ai-barometer] To disable, run: git config ai.barometer.autopush false");
+    eprintln!("[ai-session-commit-linker] AI session notes will be pushed to the remote via:");
+    eprintln!("[ai-session-commit-linker]   git push origin refs/notes/ai-sessions");
+    eprintln!(
+        "[ai-session-commit-linker] To disable, run: git config ai.session-commit-linker.autopush false"
+    );
 
     // Record consent
-    if let Err(e) = git::config_set("ai.barometer.autopush", "true") {
+    if let Err(e) = git::config_set("ai.session-commit-linker.autopush", "true") {
         eprintln!(
-            "[ai-barometer] warning: failed to record autopush consent: {}",
+            "[ai-session-commit-linker] warning: failed to record autopush consent: {}",
             e
         );
         // Still allow this push attempt even if we couldn't save the config
@@ -211,7 +216,10 @@ mod tests {
         assert!(check_or_request_consent());
 
         // Should now have autopush=true recorded
-        let val = run_git(dir.path(), &["config", "--get", "ai.barometer.autopush"]);
+        let val = run_git(
+            dir.path(),
+            &["config", "--get", "ai.session-commit-linker.autopush"],
+        );
         assert_eq!(val, "true");
 
         std::env::set_current_dir(original_cwd).unwrap();
@@ -224,7 +232,10 @@ mod tests {
         let original_cwd = safe_cwd();
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
-        run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.autopush", "true"],
+        );
         assert!(check_or_request_consent());
 
         std::env::set_current_dir(original_cwd).unwrap();
@@ -237,7 +248,10 @@ mod tests {
         let original_cwd = safe_cwd();
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
-        run_git(dir.path(), &["config", "ai.barometer.autopush", "false"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.autopush", "false"],
+        );
         assert!(!check_or_request_consent());
 
         std::env::set_current_dir(original_cwd).unwrap();
@@ -270,7 +284,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
         // Use an empty global config so we don't depend on the developer's
-        // real global git config (which might have ai.barometer.org set).
+        // real global git config (which might have ai.session-commit-linker.org set).
         let global_config = dir.path().join("fake-global-gitconfig");
         std::fs::write(&global_config, "").unwrap();
 
@@ -312,7 +326,11 @@ mod tests {
 
         // Create a global config with matching org filter
         let global_config = dir.path().join("fake-global-gitconfig");
-        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = my-org\n").unwrap();
+        std::fs::write(
+            &global_config,
+            "[ai \"session-commit-linker\"]\n    org = my-org\n",
+        )
+        .unwrap();
 
         let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
         unsafe {
@@ -343,7 +361,7 @@ mod tests {
         let global_config = dir.path().join("fake-global-gitconfig");
         std::fs::write(
             &global_config,
-            "[ai \"barometer\"]\n    org = required-org\n",
+            "[ai \"session-commit-linker\"]\n    org = required-org\n",
         )
         .unwrap();
 
@@ -401,7 +419,10 @@ mod tests {
         );
 
         // Pre-set consent so should_push doesn't need to print the warning
-        run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.autopush", "true"],
+        );
 
         // should_push should return true (remote exists, no org filter, consent given)
         assert!(should_push());
@@ -428,7 +449,10 @@ mod tests {
         );
 
         // Explicitly deny consent
-        run_git(dir.path(), &["config", "ai.barometer.autopush", "false"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.autopush", "false"],
+        );
 
         assert!(!should_push());
 
@@ -579,13 +603,16 @@ mod tests {
         );
 
         // Pre-set consent so we isolate the org filter behavior
-        run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.autopush", "true"],
+        );
 
         // Create a temp global config file with a different org filter
         let global_config = dir.path().join("fake-global-gitconfig");
         std::fs::write(
             &global_config,
-            "[ai \"barometer\"]\n    org = required-org\n",
+            "[ai \"session-commit-linker\"]\n    org = required-org\n",
         )
         .unwrap();
 
@@ -622,11 +649,18 @@ mod tests {
         );
 
         // Pre-set consent
-        run_git(dir.path(), &["config", "ai.barometer.autopush", "true"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.autopush", "true"],
+        );
 
         // Create a global config file with matching org filter
         let global_config = dir.path().join("fake-global-gitconfig");
-        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = my-org\n").unwrap();
+        std::fs::write(
+            &global_config,
+            "[ai \"session-commit-linker\"]\n    org = my-org\n",
+        )
+        .unwrap();
 
         let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
         unsafe {
@@ -666,7 +700,11 @@ mod tests {
 
         // Create a global config with matching org
         let global_config = dir.path().join("fake-global-gitconfig");
-        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = Test-Org\n").unwrap();
+        std::fs::write(
+            &global_config,
+            "[ai \"session-commit-linker\"]\n    org = Test-Org\n",
+        )
+        .unwrap();
 
         let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
         unsafe {
@@ -677,7 +715,11 @@ mod tests {
         assert!(check_org_filter());
 
         // Now test with non-matching org
-        std::fs::write(&global_config, "[ai \"barometer\"]\n    org = other-org\n").unwrap();
+        std::fs::write(
+            &global_config,
+            "[ai \"session-commit-linker\"]\n    org = other-org\n",
+        )
+        .unwrap();
 
         assert!(!check_org_filter());
 

@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-REPO="TeamCadenceAI/ai-barometer"
+REPO="TeamCadenceAI/ai-session-commit-linker"
 INSTALL_DIR="${HOME}/.local/bin"
 
 main() {
     # Must be macOS
     if [ "$(uname -s)" != "Darwin" ]; then
-        echo "Error: ai-barometer only supports macOS." >&2
+        echo "Error: ai-session-commit-linker only supports macOS." >&2
         exit 1
     fi
 
@@ -41,7 +41,7 @@ main() {
     echo "Latest release: $tag"
 
     # Download tarball
-    tarball="ai-barometer-${target}.tar.gz"
+    tarball="ai-session-commit-linker-${target}.tar.gz"
     download_url="https://github.com/${REPO}/releases/download/${tag}/${tarball}"
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
@@ -58,17 +58,17 @@ main() {
     tar xzf "${tmpdir}/${tarball}" -C "$tmpdir"
 
     mkdir -p "$INSTALL_DIR"
-    echo "Installing to ${INSTALL_DIR}/ai-barometer..."
-    cp "${tmpdir}/ai-barometer" "${INSTALL_DIR}/ai-barometer"
-    chmod +x "${INSTALL_DIR}/ai-barometer"
+    echo "Installing to ${INSTALL_DIR}/ai-session-commit-linker..."
+    cp "${tmpdir}/ai-session-commit-linker" "${INSTALL_DIR}/ai-session-commit-linker"
+    chmod +x "${INSTALL_DIR}/ai-session-commit-linker"
 
     echo "Running initial setup..."
-    "${INSTALL_DIR}/ai-barometer" install || {
-        echo "Warning: 'ai-barometer install' failed. You can run it manually later." >&2
+    "${INSTALL_DIR}/ai-session-commit-linker" install || {
+        echo "Warning: 'ai-session-commit-linker install' failed. You can run it manually later." >&2
     }
 
     echo ""
-    echo "ai-barometer installed successfully!"
+    echo "ai-session-commit-linker installed successfully!"
 
     # Check if install dir is on PATH
     case ":${PATH}:" in

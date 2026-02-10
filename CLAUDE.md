@@ -1,6 +1,6 @@
 ## Project Overview
 
-**AI Barometer** is a single Rust CLI binary that attaches AI coding agent session logs (Claude Code, Codex) to Git commits using **git notes** (ref: `refs/notes/ai-sessions`).
+**AI Session Commit Linker** is a single Rust CLI binary that attaches AI coding agent session logs (Claude Code, Codex) to Git commits using **git notes** (ref: `refs/notes/ai-sessions`).
 It provides provenance and measurement of AI-assisted development without polluting commit history.
 
 ## Build & Development Commands

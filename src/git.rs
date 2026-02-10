@@ -69,9 +69,9 @@ fn git_succeeds(args: &[&str]) -> Result<bool> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Check whether AI Barometer is enabled for the current repository.
+/// Check whether AI Session Commit Linker is enabled for the current repository.
 ///
-/// Reads `git config ai.barometer.enabled`. If the value is exactly
+/// Reads `git config ai.session-commit-linker.enabled`. If the value is exactly
 /// `"false"`, returns `false` -- the caller should skip ALL processing
 /// (session scanning, note attachment, pending records, push, retry).
 /// Any other value (including unset) returns `true`.
@@ -79,24 +79,30 @@ fn git_succeeds(args: &[&str]) -> Result<bool> {
 /// This is placed in the `git` module (not `push`) because it gates
 /// the entire hook lifecycle, not just the push decision.
 pub fn check_enabled() -> bool {
-    match config_get("ai.barometer.enabled") {
+    match config_get("ai.session-commit-linker.enabled") {
         Ok(Some(val)) => val != "false",
         // Unset or error: default to enabled
         _ => true,
     }
 }
 
-/// Check whether AI Barometer is enabled for a specific repository directory.
+/// Check whether AI Session Commit Linker is enabled for a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`check_enabled`], for use
 /// by commands that operate on repos other than the CWD (e.g., `hydrate`).
 ///
-/// Reads `git -C <repo> config ai.barometer.enabled`. If the value is exactly
+/// Reads `git -C <repo> config ai.session-commit-linker.enabled`. If the value is exactly
 /// `"false"`, returns `false`. Any other value (including unset) returns `true`.
 pub(crate) fn check_enabled_at(repo: &Path) -> bool {
     let repo_str = repo.to_string_lossy();
     let output = Command::new("git")
-        .args(["-C", &repo_str, "config", "--get", "ai.barometer.enabled"])
+        .args([
+            "-C",
+            &repo_str,
+            "config",
+            "--get",
+            "ai.session-commit-linker.enabled",
+        ])
         .output();
 
     match output {
@@ -412,7 +418,7 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
 /// Read a git config value from global scope. Returns `Ok(None)` if the key is not set.
 ///
 /// Uses `--global` flag to read only the global config, not repo-local.
-/// This is used for settings like `ai.barometer.org` that are set at install time.
+/// This is used for settings like `ai.session-commit-linker.org` that are set at install time.
 pub fn config_get_global(key: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["config", "--global", "--get", key])
@@ -455,7 +461,7 @@ pub fn config_set(key: &str, value: &str) -> Result<()> {
 /// Write a git config value in global scope (`--global`).
 ///
 /// Used by the `install` subcommand to persist settings like
-/// `core.hooksPath` and `ai.barometer.org` globally.
+/// `core.hooksPath` and `ai.session-commit-linker.org` globally.
 pub fn config_set_global(key: &str, value: &str) -> Result<()> {
     let output = Command::new("git")
         .args(["config", "--global", key, value])
@@ -725,7 +731,7 @@ mod tests {
         let path = dir.path();
         let output = Command::new("git")
             .args(["-C", path.to_str().unwrap()])
-            .args(["config", "--get", "ai.barometer.nonexistent"])
+            .args(["config", "--get", "ai.session-commit-linker.nonexistent"])
             .output()
             .unwrap();
         // Should exit non-zero (key not set)
@@ -738,10 +744,17 @@ mod tests {
         let path = dir.path();
 
         // Set a config value
-        run_git(path, &["config", "ai.barometer.autopush", "true"]);
+        run_git(
+            path,
+            &["config", "ai.session-commit-linker.autopush", "true"],
+        );
 
         // Read it back
-        let value = git_output_in(path, &["config", "--get", "ai.barometer.autopush"]).unwrap();
+        let value = git_output_in(
+            path,
+            &["config", "--get", "ai.session-commit-linker.autopush"],
+        )
+        .unwrap();
         assert_eq!(value, "true");
     }
 
@@ -750,10 +763,17 @@ mod tests {
         let dir = init_temp_repo();
         let path = dir.path();
 
-        run_git(path, &["config", "ai.barometer.org", "first-org"]);
-        run_git(path, &["config", "ai.barometer.org", "second-org"]);
+        run_git(
+            path,
+            &["config", "ai.session-commit-linker.org", "first-org"],
+        );
+        run_git(
+            path,
+            &["config", "ai.session-commit-linker.org", "second-org"],
+        );
 
-        let value = git_output_in(path, &["config", "--get", "ai.barometer.org"]).unwrap();
+        let value =
+            git_output_in(path, &["config", "--get", "ai.session-commit-linker.org"]).unwrap();
         assert_eq!(value, "second-org");
     }
 
@@ -957,7 +977,7 @@ mod tests {
     #[serial]
     fn test_api_config_get_missing() {
         let (_dir, original_cwd) = enter_temp_repo();
-        let val = config_get("ai.barometer.nonexistent").expect("config_get failed");
+        let val = config_get("ai.session-commit-linker.nonexistent").expect("config_get failed");
         assert_eq!(val, None);
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -966,8 +986,8 @@ mod tests {
     #[serial]
     fn test_api_config_set_then_get() {
         let (_dir, original_cwd) = enter_temp_repo();
-        config_set("ai.barometer.autopush", "true").expect("config_set failed");
-        let val = config_get("ai.barometer.autopush").expect("config_get failed");
+        config_set("ai.session-commit-linker.autopush", "true").expect("config_set failed");
+        let val = config_get("ai.session-commit-linker.autopush").expect("config_get failed");
         assert_eq!(val, Some("true".to_string()));
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -992,7 +1012,10 @@ mod tests {
     fn test_check_enabled_explicitly_true() {
         let (dir, original_cwd) = enter_temp_repo();
 
-        run_git(dir.path(), &["config", "ai.barometer.enabled", "true"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.enabled", "true"],
+        );
         assert!(check_enabled());
 
         std::env::set_current_dir(original_cwd).unwrap();
@@ -1003,7 +1026,10 @@ mod tests {
     fn test_check_enabled_explicitly_false() {
         let (dir, original_cwd) = enter_temp_repo();
 
-        run_git(dir.path(), &["config", "ai.barometer.enabled", "false"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.enabled", "false"],
+        );
         assert!(!check_enabled());
 
         std::env::set_current_dir(original_cwd).unwrap();
@@ -1014,7 +1040,10 @@ mod tests {
     fn test_check_enabled_other_value_treated_as_true() {
         let (dir, original_cwd) = enter_temp_repo();
 
-        run_git(dir.path(), &["config", "ai.barometer.enabled", "yes"]);
+        run_git(
+            dir.path(),
+            &["config", "ai.session-commit-linker.enabled", "yes"],
+        );
         assert!(check_enabled());
 
         std::env::set_current_dir(original_cwd).unwrap();

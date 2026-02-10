@@ -1,5 +1,5 @@
 [package]
-name = "ai-barometer"
+name = "ai-session-commit-linker"
 version = "0.1.2"
 edition = "2024"
 

@@ -9,12 +9,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::process;
 
-/// AI Barometer: attach AI coding agent session logs to Git commits via git notes.
+/// AI Session Commit Linker: attach AI coding agent session logs to Git commits via git notes.
 ///
 /// Provides provenance and measurement of AI-assisted development
 /// without polluting commit history.
 #[derive(Parser, Debug)]
-#[command(name = "ai-barometer", version, about)]
+#[command(name = "ai-session-commit-linker", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install AI Barometer: set up git hooks and run initial hydration.
+    /// Install AI Session Commit Linker: set up git hooks and run initial hydration.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
@@ -49,7 +49,7 @@ enum Command {
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
 
-    /// Show AI Barometer status for the current repository.
+    /// Show AI Session Commit Linker status for the current repository.
     Status,
 }
 
@@ -92,7 +92,7 @@ fn run_install(org: Option<String>) -> Result<()> {
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
-    eprintln!("[ai-barometer] Installing...");
+    eprintln!("[ai-session-commit-linker] Installing...");
 
     let home = match home_override {
         Some(h) => h.to_path_buf(),
@@ -109,10 +109,16 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     // Step 1: Set git config --global core.hooksPath ~/.git-hooks
     match git::config_set_global("core.hooksPath", &hooks_dir_str) {
         Ok(()) => {
-            eprintln!("[ai-barometer] Set core.hooksPath = {}", hooks_dir_str);
+            eprintln!(
+                "[ai-session-commit-linker] Set core.hooksPath = {}",
+                hooks_dir_str
+            );
         }
         Err(e) => {
-            eprintln!("[ai-barometer] error: failed to set core.hooksPath: {}", e);
+            eprintln!(
+                "[ai-session-commit-linker] error: failed to set core.hooksPath: {}",
+                e
+            );
             had_errors = true;
         }
     }
@@ -121,45 +127,50 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if !hooks_dir.exists() {
         match std::fs::create_dir_all(&hooks_dir) {
             Ok(()) => {
-                eprintln!("[ai-barometer] Created {}", hooks_dir_str);
+                eprintln!("[ai-session-commit-linker] Created {}", hooks_dir_str);
             }
             Err(e) => {
                 eprintln!(
-                    "[ai-barometer] error: failed to create {}: {}",
+                    "[ai-session-commit-linker] error: failed to create {}: {}",
                     hooks_dir_str, e
                 );
                 had_errors = true;
             }
         }
     } else {
-        eprintln!("[ai-barometer] {} already exists", hooks_dir_str);
+        eprintln!(
+            "[ai-session-commit-linker] {} already exists",
+            hooks_dir_str
+        );
     }
 
     // Step 3 & 4: Write post-commit shim and make it executable
     let shim_path = hooks_dir.join("post-commit");
-    let shim_content = "#!/bin/sh\nexec ai-barometer hook post-commit\n";
+    let shim_content = "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n";
 
     // Check if hook already exists
     let should_write = if shim_path.exists() {
         match std::fs::read_to_string(&shim_path) {
             Ok(existing) => {
-                if existing.contains("ai-barometer") {
-                    eprintln!("[ai-barometer] post-commit hook already installed, updating");
+                if existing.contains("ai-session-commit-linker") {
+                    eprintln!(
+                        "[ai-session-commit-linker] post-commit hook already installed, updating"
+                    );
                     true
                 } else {
                     // Back up the existing hook before overwriting
-                    let backup_path = hooks_dir.join("post-commit.pre-ai-barometer");
+                    let backup_path = hooks_dir.join("post-commit.pre-ai-session-commit-linker");
                     match std::fs::copy(&shim_path, &backup_path) {
                         Ok(_) => {
                             eprintln!(
-                                "[ai-barometer] warning: {} exists but was not created by ai-barometer; backed up to {}",
+                                "[ai-session-commit-linker] warning: {} exists but was not created by ai-session-commit-linker; backed up to {}",
                                 shim_path.display(),
                                 backup_path.display()
                             );
                         }
                         Err(e) => {
                             eprintln!(
-                                "[ai-barometer] warning: {} exists but was not created by ai-barometer; failed to back up: {}",
+                                "[ai-session-commit-linker] warning: {} exists but was not created by ai-session-commit-linker; failed to back up: {}",
                                 shim_path.display(),
                                 e
                             );
@@ -170,7 +181,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
             }
             Err(_) => {
                 eprintln!(
-                    "[ai-barometer] warning: could not read existing {}; overwriting",
+                    "[ai-session-commit-linker] warning: could not read existing {}; overwriting",
                     shim_path.display()
                 );
                 true
@@ -183,7 +194,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if should_write {
         match std::fs::write(&shim_path, shim_content) {
             Ok(()) => {
-                eprintln!("[ai-barometer] Wrote {}", shim_path.display());
+                eprintln!("[ai-session-commit-linker] Wrote {}", shim_path.display());
 
                 // Make executable (Unix only)
                 #[cfg(unix)]
@@ -192,11 +203,14 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                     let perms = std::fs::Permissions::from_mode(0o755);
                     match std::fs::set_permissions(&shim_path, perms) {
                         Ok(()) => {
-                            eprintln!("[ai-barometer] Made {} executable", shim_path.display());
+                            eprintln!(
+                                "[ai-session-commit-linker] Made {} executable",
+                                shim_path.display()
+                            );
                         }
                         Err(e) => {
                             eprintln!(
-                                "[ai-barometer] error: failed to chmod {}: {}",
+                                "[ai-session-commit-linker] error: failed to chmod {}: {}",
                                 shim_path.display(),
                                 e
                             );
@@ -207,7 +221,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
             }
             Err(e) => {
                 eprintln!(
-                    "[ai-barometer] error: failed to write {}: {}",
+                    "[ai-session-commit-linker] error: failed to write {}: {}",
                     shim_path.display(),
                     e
                 );
@@ -218,28 +232,31 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
-        match git::config_set_global("ai.barometer.org", org_value) {
+        match git::config_set_global("ai.session-commit-linker.org", org_value) {
             Ok(()) => {
-                eprintln!("[ai-barometer] Set org filter: {}", org_value);
+                eprintln!("[ai-session-commit-linker] Set org filter: {}", org_value);
             }
             Err(e) => {
-                eprintln!("[ai-barometer] error: failed to set org filter: {}", e);
+                eprintln!(
+                    "[ai-session-commit-linker] error: failed to set org filter: {}",
+                    e
+                );
                 had_errors = true;
             }
         }
     }
 
     // Step 6: Run hydration for the last 7 days
-    eprintln!("[ai-barometer] Running initial hydration (last 7 days)...");
+    eprintln!("[ai-session-commit-linker] Running initial hydration (last 7 days)...");
     if let Err(e) = run_hydrate("7d", false) {
-        eprintln!("[ai-barometer] error: hydration failed: {}", e);
+        eprintln!("[ai-session-commit-linker] error: hydration failed: {}", e);
         had_errors = true;
     }
 
     if had_errors {
-        eprintln!("[ai-barometer] Installation completed with errors (see above)");
+        eprintln!("[ai-session-commit-linker] Installation completed with errors (see above)");
     } else {
-        eprintln!("[ai-barometer] Installation complete!");
+        eprintln!("[ai-session-commit-linker] Installation complete!");
     }
 
     Ok(())
@@ -252,7 +269,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 ///
 /// The outer wrapper uses `std::panic::catch_unwind` to catch panics, and
 /// an inner `Result` to catch all other errors. Any failure is logged to
-/// stderr with the `[ai-barometer]` prefix and silently ignored.
+/// stderr with the `[ai-session-commit-linker]` prefix and silently ignored.
 fn run_hook_post_commit() -> Result<()> {
     // Catch-all: catch panics
     let result = std::panic::catch_unwind(|| -> Result<()> { hook_post_commit_inner() });
@@ -260,10 +277,10 @@ fn run_hook_post_commit() -> Result<()> {
     match result {
         Ok(Ok(())) => {} // Success
         Ok(Err(e)) => {
-            eprintln!("[ai-barometer] warning: hook failed: {}", e);
+            eprintln!("[ai-session-commit-linker] warning: hook failed: {}", e);
         }
         Err(_) => {
-            eprintln!("[ai-barometer] warning: hook panicked (this is a bug)");
+            eprintln!("[ai-session-commit-linker] warning: hook panicked (this is a bug)");
         }
     }
 
@@ -320,12 +337,15 @@ fn hook_post_commit_inner() -> Result<()> {
             let session_log = match std::fs::read_to_string(&matched.file_path) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!("[ai-barometer] warning: failed to read session log: {}", e);
+                    eprintln!(
+                        "[ai-session-commit-linker] warning: failed to read session log: {}",
+                        e
+                    );
                     if let Err(e) =
                         pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
                     {
                         eprintln!(
-                            "[ai-barometer] warning: failed to write pending record: {}",
+                            "[ai-session-commit-linker] warning: failed to write pending record: {}",
                             e
                         );
                     }
@@ -350,7 +370,7 @@ fn hook_post_commit_inner() -> Result<()> {
             git::add_note(&head_hash, &note_content)?;
 
             eprintln!(
-                "[ai-barometer] attached session {} to commit {}",
+                "[ai-session-commit-linker] attached session {} to commit {}",
                 session_id,
                 &head_hash[..7]
             );
@@ -363,7 +383,7 @@ fn hook_post_commit_inner() -> Result<()> {
             // Verification failed — treat as no match, write pending
             if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
                 eprintln!(
-                    "[ai-barometer] warning: failed to write pending record: {}",
+                    "[ai-session-commit-linker] warning: failed to write pending record: {}",
                     e
                 );
             }
@@ -373,7 +393,7 @@ fn hook_post_commit_inner() -> Result<()> {
         // Step 6b: No match found — write pending record
         if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
             eprintln!(
-                "[ai-barometer] warning: failed to write pending record: {}",
+                "[ai-session-commit-linker] warning: failed to write pending record: {}",
                 e
             );
         }
@@ -538,7 +558,7 @@ fn try_resolve_single_commit(
 
     if git::add_note(commit, &note_content).is_ok() {
         eprintln!(
-            "[ai-barometer] retry: attached session {} to commit {}",
+            "[ai-session-commit-linker] retry: attached session {} to commit {}",
             session_id,
             &commit[..std::cmp::min(7, commit.len())]
         );
@@ -576,7 +596,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
         // Check if max retry attempts exceeded -- abandon the record
         if record.attempts >= MAX_RETRY_ATTEMPTS {
             eprintln!(
-                "[ai-barometer] warning: abandoning pending commit {} after {} attempts",
+                "[ai-session-commit-linker] warning: abandoning pending commit {} after {} attempts",
                 &record.commit[..std::cmp::min(7, record.commit.len())],
                 record.attempts
             );
@@ -645,13 +665,13 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Step 1: Collect all log directories (repo-agnostic)
     eprintln!(
-        "[ai-barometer] Scanning Claude logs (last {} days)...",
+        "[ai-session-commit-linker] Scanning Claude logs (last {} days)...",
         since_days
     );
     let claude_dirs = agents::claude::all_log_dirs();
 
     eprintln!(
-        "[ai-barometer] Scanning Codex logs (last {} days)...",
+        "[ai-session-commit-linker] Scanning Codex logs (last {} days)...",
         since_days
     );
     let codex_dirs = agents::codex::all_log_dirs();
@@ -662,7 +682,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Step 2: Find all .jsonl files modified within the --since window
     let files = agents::recent_files(&all_dirs, now, since_secs);
-    eprintln!("[ai-barometer] Found {} session logs", files.len());
+    eprintln!(
+        "[ai-session-commit-linker] Found {} session logs",
+        files.len()
+    );
 
     // Counters for final summary
     let mut attached = 0usize;
@@ -730,7 +753,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Step 4: Process sessions grouped by repo
     for (repo_display, sessions) in &sessions_by_repo {
-        eprintln!("[ai-barometer] {}", repo_display);
+        eprintln!("[ai-session-commit-linker] {}", repo_display);
 
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
@@ -765,7 +788,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             let mut session_skipped = 0usize;
             let mut messages: Vec<String> = Vec::new();
 
-            let header = format!("[ai-barometer]   {} |", session_display);
+            let header = format!("[ai-session-commit-linker]   {} |", session_display);
 
             for hash in &commit_hashes {
                 // Verify the commit exists in the resolved repo
@@ -864,27 +887,27 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             } else {
                 eprintln!("{}", header);
                 for msg in &messages {
-                    eprintln!("[ai-barometer]     {}", msg);
+                    eprintln!("[ai-session-commit-linker]     {}", msg);
                 }
             }
         }
 
         // Per-repo summary
         eprintln!(
-            "[ai-barometer]   {} sessions, {} with commits, {} without",
+            "[ai-session-commit-linker]   {} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
         );
     }
 
     // Final summary
     eprintln!(
-        "[ai-barometer] Done. {} attached, {} skipped, {} errors.",
+        "[ai-session-commit-linker] Done. {} attached, {} skipped, {} errors.",
         attached, skipped, errors
     );
 
     // Step 7: Push if requested
     if do_push {
-        eprintln!("[ai-barometer] Pushing notes...");
+        eprintln!("[ai-session-commit-linker] Pushing notes...");
         push::attempt_push();
     }
 
@@ -900,12 +923,12 @@ fn run_retry() -> Result<()> {
         .unwrap_or(0);
 
     if pending_count == 0 {
-        eprintln!("[ai-barometer] no pending commits for this repo");
+        eprintln!("[ai-session-commit-linker] no pending commits for this repo");
         return Ok(());
     }
 
     eprintln!(
-        "[ai-barometer] retrying {} pending commit(s)...",
+        "[ai-session-commit-linker] retrying {} pending commit(s)...",
         pending_count
     );
     retry_pending_for_repo(&repo_str, &repo_root);
@@ -915,14 +938,14 @@ fn run_retry() -> Result<()> {
         .unwrap_or(0);
     let resolved = pending_count - remaining;
     eprintln!(
-        "[ai-barometer] retry complete: {} resolved, {} still pending",
+        "[ai-session-commit-linker] retry complete: {} resolved, {} still pending",
         resolved, remaining
     );
 
     Ok(())
 }
 
-/// The status subcommand: show AI Barometer configuration and state.
+/// The status subcommand: show AI Session Commit Linker configuration and state.
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
@@ -932,7 +955,7 @@ fn run_retry() -> Result<()> {
 /// - Autopush consent status
 /// - Per-repo enabled/disabled status
 ///
-/// All output uses the `[ai-barometer]` prefix on stderr.
+/// All output uses the `[ai-session-commit-linker]` prefix on stderr.
 /// Handles being called outside a git repo gracefully.
 fn run_status() -> Result<()> {
     run_status_inner(&mut std::io::stderr())
@@ -941,16 +964,25 @@ fn run_status() -> Result<()> {
 /// Inner implementation of `run_status` that writes to a `Write` impl.
 /// This allows tests to capture the output for verification.
 fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
-    writeln!(w, "[ai-barometer] Status").ok();
+    writeln!(w, "[ai-session-commit-linker] Status").ok();
 
     // --- Repo root ---
     let repo_root = match git::repo_root() {
         Ok(root) => {
-            writeln!(w, "[ai-barometer]   Repo: {}", root.to_string_lossy()).ok();
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Repo: {}",
+                root.to_string_lossy()
+            )
+            .ok();
             Some(root)
         }
         Err(_) => {
-            writeln!(w, "[ai-barometer]   Repo: (not in a git repository)").ok();
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Repo: (not in a git repository)"
+            )
+            .ok();
             None
         }
     };
@@ -960,19 +992,23 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         Ok(Some(path)) => {
             let shim_path = std::path::Path::new(&path).join("post-commit");
             let shim_installed = match std::fs::read_to_string(&shim_path) {
-                Ok(content) => content.contains("ai-barometer"),
+                Ok(content) => content.contains("ai-session-commit-linker"),
                 Err(_) => false,
             };
             let installed_str = if shim_installed { "yes" } else { "no" };
             writeln!(
                 w,
-                "[ai-barometer]   Hooks path: {} (shim installed: {})",
+                "[ai-session-commit-linker]   Hooks path: {} (shim installed: {})",
                 path, installed_str
             )
             .ok();
         }
         _ => {
-            writeln!(w, "[ai-barometer]   Hooks path: (not configured)").ok();
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Hooks path: (not configured)"
+            )
+            .ok();
         }
     }
 
@@ -982,52 +1018,77 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         let pending_count = pending::list_for_repo(&repo_str)
             .map(|r| r.len())
             .unwrap_or(0);
-        writeln!(w, "[ai-barometer]   Pending retries: {}", pending_count).ok();
+        writeln!(
+            w,
+            "[ai-session-commit-linker]   Pending retries: {}",
+            pending_count
+        )
+        .ok();
     } else {
-        writeln!(w, "[ai-barometer]   Pending retries: (n/a - not in a repo)").ok();
+        writeln!(
+            w,
+            "[ai-session-commit-linker]   Pending retries: (n/a - not in a repo)"
+        )
+        .ok();
     }
 
     // --- Org filter ---
-    match git::config_get_global("ai.barometer.org") {
+    match git::config_get_global("ai.session-commit-linker.org") {
         Ok(Some(org)) => {
-            writeln!(w, "[ai-barometer]   Org filter: {}", org).ok();
+            writeln!(w, "[ai-session-commit-linker]   Org filter: {}", org).ok();
         }
         _ => {
-            writeln!(w, "[ai-barometer]   Org filter: (none)").ok();
+            writeln!(w, "[ai-session-commit-linker]   Org filter: (none)").ok();
         }
     }
 
     // --- Autopush consent ---
     if repo_root.is_some() {
-        match git::config_get("ai.barometer.autopush") {
+        match git::config_get("ai.session-commit-linker.autopush") {
             Ok(Some(val)) if val == "true" => {
-                writeln!(w, "[ai-barometer]   Auto-push: enabled (consented)").ok();
+                writeln!(
+                    w,
+                    "[ai-session-commit-linker]   Auto-push: enabled (consented)"
+                )
+                .ok();
             }
             Ok(Some(val)) if val == "false" => {
-                writeln!(w, "[ai-barometer]   Auto-push: disabled (opted out)").ok();
+                writeln!(
+                    w,
+                    "[ai-session-commit-linker]   Auto-push: disabled (opted out)"
+                )
+                .ok();
             }
             _ => {
                 writeln!(
                     w,
-                    "[ai-barometer]   Auto-push: not yet configured (will prompt on first push)"
+                    "[ai-session-commit-linker]   Auto-push: not yet configured (will prompt on first push)"
                 )
                 .ok();
             }
         }
     } else {
-        writeln!(w, "[ai-barometer]   Auto-push: (n/a - not in a repo)").ok();
+        writeln!(
+            w,
+            "[ai-session-commit-linker]   Auto-push: (n/a - not in a repo)"
+        )
+        .ok();
     }
 
     // --- Per-repo enabled/disabled ---
     if repo_root.is_some() {
         let enabled = git::check_enabled();
         if enabled {
-            writeln!(w, "[ai-barometer]   Repo enabled: yes").ok();
+            writeln!(w, "[ai-session-commit-linker]   Repo enabled: yes").ok();
         } else {
-            writeln!(w, "[ai-barometer]   Repo enabled: no").ok();
+            writeln!(w, "[ai-session-commit-linker]   Repo enabled: no").ok();
         }
     } else {
-        writeln!(w, "[ai-barometer]   Repo enabled: (n/a - not in a repo)").ok();
+        writeln!(
+            w,
+            "[ai-session-commit-linker]   Repo enabled: (n/a - not in a repo)"
+        )
+        .ok();
     }
 
     Ok(())
@@ -1056,7 +1117,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("[ai-barometer] error: {}", e);
+        eprintln!("[ai-session-commit-linker] error: {}", e);
         process::exit(1);
     }
 }
@@ -1071,13 +1132,13 @@ mod tests {
 
     #[test]
     fn cli_parses_install() {
-        let cli = Cli::parse_from(["ai-barometer", "install"]);
+        let cli = Cli::parse_from(["ai-session-commit-linker", "install"]);
         assert!(matches!(cli.command, Command::Install { org: None }));
     }
 
     #[test]
     fn cli_parses_install_with_org() {
-        let cli = Cli::parse_from(["ai-barometer", "install", "--org", "my-org"]);
+        let cli = Cli::parse_from(["ai-session-commit-linker", "install", "--org", "my-org"]);
         match cli.command {
             Command::Install { org } => assert_eq!(org.as_deref(), Some("my-org")),
             _ => panic!("expected Install command"),
@@ -1086,7 +1147,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hook_post_commit() {
-        let cli = Cli::parse_from(["ai-barometer", "hook", "post-commit"]);
+        let cli = Cli::parse_from(["ai-session-commit-linker", "hook", "post-commit"]);
         assert!(matches!(
             cli.command,
             Command::Hook {
@@ -1098,7 +1159,7 @@ mod tests {
     #[test]
     fn cli_parses_hook_post_commit_retry() {
         let cli = Cli::parse_from([
-            "ai-barometer",
+            "ai-session-commit-linker",
             "hook",
             "post-commit-retry",
             "abcdef0123456789abcdef0123456789abcdef01",
@@ -1124,7 +1185,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hydrate_defaults() {
-        let cli = Cli::parse_from(["ai-barometer", "hydrate"]);
+        let cli = Cli::parse_from(["ai-session-commit-linker", "hydrate"]);
         match cli.command {
             Command::Hydrate { since, push } => {
                 assert_eq!(since, "7d");
@@ -1136,7 +1197,13 @@ mod tests {
 
     #[test]
     fn cli_parses_hydrate_with_flags() {
-        let cli = Cli::parse_from(["ai-barometer", "hydrate", "--since", "30d", "--push"]);
+        let cli = Cli::parse_from([
+            "ai-session-commit-linker",
+            "hydrate",
+            "--since",
+            "30d",
+            "--push",
+        ]);
         match cli.command {
             Command::Hydrate { since, push } => {
                 assert_eq!(since, "30d");
@@ -1148,13 +1215,13 @@ mod tests {
 
     #[test]
     fn cli_parses_retry() {
-        let cli = Cli::parse_from(["ai-barometer", "retry"]);
+        let cli = Cli::parse_from(["ai-session-commit-linker", "retry"]);
         assert!(matches!(cli.command, Command::Retry));
     }
 
     #[test]
     fn cli_parses_status() {
-        let cli = Cli::parse_from(["ai-barometer", "status"]);
+        let cli = Cli::parse_from(["ai-session-commit-linker", "status"]);
         assert!(matches!(cli.command, Command::Status));
     }
 
@@ -1336,25 +1403,25 @@ mod tests {
 
     #[test]
     fn cli_rejects_unknown_subcommand() {
-        let result = Cli::try_parse_from(["ai-barometer", "frobnicate"]);
+        let result = Cli::try_parse_from(["ai-session-commit-linker", "frobnicate"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_hook_without_sub_subcommand() {
-        let result = Cli::try_parse_from(["ai-barometer", "hook"]);
+        let result = Cli::try_parse_from(["ai-session-commit-linker", "hook"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_hydrate_since_missing_value() {
-        let result = Cli::try_parse_from(["ai-barometer", "hydrate", "--since"]);
+        let result = Cli::try_parse_from(["ai-session-commit-linker", "hydrate", "--since"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_no_subcommand() {
-        let result = Cli::try_parse_from(["ai-barometer"]);
+        let result = Cli::try_parse_from(["ai-session-commit-linker"]);
         assert!(result.is_err());
     }
 
@@ -1569,7 +1636,7 @@ mod tests {
         let original_cwd = safe_cwd();
 
         // Use a fake HOME so pending records are written to a temp dir
-        // instead of the real ~/.ai-barometer/pending/.
+        // instead of the real ~/.ai-session-commit-linker/pending/.
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
         // SAFETY: This test is #[serial], so no other threads are reading
@@ -1605,7 +1672,7 @@ mod tests {
         // A pending record should have been written inside the fake home
         let pending_path = fake_home
             .path()
-            .join(".ai-barometer")
+            .join(".ai-session-commit-linker")
             .join("pending")
             .join(format!("{}.json", head_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -1674,7 +1741,7 @@ mod tests {
         // Verify pending record was created
         let pending_path = fake_home
             .path()
-            .join(".ai-barometer")
+            .join(".ai-session-commit-linker")
             .join("pending")
             .join(format!("{}.json", first_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -1777,7 +1844,7 @@ mod tests {
         // increments it to 2 (because retry also fails to find a session log).
         let pending_path = fake_home
             .path()
-            .join(".ai-barometer")
+            .join(".ai-session-commit-linker")
             .join("pending")
             .join(format!("{}.json", first_hash));
         let content = std::fs::read_to_string(&pending_path).unwrap();
@@ -2187,7 +2254,7 @@ mod tests {
 
         let shim_content = std::fs::read_to_string(&shim_path).unwrap();
         assert_eq!(
-            shim_content, "#!/bin/sh\nexec ai-barometer hook post-commit\n",
+            shim_content, "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
             "shim content should match exactly"
         );
 
@@ -2291,7 +2358,10 @@ mod tests {
         // Shim should still be correct
         let shim_path = fake_home.path().join(".git-hooks").join("post-commit");
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
+        assert_eq!(
+            content,
+            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
+        );
 
         // Restore
         unsafe {
@@ -2308,8 +2378,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_install_detects_existing_non_barometer_hook() {
-        // If a post-commit hook exists that was NOT created by ai-barometer,
+    fn test_install_detects_existing_non_linker_hook() {
+        // If a post-commit hook exists that was NOT created by ai-session-commit-linker,
         // install should still overwrite it (with a warning).
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
@@ -2323,7 +2393,7 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        // Pre-create hooks dir and a non-barometer hook
+        // Pre-create hooks dir and a non-linker hook
         let hooks_dir = fake_home.path().join(".git-hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let shim_path = hooks_dir.join("post-commit");
@@ -2332,15 +2402,18 @@ mod tests {
         let result = run_install_inner(None, Some(fake_home.path()));
         assert!(result.is_ok());
 
-        // The shim should now be the ai-barometer one (overwritten)
+        // The shim should now be the ai-session-commit-linker one (overwritten)
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
+        assert_eq!(
+            content,
+            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
+        );
 
         // The original hook should have been backed up
-        let backup_path = hooks_dir.join("post-commit.pre-ai-barometer");
+        let backup_path = hooks_dir.join("post-commit.pre-ai-session-commit-linker");
         assert!(
             backup_path.exists(),
-            "backup of original hook should exist at post-commit.pre-ai-barometer"
+            "backup of original hook should exist at post-commit.pre-ai-session-commit-linker"
         );
         let backup_content = std::fs::read_to_string(&backup_path).unwrap();
         assert_eq!(
@@ -2363,8 +2436,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_install_detects_existing_barometer_hook() {
-        // If a post-commit hook exists that WAS created by ai-barometer,
+    fn test_install_detects_existing_linker_hook() {
+        // If a post-commit hook exists that WAS created by ai-session-commit-linker,
         // install should update it silently.
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
@@ -2378,13 +2451,13 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        // Pre-create hooks dir with an existing ai-barometer hook
+        // Pre-create hooks dir with an existing ai-session-commit-linker hook
         let hooks_dir = fake_home.path().join(".git-hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let shim_path = hooks_dir.join("post-commit");
         std::fs::write(
             &shim_path,
-            "#!/bin/sh\nexec ai-barometer hook post-commit\n",
+            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
         )
         .unwrap();
 
@@ -2393,7 +2466,10 @@ mod tests {
 
         // The shim should still be correct
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(content, "#!/bin/sh\nexec ai-barometer hook post-commit\n");
+        assert_eq!(
+            content,
+            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
+        );
 
         // Restore
         unsafe {
@@ -2591,11 +2667,11 @@ mod tests {
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
 
-        // Write the ai-barometer shim
+        // Write the ai-session-commit-linker shim
         let shim_path = hooks_dir.join("post-commit");
         std::fs::write(
             &shim_path,
-            "#!/bin/sh\nexec ai-barometer hook post-commit\n",
+            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
         )
         .unwrap();
 
@@ -2654,7 +2730,10 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
 
         // Write some pending records for this repo
-        let pending_dir = fake_home.path().join(".ai-barometer").join("pending");
+        let pending_dir = fake_home
+            .path()
+            .join(".ai-session-commit-linker")
+            .join("pending");
         std::fs::create_dir_all(&pending_dir).unwrap();
 
         for i in 0..3 {
@@ -2711,7 +2790,7 @@ mod tests {
         let global_config = fake_home.path().join("fake-global-gitconfig");
         std::fs::write(
             &global_config,
-            "[ai \"barometer\"]\n    org = my-test-org\n",
+            "[ai \"session-commit-linker\"]\n    org = my-test-org\n",
         )
         .unwrap();
 
@@ -2761,7 +2840,10 @@ mod tests {
         }
 
         // Set autopush to true
-        run_git(repo_path, &["config", "ai.barometer.autopush", "true"]);
+        run_git(
+            repo_path,
+            &["config", "ai.session-commit-linker.autopush", "true"],
+        );
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
@@ -2800,7 +2882,10 @@ mod tests {
         }
 
         // Disable this repo
-        run_git(repo_path, &["config", "ai.barometer.enabled", "false"]);
+        run_git(
+            repo_path,
+            &["config", "ai.session-commit-linker.enabled", "false"],
+        );
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
@@ -2831,7 +2916,7 @@ mod tests {
 
     #[test]
     fn test_existing_notes_from_other_refs_not_affected() {
-        // AI Barometer uses refs/notes/ai-sessions. Existing notes from
+        // AI Session Commit Linker uses refs/notes/ai-sessions. Existing notes from
         // other refs (e.g., the default refs/notes/commits) should not
         // be affected by our operations.
         let dir = init_temp_repo();
@@ -2939,7 +3024,10 @@ mod tests {
         let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
         // Create a pending record with attempts >= MAX_RETRY_ATTEMPTS
-        let pending_dir = fake_home.path().join(".ai-barometer").join("pending");
+        let pending_dir = fake_home
+            .path()
+            .join(".ai-session-commit-linker")
+            .join("pending");
         std::fs::create_dir_all(&pending_dir).unwrap();
 
         let record = serde_json::json!({
