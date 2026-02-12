@@ -19,7 +19,7 @@ use std::process;
     name = "ai-session-commit-linker",
     version,
     about,
-    after_help = "Examples:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker uninstall\n  ai-session-commit-linker status\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
+    after_help = "Examples:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker reset\n  ai-session-commit-linker status\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -71,8 +71,9 @@ enum Command {
         scope_command: ScopeCommand,
     },
 
-    /// Uninstall and reset AI Session Commit Linker configuration/state.
-    Uninstall,
+    /// Reset AI Session Commit Linker configuration/state.
+    #[command(alias = "uninstall")]
+    Reset,
 
     /// Show AI Session Commit Linker status for the current repository.
     Status,
@@ -1065,8 +1066,8 @@ fn run_scope(scope_command: ScopeCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_uninstall() -> Result<()> {
-    eprintln!("[ai-session-commit-linker] Uninstalling and resetting state...");
+fn run_reset() -> Result<()> {
+    eprintln!("[ai-session-commit-linker] Resetting configuration/state...");
 
     // Global keys set/used by this tool.
     let global_keys = [
@@ -1074,6 +1075,7 @@ fn run_uninstall() -> Result<()> {
         "ai.session-commit-linker.org",
         "ai.session-commit-linker.email",
         "ai.session-commit-linker.scope",
+        "ai.session-commit-linker.scope.current-repo",
         "ai.session-commit-linker.scope.current_repo",
         "ai.session-commit-linker.scope.selected",
     ];
@@ -1119,7 +1121,10 @@ fn run_uninstall() -> Result<()> {
         }
     }
 
-    eprintln!("[ai-session-commit-linker] Uninstall complete.");
+    eprintln!("[ai-session-commit-linker] Reset complete.");
+    eprintln!(
+        "[ai-session-commit-linker] To remove binary: cargo uninstall ai-session-commit-linker"
+    );
     Ok(())
 }
 
@@ -1336,7 +1341,7 @@ fn main() {
         Command::Retry => run_retry(),
         Command::Onboard { email } => run_onboard(email),
         Command::Scope { scope_command } => run_scope(scope_command),
-        Command::Uninstall => run_uninstall(),
+        Command::Reset => run_reset(),
         Command::Status => run_status(),
     };
 
@@ -1500,7 +1505,13 @@ mod tests {
     #[test]
     fn cli_parses_uninstall() {
         let cli = Cli::parse_from(["ai-session-commit-linker", "uninstall"]);
-        assert!(matches!(cli.command, Command::Uninstall));
+        assert!(matches!(cli.command, Command::Reset));
+    }
+
+    #[test]
+    fn cli_parses_reset() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "reset"]);
+        assert!(matches!(cli.command, Command::Reset));
     }
 
     #[test]
