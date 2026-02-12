@@ -638,9 +638,7 @@ mod tests {
 
     #[test]
     fn test_infer_agent_type_antigravity_api_cache() {
-        let path = Path::new(
-            "/Users/foo/.ai-session-commit-linker/antigravity-api/abc.json",
-        );
+        let path = Path::new("/Users/foo/.ai-session-commit-linker/antigravity-api/abc.json");
         assert_eq!(infer_agent_type(path), AgentType::Antigravity);
     }
 

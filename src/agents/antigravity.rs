@@ -89,9 +89,9 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
         );
     }
     let ports = discover_listening_ports(process.pid);
-    let (scheme, port) = match override_connect_port().or_else(|| {
-        probe_connect_port(&ports, &process.csrf_token)
-    }) {
+    let (scheme, port) = match override_connect_port()
+        .or_else(|| probe_connect_port(&ports, &process.csrf_token))
+    {
         Some(p) => p,
         None => {
             if let Some(ext_port) = process.extension_port {
@@ -148,10 +148,7 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
                     "fetchedAt": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
                     "steps": steps,
                 });
-                let filename = format!(
-                    "{}.json",
-                    sanitize_filename(cascade_id, idx)
-                );
+                let filename = format!("{}.json", sanitize_filename(cascade_id, idx));
                 let path = cache_dir.join(filename);
                 if std::fs::write(&path, payload.to_string()).is_ok() {
                     wrote_any = true;
@@ -234,8 +231,8 @@ fn discover_lsp_process() -> Option<LspProcess> {
         }
 
         let csrf_token = extract_flag_value(cmd, "--csrf_token")?;
-        let extension_port = extract_flag_value(cmd, "--extension_server_port")
-            .and_then(|v| v.parse::<u16>().ok());
+        let extension_port =
+            extract_flag_value(cmd, "--extension_server_port").and_then(|v| v.parse::<u16>().ok());
         return Some(LspProcess {
             pid,
             csrf_token,
@@ -295,12 +292,28 @@ fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
 
 fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, u16)> {
     for port in ports {
-        if post_json("https", *port, "GetUnleashData", csrf, &serde_json::json!({})).is_ok() {
+        if post_json(
+            "https",
+            *port,
+            "GetUnleashData",
+            csrf,
+            &serde_json::json!({}),
+        )
+        .is_ok()
+        {
             return Some(("https", *port));
         }
     }
     for port in ports {
-        if post_json("http", *port, "GetUnleashData", csrf, &serde_json::json!({})).is_ok() {
+        if post_json(
+            "http",
+            *port,
+            "GetUnleashData",
+            csrf,
+            &serde_json::json!({}),
+        )
+        .is_ok()
+        {
             return Some(("http", *port));
         }
     }
@@ -322,11 +335,7 @@ fn override_connect_port() -> Option<(&'static str, u16)> {
     Some((scheme, port))
 }
 
-fn fetch_cascade_ids(
-    scheme: &str,
-    port: u16,
-    csrf: &str,
-) -> anyhow::Result<Vec<String>> {
+fn fetch_cascade_ids(scheme: &str, port: u16, csrf: &str) -> anyhow::Result<Vec<String>> {
     let method = std::env::var("ANTIGRAVITY_LSP_LIST_METHOD")
         .unwrap_or_else(|_| "GetAllCascadeTrajectories".to_string());
     let response = post_json(scheme, port, &method, csrf, &serde_json::json!({}))?;
@@ -443,17 +452,20 @@ fn sanitize_filename(input: &str, fallback_index: usize) -> String {
 }
 
 fn extract_workspace_uri(value: &serde_json::Value) -> Option<String> {
-    if let Some(uri) = value.pointer("/steps/0/userInput/activeUserState/activeDocument/workspaceUri")
+    if let Some(uri) = value
+        .pointer("/steps/0/userInput/activeUserState/activeDocument/workspaceUri")
         .and_then(|v| v.as_str())
     {
         return Some(uri.to_string());
     }
-    if let Some(uri) = value.pointer("/steps/0/userInput/activeUserState/workspaceUri")
+    if let Some(uri) = value
+        .pointer("/steps/0/userInput/activeUserState/workspaceUri")
         .and_then(|v| v.as_str())
     {
         return Some(uri.to_string());
     }
-    if let Some(uri) = value.pointer("/steps/0/userInput/activeUserState/openDocuments/0/workspaceUri")
+    if let Some(uri) = value
+        .pointer("/steps/0/userInput/activeUserState/openDocuments/0/workspaceUri")
         .and_then(|v| v.as_str())
     {
         return Some(uri.to_string());
@@ -468,9 +480,9 @@ fn extract_workspace_uri(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
-    use serde_json::json;
 
     #[test]
     fn test_antigravity_log_dirs_collects_chat_sessions() {
