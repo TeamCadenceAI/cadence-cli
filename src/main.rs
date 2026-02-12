@@ -15,7 +15,12 @@ use std::process;
 /// Provides provenance and measurement of AI-assisted development
 /// without polluting commit history.
 #[derive(Parser, Debug)]
-#[command(name = "ai-session-commit-linker", version, about)]
+#[command(
+    name = "ai-session-commit-linker",
+    version,
+    about,
+    after_help = "Examples:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker uninstall\n  ai-session-commit-linker status\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
