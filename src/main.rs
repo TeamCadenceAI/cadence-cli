@@ -362,16 +362,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         had_errors = true;
     }
 
-    // Optional: sync notes for the current repo if a push remote resolves
-    if let Ok(Some(remote)) = git::resolve_push_remote() {
-        let consented = matches!(
-            git::config_get("ai.session-commit-linker.autopush"),
-            Ok(Some(val)) if val == "true"
-        );
-        if consented && push::check_org_filter_remote(&remote) {
-            push::sync_notes_for_remote(&remote);
-        }
-    }
+    // Note: install intentionally does not sync notes to avoid blocking.
 
     if had_errors {
         eprintln!("[cadence] Installation completed with errors (see above)");

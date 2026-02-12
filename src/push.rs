@@ -83,6 +83,15 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         anyhow::bail!("invalid remote name");
     }
 
+    let local_hash = local_notes_hash().context("failed to read local notes ref")?;
+    let remote_hash = remote_notes_hash(remote).context("failed to read remote notes ref")?;
+
+    match (&local_hash, &remote_hash) {
+        (None, None) => return Ok(()),
+        (Some(l), Some(r)) if l == r => return Ok(()),
+        _ => {}
+    }
+
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
     let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
 
@@ -121,6 +130,13 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
             .output();
     }
 
+    let post_merge_hash = local_notes_hash().context("failed to read local notes ref")?;
+    if let (Some(local), Some(remote)) = (&post_merge_hash, &remote_hash) {
+        if local == remote {
+            return Ok(());
+        }
+    }
+
     let push_status = Command::new("git")
         .args(["push", remote, git::NOTES_REF])
         .output()
@@ -132,6 +148,46 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn local_notes_hash() -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["show-ref", "--verify", "--hash", git::NOTES_REF])
+        .output()
+        .context("failed to execute git show-ref")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let hash = stdout.trim();
+    if hash.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hash.to_string()))
+    }
+}
+
+fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["ls-remote", "--refs", remote, git::NOTES_REF])
+        .output()
+        .context("failed to execute git ls-remote")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git ls-remote failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let line = stdout.lines().next().unwrap_or("");
+    let hash = line.split_whitespace().next().unwrap_or("");
+    if hash.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hash.to_string()))
+    }
 }
 
 /// Check the org filter: if a global org is configured, verify that the
