@@ -3,8 +3,11 @@
 //! Discovers AI coding agent session logs (Claude Code, Codex) on disk
 //! and filters candidate files by modification time relative to a commit.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod copilot;
+pub mod cursor;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,30 @@ pub fn encode_repo_path(path: &Path) -> String {
 ///
 /// Files that cannot be read or whose metadata is unavailable are silently skipped.
 pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> Vec<PathBuf> {
+    candidate_files_with_exts(dirs, commit_time, window_secs, &["jsonl"])
+}
+
+/// Find all `.jsonl` files in the given directories whose modification time
+/// is within `since_secs` seconds of `now`.
+///
+/// This is used by the `hydrate` command to find recently-modified session
+/// logs regardless of any specific commit time. Unlike `candidate_files`,
+/// which filters by a symmetric window around a commit timestamp, this
+/// filters by `mtime >= now - since_secs`.
+///
+/// Files that cannot be read or whose metadata is unavailable are silently skipped.
+pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf> {
+    recent_files_with_exts(dirs, now, since_secs, &["jsonl"])
+}
+
+/// Filter files in the given directories whose modification time falls within
+/// +/- `window_secs` of `commit_time`, and whose extension matches `exts`.
+pub fn candidate_files_with_exts(
+    dirs: &[PathBuf],
+    commit_time: i64,
+    window_secs: i64,
+    exts: &[&str],
+) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
     for dir in dirs {
@@ -47,15 +74,22 @@ pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> 
 
             let path = entry.path();
 
-            // Only consider .jsonl files
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            // Only consider files with matching extensions
+            let ext = match path.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_ascii_lowercase(),
+                None => continue,
+            };
+            if !exts
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&ext))
+            {
                 continue;
             }
 
             // Only consider regular files (not directories).
             // Use fs::metadata instead of entry.metadata() so that symlinks
             // are followed -- entry.metadata() uses lstat on Unix, which
-            // would cause symlinked .jsonl files to be skipped.
+            // would cause symlinked files to be skipped.
             let metadata = match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -85,16 +119,14 @@ pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> 
     results
 }
 
-/// Find all `.jsonl` files in the given directories whose modification time
-/// is within `since_secs` seconds of `now`.
-///
-/// This is used by the `hydrate` command to find recently-modified session
-/// logs regardless of any specific commit time. Unlike `candidate_files`,
-/// which filters by a symmetric window around a commit timestamp, this
-/// filters by `mtime >= now - since_secs`.
-///
-/// Files that cannot be read or whose metadata is unavailable are silently skipped.
-pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf> {
+/// Find files in the given directories whose modification time is within
+/// `since_secs` of `now`, and whose extension matches `exts`.
+pub fn recent_files_with_exts(
+    dirs: &[PathBuf],
+    now: i64,
+    since_secs: i64,
+    exts: &[&str],
+) -> Vec<PathBuf> {
     let cutoff = now - since_secs;
     let mut results = Vec::new();
 
@@ -112,8 +144,15 @@ pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf>
 
             let path = entry.path();
 
-            // Only consider .jsonl files
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            // Only consider files with matching extensions
+            let ext = match path.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_ascii_lowercase(),
+                None => continue,
+            };
+            if !exts
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&ext))
+            {
                 continue;
             }
 
@@ -152,6 +191,132 @@ pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf>
 /// Uses the `HOME` environment variable, which works on Unix/macOS.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// Recursively find directories named `chatSessions` under a workspaceStorage root.
+pub fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("chatSessions") {
+                    results.push(path);
+                } else {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Collect candidate files across all supported agents for a specific commit.
+pub fn all_candidate_files(repo_root: &Path, commit_time: i64, window_secs: i64) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+
+    let mut claude_dirs = Vec::new();
+    claude_dirs.extend(claude::log_dirs(repo_root));
+    results.extend(candidate_files_with_exts(
+        &claude_dirs,
+        commit_time,
+        window_secs,
+        &["jsonl"],
+    ));
+
+    let codex_dirs = codex::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &codex_dirs,
+        commit_time,
+        window_secs,
+        &["jsonl"],
+    ));
+
+    let cursor_dirs = cursor::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &cursor_dirs,
+        commit_time,
+        window_secs,
+        &["json", "txt"],
+    ));
+
+    let copilot_dirs = copilot::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &copilot_dirs,
+        commit_time,
+        window_secs,
+        &["json"],
+    ));
+
+    let antigravity_dirs = antigravity::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &antigravity_dirs,
+        commit_time,
+        window_secs,
+        &["json"],
+    ));
+
+    results
+}
+
+/// Collect recent files across all supported agents.
+pub fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+
+    let claude_dirs = claude::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &claude_dirs,
+        now,
+        since_secs,
+        &["jsonl"],
+    ));
+
+    let codex_dirs = codex::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &codex_dirs,
+        now,
+        since_secs,
+        &["jsonl"],
+    ));
+
+    let cursor_dirs = cursor::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &cursor_dirs,
+        now,
+        since_secs,
+        &["json", "txt"],
+    ));
+
+    let copilot_dirs = copilot::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &copilot_dirs,
+        now,
+        since_secs,
+        &["json"],
+    ));
+
+    let antigravity_dirs = antigravity::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &antigravity_dirs,
+        now,
+        since_secs,
+        &["json"],
+    ));
+
+    results
 }
 
 /// Set a file's modification time to a specific Unix epoch timestamp.

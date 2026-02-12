@@ -13,6 +13,8 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -23,6 +25,9 @@ use std::path::{Path, PathBuf};
 pub enum AgentType {
     Claude,
     Codex,
+    Cursor,
+    Copilot,
+    Antigravity,
 }
 
 impl std::fmt::Display for AgentType {
@@ -30,6 +35,9 @@ impl std::fmt::Display for AgentType {
         match self {
             AgentType::Claude => write!(f, "claude-code"),
             AgentType::Codex => write!(f, "codex"),
+            AgentType::Cursor => write!(f, "cursor"),
+            AgentType::Copilot => write!(f, "copilot"),
+            AgentType::Antigravity => write!(f, "antigravity"),
         }
     }
 }
@@ -152,26 +160,28 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
         };
 
         // Extract session_id (top-level or nested under payload for Codex)
-        if metadata.session_id.is_none()
-            && let Some(id) = value
+        if metadata.session_id.is_none() {
+            if let Some(id) = value
                 .get("session_id")
                 .or_else(|| value.get("sessionId"))
                 .or_else(|| value.pointer("/payload/id"))
                 .and_then(|v| v.as_str())
-        {
-            metadata.session_id = Some(id.to_string());
+            {
+                metadata.session_id = Some(id.to_string());
+            }
         }
 
         // Extract cwd / workdir (top-level or nested under payload for Codex)
-        if metadata.cwd.is_none()
-            && let Some(cwd) = value
+        if metadata.cwd.is_none() {
+            if let Some(cwd) = value
                 .get("cwd")
                 .or_else(|| value.get("workdir"))
                 .or_else(|| value.get("working_directory"))
                 .or_else(|| value.pointer("/payload/cwd"))
                 .and_then(|v| v.as_str())
-        {
-            metadata.cwd = Some(cwd.to_string());
+            {
+                metadata.cwd = Some(cwd.to_string());
+            }
         }
 
         // If we have both fields, stop early
@@ -180,10 +190,96 @@ pub fn parse_session_metadata(file: &Path) -> SessionMetadata {
         }
     }
 
+    // Fallback: parse full JSON (chatSessions format).
+    if metadata.session_id.is_none() || metadata.cwd.is_none() {
+        if let Some(value) = read_json_value(file) {
+            if metadata.session_id.is_none() {
+                if let Some(id) = value.get("sessionId").and_then(|v| v.as_str()) {
+                    metadata.session_id = Some(id.to_string());
+                }
+            }
+
+            if metadata.cwd.is_none() {
+                if let Some(path) = extract_cwd_from_value(&value) {
+                    metadata.cwd = Some(path);
+                }
+            }
+        }
+    }
+
     // Infer agent type from file path
     metadata.agent_type = Some(infer_agent_type(file));
 
     metadata
+}
+
+/// Extract the session time range (start, end) from a session log file.
+///
+/// Scans each line as JSON and looks for known timestamp keys:
+/// - Top-level: `timestamp`, `time`, `created_at`, `createdAt`
+/// - Nested under `payload`: `timestamp`, `created_at`, `createdAt`
+///
+/// Parses RFC3339/ISO8601 timestamps and returns the min/max epoch seconds.
+/// Returns `None` if no parseable timestamps are found.
+pub fn session_time_range(file: &Path) -> Option<(i64, i64)> {
+    let file_handle = File::open(file).ok()?;
+    let reader = BufReader::new(file_handle);
+
+    let mut min_ts: Option<i64> = None;
+    let mut max_ts: Option<i64> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let candidates = [
+            value.get("timestamp"),
+            value.get("time"),
+            value.get("created_at"),
+            value.get("createdAt"),
+            value.get("creationDate"),
+            value.get("lastMessageDate"),
+            value.pointer("/payload/timestamp"),
+            value.pointer("/payload/created_at"),
+            value.pointer("/payload/createdAt"),
+        ];
+
+        for candidate in candidates.iter().flatten() {
+            if let Some(ts) =
+                parse_timestamp(candidate).or_else(|| parse_numeric_timestamp(candidate))
+            {
+                min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+                max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
+            }
+        }
+    }
+
+    if min_ts.is_none() || max_ts.is_none() {
+        if let Some(value) = read_json_value(file) {
+            let mut all = Vec::new();
+            collect_timestamp_candidates(&value, &mut all);
+            for candidate in all {
+                if let Some(ts) =
+                    parse_timestamp(&candidate).or_else(|| parse_numeric_timestamp(&candidate))
+                {
+                    min_ts = Some(min_ts.map_or(ts, |min| min.min(ts)));
+                    max_ts = Some(max_ts.map_or(ts, |max| max.max(ts)));
+                }
+            }
+        }
+    }
+
+    match (min_ts, max_ts) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    }
 }
 
 /// Verify that a session match is valid for a given repository and commit.
@@ -347,9 +443,127 @@ fn infer_agent_type(path: &Path) -> AgentType {
     let path_str = path.to_string_lossy();
     if path_str.contains(".codex") {
         AgentType::Codex
+    } else if path_str.contains(".cursor") || path_str.contains("/Cursor/") {
+        AgentType::Cursor
+    } else if path_str.contains("/Antigravity/") {
+        AgentType::Antigravity
+    } else if path_str.contains("/Code/") {
+        AgentType::Copilot
     } else {
         // Default to Claude -- `.claude` paths and unknown paths
         AgentType::Claude
+    }
+}
+
+/// Parse a timestamp value into epoch seconds.
+fn parse_timestamp(value: &serde_json::Value) -> Option<i64> {
+    let s = value.as_str()?;
+    let dt = OffsetDateTime::parse(s, &Rfc3339).ok()?;
+    Some(dt.unix_timestamp())
+}
+
+fn parse_numeric_timestamp(value: &serde_json::Value) -> Option<i64> {
+    let num = value.as_i64()?;
+    if num <= 0 {
+        return None;
+    }
+    if num > 1_000_000_000_000 {
+        Some(num / 1000)
+    } else {
+        Some(num)
+    }
+}
+
+fn read_json_value(file: &Path) -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(file).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn extract_cwd_from_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(path) = value.pointer("/baseUri/fsPath").and_then(|v| v.as_str()) {
+        return Some(normalize_cwd_path(path));
+    }
+    if let Some(path) = value.pointer("/baseUri/path").and_then(|v| v.as_str()) {
+        return Some(normalize_cwd_path(path));
+    }
+
+    if let Some(requests) = value.get("requests").and_then(|v| v.as_array()) {
+        for request in requests {
+            if let Some(path) = request
+                .pointer("/variableData/variables")
+                .and_then(|v| v.as_array())
+                .and_then(|vars| {
+                    vars.iter().find_map(|var| {
+                        var.pointer("/value/uri/fsPath")
+                            .or_else(|| var.pointer("/value/uri/path"))
+                            .and_then(|v| v.as_str())
+                    })
+                })
+            {
+                return Some(normalize_cwd_path(path));
+            }
+
+            if let Some(path) = request
+                .pointer("/response")
+                .and_then(|v| v.as_array())
+                .and_then(|responses| {
+                    responses.iter().find_map(|resp| {
+                        resp.pointer("/baseUri/fsPath")
+                            .or_else(|| resp.pointer("/baseUri/path"))
+                            .and_then(|v| v.as_str())
+                    })
+                })
+            {
+                return Some(normalize_cwd_path(path));
+            }
+        }
+    }
+
+    None
+}
+
+fn normalize_cwd_path(path: &str) -> String {
+    let trimmed = path.strip_prefix("file://").unwrap_or(path);
+    let candidate = Path::new(trimmed);
+    if looks_like_file(candidate) {
+        candidate
+            .parent()
+            .unwrap_or(candidate)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        candidate.to_string_lossy().to_string()
+    }
+}
+
+fn looks_like_file(path: &Path) -> bool {
+    if path.extension().is_some() {
+        return true;
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        return name.contains('.');
+    }
+    false
+}
+
+fn collect_timestamp_candidates(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                match key.as_str() {
+                    "timestamp" | "time" | "created_at" | "createdAt" | "creationDate"
+                    | "lastMessageDate" => out.push(val.clone()),
+                    _ => {}
+                }
+                collect_timestamp_candidates(val, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_timestamp_candidates(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -363,6 +577,8 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
 
     // -----------------------------------------------------------------------
     // Helper: create a temp file with given content
@@ -391,6 +607,30 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_agent_type_cursor() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Cursor/User/workspaceStorage/x/chatSessions/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Cursor);
+    }
+
+    #[test]
+    fn test_infer_agent_type_copilot() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Code/User/workspaceStorage/x/chatSessions/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Copilot);
+    }
+
+    #[test]
+    fn test_infer_agent_type_antigravity() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Antigravity/User/workspaceStorage/x/chatSessions/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Antigravity);
+    }
+
+    #[test]
     fn test_infer_agent_type_unknown_defaults_to_claude() {
         let path = Path::new("/tmp/some/random/session.jsonl");
         assert_eq!(infer_agent_type(path), AgentType::Claude);
@@ -408,6 +648,21 @@ mod tests {
     #[test]
     fn test_agent_type_display_codex() {
         assert_eq!(AgentType::Codex.to_string(), "codex");
+    }
+
+    #[test]
+    fn test_agent_type_display_cursor() {
+        assert_eq!(AgentType::Cursor.to_string(), "cursor");
+    }
+
+    #[test]
+    fn test_agent_type_display_copilot() {
+        assert_eq!(AgentType::Copilot.to_string(), "copilot");
+    }
+
+    #[test]
+    fn test_agent_type_display_antigravity() {
+        assert_eq!(AgentType::Antigravity.to_string(), "antigravity");
     }
 
     // -----------------------------------------------------------------------
@@ -731,6 +986,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_metadata_chat_session_json() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{
+  "sessionId": "chat-123",
+  "requests": [
+    {
+      "variableData": {
+        "variables": [
+          {
+            "value": {
+              "uri": {
+                "fsPath": "/Users/foo/dev/my-repo/src/main.rs"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}"#;
+        let file = write_temp_file(dir.path(), "session.json", content);
+
+        let metadata = parse_session_metadata(&file);
+
+        assert_eq!(metadata.session_id, Some("chat-123".to_string()));
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/my-repo/src".to_string()));
+    }
+
+    #[test]
     fn test_parse_metadata_fields_across_multiple_lines() {
         let dir = TempDir::new().unwrap();
         // session_id on one line, cwd on another
@@ -893,6 +1177,53 @@ also not json {{{{
 
         assert_eq!(metadata.session_id, Some("top-level-id".to_string()));
         assert_eq!(metadata.cwd, Some("/top/level".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // session_time_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_time_range_parses_rfc3339() {
+        let dir = TempDir::new().unwrap();
+        let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let t2 = OffsetDateTime::from_unix_timestamp(1_700_000_120).unwrap();
+        let s1 = t1.format(&Rfc3339).unwrap();
+        let s2 = t2.format(&Rfc3339).unwrap();
+
+        let content = format!(
+            r#"{{"timestamp":"{s1}"}}
+{{"payload":{{"createdAt":"{s2}"}}}}"#,
+        );
+        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+
+        let range = session_time_range(&file).unwrap();
+        assert_eq!(range.0, t1.unix_timestamp());
+        assert_eq!(range.1, t2.unix_timestamp());
+    }
+
+    #[test]
+    fn test_session_time_range_numeric_ms() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{
+  "creationDate": 1749509938455,
+  "lastMessageDate": 1749509971642
+}"#;
+        let file = write_temp_file(dir.path(), "session.json", content);
+
+        let range = session_time_range(&file).unwrap();
+        assert_eq!(range.0, 1_749_509_938);
+        assert_eq!(range.1, 1_749_509_971);
+    }
+
+    #[test]
+    fn test_session_time_range_none_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"type":"message","content":"no timestamps"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
+
+        let range = session_time_range(&file);
+        assert!(range.is_none());
     }
 
     #[test]

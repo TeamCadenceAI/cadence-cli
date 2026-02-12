@@ -12,12 +12,28 @@ use sha2::{Digest, Sha256};
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Confidence level of the match between session and commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    ExactHashMatch,
+    TimeWindowMatch,
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Confidence::ExactHashMatch => write!(f, "exact_hash_match"),
+            Confidence::TimeWindowMatch => write!(f, "time_window_match"),
+        }
+    }
+}
+
 /// Produce a complete note with YAML-style header and verbatim session log.
 ///
 /// The note format is:
 /// ```text
 /// ---
-/// agent: claude-code | codex
+/// agent: claude-code | codex | cursor | copilot | antigravity
 /// session_id: <uuid>
 /// repo: <path>
 /// commit: <full hash>
@@ -48,6 +64,25 @@ pub fn format(
     commit: &str,
     session_log: &str,
 ) -> anyhow::Result<String> {
+    format_with_confidence(
+        agent,
+        session_id,
+        repo,
+        commit,
+        session_log,
+        Confidence::ExactHashMatch,
+    )
+}
+
+/// Produce a complete note with an explicit confidence value.
+pub fn format_with_confidence(
+    agent: &AgentType,
+    session_id: &str,
+    repo: &str,
+    commit: &str,
+    session_log: &str,
+    confidence: Confidence,
+) -> anyhow::Result<String> {
     crate::git::validate_commit_hash(commit)?;
     let sha = payload_sha256(session_log);
 
@@ -57,7 +92,7 @@ pub fn format(
     note.push_str(&format!("session_id: {}\n", session_id));
     note.push_str(&format!("repo: {}\n", repo));
     note.push_str(&format!("commit: {}\n", commit));
-    note.push_str("confidence: exact_hash_match\n");
+    note.push_str(&format!("confidence: {}\n", confidence));
     note.push_str(&format!("payload_sha256: {}\n", sha));
     note.push_str("---\n");
     note.push_str(session_log);
@@ -261,6 +296,45 @@ mod tests {
     }
 
     #[test]
+    fn test_format_cursor_agent() {
+        let note = format(
+            &AgentType::Cursor,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+        )
+        .unwrap();
+        assert!(note.contains("agent: cursor\n"));
+    }
+
+    #[test]
+    fn test_format_copilot_agent() {
+        let note = format(
+            &AgentType::Copilot,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+        )
+        .unwrap();
+        assert!(note.contains("agent: copilot\n"));
+    }
+
+    #[test]
+    fn test_format_antigravity_agent() {
+        let note = format(
+            &AgentType::Antigravity,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+        )
+        .unwrap();
+        assert!(note.contains("agent: antigravity\n"));
+    }
+
+    #[test]
     fn test_format_sha256_matches_payload() {
         let session_log = "some session log content\nwith multiple lines\n";
         let note = format(
@@ -359,5 +433,20 @@ mod tests {
     fn test_format_rejects_short_commit_hash() {
         let result = format(&AgentType::Claude, "sid", "/repo", "abcdef", "log");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_with_time_window_confidence() {
+        let note = format_with_confidence(
+            &AgentType::Claude,
+            "time-window-session",
+            "/repo",
+            "abcdef0123456789abcdef0123456789abcdef01",
+            "payload",
+            Confidence::TimeWindowMatch,
+        )
+        .unwrap();
+
+        assert!(note.contains("confidence: time_window_match\n"));
     }
 }
