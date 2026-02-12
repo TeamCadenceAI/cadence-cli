@@ -208,6 +208,55 @@ pub(crate) fn commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+/// Return full commit hashes within the given time range for a repository.
+///
+/// Uses `git log --since=@<start> --until=@<end> --format=%H`.
+pub(crate) fn commits_in_time_range(
+    repo: &Path,
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<Vec<String>> {
+    let repo_str = repo.to_string_lossy();
+    let (start, end) = if start_ts <= end_ts {
+        (start_ts, end_ts)
+    } else {
+        (end_ts, start_ts)
+    };
+
+    let since = format!("@{}", start);
+    let until = format!("@{}", end);
+
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &repo_str,
+            "log",
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--format=%H",
+        ])
+        .output()
+        .context("failed to execute git log")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git log failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git log output was not valid UTF-8")?;
+    let mut commits = Vec::new();
+    for line in stdout.lines() {
+        let hash = line.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        commits.push(hash.to_string());
+    }
+    Ok(commits)
+}
+
 /// Return the full 40-character SHA of HEAD.
 pub fn head_hash() -> Result<String> {
     git_output(&["rev-parse", "HEAD"])
@@ -867,6 +916,35 @@ mod tests {
         // SSH with nested paths — org is the first segment after the colon
         let org = parse_org_from_url("git@github.com:org/sub/repo.git");
         assert_eq!(org, Some("org".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // commits_in_time_range
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commits_in_time_range_includes_commit() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        let hash = run_git(path, &["rev-parse", "HEAD"]);
+        let ts_str = run_git(path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let ts: i64 = ts_str.parse().unwrap();
+
+        let commits = commits_in_time_range(path, ts - 10, ts + 10).unwrap();
+        assert!(commits.contains(&hash));
+    }
+
+    #[test]
+    fn test_commits_in_time_range_empty_outside_window() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        let ts_str = run_git(path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let ts: i64 = ts_str.parse().unwrap();
+
+        let commits = commits_in_time_range(path, ts - 10_000, ts - 9_000).unwrap();
+        assert!(commits.is_empty());
     }
 
     #[test]

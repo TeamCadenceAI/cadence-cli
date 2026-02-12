@@ -311,17 +311,13 @@ fn hook_post_commit_inner() -> Result<()> {
         return Ok(());
     }
 
-    // Step 3: Collect candidate log directories from agents
-    let mut candidate_dirs = Vec::new();
-    candidate_dirs.extend(agents::claude::log_dirs(&repo_root));
-    candidate_dirs.extend(agents::codex::log_dirs());
-
-    // Step 4: Filter candidate files by ±10 min (600 sec) window
-    let candidate_files = agents::candidate_files(&candidate_dirs, head_timestamp, 600);
+    // Step 3: Collect candidate files across all agents
+    let candidate_files = agents::all_candidate_files(&repo_root, head_timestamp, 600);
 
     // Step 5: Run scanner to find session match
     let session_match = scanner::find_session_for_commit(&head_hash, &candidate_files);
 
+    let mut attached = false;
     if let Some(ref matched) = session_match {
         // Step 6a: Parse metadata and verify match
         let metadata = scanner::parse_session_metadata(&matched.file_path);
@@ -357,17 +353,15 @@ fn hook_post_commit_inner() -> Result<()> {
 
             let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
 
-            // Format the note
-            let note_content = note::format(
+            // Attach the note
+            attach_note_from_log(
                 &matched.agent_type,
                 session_id,
                 &repo_root_str,
                 &head_hash,
                 &session_log,
+                note::Confidence::ExactHashMatch,
             )?;
-
-            // Attach the note
-            git::add_note(&head_hash, &note_content)?;
 
             eprintln!(
                 "[ai-session-commit-linker] attached session {} to commit {}",
@@ -379,18 +373,61 @@ fn hook_post_commit_inner() -> Result<()> {
             if push::should_push() {
                 push::attempt_push();
             }
-        } else {
-            // Verification failed — treat as no match, write pending
-            if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
-                eprintln!(
-                    "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                    e
-                );
-            }
-            spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
+
+            attached = true;
         }
-    } else {
-        // Step 6b: No match found — write pending record
+    }
+
+    if !attached {
+        // Step 6b: No exact match found — attempt time-based fallback
+        if let Some(fallback) =
+            fallback_match_for_commit(head_timestamp, &repo_root, &candidate_files, 600)
+        {
+            let session_log = match std::fs::read_to_string(&fallback.file_path) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!(
+                        "[ai-session-commit-linker] warning: failed to read session log: {}",
+                        e
+                    );
+                    if let Err(e) =
+                        pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
+                    {
+                        eprintln!(
+                            "[ai-session-commit-linker] warning: failed to write pending record: {}",
+                            e
+                        );
+                    }
+                    spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
+                    return Ok(());
+                }
+            };
+
+            attach_note_from_log(
+                &fallback.agent_type,
+                &fallback.session_id,
+                &repo_root_str,
+                &head_hash,
+                &session_log,
+                note::Confidence::TimeWindowMatch,
+            )?;
+
+            eprintln!(
+                "[ai-session-commit-linker] attached session {} to commit {} (time window match)",
+                fallback.session_id,
+                &head_hash[..7]
+            );
+
+            if push::should_push() {
+                push::attempt_push();
+            }
+
+            attached = true;
+        }
+    }
+
+    if !attached {
+        // No match found — write pending record
         if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
             eprintln!(
                 "[ai-session-commit-linker] warning: failed to write pending record: {}",
@@ -417,6 +454,130 @@ const MAX_RETRY_ATTEMPTS: u32 = 20;
 /// Backoff schedule for background retry (in seconds).
 /// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
 const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
+
+/// If two fallback candidates are within this many seconds, treat as ambiguous.
+const FALLBACK_AMBIGUITY_MARGIN_SECS: i64 = 120;
+
+/// Expand session time ranges by this many seconds when matching commits.
+const FALLBACK_RANGE_BUFFER_SECS: i64 = 300;
+
+struct FallbackMatch {
+    file_path: std::path::PathBuf,
+    agent_type: scanner::AgentType,
+    session_id: String,
+}
+
+fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let mtime_epoch = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(mtime_epoch)
+}
+
+fn metadata_repo_matches(metadata: &scanner::SessionMetadata, repo_root: &std::path::Path) -> bool {
+    let cwd = match &metadata.cwd {
+        Some(c) => c,
+        None => return false,
+    };
+    let cwd_path = std::path::Path::new(cwd);
+    match git::repo_root_at(cwd_path) {
+        Ok(cwd_repo_root) => {
+            let canonical_repo = repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf());
+            let canonical_cwd_repo = cwd_repo_root.canonicalize().unwrap_or(cwd_repo_root);
+            canonical_repo == canonical_cwd_repo
+        }
+        Err(_) => false,
+    }
+}
+
+fn fallback_match_for_commit(
+    commit_time: i64,
+    repo_root: &std::path::Path,
+    candidate_files: &[std::path::PathBuf],
+    time_window: i64,
+) -> Option<FallbackMatch> {
+    let mut candidates: Vec<(i64, std::path::PathBuf, scanner::SessionMetadata)> = Vec::new();
+
+    for file_path in candidate_files {
+        let metadata = scanner::parse_session_metadata(file_path);
+        if !metadata_repo_matches(&metadata, repo_root) {
+            continue;
+        }
+
+        let distance = if let Some((start_ts, end_ts)) = scanner::session_time_range(file_path) {
+            let start = start_ts - FALLBACK_RANGE_BUFFER_SECS;
+            let end = end_ts + FALLBACK_RANGE_BUFFER_SECS;
+            if commit_time >= start && commit_time <= end {
+                0
+            } else {
+                let d1 = (commit_time - start_ts).abs();
+                let d2 = (commit_time - end_ts).abs();
+                d1.min(d2)
+            }
+        } else {
+            let mtime = match file_mtime_epoch(file_path) {
+                Some(t) => t,
+                None => continue,
+            };
+            (commit_time - mtime).abs()
+        };
+
+        if distance <= time_window {
+            candidates.push((distance, file_path.clone(), metadata));
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by_key(|(distance, _, _)| *distance);
+    if candidates.len() >= 2 {
+        let diff = (candidates[1].0 - candidates[0].0).abs();
+        if diff <= FALLBACK_AMBIGUITY_MARGIN_SECS {
+            return None;
+        }
+    }
+
+    let (_, file_path, metadata) = candidates.remove(0);
+    let agent_type = metadata
+        .agent_type
+        .clone()
+        .unwrap_or(scanner::AgentType::Claude);
+    let session_id = metadata
+        .session_id
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+
+    Some(FallbackMatch {
+        file_path,
+        agent_type,
+        session_id,
+    })
+}
+
+fn attach_note_from_log(
+    agent_type: &scanner::AgentType,
+    session_id: &str,
+    repo_str: &str,
+    commit: &str,
+    session_log: &str,
+    confidence: note::Confidence,
+) -> Result<()> {
+    let note_content = note::format_with_confidence(
+        agent_type,
+        session_id,
+        repo_str,
+        commit,
+        session_log,
+        confidence,
+    )?;
+    git::add_note(commit, &note_content)?;
+    Ok(())
+}
 
 /// Spawn a detached background process that retries resolving a commit
 /// with exponential backoff over ~1 minute.
@@ -518,23 +679,87 @@ fn try_resolve_single_commit(
         Err(_) => return ResolveResult::TransientError,
     }
 
-    // Collect candidate dirs and files
-    let mut candidate_dirs = Vec::new();
-    candidate_dirs.extend(agents::claude::log_dirs(repo_root));
-    candidate_dirs.extend(agents::codex::log_dirs());
-
-    let candidate_files = agents::candidate_files(&candidate_dirs, commit_time, time_window);
+    // Collect candidate files across all agents
+    let candidate_files = agents::all_candidate_files(repo_root, commit_time, time_window);
 
     let session_match = scanner::find_session_for_commit(commit, &candidate_files);
 
     let matched = match session_match {
         Some(m) => m,
-        None => return ResolveResult::NotFound,
+        None => {
+            if let Some(fallback) =
+                fallback_match_for_commit(commit_time, repo_root, &candidate_files, time_window)
+            {
+                let session_log = match std::fs::read_to_string(&fallback.file_path) {
+                    Ok(content) => content,
+                    Err(_) => return ResolveResult::TransientError,
+                };
+
+                if attach_note_from_log(
+                    &fallback.agent_type,
+                    &fallback.session_id,
+                    repo_str,
+                    commit,
+                    &session_log,
+                    note::Confidence::TimeWindowMatch,
+                )
+                .is_ok()
+                {
+                    eprintln!(
+                        "[ai-session-commit-linker] retry: attached session {} to commit {} (time window match)",
+                        fallback.session_id,
+                        &commit[..std::cmp::min(7, commit.len())]
+                    );
+
+                    if push::should_push() {
+                        push::attempt_push();
+                    }
+
+                    return ResolveResult::Attached;
+                }
+                return ResolveResult::TransientError;
+            }
+
+            return ResolveResult::NotFound;
+        }
     };
 
     let metadata = scanner::parse_session_metadata(&matched.file_path);
 
     if !scanner::verify_match(&metadata, repo_root, commit) {
+        if let Some(fallback) =
+            fallback_match_for_commit(commit_time, repo_root, &candidate_files, time_window)
+        {
+            let session_log = match std::fs::read_to_string(&fallback.file_path) {
+                Ok(content) => content,
+                Err(_) => return ResolveResult::TransientError,
+            };
+
+            if attach_note_from_log(
+                &fallback.agent_type,
+                &fallback.session_id,
+                repo_str,
+                commit,
+                &session_log,
+                note::Confidence::TimeWindowMatch,
+            )
+            .is_ok()
+            {
+                eprintln!(
+                    "[ai-session-commit-linker] retry: attached session {} to commit {} (time window match)",
+                    fallback.session_id,
+                    &commit[..std::cmp::min(7, commit.len())]
+                );
+
+                if push::should_push() {
+                    push::attempt_push();
+                }
+
+                return ResolveResult::Attached;
+            }
+            return ResolveResult::TransientError;
+        }
+
         return ResolveResult::NotFound;
     }
 
@@ -545,18 +770,16 @@ fn try_resolve_single_commit(
 
     let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
 
-    let note_content = match note::format(
+    if attach_note_from_log(
         &matched.agent_type,
         session_id,
         repo_str,
         commit,
         &session_log,
-    ) {
-        Ok(c) => c,
-        Err(_) => return ResolveResult::TransientError,
-    };
-
-    if git::add_note(commit, &note_content).is_ok() {
+        note::Confidence::ExactHashMatch,
+    )
+    .is_ok()
+    {
         eprintln!(
             "[ai-session-commit-linker] retry: attached session {} to commit {}",
             session_id,
@@ -663,34 +886,41 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Step 1: Collect all log directories (repo-agnostic)
+    // Step 1: Collect all recent session logs (repo-agnostic)
     eprintln!(
-        "[ai-session-commit-linker] Scanning Claude logs (last {} days)...",
+        "[ai-session-commit-linker] Scanning agent logs (last {} days)...",
         since_days
     );
-    let claude_dirs = agents::claude::all_log_dirs();
 
-    eprintln!(
-        "[ai-session-commit-linker] Scanning Codex logs (last {} days)...",
-        since_days
-    );
-    let codex_dirs = agents::codex::all_log_dirs();
-
-    let mut all_dirs = Vec::new();
-    all_dirs.extend(claude_dirs);
-    all_dirs.extend(codex_dirs);
-
-    // Step 2: Find all .jsonl files modified within the --since window
-    let files = agents::recent_files(&all_dirs, now, since_secs);
+    // Step 2: Find all session files modified within the --since window
+    let files = agents::all_recent_files(now, since_secs);
     eprintln!(
         "[ai-session-commit-linker] Found {} session logs",
         files.len()
     );
+    if !files.is_empty() {
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for file in &files {
+            let agent = scanner::agent_type_from_path(file).to_string();
+            *counts.entry(agent).or_insert(0) += 1;
+        }
+        let summary = counts
+            .into_iter()
+            .map(|(agent, count)| format!("{agent}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[ai-session-commit-linker]   Agents with sessions: {}",
+            summary
+        );
+    }
 
     // Counters for final summary
     let mut attached = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
+    let mut fallback_attached = 0usize;
 
     // Step 3: Pre-process each file to resolve repo and group by repo display
     struct SessionInfo {
@@ -773,6 +1003,119 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
             if commit_hashes.is_empty() {
                 repo_without_commits += 1;
+
+                if !git::check_enabled_at(&session.repo_root) {
+                    continue;
+                }
+
+                let header = format!("[ai-session-commit-linker]   {} |", session_display);
+
+                let time_range =
+                    if let Some((start, end)) = scanner::session_time_range(&session.file) {
+                        Some((start, end))
+                    } else {
+                        // Fall back to file mtime ± 24 hours
+                        let mtime = match file_mtime_epoch(&session.file) {
+                            Some(t) => t,
+                            None => {
+                                eprintln!("{} no timestamps and no mtime", header);
+                                continue;
+                            }
+                        };
+                        Some((mtime - 86_400, mtime + 86_400))
+                    };
+
+                let (start_ts, end_ts) = match time_range {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("{} no timestamps", header);
+                        continue;
+                    }
+                };
+
+                let commits = match git::commits_in_time_range(&session.repo_root, start_ts, end_ts)
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} error scanning commits: {}", header, e);
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                if commits.len() != 1 {
+                    let status = if commits.is_empty() {
+                        "no commits in time window"
+                    } else {
+                        "ambiguous commits in time window"
+                    };
+                    eprintln!("{} {}", header, status);
+                    continue;
+                }
+
+                let hash = &commits[0];
+                match git::note_exists_at(&session.repo_root, hash) {
+                    Ok(true) => {
+                        skipped += 1;
+                        eprintln!("{} commit {} already attached", header, &hash[..7]);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("{} error checking note for {}: {}", header, &hash[..7], e);
+                        errors += 1;
+                        continue;
+                    }
+                }
+
+                let session_log = match std::fs::read_to_string(&session.file) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("{} failed to read session log: {}", header, e);
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                let agent_type = session
+                    .metadata
+                    .agent_type
+                    .clone()
+                    .unwrap_or(scanner::AgentType::Claude);
+                let repo_str = session.repo_root.to_string_lossy().to_string();
+
+                let note_content = match note::format_with_confidence(
+                    &agent_type,
+                    &session.session_id,
+                    &repo_str,
+                    hash,
+                    &session_log,
+                    note::Confidence::TimeWindowMatch,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} failed to format note for {}: {}", header, &hash[..7], e);
+                        errors += 1;
+                        continue;
+                    }
+                };
+
+                match git::add_note_at(&session.repo_root, hash, &note_content) {
+                    Ok(()) => {
+                        attached += 1;
+                        fallback_attached += 1;
+                        eprintln!(
+                            "{} commit {} attached (time window match)",
+                            header,
+                            &hash[..7]
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("{} failed to attach note to {}: {}", header, &hash[..7], e);
+                        errors += 1;
+                    }
+                }
+
                 continue;
             }
 
@@ -901,8 +1244,8 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Final summary
     eprintln!(
-        "[ai-session-commit-linker] Done. {} attached, {} skipped, {} errors.",
-        attached, skipped, errors
+        "[ai-session-commit-linker] Done. {} attached, {} fallback attached, {} skipped, {} errors.",
+        attached, fallback_attached, skipped, errors
     );
 
     // Step 7: Push if requested
@@ -1129,6 +1472,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
 
     #[test]
     fn cli_parses_install() {
@@ -1286,7 +1631,7 @@ mod tests {
         unsafe { std::env::set_var("HOME", fake_home.path()) };
 
         // With a fake HOME and no session logs, hydrate should
-        // succeed quickly with "Done. 0 attached, 0 skipped, 0 errors."
+        // succeed quickly with "Done. 0 attached, 0 fallback attached, 0 skipped, 0 errors."
         let result = run_hydrate("7d", false);
 
         unsafe { std::env::set_var("HOME", &original_home) };
@@ -1429,6 +1774,7 @@ mod tests {
     // Integration test: post-commit hook with a real temp repo
     // -----------------------------------------------------------------------
 
+    use serde_json::json;
     use serial_test::serial;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -1563,6 +1909,451 @@ mod tests {
         // Restore HOME and cwd
         // SAFETY: This test is #[serial], so no other threads are reading
         // env vars concurrently.
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_post_commit_attaches_note_cursor_chat_session() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let chat_dir = fake_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Cursor")
+            .join("User")
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("chatSessions");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+
+        let session_content = json!({
+            "sessionId": "cursor-chat-1",
+            "baseUri": { "fsPath": format!("{}/README.md", git_repo_root) },
+            "requests": [{
+                "response": [{
+                    "value": format!("[main {}] initial commit", head_hash)
+                }],
+                "variableData": {
+                    "variables": [{
+                        "value": { "uri": { "fsPath": format!("{}/README.md", git_repo_root) } }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let session_file = chat_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: cursor"));
+        assert!(note_output.contains("session_id: cursor-chat-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_post_commit_attaches_note_cursor_project() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let project_dir = fake_home
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join("proj1");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"cursor-proj-1"}}
+{{"cwd":"{cwd}"}}
+{{"content":"[main {hash}] initial commit"}}
+"#,
+            cwd = git_repo_root,
+            hash = head_hash,
+        );
+        let session_file = project_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: cursor"));
+        assert!(note_output.contains("session_id: cursor-proj-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_post_commit_attaches_note_copilot_chat_session() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let chat_dir = fake_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("chatSessions");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+
+        let session_content = json!({
+            "sessionId": "copilot-chat-1",
+            "baseUri": { "fsPath": format!("{}/README.md", git_repo_root) },
+            "requests": [{
+                "response": [{
+                    "value": format!("[main {}] initial commit", head_hash)
+                }],
+                "variableData": {
+                    "variables": [{
+                        "value": { "uri": { "fsPath": format!("{}/README.md", git_repo_root) } }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let session_file = chat_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: copilot"));
+        assert!(note_output.contains("session_id: copilot-chat-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_post_commit_attaches_note_antigravity_chat_session() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let chat_dir = fake_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Antigravity")
+            .join("User")
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("chatSessions");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+
+        let session_content = json!({
+            "sessionId": "antigravity-chat-1",
+            "baseUri": { "fsPath": format!("{}/README.md", git_repo_root) },
+            "requests": [{
+                "response": [{
+                    "value": format!("[main {}] initial commit", head_hash)
+                }],
+                "variableData": {
+                    "variables": [{
+                        "value": { "uri": { "fsPath": format!("{}/README.md", git_repo_root) } }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let session_file = chat_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: antigravity"));
+        assert!(note_output.contains("session_id: antigravity-chat-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_post_commit_fallback_time_match_attaches_note() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        // Session log without commit hash (fallback should use time window)
+        let session_content = format!(
+            r#"{{"session_id":"fallback-session","cwd":"{cwd}"}}
+{{"type":"assistant","message":"no commit hash here"}}
+"#,
+            cwd = git_repo_root,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: claude-code"));
+        assert!(note_output.contains("session_id: fallback-session"));
+        assert!(note_output.contains("confidence: time_window_match"));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_post_commit_fallback_ambiguous_skips() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"fallback-a","cwd":"{cwd}"}}
+{{"type":"assistant","message":"no commit hash here"}}
+"#,
+            cwd = git_repo_root,
+        );
+        let session_a = claude_project_dir.join("session-a.jsonl");
+        let session_b = claude_project_dir.join("session-b.jsonl");
+        std::fs::write(&session_a, &session_content).unwrap();
+        std::fs::write(&session_b, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_a, ft).unwrap();
+        filetime::set_file_mtime(&session_b, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // No note should be attached due to ambiguity
+        let status = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+
+        // Pending record should exist
+        let pending_path = fake_home
+            .path()
+            .join(".ai-session-commit-linker")
+            .join("pending")
+            .join(format!("{}.json", head_hash));
+        assert!(pending_path.exists(), "pending record should exist");
+
         unsafe {
             match original_home {
                 Some(h) => std::env::set_var("HOME", h),
@@ -2020,6 +2811,973 @@ mod tests {
         assert!(note_output.contains("confidence: exact_hash_match"));
 
         // Restore
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_attaches_note_cursor_chat_session() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        let chat_dir = fake_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Cursor")
+            .join("User")
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("chatSessions");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+
+        let session_content = json!({
+            "sessionId": "cursor-hydrate-1",
+            "baseUri": { "fsPath": format!("{}/README.md", git_repo_root) },
+            "requests": [{
+                "response": [{
+                    "value": format!("[main {}] initial commit", head_hash)
+                }],
+                "variableData": {
+                    "variables": [{
+                        "value": { "uri": { "fsPath": format!("{}/README.md", git_repo_root) } }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let session_file = chat_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: cursor"));
+        assert!(note_output.contains("session_id: cursor-hydrate-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_attaches_note_cursor_project() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        let project_dir = fake_home
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join("proj1");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"cursor-hydrate-proj"}}
+{{"cwd":"{cwd}"}}
+{{"content":"[main {hash}] initial commit"}}
+"#,
+            cwd = git_repo_root,
+            hash = head_hash,
+        );
+        let session_file = project_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: cursor"));
+        assert!(note_output.contains("session_id: cursor-hydrate-proj"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_attaches_note_copilot_chat_session() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        let chat_dir = fake_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("chatSessions");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+
+        let session_content = json!({
+            "sessionId": "copilot-hydrate-1",
+            "baseUri": { "fsPath": format!("{}/README.md", git_repo_root) },
+            "requests": [{
+                "response": [{
+                    "value": format!("[main {}] initial commit", head_hash)
+                }],
+                "variableData": {
+                    "variables": [{
+                        "value": { "uri": { "fsPath": format!("{}/README.md", git_repo_root) } }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let session_file = chat_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: copilot"));
+        assert!(note_output.contains("session_id: copilot-hydrate-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_attaches_note_antigravity_chat_session() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        let chat_dir = fake_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("Antigravity")
+            .join("User")
+            .join("workspaceStorage")
+            .join("ws1")
+            .join("chatSessions");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+
+        let session_content = json!({
+            "sessionId": "antigravity-hydrate-1",
+            "baseUri": { "fsPath": format!("{}/README.md", git_repo_root) },
+            "requests": [{
+                "response": [{
+                    "value": format!("[main {}] initial commit", head_hash)
+                }],
+                "variableData": {
+                    "variables": [{
+                        "value": { "uri": { "fsPath": format!("{}/README.md", git_repo_root) } }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let session_file = chat_dir.join("session.json");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: antigravity"));
+        assert!(note_output.contains("session_id: antigravity-hydrate-1"));
+        assert!(note_output.contains(&head_hash));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_fallback_single_commit() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+        let head_time = OffsetDateTime::from_unix_timestamp(head_ts).unwrap();
+        let head_time_str = head_time.format(&Rfc3339).unwrap();
+
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"hydrate-fallback-session","cwd":"{cwd}","timestamp":"{ts}"}}
+{{"type":"assistant","message":"no commit hash"}}
+"#,
+            cwd = git_repo_root,
+            ts = head_time_str,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("session_id: hydrate-fallback-session"));
+        assert!(note_output.contains("confidence: time_window_match"));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_fallback_multiple_commits_skips() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let first_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let first_ts: i64 = first_ts_str.parse().unwrap();
+
+        // Create a second commit
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        run_git(repo_path, &["commit", "-m", "second commit"]);
+        let second_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let second_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let second_ts: i64 = second_ts_str.parse().unwrap();
+
+        let t1 = OffsetDateTime::from_unix_timestamp(first_ts).unwrap();
+        let t2 = OffsetDateTime::from_unix_timestamp(second_ts).unwrap();
+        let s1 = t1.format(&Rfc3339).unwrap();
+        let s2 = t2.format(&Rfc3339).unwrap();
+
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"hydrate-fallback-ambiguous","cwd":"{cwd}","timestamp":"{ts1}"}}
+{{"timestamp":"{ts2}","type":"assistant","message":"no commit hash"}}
+"#,
+            cwd = git_repo_root,
+            ts1 = s1,
+            ts2 = s2,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let status_first = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let status_second = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &second_hash,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status_first.success());
+        assert!(!status_second.success());
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Codex fallback via timestamp (post-commit)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_e2e_post_commit_fallback_codex_timestamp() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+        let head_time = OffsetDateTime::from_unix_timestamp(head_ts).unwrap();
+        let head_time_str = head_time.format(&Rfc3339).unwrap();
+
+        let codex_dir = fake_home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("10");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"id":"codex-session-1","cwd":"{cwd}"}}}}
+{{"type":"assistant","message":"no commit hash"}}"#,
+            ts = head_time_str,
+            cwd = git_repo_root,
+        );
+        let session_file = codex_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: codex"));
+        assert!(note_output.contains("session_id: codex-session-1"));
+        assert!(note_output.contains("confidence: time_window_match"));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Hydrate fallback with timestamp range selects single commit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_e2e_hydrate_fallback_timestamp_single_commit() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+
+        // Create two commits with distinct timestamps
+        let t1 = 1_700_000_100i64;
+        let t2 = 1_700_003_700i64;
+
+        std::fs::write(repo_path.join("file1.txt"), "first").unwrap();
+        run_git(repo_path, &["add", "file1.txt"]);
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["-C", repo_path.to_str().unwrap()])
+            .args(["commit", "-m", "first commit"])
+            .env("GIT_AUTHOR_DATE", t1.to_string())
+            .env("GIT_COMMITTER_DATE", t1.to_string());
+        let output = cmd.output().expect("failed to run git");
+        assert!(output.status.success(), "git commit failed");
+
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["-C", repo_path.to_str().unwrap()])
+            .args(["commit", "-m", "second commit"])
+            .env("GIT_AUTHOR_DATE", t2.to_string())
+            .env("GIT_COMMITTER_DATE", t2.to_string());
+        let output = cmd.output().expect("failed to run git");
+        assert!(output.status.success(), "git commit failed");
+
+        let second_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        let ts_str = OffsetDateTime::from_unix_timestamp(t1)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"hydrate-e2e","cwd":"{cwd}","timestamp":"{ts}"}}
+{{"type":"assistant","message":"no commit hash"}}"#,
+            cwd = git_repo_root,
+            ts = ts_str,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_first = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ],
+        );
+        assert!(note_first.contains("confidence: time_window_match"));
+
+        let status_second = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &second_hash,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status_second.success());
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Retry fallback resolves pending commit via time window
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_e2e_retry_fallback_time_window() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let first_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let first_ts: i64 = first_ts_str.parse().unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let pending_path = fake_home
+            .path()
+            .join(".ai-session-commit-linker")
+            .join("pending")
+            .join(format!("{}.json", first_hash));
+        assert!(pending_path.exists(), "pending record should exist");
+
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"retry-fallback","cwd":"{cwd}"}}
+{{"type":"assistant","message":"no commit hash"}}"#,
+            cwd = git_repo_root,
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(first_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        run_git(repo_path, &["commit", "-m", "second commit"]);
+
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ],
+        );
+        assert!(note_output.contains("session_id: retry-fallback"));
+        assert!(note_output.contains("confidence: time_window_match"));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Codex exact hash match (post-commit)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_e2e_post_commit_codex_exact_hash() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        let codex_dir = fake_home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("10");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"codex-exact","cwd":"{cwd}"}}}}
+{{"type":"assistant","message":"commit {hash} done"}}"#,
+            cwd = git_repo_root,
+            hash = head_hash,
+        );
+        let session_file = codex_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: codex"));
+        assert!(note_output.contains("session_id: codex-exact"));
+        assert!(note_output.contains("confidence: exact_hash_match"));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Hydrate exact hash for Codex sessions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_e2e_hydrate_codex_exact_hash() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+
+        let codex_dir = fake_home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("10");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"codex-hydrate","cwd":"{cwd}"}}}}
+{{"type":"assistant","message":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"commit {hash} done"}}"#,
+            cwd = git_repo_root,
+            short = &head_hash[..7],
+            hash = head_hash,
+        );
+        let session_file = codex_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: codex"));
+        assert!(note_output.contains("session_id: codex-hydrate"));
+        assert!(note_output.contains("confidence: exact_hash_match"));
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Hydrate fallback for Codex sessions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_e2e_hydrate_fallback_codex_timestamp() {
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+        let head_time = OffsetDateTime::from_unix_timestamp(head_ts).unwrap();
+        let head_time_str = head_time.format(&Rfc3339).unwrap();
+
+        let codex_dir = fake_home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("10");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"id":"codex-hydrate-fallback","cwd":"{cwd}"}}}}
+{{"type":"assistant","message":"no commit hash"}}"#,
+            ts = head_time_str,
+            cwd = git_repo_root,
+        );
+        let session_file = codex_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ft = filetime::FileTime::from_unix_time(now, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = run_git(
+            repo_path,
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ],
+        );
+        assert!(note_output.contains("agent: codex"));
+        assert!(note_output.contains("session_id: codex-hydrate-fallback"));
+        assert!(note_output.contains("confidence: time_window_match"));
+
         unsafe {
             match original_home {
                 Some(h) => std::env::set_var("HOME", h),
