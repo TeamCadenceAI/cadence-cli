@@ -4,6 +4,7 @@
 //! The notes ref used throughout is `refs/notes/ai-sessions`.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -306,6 +307,92 @@ pub fn add_note(commit: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// A single `git log` entry annotated with whether it has a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitNoteMarker {
+    pub short: String,
+    pub date: String,
+    pub subject: String,
+    pub has_note: bool,
+}
+
+/// Return `git log` entries annotated with note presence from the given notes ref.
+///
+/// This mirrors:
+/// `git log --date=short --format='%H%x09%h%x09%ad%x09%s'`
+/// plus a per-commit note existence check against `notes_ref`.
+pub fn list_commits_with_note_markers(notes_ref: &str) -> Result<Vec<CommitNoteMarker>> {
+    let log_output = Command::new("git")
+        .args(["log", "--date=short", "--format=%H%x09%h%x09%ad%x09%s"])
+        .output()
+        .context("failed to execute git log")?;
+
+    if !log_output.status.success() {
+        let stderr = String::from_utf8_lossy(&log_output.stderr);
+        bail!("git log failed: {}", stderr.trim());
+    }
+
+    let notes_output = Command::new("git")
+        .args(["notes", "--ref", notes_ref, "list"])
+        .output()
+        .context("failed to execute git notes list")?;
+
+    if !notes_output.status.success() {
+        let stderr = String::from_utf8_lossy(&notes_output.stderr);
+        bail!(
+            "git notes list failed for ref {:?}: {}",
+            notes_ref,
+            stderr.trim()
+        );
+    }
+
+    let notes_stdout = String::from_utf8(notes_output.stdout)
+        .context("git notes list output was not valid UTF-8")?;
+    let noted_commit_ids = parse_noted_commit_ids(&notes_stdout);
+
+    let log_stdout =
+        String::from_utf8(log_output.stdout).context("git log output was not valid UTF-8")?;
+    let mut entries = Vec::new();
+    for line in log_stdout.lines() {
+        if let Some((full, short, date, subject)) = parse_log_line(line) {
+            entries.push(CommitNoteMarker {
+                short,
+                date,
+                subject,
+                has_note: noted_commit_ids.contains(full.as_str()),
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_log_line(line: &str) -> Option<(String, String, String, String)> {
+    let mut parts = line.splitn(4, '\t');
+    let full = parts.next()?.to_string();
+    let short = parts.next()?.to_string();
+    let date = parts.next()?.to_string();
+    let subject = parts.next().unwrap_or("").to_string();
+
+    if full.is_empty() || short.is_empty() || date.is_empty() {
+        return None;
+    }
+
+    Some((full, short, date, subject))
+}
+
+fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
+    notes_list_stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _note_object = parts.next()?;
+            let commit_object = parts.next()?;
+            Some(commit_object.to_string())
+        })
+        .collect()
+}
+
 /// Push the AI-session notes ref to `origin`.
 pub fn push_notes() -> Result<()> {
     let output = Command::new("git")
@@ -524,6 +611,32 @@ pub fn config_set_global(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove a git config key from global scope (`--global --unset`).
+///
+/// Returns `Ok(())` if the key was removed or was already absent.
+/// Returns an error only on genuine git failures.
+pub fn config_unset_global(key: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["config", "--global", "--unset", key])
+        .output()
+        .context("failed to execute git config --global --unset")?;
+
+    if !output.status.success() {
+        // Exit code 5 means the key was not set — not an error for us.
+        let code = output.status.code().unwrap_or(-1);
+        if code != 5 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --global --unset {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -593,6 +706,34 @@ mod tests {
 
         let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
         Ok(stdout.trim().to_string())
+    }
+
+    #[test]
+    fn test_parse_log_line_valid() {
+        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tabc1234\t2026-02-12\tsubject";
+        let parsed = parse_log_line(line).expect("expected parsed log line");
+        assert_eq!(parsed.0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(parsed.1, "abc1234");
+        assert_eq!(parsed.2, "2026-02-12");
+        assert_eq!(parsed.3, "subject");
+    }
+
+    #[test]
+    fn test_parse_log_line_invalid() {
+        assert!(parse_log_line("bad-line").is_none());
+        assert!(parse_log_line("\tabc1234\t2026-02-12\tsubject").is_none());
+    }
+
+    #[test]
+    fn test_parse_noted_commit_ids_uses_second_column() {
+        let input = "\
+1111111111111111111111111111111111111111 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+2222222222222222222222222222222222222222 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+";
+        let ids = parse_noted_commit_ids(input);
+        assert!(ids.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(ids.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(!ids.contains("1111111111111111111111111111111111111111"));
     }
 
     // -----------------------------------------------------------------------

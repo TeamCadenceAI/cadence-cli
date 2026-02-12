@@ -1,5 +1,6 @@
 mod agents;
 mod git;
+mod gpg;
 mod note;
 mod pending;
 mod push;
@@ -49,8 +50,30 @@ enum Command {
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
 
+    /// Inspect linked git notes.
+    Notes {
+        #[command(subcommand)]
+        notes_command: NotesCommand,
+    },
+
     /// Show AI Session Commit Linker status for the current repository.
     Status,
+
+    /// GPG encryption management.
+    Gpg {
+        #[command(subcommand)]
+        gpg_command: GpgCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NotesCommand {
+    /// List commits and mark ones that have AI session notes.
+    List {
+        /// Git notes ref to inspect.
+        #[arg(long, default_value = "refs/notes/ai-sessions")]
+        notes_ref: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,6 +90,56 @@ enum HookCommand {
         /// Unix epoch timestamp of the commit.
         timestamp: i64,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum GpgCommands {
+    /// Show GPG encryption status.
+    Status,
+    /// Set up GPG encryption.
+    Setup,
+}
+
+// ---------------------------------------------------------------------------
+// Hook error taxonomy
+// ---------------------------------------------------------------------------
+
+/// Error classification for the post-commit hook.
+///
+/// The hook must normally never block a commit (all errors are swallowed).
+/// The single exception is when GPG encryption is configured but fails —
+/// in that case the hook MUST exit non-zero to prevent unencrypted notes.
+enum HookError {
+    /// GPG encryption was configured but failed. The hook must propagate
+    /// this as a non-zero exit to block the commit.
+    GpgEncryptionFailed(String),
+    /// Any other error (session not found, git error, etc.). These are
+    /// logged as warnings and the commit proceeds.
+    Soft(anyhow::Error),
+}
+
+impl From<anyhow::Error> for HookError {
+    fn from(e: anyhow::Error) -> Self {
+        HookError::Soft(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared encryption helper
+// ---------------------------------------------------------------------------
+
+/// Optionally encrypt note content before storage.
+///
+/// If `recipient` is `Some`, encrypts the note using GPG and returns the
+/// ciphertext. If `recipient` is `None`, returns the plaintext unchanged.
+///
+/// This is the single place that maps "should encrypt" to "do encrypt",
+/// used by hook, retry, and hydrate paths.
+fn maybe_encrypt_note(content: &str, recipient: &Option<String>) -> Result<String> {
+    match recipient {
+        Some(r) => gpg::encrypt_to_recipient(content, r),
+        None => Ok(content.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,35 +337,46 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
 /// The post-commit hook handler. This is the critical hot path.
 ///
-/// CRITICAL: This function must NEVER fail the commit. All errors are caught
-/// and logged as warnings. The function always exits 0.
+/// This function swallows all errors and returns `Ok(())` EXCEPT when GPG
+/// encryption is configured and fails — in that case it returns `Err` to
+/// block the commit (non-zero exit). This is the only case where the hook
+/// intentionally fails.
 ///
 /// The outer wrapper uses `std::panic::catch_unwind` to catch panics, and
-/// an inner `Result` to catch all other errors. Any failure is logged to
-/// stderr with the `[ai-session-commit-linker]` prefix and silently ignored.
+/// pattern-matches on `HookError` to distinguish commit-blocking GPG
+/// failures from soft failures that should be swallowed.
 fn run_hook_post_commit() -> Result<()> {
     // Catch-all: catch panics
-    let result = std::panic::catch_unwind(|| -> Result<()> { hook_post_commit_inner() });
+    let result = std::panic::catch_unwind(|| -> std::result::Result<(), HookError> {
+        hook_post_commit_inner()
+    });
 
     match result {
-        Ok(Ok(())) => {} // Success
-        Ok(Err(e)) => {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(HookError::GpgEncryptionFailed(msg))) => {
+            eprintln!(
+                "[ai-session-commit-linker] error: GPG encryption failed: {}",
+                msg
+            );
+            anyhow::bail!("GPG encryption configured but failed: {}", msg);
+        }
+        Ok(Err(HookError::Soft(e))) => {
             eprintln!("[ai-session-commit-linker] warning: hook failed: {}", e);
+            Ok(())
         }
         Err(_) => {
             eprintln!("[ai-session-commit-linker] warning: hook panicked (this is a bug)");
+            Ok(())
         }
     }
-
-    // Always succeed — never block the commit
-    Ok(())
 }
 
 /// Inner implementation of the post-commit hook.
 ///
-/// This function is allowed to return errors — the caller (`run_hook_post_commit`)
-/// catches all errors and panics.
-fn hook_post_commit_inner() -> Result<()> {
+/// Returns `HookError::GpgEncryptionFailed` if encryption is configured but
+/// fails — this is the only case where the hook blocks the commit. All other
+/// errors are wrapped in `HookError::Soft` and swallowed by the caller.
+fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
     if !git::check_enabled() {
         return Ok(());
@@ -303,6 +387,12 @@ fn hook_post_commit_inner() -> Result<()> {
     let head_hash = git::head_hash()?;
     let head_timestamp = git::head_timestamp()?;
     let repo_root_str = repo_root.to_string_lossy().to_string();
+
+    // Step 1.5: Resolve GPG recipient once for this invocation
+    let recipient = gpg::get_recipient().map_err(|e| {
+        // Config read failure is a soft error — don't block commit
+        HookError::Soft(e)
+    })?;
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
@@ -353,7 +443,7 @@ fn hook_post_commit_inner() -> Result<()> {
 
             let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
 
-            // Attach the note
+            // Attach the note (encryption failure blocks the commit when configured)
             attach_note_from_log(
                 &matched.agent_type,
                 session_id,
@@ -361,7 +451,15 @@ fn hook_post_commit_inner() -> Result<()> {
                 &head_hash,
                 &session_log,
                 note::Confidence::ExactHashMatch,
-            )?;
+                &recipient,
+            )
+            .map_err(|e| {
+                if recipient.is_some() {
+                    HookError::GpgEncryptionFailed(format!("{}", e))
+                } else {
+                    HookError::Soft(e)
+                }
+            })?;
 
             eprintln!(
                 "[ai-session-commit-linker] attached session {} to commit {}",
@@ -410,7 +508,15 @@ fn hook_post_commit_inner() -> Result<()> {
                 &head_hash,
                 &session_log,
                 note::Confidence::TimeWindowMatch,
-            )?;
+                &recipient,
+            )
+            .map_err(|e| {
+                if recipient.is_some() {
+                    HookError::GpgEncryptionFailed(format!("{}", e))
+                } else {
+                    HookError::Soft(e)
+                }
+            })?;
 
             eprintln!(
                 "[ai-session-commit-linker] attached session {} to commit {} (time window match)",
@@ -437,8 +543,8 @@ fn hook_post_commit_inner() -> Result<()> {
         spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
     }
 
-    // Step 7: Retry pending commits for this repo
-    retry_pending_for_repo(&repo_root_str, &repo_root);
+    // Step 7: Retry pending commits for this repo (uses same recipient)
+    retry_pending_for_repo(&repo_root_str, &repo_root, &recipient);
 
     Ok(())
 }
@@ -566,6 +672,7 @@ fn attach_note_from_log(
     commit: &str,
     session_log: &str,
     confidence: note::Confidence,
+    recipient: &Option<String>,
 ) -> Result<()> {
     let note_content = note::format_with_confidence(
         agent_type,
@@ -575,7 +682,8 @@ fn attach_note_from_log(
         session_log,
         confidence,
     )?;
-    git::add_note(commit, &note_content)?;
+    let final_content = maybe_encrypt_note(&note_content, recipient)?;
+    git::add_note(commit, &final_content)?;
     Ok(())
 }
 
@@ -621,10 +729,13 @@ fn spawn_background_retry(commit: &str, repo: &str, timestamp: i64) {
 fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Result<()> {
     let repo_root = std::path::Path::new(repo);
 
+    // Resolve recipient once for this retry process
+    let recipient = gpg::get_recipient().unwrap_or(None);
+
     for delay in BACKGROUND_RETRY_DELAYS {
         std::thread::sleep(std::time::Duration::from_secs(*delay));
 
-        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600) {
+        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600, &recipient) {
             ResolveResult::Attached => {
                 let _ = pending::remove(commit);
                 return Ok(());
@@ -665,12 +776,16 @@ enum ResolveResult {
 /// The `time_window` parameter controls how wide the candidate file mtime
 /// window is (in seconds). The initial hook uses 600s (±10 min), retries
 /// use 86400s (±24 hours).
+///
+/// The `recipient` parameter controls optional GPG encryption. In the retry
+/// path, encryption failure is treated as a transient error (not commit-blocking).
 fn try_resolve_single_commit(
     commit: &str,
     repo_str: &str,
     repo_root: &std::path::Path,
     commit_time: i64,
     time_window: i64,
+    recipient: &Option<String>,
 ) -> ResolveResult {
     // Check if note already exists
     match git::note_exists(commit) {
@@ -702,6 +817,7 @@ fn try_resolve_single_commit(
                     commit,
                     &session_log,
                     note::Confidence::TimeWindowMatch,
+                    recipient,
                 )
                 .is_ok()
                 {
@@ -742,6 +858,7 @@ fn try_resolve_single_commit(
                 commit,
                 &session_log,
                 note::Confidence::TimeWindowMatch,
+                recipient,
             )
             .is_ok()
             {
@@ -777,6 +894,7 @@ fn try_resolve_single_commit(
         commit,
         &session_log,
         note::Confidence::ExactHashMatch,
+        recipient,
     )
     .is_ok()
     {
@@ -809,7 +927,10 @@ fn try_resolve_single_commit(
 /// Pending retries use a much wider time window than the initial hook
 /// (24 hours instead of 10 minutes) because the commit could be old and
 /// the session log file may have been modified since the commit was created.
-fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
+///
+/// The `recipient` parameter controls optional GPG encryption. Encryption
+/// failures in the retry path are treated as transient errors.
+fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, recipient: &Option<String>) {
     let mut pending_records = match pending::list_for_repo(repo_str) {
         Ok(records) => records,
         Err(_) => return,
@@ -833,6 +954,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path) {
             repo_root,
             record.commit_time,
             86_400,
+            recipient,
         ) {
             ResolveResult::Attached | ResolveResult::AlreadyExists => {
                 let _ = pending::remove(&record.commit);
@@ -885,6 +1007,9 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+
+    // Resolve GPG recipient once for this hydration run
+    let recipient = gpg::get_recipient().unwrap_or(None);
 
     // Step 1: Collect all recent session logs (repo-agnostic)
     eprintln!(
@@ -1201,8 +1326,18 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     }
                 };
 
+                // Optionally encrypt — in hydrate, encryption failure is non-fatal
+                let final_content = match maybe_encrypt_note(&note_content, &recipient) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        messages.push(format!("encryption failed for {}: {}", &hash[..7], e));
+                        errors += 1;
+                        continue;
+                    }
+                };
+
                 // Attach the note
-                match git::add_note_at(&session.repo_root, hash, &note_content) {
+                match git::add_note_at(&session.repo_root, hash, &final_content) {
                     Ok(()) => {
                         messages.push(format!("commit {} attached", &hash[..7]));
                         session_attached += 1;
@@ -1270,11 +1405,14 @@ fn run_retry() -> Result<()> {
         return Ok(());
     }
 
+    // Resolve GPG recipient once for this retry run
+    let recipient = gpg::get_recipient().unwrap_or(None);
+
     eprintln!(
         "[ai-session-commit-linker] retrying {} pending commit(s)...",
         pending_count
     );
-    retry_pending_for_repo(&repo_str, &repo_root);
+    retry_pending_for_repo(&repo_str, &repo_root, &recipient);
 
     let remaining = pending::list_for_repo(&repo_str)
         .map(|r| r.len())
@@ -1437,6 +1575,420 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     Ok(())
 }
 
+/// The notes list subcommand: show recent commits with note markers.
+///
+/// Output format:
+/// - `* <short> <date> <subject>` if note exists
+/// - `  <short> <date> <subject>` otherwise
+fn run_notes_list(notes_ref: &str) -> Result<()> {
+    let entries = git::list_commits_with_note_markers(notes_ref)?;
+    for entry in entries {
+        if entry.has_note {
+            println!("* {} {} {}", entry.short, entry.date, entry.subject);
+        } else {
+            println!("  {} {} {}", entry.short, entry.date, entry.subject);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPG status command
+// ---------------------------------------------------------------------------
+
+/// Aggregated GPG status probe results.
+///
+/// Separates data collection from rendering so that tests can construct
+/// specific scenarios without running real probes, and future commands
+/// (setup, installer) can reuse the same health model.
+struct GpgStatusReport {
+    gpg_available: bool,
+    /// `Some(email)` if configured, `None` if not configured.
+    /// `recipient_error` captures failures reading the config key.
+    recipient: Option<String>,
+    /// Non-empty when `get_recipient()` returned an error.
+    recipient_error: Option<String>,
+    /// `Some(true/false)` when both gpg and recipient are available;
+    /// `None` when the check was skipped (gpg missing or no recipient).
+    key_in_keyring: Option<bool>,
+}
+
+impl GpgStatusReport {
+    /// Collect status by running real probes against system gpg/git.
+    fn collect() -> Self {
+        let gpg_available = gpg::gpg_available();
+
+        let (recipient, recipient_error) = match gpg::get_recipient() {
+            Ok(r) => (r, None),
+            Err(e) => (None, Some(format!("{}", e))),
+        };
+
+        let key_in_keyring = if gpg_available {
+            recipient.as_ref().map(|r| gpg::key_exists(r))
+        } else {
+            None
+        };
+
+        GpgStatusReport {
+            gpg_available,
+            recipient,
+            recipient_error,
+            key_in_keyring,
+        }
+    }
+
+    /// Derive the summary line from probe results.
+    fn summary(&self) -> &'static str {
+        match (&self.recipient, self.gpg_available, self.key_in_keyring) {
+            (Some(_), true, Some(true)) => "enabled",
+            (Some(_), true, Some(false)) => "configured but key not in keyring",
+            (Some(_), true, None) => "enabled",
+            (Some(_), false, _) => "configured but gpg not available",
+            (None, _, _) if self.recipient_error.is_some() => "unknown (config read error)",
+            _ => "disabled (plaintext mode)",
+        }
+    }
+}
+
+/// Render GPG status report to the given writer.
+///
+/// Output lines (stable order):
+/// 1. `gpg binary: found|not found`
+/// 2. `recipient: <email>|not configured|error (<msg>)`
+/// 3. `key in keyring: yes|no` (only when applicable)
+/// 4. blank line + `Encryption: <summary>`
+fn render_gpg_status(w: &mut dyn std::io::Write, report: &GpgStatusReport) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "gpg binary: {}",
+        if report.gpg_available {
+            "found"
+        } else {
+            "not found"
+        }
+    )?;
+
+    match (&report.recipient, &report.recipient_error) {
+        (Some(r), _) => writeln!(w, "recipient: {}", r)?,
+        (None, Some(err)) => writeln!(w, "recipient: error ({})", err)?,
+        (None, None) => writeln!(w, "recipient: not configured")?,
+    }
+
+    if let Some(key_ok) = report.key_in_keyring {
+        writeln!(w, "key in keyring: {}", if key_ok { "yes" } else { "no" })?;
+    }
+
+    writeln!(w)?;
+    writeln!(w, "Encryption: {}", report.summary())?;
+
+    Ok(())
+}
+
+/// GPG status command: always returns `Ok(())` (exit code 0).
+///
+/// All probe errors are captured into the status report and rendered
+/// as user-facing status text rather than propagated as errors.
+fn run_gpg_status() -> Result<()> {
+    let report = GpgStatusReport::collect();
+    // Ignore write errors to stdout — nothing we can do if the terminal is gone.
+    let _ = render_gpg_status(&mut std::io::stdout(), &report);
+    Ok(())
+}
+
+/// GPG setup command: interactive flow for configuring GPG encryption.
+///
+/// Delegates to `run_gpg_setup_inner` with real stdin/stdout so that the
+/// flow can be tested with scripted input.
+fn run_gpg_setup() -> Result<()> {
+    run_gpg_setup_inner(&mut std::io::stdin().lock(), &mut std::io::stdout())
+}
+
+// ---------------------------------------------------------------------------
+// GPG setup: prompt helpers
+// ---------------------------------------------------------------------------
+
+/// Read a single line from `reader`, trimming the trailing newline.
+/// Returns `None` on EOF (reader returns 0 bytes).
+fn read_line(reader: &mut dyn std::io::BufRead) -> Result<Option<String>> {
+    let mut buf = String::new();
+    let n = reader.read_line(&mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        buf.trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string(),
+    ))
+}
+
+/// Prompt the user for a line of input. Returns `None` on EOF.
+fn prompt_line(
+    reader: &mut dyn std::io::BufRead,
+    writer: &mut dyn std::io::Write,
+    prompt: &str,
+) -> Result<Option<String>> {
+    write!(writer, "{}", prompt)?;
+    writer.flush()?;
+    read_line(reader)
+}
+
+/// Prompt a yes/no question. Returns `None` on EOF.
+/// Accepts y/yes/n/no (case-insensitive). Re-prompts on invalid input.
+fn prompt_yes_no(
+    reader: &mut dyn std::io::BufRead,
+    writer: &mut dyn std::io::Write,
+    question: &str,
+) -> Result<Option<bool>> {
+    loop {
+        let Some(answer) = prompt_line(reader, writer, &format!("{} [y/n]: ", question))? else {
+            return Ok(None);
+        };
+        match answer.trim().to_lowercase().as_str() {
+            "y" | "yes" => return Ok(Some(true)),
+            "n" | "no" => return Ok(Some(false)),
+            _ => {
+                writeln!(writer, "Please enter 'y' or 'n'.")?;
+            }
+        }
+    }
+}
+
+/// Return platform-specific GPG install guidance.
+fn gpg_install_guidance() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Install GPG: brew install gnupg"
+    } else if cfg!(target_os = "linux") {
+        "Install GPG: sudo apt install gnupg  (or your distro's package manager)"
+    } else {
+        "Install GPG: download from https://gnupg.org/download/"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPG setup: user abort result
+// ---------------------------------------------------------------------------
+
+/// Outcome of the setup flow: either completed with collected values or
+/// the user explicitly aborted.
+enum SetupOutcome {
+    /// User completed all prompts. Contains recipient and optional key source.
+    Completed {
+        recipient: String,
+        key_source: Option<String>,
+    },
+    /// User aborted the setup flow. No config should be written.
+    Aborted,
+}
+
+// ---------------------------------------------------------------------------
+// GPG setup: inner testable runner
+// ---------------------------------------------------------------------------
+
+/// Inner implementation of `gpg setup` that accepts injectable I/O.
+///
+/// Steps:
+/// 1. Check gpg binary availability.
+/// 2. Optionally import a GPG public key.
+/// 3. Prompt for recipient and validate.
+/// 4. Persist global git config (deferred, with rollback on partial failure).
+/// 5. Print summary and run `gpg status`.
+fn run_gpg_setup_inner(
+    reader: &mut dyn std::io::BufRead,
+    writer: &mut dyn std::io::Write,
+) -> Result<()> {
+    writeln!(writer, "=== GPG Encryption Setup ===")?;
+    writeln!(writer)?;
+
+    // Step 1: Check gpg binary
+    if !gpg::gpg_available() {
+        writeln!(writer, "gpg binary: not found")?;
+        writeln!(writer)?;
+        writeln!(writer, "{}", gpg_install_guidance())?;
+        writeln!(writer, "Please install GPG and run this command again.")?;
+        return Ok(());
+    }
+    writeln!(writer, "gpg binary: found")?;
+    writeln!(writer)?;
+
+    // Steps 2-3: Collect inputs without writing config
+    let outcome = collect_setup_inputs(reader, writer)?;
+
+    let (recipient, key_source) = match outcome {
+        SetupOutcome::Completed {
+            recipient,
+            key_source,
+        } => (recipient, key_source),
+        SetupOutcome::Aborted => {
+            writeln!(writer)?;
+            writeln!(writer, "Setup aborted. No configuration was changed.")?;
+            return Ok(());
+        }
+    };
+
+    // Step 4: Persist config (deferred writes with rollback)
+    persist_setup_config(writer, &recipient, key_source.as_deref())?;
+
+    // Step 5: Summary and verification
+    writeln!(writer)?;
+    writeln!(writer, "=== Setup Complete ===")?;
+    writeln!(writer, "recipient: {}", recipient)?;
+    if let Some(ref src) = key_source {
+        writeln!(writer, "key source: {}", src)?;
+    }
+    writeln!(writer)?;
+
+    // Run gpg status for verification
+    let report = GpgStatusReport::collect();
+    render_gpg_status(writer, &report)?;
+
+    Ok(())
+}
+
+/// Collect user inputs for key import and recipient (Steps 2-3).
+/// Does not write any config. Returns `SetupOutcome`.
+fn collect_setup_inputs(
+    reader: &mut dyn std::io::BufRead,
+    writer: &mut dyn std::io::Write,
+) -> Result<SetupOutcome> {
+    // Step 2: Optional key import
+    let key_source = loop {
+        let Some(source) = prompt_line(
+            reader,
+            writer,
+            "Enter path to GPG public key file (or press Enter to skip): ",
+        )?
+        else {
+            return Ok(SetupOutcome::Aborted);
+        };
+
+        let trimmed = source.trim().to_string();
+        if trimmed.is_empty() {
+            break None;
+        }
+
+        match gpg::import_key(&trimmed) {
+            Ok(()) => {
+                writeln!(writer, "Key imported successfully.")?;
+                break Some(trimmed);
+            }
+            Err(e) => {
+                writeln!(writer, "Import failed: {}", e)?;
+                let Some(retry) = prompt_yes_no(reader, writer, "Retry?")? else {
+                    return Ok(SetupOutcome::Aborted);
+                };
+                if !retry {
+                    return Ok(SetupOutcome::Aborted);
+                }
+                // Loop back to prompt again
+            }
+        }
+    };
+
+    // Step 3: Recipient prompt
+    let recipient = loop {
+        let Some(input) = prompt_line(
+            reader,
+            writer,
+            "Enter GPG recipient (fingerprint, email, or key ID): ",
+        )?
+        else {
+            return Ok(SetupOutcome::Aborted);
+        };
+
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            writeln!(writer, "Recipient must not be blank.")?;
+            continue;
+        }
+
+        if gpg::key_exists(&trimmed) {
+            writeln!(writer, "Key found in keyring.")?;
+            break trimmed;
+        }
+
+        writeln!(
+            writer,
+            "Warning: key not found in keyring for '{}'.",
+            trimmed
+        )?;
+        let Some(cont) = prompt_yes_no(reader, writer, "Continue with this recipient anyway?")?
+        else {
+            return Ok(SetupOutcome::Aborted);
+        };
+        if cont {
+            break trimmed;
+        } else {
+            return Ok(SetupOutcome::Aborted);
+        }
+    };
+
+    Ok(SetupOutcome::Completed {
+        recipient,
+        key_source,
+    })
+}
+
+/// Persist setup config to global git config with rollback on partial failure.
+///
+/// If writing `publicKeySource` fails after `recipient` was written, the prior
+/// recipient value (if any) is restored rather than unconditionally unsetting it.
+fn persist_setup_config(
+    writer: &mut dyn std::io::Write,
+    recipient: &str,
+    key_source: Option<&str>,
+) -> Result<()> {
+    persist_setup_config_with(writer, recipient, key_source, git::config_set_global)
+}
+
+/// Inner implementation of config persistence with injectable config-writer.
+///
+/// Accepts a `set_global` function so tests can inject failures for the second write
+/// while letting the first succeed.
+fn persist_setup_config_with(
+    writer: &mut dyn std::io::Write,
+    recipient: &str,
+    key_source: Option<&str>,
+    set_global: fn(&str, &str) -> Result<()>,
+) -> Result<()> {
+    // Snapshot the prior recipient value so we can restore it on rollback.
+    let prior_recipient = git::config_get_global(gpg::GPG_RECIPIENT_KEY).unwrap_or(None);
+
+    // Write recipient first
+    if let Err(e) = set_global(gpg::GPG_RECIPIENT_KEY, recipient) {
+        writeln!(
+            writer,
+            "Error: failed to save recipient to git config: {}",
+            e
+        )?;
+        return Err(e);
+    }
+
+    // Write key source if provided
+    if let Some(source) = key_source
+        && let Err(e) = set_global(gpg::GPG_PUBLIC_KEY_SOURCE_KEY, source)
+    {
+        writeln!(
+            writer,
+            "Error: failed to save key source to git config: {}",
+            e
+        )?;
+        // Rollback recipient to its prior state
+        writeln!(writer, "Rolling back recipient config...")?;
+        match prior_recipient {
+            Some(ref old_value) => {
+                let _ = git::config_set_global(gpg::GPG_RECIPIENT_KEY, old_value);
+            }
+            None => {
+                let _ = git::config_unset_global(gpg::GPG_RECIPIENT_KEY);
+            }
+        }
+        return Err(e);
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1456,7 +2008,14 @@ fn main() {
         },
         Command::Hydrate { since, push } => run_hydrate(&since, push),
         Command::Retry => run_retry(),
+        Command::Notes { notes_command } => match notes_command {
+            NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
+        },
         Command::Status => run_status(),
+        Command::Gpg { gpg_command } => match gpg_command {
+            GpgCommands::Status => run_gpg_status(),
+            GpgCommands::Setup => run_gpg_setup(),
+        },
     };
 
     if let Err(e) = result {
@@ -1565,9 +2124,69 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_notes_list_default_ref() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "notes", "list"]);
+        match cli.command {
+            Command::Notes { notes_command } => match notes_command {
+                NotesCommand::List { notes_ref } => {
+                    assert_eq!(notes_ref, "refs/notes/ai-sessions");
+                }
+            },
+            _ => panic!("expected Notes command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_notes_list_custom_ref() {
+        let cli = Cli::parse_from([
+            "ai-session-commit-linker",
+            "notes",
+            "list",
+            "--notes-ref",
+            "refs/notes/custom",
+        ]);
+        match cli.command {
+            Command::Notes { notes_command } => match notes_command {
+                NotesCommand::List { notes_ref } => {
+                    assert_eq!(notes_ref, "refs/notes/custom");
+                }
+            },
+            _ => panic!("expected Notes command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_status() {
         let cli = Cli::parse_from(["ai-session-commit-linker", "status"]);
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn cli_parses_gpg_status() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "gpg", "status"]);
+        match cli.command {
+            Command::Gpg { gpg_command } => {
+                assert!(matches!(gpg_command, GpgCommands::Status));
+            }
+            _ => panic!("expected Gpg command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_gpg_setup() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "gpg", "setup"]);
+        match cli.command {
+            Command::Gpg { gpg_command } => {
+                assert!(matches!(gpg_command, GpgCommands::Setup));
+            }
+            _ => panic!("expected Gpg command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_gpg_without_subcommand() {
+        let result = Cli::try_parse_from(["ai-session-commit-linker", "gpg"]);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1768,6 +2387,804 @@ mod tests {
     fn cli_rejects_no_subcommand() {
         let result = Cli::try_parse_from(["ai-session-commit-linker"]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG status report unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gpg_status_report_summary_disabled_no_recipient() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: None,
+            recipient_error: None,
+            key_in_keyring: None,
+        };
+        assert_eq!(report.summary(), "disabled (plaintext mode)");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_enabled() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: Some("test@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: Some(true),
+        };
+        assert_eq!(report.summary(), "enabled");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_key_missing() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: Some("test@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: Some(false),
+        };
+        assert_eq!(report.summary(), "configured but key not in keyring");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_gpg_not_available() {
+        let report = GpgStatusReport {
+            gpg_available: false,
+            recipient: Some("test@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: None,
+        };
+        assert_eq!(report.summary(), "configured but gpg not available");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_config_error() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: None,
+            recipient_error: Some("config read failed".to_string()),
+            key_in_keyring: None,
+        };
+        assert_eq!(report.summary(), "unknown (config read error)");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_disabled_gpg_missing_no_recipient() {
+        let report = GpgStatusReport {
+            gpg_available: false,
+            recipient: None,
+            recipient_error: None,
+            key_in_keyring: None,
+        };
+        assert_eq!(report.summary(), "disabled (plaintext mode)");
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG status render tests (no system probes — constructed reports)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_gpg_status_no_recipient() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: None,
+            recipient_error: None,
+            key_in_keyring: None,
+        };
+        let mut buf = Vec::new();
+        render_gpg_status(&mut buf, &report).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(output.contains("gpg binary: found"), "got: {}", output);
+        assert!(
+            output.contains("recipient: not configured"),
+            "got: {}",
+            output
+        );
+        assert!(
+            !output.contains("key in keyring"),
+            "key line should be absent, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Encryption: disabled (plaintext mode)"),
+            "got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn render_gpg_status_enabled() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: Some("user@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: Some(true),
+        };
+        let mut buf = Vec::new();
+        render_gpg_status(&mut buf, &report).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(output.contains("gpg binary: found"), "got: {}", output);
+        assert!(
+            output.contains("recipient: user@example.com"),
+            "got: {}",
+            output
+        );
+        assert!(output.contains("key in keyring: yes"), "got: {}", output);
+        assert!(output.contains("Encryption: enabled"), "got: {}", output);
+    }
+
+    #[test]
+    fn render_gpg_status_gpg_missing_with_recipient() {
+        let report = GpgStatusReport {
+            gpg_available: false,
+            recipient: Some("user@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: None,
+        };
+        let mut buf = Vec::new();
+        render_gpg_status(&mut buf, &report).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(output.contains("gpg binary: not found"), "got: {}", output);
+        assert!(
+            output.contains("recipient: user@example.com"),
+            "got: {}",
+            output
+        );
+        assert!(
+            !output.contains("key in keyring"),
+            "key line should be absent when gpg missing, got: {}",
+            output
+        );
+        assert!(
+            output.contains("Encryption: configured but gpg not available"),
+            "got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn render_gpg_status_key_missing() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: Some("user@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: Some(false),
+        };
+        let mut buf = Vec::new();
+        render_gpg_status(&mut buf, &report).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(output.contains("key in keyring: no"), "got: {}", output);
+        assert!(
+            output.contains("Encryption: configured but key not in keyring"),
+            "got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn render_gpg_status_config_error() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: None,
+            recipient_error: Some("invalid config file".to_string()),
+            key_in_keyring: None,
+        };
+        let mut buf = Vec::new();
+        render_gpg_status(&mut buf, &report).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(
+            output.contains("recipient: error (invalid config file)"),
+            "got: {}",
+            output
+        );
+        assert!(
+            output.contains("Encryption: unknown (config read error)"),
+            "got: {}",
+            output
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG status exit-code-0 invariance tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn run_gpg_status_returns_ok_with_no_config() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        let result = with_env(
+            "GIT_CONFIG_GLOBAL",
+            config_path.to_str().unwrap(),
+            run_gpg_status,
+        );
+        assert!(result.is_ok(), "gpg status should always return Ok");
+    }
+
+    #[test]
+    #[serial]
+    fn run_gpg_status_returns_ok_with_bad_config() {
+        // Point GIT_CONFIG_GLOBAL to nonexistent file
+        let result = with_env(
+            "GIT_CONFIG_GLOBAL",
+            "/tmp/nonexistent-gitconfig-for-test-12345",
+            run_gpg_status,
+        );
+        assert!(
+            result.is_ok(),
+            "gpg status should always return Ok even with bad config"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG setup: prompt helper unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prompt_yes_no_accepts_y() {
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::new();
+        let result = prompt_yes_no(&mut input, &mut output, "Continue?").unwrap();
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn prompt_yes_no_accepts_yes_case_insensitive() {
+        let mut input = std::io::Cursor::new(b"YES\n".to_vec());
+        let mut output = Vec::new();
+        let result = prompt_yes_no(&mut input, &mut output, "Continue?").unwrap();
+        assert_eq!(result, Some(true));
+    }
+
+    #[test]
+    fn prompt_yes_no_accepts_n() {
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::new();
+        let result = prompt_yes_no(&mut input, &mut output, "Continue?").unwrap();
+        assert_eq!(result, Some(false));
+    }
+
+    #[test]
+    fn prompt_yes_no_reprompts_then_accepts() {
+        let mut input = std::io::Cursor::new(b"maybe\ny\n".to_vec());
+        let mut output = Vec::new();
+        let result = prompt_yes_no(&mut input, &mut output, "Continue?").unwrap();
+        assert_eq!(result, Some(true));
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("Please enter 'y' or 'n'."));
+    }
+
+    #[test]
+    fn prompt_yes_no_eof_returns_none() {
+        let mut input = std::io::Cursor::new(b"".to_vec());
+        let mut output = Vec::new();
+        let result = prompt_yes_no(&mut input, &mut output, "Continue?").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn read_line_eof_returns_none() {
+        let mut input = std::io::Cursor::new(b"".to_vec());
+        let result = read_line(&mut input).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn read_line_trims_newline() {
+        let mut input = std::io::Cursor::new(b"hello\n".to_vec());
+        let result = read_line(&mut input).unwrap();
+        assert_eq!(result, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn read_line_trims_crlf() {
+        let mut input = std::io::Cursor::new(b"hello\r\n".to_vec());
+        let result = read_line(&mut input).unwrap();
+        assert_eq!(result, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn gpg_install_guidance_returns_nonempty() {
+        let guidance = gpg_install_guidance();
+        assert!(!guidance.is_empty());
+        assert!(guidance.contains("GPG") || guidance.contains("gpg"));
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG setup: workflow tests with scripted I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn gpg_setup_exits_early_when_gpg_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Build a restricted PATH that includes git but NOT gpg.
+        let restricted_bin = TempDir::new().unwrap();
+        let git_path_output = std::process::Command::new("which")
+            .arg("git")
+            .output()
+            .expect("which git failed");
+        let git_bin = String::from_utf8(git_path_output.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::os::unix::fs::symlink(&git_bin, restricted_bin.path().join("git")).unwrap();
+
+        let mut input = std::io::Cursor::new(b"".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            with_env("PATH", restricted_bin.path().to_str().unwrap(), || {
+                run_gpg_setup_inner(&mut input, &mut output)
+            })
+        });
+
+        assert!(
+            result.is_ok(),
+            "gpg-unavailable should exit cleanly: {:?}",
+            result.err()
+        );
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("not found"),
+            "should say gpg not found: {output_str}"
+        );
+        assert!(
+            output_str.contains("install") || output_str.contains("Install"),
+            "should provide install guidance: {output_str}"
+        );
+
+        // No config should be written
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(recipient.unwrap(), None, "no recipient should be saved");
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_setup_abort_at_key_import_eof() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // EOF immediately at key import prompt
+        let mut input = std::io::Cursor::new(b"".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            run_gpg_setup_inner(&mut input, &mut output)
+        });
+
+        // On machines without gpg, this aborts at step 1 (gpg not found).
+        // On machines with gpg, this aborts at step 2 (EOF at import prompt).
+        // Either way, it should return Ok (user abort = Ok).
+        assert!(
+            result.is_ok(),
+            "abort at EOF should return Ok: {:?}",
+            result.err()
+        );
+
+        let _output_str = String::from_utf8(output).unwrap();
+        // Should NOT have saved any config
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(
+            recipient.unwrap(),
+            None,
+            "no recipient should be saved on abort"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_setup_skip_import_then_abort_at_recipient_eof() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Skip import (enter), then EOF at recipient prompt
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            run_gpg_setup_inner(&mut input, &mut output)
+        });
+
+        assert!(result.is_ok(), "abort should return Ok: {:?}", result.err());
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("aborted")
+                || output_str.contains("Aborted")
+                || output_str.contains("No configuration"),
+            "should mention abort/no changes in output: {output_str}"
+        );
+
+        // No config should be written
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(recipient.unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_setup_blank_recipient_reprompts_then_eof() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Skip import, then blank recipient, then EOF
+        let mut input = std::io::Cursor::new(b"\n\n".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            run_gpg_setup_inner(&mut input, &mut output)
+        });
+
+        assert!(result.is_ok());
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("must not be blank"),
+            "should reject blank recipient: {output_str}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_setup_missing_key_abort() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        let gnupg_dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gnupg_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        // Skip import, enter nonexistent recipient, then say "no" to continue
+        let mut input = std::io::Cursor::new(b"\nnonexistent@example.invalid\nn\n".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            with_env("GNUPGHOME", gnupg_dir.path().to_str().unwrap(), || {
+                run_gpg_setup_inner(&mut input, &mut output)
+            })
+        });
+
+        assert!(result.is_ok());
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("not found in keyring"),
+            "should warn about missing key: {output_str}"
+        );
+        assert!(
+            output_str.contains("aborted")
+                || output_str.contains("Aborted")
+                || output_str.contains("No configuration"),
+            "should indicate abort: {output_str}"
+        );
+
+        // No config saved
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(recipient.unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_setup_missing_key_continue_anyway() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        let gnupg_dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gnupg_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        // Skip import, enter nonexistent recipient, say "yes" to continue anyway
+        let mut input = std::io::Cursor::new(b"\nnonexistent@example.invalid\ny\n".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            with_env("GNUPGHOME", gnupg_dir.path().to_str().unwrap(), || {
+                run_gpg_setup_inner(&mut input, &mut output)
+            })
+        });
+
+        assert!(result.is_ok(), "setup should succeed: {:?}", result.err());
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("Setup Complete"),
+            "should show completion: {output_str}"
+        );
+
+        // Config should be saved
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(
+            recipient.unwrap(),
+            Some("nonexistent@example.invalid".to_string())
+        );
+
+        // No key source should be saved (import was skipped)
+        let key_source = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_PUBLIC_KEY_SOURCE_KEY)
+        });
+        assert_eq!(key_source.unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_setup_import_fail_then_abort() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        let gnupg_dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gnupg_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        // Enter invalid path, then decline retry
+        let mut input = std::io::Cursor::new(b"/nonexistent/key.asc\nn\n".to_vec());
+        let mut output = Vec::new();
+
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            with_env("GNUPGHOME", gnupg_dir.path().to_str().unwrap(), || {
+                run_gpg_setup_inner(&mut input, &mut output)
+            })
+        });
+
+        assert!(result.is_ok());
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("Import failed"),
+            "should show import failure: {output_str}"
+        );
+
+        // No config saved
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(recipient.unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG setup: config persistence tests
+    // -----------------------------------------------------------------------
+
+    /// A config writer that succeeds for recipient but fails for publicKeySource.
+    /// Used to test the rollback path in persist_setup_config_with.
+    fn config_set_global_fail_on_key_source(key: &str, value: &str) -> Result<()> {
+        if key == gpg::GPG_PUBLIC_KEY_SOURCE_KEY {
+            anyhow::bail!("simulated write failure for key source");
+        }
+        git::config_set_global(key, value)
+    }
+
+    #[test]
+    #[serial]
+    fn persist_setup_config_rollback_restores_prior_recipient() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Pre-seed an existing recipient
+        with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_set_global(gpg::GPG_RECIPIENT_KEY, "original@example.com").unwrap();
+        });
+
+        // Call persist_setup_config_with using the failing writer
+        let mut output = Vec::new();
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            persist_setup_config_with(
+                &mut output,
+                "new@example.com",
+                Some("/path/to/key.asc"),
+                config_set_global_fail_on_key_source,
+            )
+        });
+
+        // Should return error (key source write failed)
+        assert!(result.is_err(), "should fail when key source write fails");
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            output_str.contains("Rolling back"),
+            "should mention rollback: {output_str}"
+        );
+
+        // Original recipient should be restored
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(
+            recipient.unwrap(),
+            Some("original@example.com".to_string()),
+            "rollback must restore original recipient, not unset it"
+        );
+
+        // Key source should NOT be set
+        let key_source = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_PUBLIC_KEY_SOURCE_KEY)
+        });
+        assert_eq!(
+            key_source.unwrap(),
+            None,
+            "key source should not be saved on failure"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn persist_setup_config_rollback_unsets_when_no_prior_recipient() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // No pre-existing recipient — config is empty
+
+        let mut output = Vec::new();
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            persist_setup_config_with(
+                &mut output,
+                "new@example.com",
+                Some("/path/to/key.asc"),
+                config_set_global_fail_on_key_source,
+            )
+        });
+
+        assert!(result.is_err(), "should fail when key source write fails");
+
+        // Recipient should be unset (rolled back to "no prior value")
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(
+            recipient.unwrap(),
+            None,
+            "rollback must unset recipient when no prior value existed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn persist_setup_config_writes_both_keys_on_success() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut output = Vec::new();
+        let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            persist_setup_config(&mut output, "test@example.com", Some("/keys/pub.asc"))
+        });
+
+        assert!(result.is_ok(), "should succeed: {:?}", result.err());
+
+        let recipient = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        });
+        assert_eq!(
+            recipient.unwrap(),
+            Some("test@example.com".to_string()),
+            "recipient should be saved"
+        );
+
+        let key_source = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
+            git::config_get_global(gpg::GPG_PUBLIC_KEY_SOURCE_KEY)
+        });
+        assert_eq!(
+            key_source.unwrap(),
+            Some("/keys/pub.asc".to_string()),
+            "key source should be saved"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG status integration tests (real probes with env isolation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn gpg_status_collect_no_recipient_configured() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        let report = with_env(
+            "GIT_CONFIG_GLOBAL",
+            config_path.to_str().unwrap(),
+            GpgStatusReport::collect,
+        );
+
+        assert!(report.recipient.is_none());
+        assert!(report.recipient_error.is_none());
+        assert!(report.key_in_keyring.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn gpg_status_collect_with_recipient_configured() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join(".gitconfig");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Configure a recipient
+        std::process::Command::new("git")
+            .args([
+                "config",
+                "--file",
+                config_path.to_str().unwrap(),
+                "ai.session-commit-linker.gpg.recipient",
+                "test-status@example.com",
+            ])
+            .output()
+            .unwrap();
+
+        let report = with_env(
+            "GIT_CONFIG_GLOBAL",
+            config_path.to_str().unwrap(),
+            GpgStatusReport::collect,
+        );
+
+        assert_eq!(report.recipient.as_deref(), Some("test-status@example.com"));
+        assert!(report.recipient_error.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -4807,7 +6224,7 @@ mod tests {
 
         // Run retry -- should abandon the record since it exceeded max attempts
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        retry_pending_for_repo(&git_repo_root, std::path::Path::new(&git_repo_root));
+        retry_pending_for_repo(&git_repo_root, std::path::Path::new(&git_repo_root), &None);
 
         // The pending record should have been removed
         assert!(
@@ -4885,6 +6302,815 @@ mod tests {
             match original_home {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG encryption test utilities
+    // -----------------------------------------------------------------------
+
+    /// Save, set, and restore an environment variable around a closure.
+    /// Uses `unsafe` as required by Rust 2024 edition.
+    fn with_env<F, R>(key: &str, value: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let orig = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, value) };
+        let result = f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        result
+    }
+
+    /// Set up a temporary GPG home directory with a test keypair.
+    /// Returns (TempDir, email) — TempDir must be kept alive for the
+    /// duration of the test. Returns None if gpg is not available.
+    fn setup_test_gpg_keyring() -> Option<(TempDir, String)> {
+        if !gpg::gpg_available() {
+            return None;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let gnupghome = dir.path();
+        let email = "test-hook-gpg@ai-session-commit-linker.test";
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gnupghome, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let key_params = format!(
+            "%no-protection\nKey-Type: RSA\nKey-Length: 2048\nSubkey-Type: RSA\nSubkey-Length: 2048\nName-Real: Test User\nName-Email: {}\nExpire-Date: 0\n%commit\n",
+            email
+        );
+
+        let output = std::process::Command::new("gpg")
+            .args(["--batch", "--gen-key"])
+            .env("GNUPGHOME", gnupghome)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(key_params.as_bytes())
+                    .unwrap();
+                child.wait_with_output()
+            });
+
+        match output {
+            Ok(o) if o.status.success() => Some((dir, email.to_string())),
+            _ => None,
+        }
+    }
+
+    /// Set up a full integration environment for GPG hook tests:
+    /// - Temporary git repo with a commit
+    /// - Fake HOME with session log matching the commit
+    /// - Isolated GIT_CONFIG_GLOBAL
+    /// - Optionally configured GPG recipient in global config
+    ///
+    /// Returns all the pieces needed to run and verify hook behavior.
+    struct GpgHookTestEnv {
+        repo_dir: TempDir,
+        #[allow(dead_code)] // Kept alive for TempDir drop behavior
+        fake_home: TempDir,
+        global_config_path: PathBuf,
+        head_hash: String,
+        original_cwd: PathBuf,
+        original_home: Option<String>,
+        original_global: Option<String>,
+        original_gnupghome: Option<String>,
+    }
+
+    impl GpgHookTestEnv {
+        /// Create a test environment with a git repo, session log, and isolated config.
+        fn setup() -> Self {
+            let dir = init_temp_repo();
+            let repo_path = dir.path();
+
+            let original_cwd = safe_cwd();
+            let fake_home = TempDir::new().expect("failed to create fake home");
+            let original_home = std::env::var("HOME").ok();
+            let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+            let original_gnupghome = std::env::var("GNUPGHOME").ok();
+
+            // Create isolated global git config
+            let global_config_path = fake_home.path().join("fake-global-gitconfig");
+            std::fs::write(&global_config_path, "").unwrap();
+
+            unsafe {
+                std::env::set_var("HOME", fake_home.path());
+                std::env::set_var("GIT_CONFIG_GLOBAL", &global_config_path);
+            }
+
+            // Get git-resolved repo root and HEAD info
+            let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+            let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+            let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+            let head_ts: i64 = head_ts_str.parse().unwrap();
+
+            // Create fake session log matching the commit
+            let git_repo_root_path = std::path::Path::new(&git_repo_root);
+            let encoded = agents::encode_repo_path(git_repo_root_path);
+            let claude_project_dir = fake_home
+                .path()
+                .join(".claude")
+                .join("projects")
+                .join(&encoded);
+            std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+            let session_content = format!(
+                r#"{{"session_id":"gpg-test-session","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"Done"}}
+"#,
+                cwd = git_repo_root,
+                short = &head_hash[..7],
+            );
+            let session_file = claude_project_dir.join("session.jsonl");
+            std::fs::write(&session_file, &session_content).unwrap();
+
+            let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+            filetime::set_file_mtime(&session_file, ft).unwrap();
+
+            // chdir into the repo
+            std::env::set_current_dir(repo_path).expect("failed to chdir");
+
+            GpgHookTestEnv {
+                repo_dir: dir,
+                fake_home,
+                global_config_path,
+                head_hash,
+                original_cwd,
+                original_home,
+                original_global,
+                original_gnupghome,
+            }
+        }
+
+        /// Configure a GPG recipient in the isolated global git config.
+        fn set_recipient(&self, recipient: &str) {
+            std::process::Command::new("git")
+                .args([
+                    "config",
+                    "--file",
+                    self.global_config_path.to_str().unwrap(),
+                    "ai.session-commit-linker.gpg.recipient",
+                    recipient,
+                ])
+                .output()
+                .unwrap();
+        }
+
+        /// Get the note content for the HEAD commit, or None if no note exists.
+        fn get_note(&self) -> Option<String> {
+            let output = std::process::Command::new("git")
+                .args(["-C", self.repo_dir.path().to_str().unwrap()])
+                .args([
+                    "notes",
+                    "--ref",
+                    "refs/notes/ai-sessions",
+                    "show",
+                    &self.head_hash,
+                ])
+                .output()
+                .unwrap();
+            if output.status.success() {
+                Some(String::from_utf8(output.stdout).unwrap().trim().to_string())
+            } else {
+                None
+            }
+        }
+
+        /// Restore environment variables on drop.
+        fn restore(&self) {
+            unsafe {
+                match &self.original_home {
+                    Some(h) => std::env::set_var("HOME", h),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.original_global {
+                    Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                    None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+                }
+                match &self.original_gnupghome {
+                    Some(g) => std::env::set_var("GNUPGHOME", g),
+                    None => std::env::remove_var("GNUPGHOME"),
+                }
+            }
+            std::env::set_current_dir(&self.original_cwd).unwrap();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: Plaintext regression (no recipient configured)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_hook_plaintext_no_recipient_attaches_unencrypted_note() {
+        let env = GpgHookTestEnv::setup();
+
+        // No GPG recipient configured — should attach plaintext
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note = env.get_note().expect("note should be attached");
+        assert!(
+            note.contains("agent: claude-code"),
+            "plaintext note should contain agent field"
+        );
+        assert!(
+            note.contains("session_id: gpg-test-session"),
+            "plaintext note should contain session_id"
+        );
+        assert!(
+            !note.starts_with("-----BEGIN PGP MESSAGE-----"),
+            "note should NOT be encrypted when no recipient is configured"
+        );
+
+        env.restore();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: Encrypted success (recipient + key available)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_hook_encrypts_note_when_recipient_configured() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let env = GpgHookTestEnv::setup();
+
+        // Configure GPG: set GNUPGHOME and recipient
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+        env.set_recipient(&email);
+
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        let note = env.get_note().expect("note should be attached");
+        assert!(
+            note.starts_with("-----BEGIN PGP MESSAGE-----"),
+            "note should be encrypted when recipient is configured, got: {}",
+            &note[..std::cmp::min(80, note.len())]
+        );
+        assert!(
+            note.contains("-----END PGP MESSAGE-----"),
+            "note should contain PGP footer"
+        );
+        // Should NOT contain plaintext session fields
+        assert!(
+            !note.contains("agent: claude-code"),
+            "encrypted note should not contain plaintext agent field"
+        );
+
+        env.restore();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: Commit-blocking failure (encryption configured but fails)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_hook_fails_when_encryption_configured_but_recipient_invalid() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let env = GpgHookTestEnv::setup();
+
+        // Configure recipient but use an empty GNUPGHOME with no keys
+        let empty_gnupghome = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                empty_gnupghome.path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        unsafe { std::env::set_var("GNUPGHOME", empty_gnupghome.path()) };
+        env.set_recipient("nonexistent-key@invalid.test");
+
+        let result = run_hook_post_commit();
+        assert!(
+            result.is_err(),
+            "hook should return Err when encryption is configured but fails"
+        );
+
+        // Verify no note was attached (commit should be blocked)
+        assert!(
+            env.get_note().is_none(),
+            "no note should be attached when encryption fails"
+        );
+
+        env.restore();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hook_fails_when_gpg_unavailable_but_recipient_configured() {
+        let env = GpgHookTestEnv::setup();
+
+        // Configure recipient
+        env.set_recipient("some-key@example.com");
+
+        // Build a restricted PATH: include git but exclude gpg.
+        // Find where git lives and construct PATH with only that directory,
+        // but exclude any gpg binary by using a wrapper dir.
+        let original_path = std::env::var("PATH").unwrap_or_default();
+
+        // Create a temporary directory with only a symlink to git
+        let restricted_bin = TempDir::new().unwrap();
+        let git_path_output = std::process::Command::new("which")
+            .arg("git")
+            .output()
+            .expect("which git failed");
+        let git_bin = String::from_utf8(git_path_output.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&git_bin, restricted_bin.path().join("git")).unwrap();
+        }
+
+        unsafe { std::env::set_var("PATH", restricted_bin.path()) };
+
+        let result = run_hook_post_commit();
+
+        // Restore PATH before assertions
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        assert!(
+            result.is_err(),
+            "hook should return Err when gpg is unavailable but encryption is configured"
+        );
+
+        // Verify no note was attached (commit should be blocked)
+        // Need PATH restored to run git
+        assert!(
+            env.get_note().is_none(),
+            "no note should be attached when gpg is unavailable"
+        );
+
+        env.restore();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: Non-GPG failures still soft (don't block commit)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_hook_soft_fails_for_non_gpg_errors() {
+        // When hook fails for non-GPG reasons (e.g., not in a git repo),
+        // it should still return Ok (soft failure).
+        let fake_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").unwrap_or_default();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        // Chdir to a non-git directory
+        let original_cwd = safe_cwd();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = run_hook_post_commit();
+        assert!(
+            result.is_ok(),
+            "non-GPG hook failures should be soft (return Ok)"
+        );
+
+        unsafe {
+            std::env::set_var("HOME", &original_home);
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: maybe_encrypt_note helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_maybe_encrypt_note_no_recipient_returns_plaintext() {
+        let content = "agent: claude-code\nsession_id: test";
+        let result = maybe_encrypt_note(content, &None).unwrap();
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    #[serial]
+    fn test_maybe_encrypt_note_with_recipient_encrypts() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let content = "agent: claude-code\nsession_id: test";
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            maybe_encrypt_note(content, &Some(email.clone()))
+        })
+        .unwrap();
+
+        assert!(
+            result.starts_with("-----BEGIN PGP MESSAGE-----"),
+            "encrypted result should start with PGP header"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_maybe_encrypt_note_with_invalid_recipient_returns_error() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let empty_gnupghome = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                empty_gnupghome.path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+
+        let content = "agent: claude-code\nsession_id: test";
+        let result = with_env(
+            "GNUPGHOME",
+            empty_gnupghome.path().to_str().unwrap(),
+            || maybe_encrypt_note(content, &Some("bad@invalid.test".to_string())),
+        );
+
+        assert!(
+            result.is_err(),
+            "encrypt with invalid recipient should fail"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: Hydrate encryption
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_hydrate_plaintext_when_no_recipient() {
+        // Existing hydrate tests already cover this path implicitly.
+        // This test explicitly verifies no PGP header in hydrated notes.
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        // Create session log
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"hydrate-gpg-test","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"Done"}}
+"#,
+            cwd = git_repo_root,
+            short = &head_hash[..7],
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // No recipient configured — hydrate should write plaintext
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ])
+            .output()
+            .unwrap();
+
+        if note_output.status.success() {
+            let note = String::from_utf8(note_output.stdout).unwrap();
+            assert!(
+                !note.starts_with("-----BEGIN PGP MESSAGE-----"),
+                "hydrated note should be plaintext when no recipient configured"
+            );
+            assert!(
+                note.contains("agent: claude-code"),
+                "hydrated note should contain agent field"
+            );
+        }
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_hydrate_encrypts_when_recipient_configured() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+            std::env::set_var("GNUPGHOME", gpg_home.path());
+        }
+
+        // Set GPG recipient in isolated global config
+        std::process::Command::new("git")
+            .args([
+                "config",
+                "--file",
+                global_config.to_str().unwrap(),
+                "ai.session-commit-linker.gpg.recipient",
+                &email,
+            ])
+            .output()
+            .unwrap();
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let head_ts: i64 = head_ts_str.parse().unwrap();
+
+        // Create session log
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"hydrate-encrypt-test","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"Done"}}
+"#,
+            cwd = git_repo_root,
+            short = &head_hash[..7],
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(head_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Run hydrate with recipient configured
+        let result = run_hydrate("7d", false);
+        assert!(result.is_ok());
+
+        let note_output = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &head_hash,
+            ])
+            .output()
+            .unwrap();
+
+        if note_output.status.success() {
+            let note = String::from_utf8(note_output.stdout).unwrap();
+            assert!(
+                note.trim().starts_with("-----BEGIN PGP MESSAGE-----"),
+                "hydrated note should be encrypted when recipient is configured, got: {}",
+                &note[..std::cmp::min(80, note.len())]
+            );
+            assert!(
+                !note.contains("agent: claude-code"),
+                "encrypted hydrated note should not contain plaintext fields"
+            );
+        }
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+            match original_gnupghome {
+                Some(g) => std::env::set_var("GNUPGHOME", g),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPG Hook Tests: Retry path encryption
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_retry_encrypts_note_when_recipient_configured() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let dir = init_temp_repo();
+        let repo_path = dir.path();
+
+        let original_cwd = safe_cwd();
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let original_home = std::env::var("HOME").ok();
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+
+        let global_config = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+            std::env::set_var("GNUPGHOME", gpg_home.path());
+        }
+
+        // Set GPG recipient
+        std::process::Command::new("git")
+            .args([
+                "config",
+                "--file",
+                global_config.to_str().unwrap(),
+                "ai.session-commit-linker.gpg.recipient",
+                &email,
+            ])
+            .output()
+            .unwrap();
+
+        let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
+        let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let first_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
+        let first_ts: i64 = first_ts_str.parse().unwrap();
+
+        // Step 1: Run hook with no session logs — creates pending record
+        std::env::set_current_dir(repo_path).expect("failed to chdir");
+
+        // Force hook to not find session (encryption isn't attempted if no session)
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // Step 2: Now create session log for the first commit
+        let git_repo_root_path = std::path::Path::new(&git_repo_root);
+        let encoded = agents::encode_repo_path(git_repo_root_path);
+        let claude_project_dir = fake_home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&claude_project_dir).unwrap();
+
+        let session_content = format!(
+            r#"{{"session_id":"retry-encrypt-test","cwd":"{cwd}"}}
+{{"type":"tool_result","content":"[main {short}] initial commit\n 1 file changed"}}
+{{"type":"assistant","message":"Done"}}
+"#,
+            cwd = git_repo_root,
+            short = &first_hash[..7],
+        );
+        let session_file = claude_project_dir.join("session.jsonl");
+        std::fs::write(&session_file, &session_content).unwrap();
+
+        let ft = filetime::FileTime::from_unix_time(first_ts, 0);
+        filetime::set_file_mtime(&session_file, ft).unwrap();
+
+        // Step 3: Make second commit, triggering retry of pending
+        std::fs::write(repo_path.join("file2.txt"), "second").unwrap();
+        run_git(repo_path, &["add", "file2.txt"]);
+        run_git(repo_path, &["commit", "-m", "second commit"]);
+
+        let result = run_hook_post_commit();
+        assert!(result.is_ok());
+
+        // Verify the note on first commit is encrypted
+        let note_output = std::process::Command::new("git")
+            .args(["-C", repo_path.to_str().unwrap()])
+            .args([
+                "notes",
+                "--ref",
+                "refs/notes/ai-sessions",
+                "show",
+                &first_hash,
+            ])
+            .output()
+            .unwrap();
+
+        if note_output.status.success() {
+            let note = String::from_utf8(note_output.stdout).unwrap();
+            assert!(
+                note.trim().starts_with("-----BEGIN PGP MESSAGE-----"),
+                "retry-attached note should be encrypted, got: {}",
+                &note[..std::cmp::min(80, note.len())]
+            );
+        }
+
+        unsafe {
+            match original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+            match original_gnupghome {
+                Some(g) => std::env::set_var("GNUPGHOME", g),
+                None => std::env::remove_var("GNUPGHOME"),
             }
         }
         std::env::set_current_dir(original_cwd).unwrap();
