@@ -187,10 +187,7 @@ fn ensure_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 fn clear_json_files(dir: &Path) -> anyhow::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => return Err(e.into()),
-    };
+    let entries = std::fs::read_dir(dir)?;
 
     for entry in entries {
         let entry = match entry {
