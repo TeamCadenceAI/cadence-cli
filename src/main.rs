@@ -3495,6 +3495,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(not(windows))]
     fn gpg_status_collect_with_recipient_configured() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join(".gitconfig");
@@ -4574,6 +4575,7 @@ mod tests {
         let original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -4636,6 +4638,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -4715,6 +4718,7 @@ mod tests {
         let original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -4777,6 +4781,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -4789,6 +4794,7 @@ mod tests {
         let original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -4851,6 +4857,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 

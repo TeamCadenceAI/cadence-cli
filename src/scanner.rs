@@ -443,17 +443,18 @@ fn extract_hashes_from_line(
 /// - If path contains `.codex` -> Codex
 /// - Otherwise -> Claude (conservative default)
 fn infer_agent_type(path: &Path) -> AgentType {
-    let path_str = path.to_string_lossy();
-    if path_str.contains(".codex") {
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let path_lower = path_str.to_ascii_lowercase();
+    if path_lower.contains(".codex") {
         AgentType::Codex
-    } else if path_str.contains(".cursor") || path_str.contains("/Cursor/") {
+    } else if path_lower.contains(".cursor") || path_lower.contains("/cursor/") {
         AgentType::Cursor
-    } else if path_str.contains("/Antigravity/")
-        || path_str.contains("/antigravity-api/")
-        || path_str.contains("/.cadence/cli/antigravity-api/")
+    } else if path_lower.contains("/antigravity/")
+        || path_lower.contains("/antigravity-api/")
+        || path_lower.contains("/.cadence/cli/antigravity-api/")
     {
         AgentType::Antigravity
-    } else if path_str.contains("/Code/") {
+    } else if path_lower.contains("/code/") {
         AgentType::Copilot
     } else {
         // Default to Claude -- `.claude` paths and unknown paths
