@@ -144,6 +144,7 @@ fn pre_push_hook_content() -> String {
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
     eprintln!("[cadence] Installing...");
+    let install_start = std::time::Instant::now();
 
     let home = match home_override {
         Some(h) => h.to_path_buf(),
@@ -357,18 +358,42 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
     // Step 6: Run hydration for the last 7 days
     eprintln!("[cadence] Running initial hydration (last 30 days)...");
+    let hydrate_start = std::time::Instant::now();
     if let Err(e) = run_hydrate("30d", false) {
         eprintln!("[cadence] error: hydration failed: {}", e);
         had_errors = true;
     }
+    eprintln!(
+        "[cadence] Hydration done in {} ms",
+        hydrate_start.elapsed().as_millis()
+    );
 
-    // Note: install intentionally does not sync notes to avoid blocking.
+    // Optional: sync notes for the current repo if a push remote resolves
+    if let Ok(Some(remote)) = git::resolve_push_remote() {
+        let consented = matches!(
+            git::config_get("ai.session-commit-linker.autopush"),
+            Ok(Some(val)) if val == "true"
+        );
+        if consented && push::check_org_filter_remote(&remote) {
+            eprintln!("[cadence] Syncing notes to {}", remote);
+            let sync_start = std::time::Instant::now();
+            push::sync_notes_for_remote(&remote);
+            eprintln!(
+                "[cadence] Sync finished in {} ms",
+                sync_start.elapsed().as_millis()
+            );
+        }
+    }
 
     if had_errors {
         eprintln!("[cadence] Installation completed with errors (see above)");
     } else {
         eprintln!("[cadence] Installation complete!");
     }
+    eprintln!(
+        "[cadence] Install total {} ms",
+        install_start.elapsed().as_millis()
+    );
 
     Ok(())
 }
@@ -496,7 +521,12 @@ fn hook_post_commit_inner() -> Result<()> {
             if let Ok(Some(remote)) = git::resolve_push_remote()
                 && push::should_push_remote(&remote)
             {
+                let push_start = std::time::Instant::now();
                 push::attempt_push_remote(&remote);
+                eprintln!(
+                    "[cadence] post-commit push elapsed_ms={}",
+                    push_start.elapsed().as_millis()
+                );
             }
 
             attached = true;
@@ -540,7 +570,12 @@ fn hook_post_commit_inner() -> Result<()> {
             if let Ok(Some(remote)) = git::resolve_push_remote()
                 && push::should_push_remote(&remote)
             {
+                let push_start = std::time::Instant::now();
                 push::attempt_push_remote(&remote);
+                eprintln!(
+                    "[cadence] post-commit push elapsed_ms={}",
+                    push_start.elapsed().as_millis()
+                );
             }
 
             attached = true;
@@ -568,7 +603,12 @@ fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     }
 
     if push::should_push_remote(remote) {
+        let sync_start = std::time::Instant::now();
         push::sync_notes_for_remote(remote);
+        eprintln!(
+            "[cadence] pre-push sync elapsed_ms={}",
+            sync_start.elapsed().as_millis()
+        );
     }
 
     Ok(())
@@ -845,7 +885,12 @@ fn try_resolve_single_commit(
                     if let Ok(Some(remote)) = git::resolve_push_remote()
                         && push::should_push_remote(&remote)
                     {
+                        let push_start = std::time::Instant::now();
                         push::attempt_push_remote(&remote);
+                        eprintln!(
+                            "[cadence] retry push elapsed_ms={}",
+                            push_start.elapsed().as_millis()
+                        );
                     }
 
                     return ResolveResult::Attached;
@@ -887,7 +932,12 @@ fn try_resolve_single_commit(
                 if let Ok(Some(remote)) = git::resolve_push_remote()
                     && push::should_push_remote(&remote)
                 {
+                    let push_start = std::time::Instant::now();
                     push::attempt_push_remote(&remote);
+                    eprintln!(
+                        "[cadence] retry push elapsed_ms={}",
+                        push_start.elapsed().as_millis()
+                    );
                 }
 
                 return ResolveResult::Attached;
@@ -925,7 +975,12 @@ fn try_resolve_single_commit(
         if let Ok(Some(remote)) = git::resolve_push_remote()
             && push::should_push_remote(&remote)
         {
+            let push_start = std::time::Instant::now();
             push::attempt_push_remote(&remote);
+            eprintln!(
+                "[cadence] retry push elapsed_ms={}",
+                push_start.elapsed().as_millis()
+            );
         }
 
         ResolveResult::Attached

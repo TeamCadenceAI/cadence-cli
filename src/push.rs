@@ -70,12 +70,19 @@ pub fn attempt_push_remote(remote: &str) {
 /// Sync notes with the provided remote:
 /// fetch notes, merge into local notes ref, then push notes to the remote.
 pub fn sync_notes_for_remote(remote: &str) {
+    let start = std::time::Instant::now();
+    eprintln!("[cadence] sync: start remote={}", remote);
     if let Err(e) = sync_notes_for_remote_inner(remote) {
         eprintln!(
             "[cadence] warning: failed to sync notes for {}: {}",
             remote, e
         );
     }
+    eprintln!(
+        "[cadence] sync: done remote={} elapsed_ms={}",
+        remote,
+        start.elapsed().as_millis()
+    );
 }
 
 fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
@@ -83,22 +90,42 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         anyhow::bail!("invalid remote name");
     }
 
+    let phase = std::time::Instant::now();
     let local_hash = local_notes_hash().context("failed to read local notes ref")?;
     let remote_hash = remote_notes_hash(remote).context("failed to read remote notes ref")?;
+    eprintln!(
+        "[cadence] sync: hashes local={:?} remote={:?} elapsed_ms={}",
+        local_hash,
+        remote_hash,
+        phase.elapsed().as_millis()
+    );
 
     match (&local_hash, &remote_hash) {
-        (None, None) => return Ok(()),
-        (Some(l), Some(r)) if l == r => return Ok(()),
+        (None, None) => {
+            eprintln!("[cadence] sync: skip (no local/remote notes)");
+            return Ok(());
+        }
+        (Some(l), Some(r)) if l == r => {
+            eprintln!("[cadence] sync: skip (hashes match)");
+            return Ok(());
+        }
         _ => {}
     }
 
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
     let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
 
+    let fetch_start = std::time::Instant::now();
     let fetch_status = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
         .args(["fetch", remote, &fetch_spec])
         .output()
         .context("failed to execute git fetch for notes")?;
+    eprintln!(
+        "[cadence] sync: fetch elapsed_ms={}",
+        fetch_start.elapsed().as_millis()
+    );
 
     let fetched = fetch_status.status.success();
     if !fetched {
@@ -111,10 +138,17 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     }
 
     if fetched {
+        let merge_start = std::time::Instant::now();
         let merge_status = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "echo")
             .args(["notes", "--ref", git::NOTES_REF, "merge", &temp_ref])
             .output()
             .context("failed to execute git notes merge")?;
+        eprintln!(
+            "[cadence] sync: merge elapsed_ms={}",
+            merge_start.elapsed().as_millis()
+        );
 
         if !merge_status.status.success() {
             let stderr = String::from_utf8_lossy(&merge_status.stderr);
@@ -126,21 +160,37 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         }
 
         let _ = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "echo")
             .args(["update-ref", "-d", &temp_ref])
             .output();
     }
 
+    let post_hash_start = std::time::Instant::now();
     let post_merge_hash = local_notes_hash().context("failed to read local notes ref")?;
+    eprintln!(
+        "[cadence] sync: post-merge hash={:?} elapsed_ms={}",
+        post_merge_hash,
+        post_hash_start.elapsed().as_millis()
+    );
     if let (Some(local), Some(remote)) = (&post_merge_hash, &remote_hash) {
         if local == remote {
+            eprintln!("[cadence] sync: skip push (hash unchanged)");
             return Ok(());
         }
     }
 
+    let push_start = std::time::Instant::now();
     let push_status = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
         .args(["push", remote, git::NOTES_REF])
         .output()
         .context("failed to execute git push for notes")?;
+    eprintln!(
+        "[cadence] sync: push elapsed_ms={}",
+        push_start.elapsed().as_millis()
+    );
 
     if !push_status.status.success() {
         let stderr = String::from_utf8_lossy(&push_status.stderr);
@@ -152,6 +202,8 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 
 fn local_notes_hash() -> Result<Option<String>> {
     let output = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
         .args(["show-ref", "--verify", "--hash", git::NOTES_REF])
         .output()
         .context("failed to execute git show-ref")?;
@@ -170,7 +222,10 @@ fn local_notes_hash() -> Result<Option<String>> {
 }
 
 fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
+    let start = std::time::Instant::now();
     let output = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
         .args(["ls-remote", "--refs", remote, git::NOTES_REF])
         .output()
         .context("failed to execute git ls-remote")?;
@@ -181,6 +236,10 @@ fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     }
 
     let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    eprintln!(
+        "[cadence] sync: ls-remote elapsed_ms={}",
+        start.elapsed().as_millis()
+    );
     let line = stdout.lines().next().unwrap_or("");
     let hash = line.split_whitespace().next().unwrap_or("");
     if hash.is_empty() {
