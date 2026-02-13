@@ -2329,10 +2329,30 @@ mod tests {
     use crate::agents::app_config_dir_in;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
+    use std::path::PathBuf;
 
     fn run_gpg_setup_with_io(input: &mut dyn std::io::BufRead, output: &mut Vec<u8>) -> Result<()> {
         let mut prompter = BufferedPrompter::new(input);
         run_gpg_setup_inner(&mut prompter, output)
+    }
+
+    fn set_isolated_global_git_config(fake_home: &TempDir) -> (PathBuf, Option<String>) {
+        let original = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        let global_config_path = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config_path, "").unwrap();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config_path);
+        }
+        (global_config_path, original)
+    }
+
+    fn restore_global_git_config(original: Option<String>) {
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
     }
 
     #[test]
@@ -3659,6 +3679,7 @@ mod tests {
 
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -3720,6 +3741,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -3798,6 +3820,7 @@ mod tests {
 
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -3859,6 +3882,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -3871,6 +3895,7 @@ mod tests {
 
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -3932,6 +3957,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 

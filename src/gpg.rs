@@ -414,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn test_key_exists_nonexistent_returns_false() {
         // Unless the test machine happens to have this key, this should be false.
         // If gpg is missing, also returns false.

@@ -31,4 +31,4 @@ jobs:
           tool: nextest
 
       - name: Test
-        run: cargo nextest run
+        run: cargo nextest run --no-fail-fast
