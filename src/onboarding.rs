@@ -10,19 +10,6 @@ const SCOPE_CONFIG_KEY: &str = "ai.session-commit-linker.scope";
 const SCOPE_CURRENT_REPO_KEY: &str = "ai.session-commit-linker.scope.current-repo";
 const SCOPE_CURRENT_REPO_KEY_LEGACY: &str = "ai.session-commit-linker.scope.current_repo";
 const SCOPE_SELECTED_REPOS_KEY: &str = "ai.session-commit-linker.scope.selected";
-const FTUE_BANNER: &str = r#"
-   ______          __
-  / ____/___ _____/ /__  ____  ________
- / /   / __ `/ __  / _ \/ __ \/ ___/ _ \
-/ /___/ /_/ / /_/ /  __/ / / / /__/  __/
-\____/\__,_/\__,_/\___/_/ /_/\___/\___/
-
-   ________    ____
-  / ____/ /   /  _/
- / /   / /    / /
-/ /___/ /____/ /
-\____/_____/___/
-"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScopeMode {
@@ -360,21 +347,29 @@ fn parse_scope_mode(raw: &str) -> Option<ScopeMode> {
 
 fn print_ftue_banner() {
     eprintln!("[ai-session-commit-linker]");
-    for line in FTUE_BANNER.trim_matches('\n').lines() {
-        eprintln!("[ai-session-commit-linker] {}", line);
-    }
-    eprintln!("[ai-session-commit-linker] Cadence CLI setup");
+    eprintln!("[ai-session-commit-linker] Cadence CLI");
+    eprintln!("[ai-session-commit-linker] First-time setup");
+    eprintln!("[ai-session-commit-linker] How it works:");
+    eprintln!(
+        "[ai-session-commit-linker]   On each commit, a hook links your latest AI session to that commit as a git note."
+    );
     eprintln!("[ai-session-commit-linker]");
 }
 
 fn print_ftue_completion() {
     eprintln!("[ai-session-commit-linker]");
     eprintln!("[ai-session-commit-linker] ================================================");
-    eprintln!("[ai-session-commit-linker] Thank you. You are now set up.");
-    eprintln!("[ai-session-commit-linker] The following repos are configured:");
+    eprintln!("[ai-session-commit-linker] Setup complete.");
+    eprintln!(
+        "[ai-session-commit-linker] A global post-commit hook is installed. New commits are processed automatically."
+    );
+    eprintln!(
+        "[ai-session-commit-linker] If allowed by your settings, notes may also be pushed to origin."
+    );
+    eprintln!("[ai-session-commit-linker] Configured repository scope:");
     match get_scope_mode() {
         ScopeMode::All => {
-            eprintln!("[ai-session-commit-linker]   - all repos");
+            eprintln!("[ai-session-commit-linker]   - all repositories");
         }
         ScopeMode::Current => {
             if let Some(repo) = current_scope_repo() {
@@ -394,7 +389,11 @@ fn print_ftue_completion() {
             }
         }
     }
-    eprintln!("[ai-session-commit-linker] Nothing more to do.");
+    eprintln!("[ai-session-commit-linker] Check status: ai-session-commit-linker status");
+    eprintln!(
+        "[ai-session-commit-linker] View upload activity: ai-session-commit-linker uploads list"
+    );
+    eprintln!("[ai-session-commit-linker] Manage scope: ai-session-commit-linker scope list");
     eprintln!("[ai-session-commit-linker] ================================================");
     eprintln!("[ai-session-commit-linker]");
 }

@@ -5,6 +5,7 @@ mod onboarding;
 mod pending;
 mod push;
 mod scanner;
+mod uploads;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -19,7 +20,7 @@ use std::process;
     name = "ai-session-commit-linker",
     version,
     about,
-    after_help = "Examples:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker reset\n  ai-session-commit-linker status\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
+    after_help = "Examples:\n  ai-session-commit-linker install --ftue\n  ai-session-commit-linker reset\n  ai-session-commit-linker status\n  ai-session-commit-linker uploads list --since 30d\n  ai-session-commit-linker uploads show <event-id>\n  ai-session-commit-linker onboard --email you@example.com\n  ai-session-commit-linker scope set selected\n  ai-session-commit-linker scope add /path/to/repo\n  ai-session-commit-linker scope list\n  ai-session-commit-linker hydrate --since 30d --push\n  ai-session-commit-linker retry"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -71,6 +72,12 @@ enum Command {
         scope_command: ScopeCommand,
     },
 
+    /// Inspect upload activity (git notes pushes) audit log.
+    Uploads {
+        #[command(subcommand)]
+        uploads_command: UploadsCommand,
+    },
+
     /// Reset AI Session Commit Linker configuration/state.
     #[command(alias = "uninstall")]
     Reset,
@@ -116,6 +123,21 @@ enum HookCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum UploadsCommand {
+    /// List upload attempts from the local audit log.
+    List {
+        /// Time window, e.g. "7d", "30d".
+        #[arg(long, default_value = "30d")]
+        since: String,
+    },
+    /// Show one upload attempt by event ID.
+    Show {
+        /// Event ID from `uploads list`.
+        id: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
@@ -144,6 +166,12 @@ fn run_install_inner(
     first_time_experience: bool,
 ) -> Result<()> {
     eprintln!("[ai-session-commit-linker] Installing...");
+    eprintln!(
+        "[ai-session-commit-linker] This tool links AI coding sessions to commits using git notes."
+    );
+    eprintln!(
+        "[ai-session-commit-linker] It runs locally for your configured scope and can push notes to your remote."
+    );
 
     let home = match home_override {
         Some(h) => h.to_path_buf(),
@@ -314,8 +342,22 @@ fn run_install_inner(
 
     if had_errors {
         eprintln!("[ai-session-commit-linker] Installation completed with errors (see above)");
+        eprintln!(
+            "[ai-session-commit-linker] Additional setup may be required; run `ai-session-commit-linker status`."
+        );
     } else {
-        eprintln!("[ai-session-commit-linker] Installation complete!");
+        eprintln!("[ai-session-commit-linker] Setup complete.");
+        eprintln!(
+            "[ai-session-commit-linker] A global post-commit hook is installed. New commits are processed automatically."
+        );
+        eprintln!(
+            "[ai-session-commit-linker] If allowed by your settings, notes may also be pushed to origin."
+        );
+        eprintln!("[ai-session-commit-linker] Check status: ai-session-commit-linker status");
+        eprintln!(
+            "[ai-session-commit-linker] View upload activity: ai-session-commit-linker uploads list"
+        );
+        eprintln!("[ai-session-commit-linker] Manage scope: ai-session-commit-linker scope list");
     }
 
     Ok(())
@@ -441,7 +483,7 @@ fn hook_post_commit_inner() -> Result<()> {
 
             // Push notes if conditions are met (consent, org filter, remote exists)
             if push::should_push() {
-                push::attempt_push();
+                push::attempt_push(uploads::UploadTrigger::Hook);
             }
         } else {
             // Verification failed — treat as no match, write pending
@@ -634,7 +676,7 @@ fn try_resolve_single_commit(
 
         // Push if conditions are met
         if push::should_push() {
-            push::attempt_push();
+            push::attempt_push(uploads::UploadTrigger::Retry);
         }
 
         ResolveResult::Attached
@@ -982,7 +1024,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     // Step 7: Push if requested
     if do_push {
         eprintln!("[ai-session-commit-linker] Pushing notes...");
-        push::attempt_push();
+        push::attempt_push(uploads::UploadTrigger::Hydrate);
     }
 
     Ok(())
@@ -1063,6 +1105,56 @@ fn run_scope(scope_command: ScopeCommand) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn run_uploads(uploads_command: UploadsCommand) -> Result<()> {
+    match uploads_command {
+        UploadsCommand::List { since } => {
+            let since_secs = parse_since_duration(&since)?;
+            let events = uploads::list_events(Some(since_secs))?;
+            if events.is_empty() {
+                eprintln!(
+                    "[ai-session-commit-linker] No upload attempts found in the last {}.",
+                    since
+                );
+                return Ok(());
+            }
+
+            eprintln!(
+                "[ai-session-commit-linker] Upload attempts (last {}): {}",
+                since,
+                events.len()
+            );
+            for event in events {
+                eprintln!(
+                    "[ai-session-commit-linker]   {}  time={}  status={}  trigger={}  repo={}  remote={}",
+                    event.id, event.time, event.status, event.trigger, event.repo, event.remote
+                );
+            }
+        }
+        UploadsCommand::Show { id } => match uploads::get_event(&id)? {
+            Some(event) => {
+                eprintln!("[ai-session-commit-linker] Upload event {}", event.id);
+                eprintln!("[ai-session-commit-linker]   time: {}", event.time);
+                eprintln!("[ai-session-commit-linker]   status: {}", event.status);
+                eprintln!("[ai-session-commit-linker]   trigger: {}", event.trigger);
+                eprintln!("[ai-session-commit-linker]   repo: {}", event.repo);
+                eprintln!("[ai-session-commit-linker]   remote: {}", event.remote);
+                eprintln!(
+                    "[ai-session-commit-linker]   notes ref: {}",
+                    event.notes_ref
+                );
+                if let Some(err) = event.error {
+                    eprintln!("[ai-session-commit-linker]   error: {}", err);
+                }
+            }
+            None => {
+                anyhow::bail!("upload event not found: {}", id);
+            }
+        },
+    }
+
     Ok(())
 }
 
@@ -1215,6 +1307,35 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         .ok();
     }
 
+    // --- Upload audit summary ---
+    match uploads::summary_last_7d() {
+        Ok(summary) => {
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Upload attempts (last 7d): {}",
+                summary.uploads_last_7d
+            )
+            .ok();
+            if let Some(last) = summary.last {
+                writeln!(
+                    w,
+                    "[ai-session-commit-linker]   Last upload: {} status={} trigger={}",
+                    last.time, last.status, last.trigger
+                )
+                .ok();
+            } else {
+                writeln!(w, "[ai-session-commit-linker]   Last upload: (none)").ok();
+            }
+        }
+        Err(_) => {
+            writeln!(
+                w,
+                "[ai-session-commit-linker]   Upload attempts (last 7d): (unavailable)"
+            )
+            .ok();
+        }
+    }
+
     // --- Org filter ---
     match git::config_get_global("ai.session-commit-linker.org") {
         Ok(Some(org)) => {
@@ -1341,6 +1462,7 @@ fn main() {
         Command::Retry => run_retry(),
         Command::Onboard { email } => run_onboard(email),
         Command::Scope { scope_command } => run_scope(scope_command),
+        Command::Uploads { uploads_command } => run_uploads(uploads_command),
         Command::Reset => run_reset(),
         Command::Status => run_status(),
     };
@@ -1536,6 +1658,36 @@ mod tests {
                 scope_command: ScopeCommand::Add { .. }
             }
         ));
+    }
+
+    #[test]
+    fn cli_parses_uploads_list() {
+        let cli = Cli::parse_from([
+            "ai-session-commit-linker",
+            "uploads",
+            "list",
+            "--since",
+            "7d",
+        ]);
+        match cli.command {
+            Command::Uploads { uploads_command } => match uploads_command {
+                UploadsCommand::List { since } => assert_eq!(since, "7d"),
+                _ => panic!("expected Uploads list command"),
+            },
+            _ => panic!("expected Uploads command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_uploads_show() {
+        let cli = Cli::parse_from(["ai-session-commit-linker", "uploads", "show", "abc123"]);
+        match cli.command {
+            Command::Uploads { uploads_command } => match uploads_command {
+                UploadsCommand::Show { id } => assert_eq!(id, "abc123"),
+                _ => panic!("expected Uploads show command"),
+            },
+            _ => panic!("expected Uploads command"),
+        }
     }
 
     #[test]

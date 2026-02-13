@@ -19,6 +19,7 @@
 //! commit, never retry automatically in the hook.
 
 use crate::git;
+use crate::uploads::UploadTrigger;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -55,12 +56,44 @@ pub fn should_push() -> bool {
 ///
 /// On success: silent (no output).
 /// On failure: logs a warning to stderr. Never blocks, never retries.
-pub fn attempt_push() {
-    if let Err(e) = git::push_notes() {
-        eprintln!(
-            "[ai-session-commit-linker] warning: failed to push notes: {}",
-            e
-        );
+pub fn attempt_push(trigger: UploadTrigger) {
+    let repo = git::repo_root()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "(unknown repo)".to_string());
+    let remote = git::repo_root()
+        .ok()
+        .and_then(|root| git::first_remote_url_at(&root).ok().flatten())
+        .unwrap_or_else(|| "origin".to_string());
+
+    match git::push_notes() {
+        Ok(()) => {
+            if let Err(e) = crate::uploads::record_push_attempt(&repo, &remote, trigger, true, None)
+            {
+                eprintln!(
+                    "[ai-session-commit-linker] warning: failed to write upload audit event: {}",
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[ai-session-commit-linker] warning: failed to push notes: {}",
+                e
+            );
+            if let Err(log_err) = crate::uploads::record_push_attempt(
+                &repo,
+                &remote,
+                trigger,
+                false,
+                Some(&e.to_string()),
+            ) {
+                eprintln!(
+                    "[ai-session-commit-linker] warning: failed to write upload audit event: {}",
+                    log_err
+                );
+            }
+        }
     }
 }
 
@@ -745,7 +778,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
 
         // No remote configured -- push will fail, but should not panic
-        attempt_push();
+        attempt_push(UploadTrigger::Hook);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -769,7 +802,7 @@ mod tests {
         );
 
         // This will fail (can't connect) but should not panic or block
-        attempt_push();
+        attempt_push(UploadTrigger::Hook);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
