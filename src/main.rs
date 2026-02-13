@@ -6156,7 +6156,12 @@ mod tests {
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
         let mut buf = Vec::new();
-        let result = run_status_inner(&mut buf);
+        let git_dir = repo_path.join(".git");
+        let result = with_env("GIT_DIR", git_dir.to_str().unwrap(), || {
+            with_env("GIT_WORK_TREE", repo_path.to_str().unwrap(), || {
+                run_status_inner(&mut buf)
+            })
+        });
         assert!(result.is_ok());
 
         let output = String::from_utf8(buf).unwrap();
