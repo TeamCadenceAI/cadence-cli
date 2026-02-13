@@ -381,10 +381,12 @@ fn run_install_inner(
             "{}",
             ui::info("Check status: ai-session-commit-linker status")
         );
-        eprintln!(
-            "{}",
-            ui::info("View upload activity: ai-session-commit-linker uploads list")
-        );
+        if !first_time_experience {
+            eprintln!(
+                "{}",
+                ui::info("View upload activity: ai-session-commit-linker uploads list")
+            );
+        }
         eprintln!(
             "{}",
             ui::info("Manage scope: ai-session-commit-linker scope list")
@@ -808,15 +810,27 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     let user_email = onboarding::get_email();
 
     // Step 1: Collect all log directories (repo-agnostic)
+    eprintln!();
     eprintln!(
-        "[ai-session-commit-linker] Scanning Claude logs (last {} days)...",
-        since_days
+        "{}",
+        ui::title(&format!("Hydration (last {} days)", since_days))
+    );
+    eprintln!();
+    eprintln!(
+        "{}",
+        ui::info(&format!(
+            "Scanning Claude logs (last {} days)...",
+            since_days
+        ))
     );
     let claude_dirs = agents::claude::all_log_dirs();
 
     eprintln!(
-        "[ai-session-commit-linker] Scanning Codex logs (last {} days)...",
-        since_days
+        "{}",
+        ui::info(&format!(
+            "Scanning Codex logs (last {} days)...",
+            since_days
+        ))
     );
     let codex_dirs = agents::codex::all_log_dirs();
 
@@ -827,9 +841,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     // Step 2: Find all .jsonl files modified within the --since window
     let files = agents::recent_files(&all_dirs, now, since_secs);
     eprintln!(
-        "[ai-session-commit-linker] Found {} session logs",
-        files.len()
+        "{}",
+        ui::info(&format!("Found {} session logs", files.len()))
     );
+    eprintln!();
 
     // Counters for final summary
     let mut attached = 0usize;
@@ -897,7 +912,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Step 4: Process sessions grouped by repo
     for (repo_display, sessions) in &sessions_by_repo {
-        eprintln!("[ai-session-commit-linker] {}", repo_display);
+        eprintln!("{}", ui::title(repo_display));
 
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
@@ -935,7 +950,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             let mut session_skipped = 0usize;
             let mut messages: Vec<String> = Vec::new();
 
-            let header = format!("[ai-session-commit-linker]   {} |", session_display);
+            let header = format!("  {} |", session_display);
 
             for hash in &commit_hashes {
                 // Verify the commit exists in the resolved repo
@@ -1031,34 +1046,46 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     .first()
                     .map(|s| s.as_str())
                     .unwrap_or("nothing to do");
-                eprintln!("{} {}", header, status);
+                let icon = if status.contains("attached") {
+                    "✓"
+                } else if status.contains("error") || status.contains("failed") {
+                    "⚠"
+                } else {
+                    "·"
+                };
+                eprintln!("{} {} {}", icon, header, status);
             } else {
-                eprintln!("{}", header);
+                eprintln!("· {}", header);
                 for msg in &messages {
-                    eprintln!("[ai-session-commit-linker]     {}", msg);
+                    eprintln!("    {}", msg);
                 }
             }
         }
 
         // Per-repo summary
         eprintln!(
-            "[ai-session-commit-linker]   {} sessions, {} with commits, {} without",
+            "  {} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
         );
+        eprintln!();
     }
 
     // Final summary
     eprintln!(
-        "[ai-session-commit-linker] Done. {} attached, {} skipped, {} errors.",
-        attached, skipped, errors
+        "{}",
+        ui::ok(&format!(
+            "Done. {} attached, {} skipped, {} errors.",
+            attached, skipped, errors
+        ))
     );
 
     // Step 7: Push if requested
     if do_push {
-        eprintln!("[ai-session-commit-linker] Pushing notes...");
+        eprintln!("{}", ui::info("Pushing notes..."));
         push::attempt_push(uploads::UploadTrigger::Hydrate);
     }
 
+    eprintln!();
     Ok(())
 }
 

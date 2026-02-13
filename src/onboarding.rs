@@ -361,17 +361,6 @@ fn print_ftue_banner() {
 
 fn print_ftue_completion() {
     eprintln!();
-    eprintln!("{}", crate::ui::ok("Setup complete."));
-    eprintln!(
-        "{}",
-        crate::ui::info(
-            "A global post-commit hook is installed. New commits are processed automatically."
-        )
-    );
-    eprintln!(
-        "{}",
-        crate::ui::info("If allowed by your settings, notes may also be pushed to origin.")
-    );
     eprintln!("{}", crate::ui::info("Configured repository scope:"));
     match get_scope_mode() {
         ScopeMode::All => {
@@ -395,18 +384,6 @@ fn print_ftue_completion() {
             }
         }
     }
-    eprintln!(
-        "{}",
-        crate::ui::info("Check status: ai-session-commit-linker status")
-    );
-    eprintln!(
-        "{}",
-        crate::ui::info("View upload activity: ai-session-commit-linker uploads list")
-    );
-    eprintln!(
-        "{}",
-        crate::ui::info("Manage scope: ai-session-commit-linker scope list")
-    );
     eprintln!();
 }
 
