@@ -184,11 +184,6 @@ pub fn home_dir() -> Option<PathBuf> {
     }
 }
 
-pub fn app_config_dir(app: &str) -> Option<PathBuf> {
-    let home = home_dir()?;
-    Some(app_config_dir_in(app, &home))
-}
-
 pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library")
@@ -670,29 +665,31 @@ mod tests {
         let homedrive_backup = std::env::var("HOMEDRIVE").ok();
         let homepath_backup = std::env::var("HOMEPATH").ok();
 
-        std::env::remove_var("HOME");
-        std::env::remove_var("HOMEDRIVE");
-        std::env::remove_var("HOMEPATH");
-        std::env::set_var("USERPROFILE", "/tmp/test-userprofile");
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("HOMEDRIVE");
+            std::env::remove_var("HOMEPATH");
+            std::env::set_var("USERPROFILE", "/tmp/test-userprofile");
+        }
 
         let result = home_dir();
         assert_eq!(result, Some(PathBuf::from("/tmp/test-userprofile")));
 
         match home_backup {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
         match userprofile_backup {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
         }
         match homedrive_backup {
-            Some(v) => std::env::set_var("HOMEDRIVE", v),
-            None => std::env::remove_var("HOMEDRIVE"),
+            Some(v) => unsafe { std::env::set_var("HOMEDRIVE", v) },
+            None => unsafe { std::env::remove_var("HOMEDRIVE") },
         }
         match homepath_backup {
-            Some(v) => std::env::set_var("HOMEPATH", v),
-            None => std::env::remove_var("HOMEPATH"),
+            Some(v) => unsafe { std::env::set_var("HOMEPATH", v) },
+            None => unsafe { std::env::remove_var("HOMEPATH") },
         }
     }
 
