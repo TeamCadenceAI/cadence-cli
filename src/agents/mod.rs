@@ -21,7 +21,12 @@ use std::time::UNIX_EPOCH;
 /// - `/Users/foo/bar` -> `-Users-foo-bar`
 /// - `/home/user/dev/my-repo` -> `-home-user-dev-my-repo`
 pub fn encode_repo_path(path: &Path) -> String {
-    let path_str = path.to_string_lossy();
+    let mut path_str = path.to_string_lossy().replace('\\', "/");
+    if path_str.contains(':') && !path_str.starts_with('/') {
+        path_str = format!("/{}", path_str.replace(':', ""));
+    } else {
+        path_str = path_str.replace(':', "");
+    }
     path_str.replace('/', "-")
 }
 
@@ -163,9 +168,40 @@ pub fn recent_files_with_exts(
 /// Resolve the user's home directory.
 ///
 /// Returns `None` if the home directory cannot be determined.
-/// Uses the `HOME` environment variable, which works on Unix/macOS.
+/// Uses `HOME` on Unix/macOS and `USERPROFILE`/`HOMEDRIVE`+`HOMEPATH` on Windows.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    let drive = std::env::var("HOMEDRIVE").ok();
+    let path = std::env::var("HOMEPATH").ok();
+    match (drive, path) {
+        (Some(drive), Some(path)) => Some(PathBuf::from(format!("{}{}", drive, path))),
+        _ => None,
+    }
+}
+
+pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join(app)
+    } else if cfg!(target_os = "windows") {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            PathBuf::from(appdata).join(app)
+        } else {
+            home.join("AppData").join("Roaming").join(app)
+        }
+    } else {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        base.join(app)
+    }
 }
 
 /// Recursively find directories named `chatSessions` under a workspaceStorage root.
@@ -312,6 +348,7 @@ pub(crate) fn set_file_mtime(path: &Path, epoch_secs: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
@@ -353,6 +390,12 @@ mod tests {
     fn test_encode_preserves_dots() {
         let path = Path::new("/Users/foo/bar.baz");
         assert_eq!(encode_repo_path(path), "-Users-foo-bar.baz");
+    }
+
+    #[test]
+    fn test_encode_windows_path_normalizes_drive_and_separators() {
+        let path = Path::new("C:\\Users\\foo\\bar");
+        assert_eq!(encode_repo_path(path), "-C-Users-foo-bar");
     }
 
     // -----------------------------------------------------------------------
@@ -612,5 +655,66 @@ mod tests {
         let home = home_dir();
         assert!(home.is_some());
         assert!(home.unwrap().is_absolute());
+    }
+
+    #[test]
+    #[serial]
+    fn test_home_dir_falls_back_to_userprofile() {
+        let home_backup = std::env::var("HOME").ok();
+        let userprofile_backup = std::env::var("USERPROFILE").ok();
+        let homedrive_backup = std::env::var("HOMEDRIVE").ok();
+        let homepath_backup = std::env::var("HOMEPATH").ok();
+
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("HOMEDRIVE");
+            std::env::remove_var("HOMEPATH");
+            std::env::set_var("USERPROFILE", "/tmp/test-userprofile");
+        }
+
+        let result = home_dir();
+        assert_eq!(result, Some(PathBuf::from("/tmp/test-userprofile")));
+
+        match home_backup {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match userprofile_backup {
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match homedrive_backup {
+            Some(v) => unsafe { std::env::set_var("HOMEDRIVE", v) },
+            None => unsafe { std::env::remove_var("HOMEDRIVE") },
+        }
+        match homepath_backup {
+            Some(v) => unsafe { std::env::set_var("HOMEPATH", v) },
+            None => unsafe { std::env::remove_var("HOMEPATH") },
+        }
+    }
+
+    #[test]
+    fn test_app_config_dir_in_platform() {
+        let home = PathBuf::from("/home/tester");
+        let xdg_backup = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/home/tester/.config");
+        }
+        let dir = app_config_dir_in("Code", &home);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                dir,
+                PathBuf::from("/home/tester/Library/Application Support/Code")
+            );
+        } else if cfg!(target_os = "windows") {
+            assert!(dir.ends_with(PathBuf::from("Code")));
+        } else {
+            assert!(dir.starts_with(PathBuf::from("/home/tester")));
+            assert!(dir.ends_with(PathBuf::from("Code")));
+        }
+        match xdg_backup {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 }

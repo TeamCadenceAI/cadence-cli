@@ -8,8 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_SCRIPT="$SCRIPT_DIR/install.sh"
 
 # Config key constants (matching install.sh)
-GPG_RECIPIENT_KEY="ai.session-commit-linker.gpg.recipient"
-GPG_KEY_SOURCE_KEY="ai.session-commit-linker.gpg.publicKeySource"
+GPG_RECIPIENT_KEY="ai.cadence.gpg.recipient"
+GPG_KEY_SOURCE_KEY="ai.cadence.gpg.publicKeySource"
 
 # --- Test harness ---
 
@@ -357,7 +357,7 @@ test_manual_steps_none_done() {
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_contains "$_output" "Import your public key" "Shows import step when nothing done"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "Shows setup command when nothing done"
+    assert_contains "$_output" "cadence gpg setup" "Shows setup command when nothing done"
     cleanup_test_env
 }
 
@@ -369,7 +369,7 @@ test_manual_steps_gpg_installed() {
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_contains "$_output" "Import your public key" "Shows import step when gpg installed"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "Shows setup command when gpg installed"
+    assert_contains "$_output" "cadence gpg setup" "Shows setup command when gpg installed"
     cleanup_test_env
 }
 
@@ -381,7 +381,7 @@ test_manual_steps_key_imported() {
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_not_contains "$_output" "Import your public key" "Hides import step when key imported"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "Shows setup command when key imported but no recipient"
+    assert_contains "$_output" "cadence gpg setup" "Shows setup command when key imported but no recipient"
     cleanup_test_env
 }
 
@@ -433,7 +433,7 @@ test_ensure_gpg_missing_brew_missing() {
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_contains "$_output" "Homebrew is not installed" "Shows Homebrew not installed message"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "https://gnupg.org/download/" "Shows manual install URL"
+    assert_contains "$_output" "Install GPG manually" "Shows manual install guidance"
     cleanup_test_env
 }
 
@@ -609,7 +609,7 @@ test_gpg_setup_skip() {
     _output=$(echo "n" | (eval_helpers; setup_gpg_encryption) 2>&1)
     assert_contains "$_output" "WARNING: Session logs will be stored as plaintext" "Skip shows plaintext warning"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "Skip references gpg setup command"
+    assert_contains "$_output" "cadence gpg setup" "Skip references gpg setup command"
     # Verify no config written
     TESTS_RUN=$((TESTS_RUN + 1))
     if git config --global --get "$GPG_RECIPIENT_KEY" >/dev/null 2>&1; then
@@ -677,7 +677,7 @@ test_gpg_setup_quit_at_recipient() {
     _output=$(printf "y\n\nq\n" | (eval_helpers; setup_gpg_encryption) 2>&1)
     assert_contains "$_output" "To complete GPG setup manually" "Quit at recipient shows manual steps"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "Quit at recipient references setup command"
+    assert_contains "$_output" "cadence gpg setup" "Quit at recipient references setup command"
     cleanup_test_env
 }
 
@@ -689,7 +689,7 @@ test_gpg_setup_blank_recipient() {
     _output=$(printf "y\n\n\n" | (eval_helpers; setup_gpg_encryption) 2>&1)
     assert_contains "$_output" "No recipient set" "Blank recipient shows plaintext message"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "Blank recipient references setup command"
+    assert_contains "$_output" "cadence gpg setup" "Blank recipient references setup command"
     TESTS_RUN=$((TESTS_RUN + 1))
     if git config --global --get "$GPG_RECIPIENT_KEY" >/dev/null 2>&1; then
         fail "No config written on blank recipient" "Recipient was unexpectedly set"
@@ -730,7 +730,7 @@ test_gpg_missing_plaintext_continuation() {
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_contains "$_output" "WARNING: Session logs will be stored as plaintext" "GPG missing: plaintext warning"
     TESTS_RUN=$((TESTS_RUN + 1))
-    assert_contains "$_output" "ai-session-commit-linker gpg setup" "GPG missing: references gpg setup command"
+    assert_contains "$_output" "cadence gpg setup" "GPG missing: references gpg setup command"
     TESTS_RUN=$((TESTS_RUN + 1))
     assert_contains "$_output" "To complete GPG setup manually" "GPG missing: shows manual steps"
     TESTS_RUN=$((TESTS_RUN + 1))

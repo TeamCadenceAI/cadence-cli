@@ -1,11 +1,13 @@
 //! Copilot (VS Code chat sessions) log discovery.
 //!
 //! VS Code stores chat sessions under:
-//! ~/Library/Application Support/Code/User/workspaceStorage/*/chatSessions/*.json
+//! - macOS: ~/Library/Application Support/Code/User/workspaceStorage/*/chatSessions/*.json
+//! - Linux: ~/.config/Code/User/workspaceStorage/*/chatSessions/*.json
+//! - Windows: %APPDATA%\\Code\\User\\workspaceStorage\\*\\chatSessions\\*.json
 
 use std::path::{Path, PathBuf};
 
-use super::{find_chat_session_dirs, home_dir};
+use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
 
 /// Return all Copilot log directories for use by the post-commit hook.
 pub fn log_dirs() -> Vec<PathBuf> {
@@ -22,10 +24,7 @@ pub fn all_log_dirs() -> Vec<PathBuf> {
 }
 
 fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
-    let ws_root = home
-        .join("Library")
-        .join("Application Support")
-        .join("Code")
+    let ws_root = app_config_dir_in("Code", home)
         .join("User")
         .join("workspaceStorage");
     find_chat_session_dirs(&ws_root)
@@ -40,15 +39,12 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_copilot_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
-        let ws_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
+        let ws_root = app_config_dir_in("Code", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")

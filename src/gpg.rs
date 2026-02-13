@@ -2,7 +2,7 @@
 //!
 //! Provides functions to encrypt/decrypt note content using the system `gpg`
 //! binary. Encryption is optional: if a GPG recipient is configured in global
-//! git config (`ai.session-commit-linker.gpg.recipient`), notes are encrypted
+//! git config (`ai.cadence.gpg.recipient`), notes are encrypted
 //! before being attached as git notes. Both plaintext and encrypted notes are
 //! supported for backward compatibility.
 
@@ -17,10 +17,10 @@ use crate::git;
 const PGP_ARMOR_HEADER: &str = "-----BEGIN PGP MESSAGE-----";
 
 /// The git config key for the GPG recipient.
-pub const GPG_RECIPIENT_KEY: &str = "ai.session-commit-linker.gpg.recipient";
+pub const GPG_RECIPIENT_KEY: &str = "ai.cadence.gpg.recipient";
 
 /// The git config key for the GPG public key source (path or URL).
-pub const GPG_PUBLIC_KEY_SOURCE_KEY: &str = "ai.session-commit-linker.gpg.publicKeySource";
+pub const GPG_PUBLIC_KEY_SOURCE_KEY: &str = "ai.cadence.gpg.publicKeySource";
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -85,7 +85,7 @@ pub fn gpg_available() -> bool {
 
 /// Read the configured GPG recipient from **global** git config.
 ///
-/// Reads `ai.session-commit-linker.gpg.recipient`. Returns `Ok(None)` if the
+/// Reads `ai.cadence.gpg.recipient`. Returns `Ok(None)` if the
 /// key is not set or is blank/whitespace-only. Propagates real git errors.
 ///
 /// Uses global scope only (not merged repo+global) so that behavior is
@@ -414,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn test_key_exists_nonexistent_returns_false() {
         // Unless the test machine happens to have this key, this should be false.
         // If gpg is missing, also returns false.
@@ -436,7 +437,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let gnupghome = dir.path();
-        let email = "test-gpg@ai-session-commit-linker.test";
+        let email = "test-gpg@cadence.test";
 
         // Set restrictive permissions on the gnupg directory
         #[cfg(unix)]

@@ -1,16 +1,18 @@
 //! Antigravity log discovery (VS Code style workspace storage + local API).
 //!
 //! Antigravity stores chat sessions under:
-//! ~/Library/Application Support/Antigravity/User/workspaceStorage/*/chatSessions/*.json
+//! - macOS: ~/Library/Application Support/Antigravity/User/workspaceStorage/*/chatSessions/*.json
+//! - Linux: ~/.config/Antigravity/User/workspaceStorage/*/chatSessions/*.json
+//! - Windows: %APPDATA%\\Antigravity\\User\\workspaceStorage\\*\\chatSessions\\*.json
 //!
 //! If local API discovery succeeds, this module also writes API-fetched
-//! conversations into `~/.ai-session-commit-linker/antigravity-api/*.json`.
+//! conversations into `~/.cadence/cli/antigravity-api/*.json`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::{find_chat_session_dirs, home_dir};
+use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
 
 /// Return all Antigravity log directories for use by the post-commit hook.
 pub fn log_dirs() -> Vec<PathBuf> {
@@ -27,17 +29,10 @@ pub fn all_log_dirs() -> Vec<PathBuf> {
 }
 
 fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
-    let ws_root = home
-        .join("Library")
-        .join("Application Support")
-        .join("Antigravity")
+    let ws_root = app_config_dir_in("Antigravity", home)
         .join("User")
         .join("workspaceStorage");
-    let user_root = home
-        .join("Library")
-        .join("Application Support")
-        .join("Antigravity")
-        .join("User");
+    let user_root = app_config_dir_in("Antigravity", home).join("User");
 
     let mut dirs = BTreeSet::new();
     for dir in find_chat_session_dirs(&ws_root) {
@@ -67,15 +62,15 @@ struct LspProcess {
 }
 
 fn api_log_dir(home: &Path) -> Option<PathBuf> {
-    if std::env::var("AI_SESSION_COMMIT_LINKER_DISABLE_ANTIGRAVITY_API").is_ok() {
+    if std::env::var("CADENCE_DISABLE_ANTIGRAVITY_API").is_ok() {
         return None;
     }
-    let debug = std::env::var("AI_SESSION_COMMIT_LINKER_ANTIGRAVITY_DEBUG").is_ok();
+    let debug = std::env::var("CADENCE_ANTIGRAVITY_DEBUG").is_ok();
 
     let cache_dir = api_cache_dir(home);
     if ensure_dir(&cache_dir).is_err() {
         if debug {
-            eprintln!("[ai-session-commit-linker] antigravity: failed to create cache dir");
+            eprintln!("[cadence] antigravity: failed to create cache dir");
         }
         return None;
     }
@@ -84,36 +79,35 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
     let process = discover_lsp_process()?;
     if debug {
         eprintln!(
-            "[ai-session-commit-linker] antigravity: pid={}, extension_port={:?}",
+            "[cadence] antigravity: pid={}, extension_port={:?}",
             process.pid, process.extension_port
         );
     }
     let ports = discover_listening_ports(process.pid);
-    let (scheme, port) = match override_connect_port()
-        .or_else(|| probe_connect_port(&ports, &process.csrf_token))
-    {
-        Some(p) => p,
-        None => {
-            if let Some(ext_port) = process.extension_port {
-                if debug {
-                    eprintln!(
-                        "[ai-session-commit-linker] antigravity: probe failed, using extension port {}",
-                        ext_port
-                    );
+    let (scheme, port) =
+        match override_connect_port().or_else(|| probe_connect_port(&ports, &process.csrf_token)) {
+            Some(p) => p,
+            None => {
+                if let Some(ext_port) = process.extension_port {
+                    if debug {
+                        eprintln!(
+                            "[cadence] antigravity: probe failed, using extension port {}",
+                            ext_port
+                        );
+                    }
+                    ("http", ext_port)
+                } else {
+                    if debug {
+                        eprintln!("[cadence] antigravity: no connect port found");
+                    }
+                    return None;
                 }
-                ("http", ext_port)
-            } else {
-                if debug {
-                    eprintln!("[ai-session-commit-linker] antigravity: no connect port found");
-                }
-                return None;
             }
-        }
-    };
+        };
 
     if debug {
         eprintln!(
-            "[ai-session-commit-linker] antigravity: connect {}://127.0.0.1:{}",
+            "[cadence] antigravity: connect {}://127.0.0.1:{}",
             scheme, port
         );
     }
@@ -122,7 +116,7 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
         Ok(ids) => ids,
         Err(e) => {
             if debug {
-                eprintln!("[ai-session-commit-linker] antigravity: list failed: {e}");
+                eprintln!("[cadence] antigravity: list failed: {e}");
             }
             return None;
         }
@@ -130,7 +124,7 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
 
     if cascade_ids.is_empty() {
         if debug {
-            eprintln!("[ai-session-commit-linker] antigravity: no cascade ids found");
+            eprintln!("[cadence] antigravity: no cascade ids found");
         }
         return None;
     }
@@ -153,16 +147,13 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
                 if std::fs::write(&path, payload.to_string()).is_ok() {
                     wrote_any = true;
                 } else if debug {
-                    eprintln!(
-                        "[ai-session-commit-linker] antigravity: failed to write {}",
-                        path.display()
-                    );
+                    eprintln!("[cadence] antigravity: failed to write {}", path.display());
                 }
             }
             Err(e) => {
                 if debug {
                     eprintln!(
-                        "[ai-session-commit-linker] antigravity: steps failed for {}: {}",
+                        "[cadence] antigravity: steps failed for {}: {}",
                         cascade_id, e
                     );
                 }
@@ -175,8 +166,7 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
 }
 
 fn api_cache_dir(home: &Path) -> PathBuf {
-    home.join(".ai-session-commit-linker")
-        .join("antigravity-api")
+    home.join(".cadence/cli").join("antigravity-api")
 }
 
 fn ensure_dir(dir: &Path) -> anyhow::Result<()> {
@@ -480,25 +470,18 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
+    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_antigravity_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
-        let ws_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let ws_root = app_config_dir_in("Antigravity", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")
             .join("chatSessions");
         fs::create_dir_all(&ws_root).unwrap();
-        let other_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let other_root = app_config_dir_in("Antigravity", home.path())
             .join("User")
             .join("other")
             .join("chatSessions");

@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
 
-REPO="TeamCadenceAI/ai-session-commit-linker"
+REPO="TeamCadenceAI/cadence-cli"
 INSTALL_DIR="${HOME}/.local/bin"
+OS_NAME="$(uname -s)"
 
 # Git config key constants for GPG encryption
-GPG_RECIPIENT_KEY="ai.session-commit-linker.gpg.recipient"
-GPG_KEY_SOURCE_KEY="ai.session-commit-linker.gpg.publicKeySource"
+GPG_RECIPIENT_KEY="ai.cadence.gpg.recipient"
+GPG_KEY_SOURCE_KEY="ai.cadence.gpg.publicKeySource"
 
 # --- Helper functions ---
 
@@ -94,13 +95,23 @@ print_gpg_manual_steps() {
     echo "To complete GPG setup manually:"
 
     if [ "$_gpg_done" = false ]; then
-        echo "  1. Install GPG: brew install gnupg"
+        case "$OS_NAME" in
+            Darwin)
+                echo "  1. Install GPG: brew install gnupg"
+                ;;
+            Linux)
+                echo "  1. Install GPG: sudo apt-get install gnupg  (or your distro's package manager)"
+                ;;
+            *)
+                echo "  1. Install GPG: use your OS package manager"
+                ;;
+        esac
     fi
     if [ "$_import_done" = false ]; then
         echo "  2. Import your public key: gpg --import <key-file>"
     fi
     if [ "$_recipient_done" = false ]; then
-        echo "  3. Run: ai-session-commit-linker gpg setup"
+        echo "  3. Run: cadence gpg setup"
     else
         echo "  GPG encryption is configured."
     fi
@@ -116,35 +127,67 @@ ensure_gpg_available() {
 
     echo "gpg not found."
 
-    # macOS-specific: offer Homebrew install
-    if ! command -v brew >/dev/null 2>&1; then
-        echo "Homebrew is not installed. Cannot auto-install GPG."
-        echo "Install GPG manually: https://gnupg.org/download/"
-        return 1
-    fi
+    if [ "$OS_NAME" = "Darwin" ]; then
+        # macOS-specific: offer Homebrew install
+        if ! command -v brew >/dev/null 2>&1; then
+            echo "Homebrew is not installed. Cannot auto-install GPG."
+            echo "Install GPG manually: use your OS package manager."
+            return 1
+        fi
 
-    if ! prompt_yn "Install GPG via Homebrew?"; then
-        return 2  # quit signal
-    fi
+        if ! prompt_yn "Install GPG via Homebrew?"; then
+            return 2  # quit signal
+        fi
 
-    if [ "$PROMPT_RESULT" = "yes" ]; then
-        echo "Installing GPG via Homebrew..."
-        if brew install gnupg; then
-            if command -v gpg >/dev/null 2>&1; then
-                echo "GPG installed successfully."
-                return 0
+        if [ "$PROMPT_RESULT" = "yes" ]; then
+            echo "Installing GPG via Homebrew..."
+            if brew install gnupg; then
+                if command -v gpg >/dev/null 2>&1; then
+                    echo "GPG installed successfully."
+                    return 0
+                else
+                    echo "Warning: brew install succeeded but gpg is still not on PATH."
+                    return 1
+                fi
             else
-                echo "Warning: brew install succeeded but gpg is still not on PATH."
+                echo "Warning: brew install gnupg failed."
                 return 1
             fi
         else
-            echo "Warning: brew install gnupg failed."
+            # User declined install
             return 1
         fi
-    else
-        # User declined install
+    fi
+
+    if [ "$OS_NAME" = "Linux" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            if ! prompt_yn "Install GPG via apt-get?"; then
+                return 2  # quit signal
+            fi
+            if [ "$PROMPT_RESULT" = "yes" ]; then
+                echo "Installing GPG via apt-get..."
+                if sudo apt-get install -y gnupg; then
+                    if command -v gpg >/dev/null 2>&1; then
+                        echo "GPG installed successfully."
+                        return 0
+                    else
+                        echo "Warning: apt-get install succeeded but gpg is still not on PATH."
+                        return 1
+                    fi
+                else
+                    echo "Warning: apt-get install gnupg failed."
+                    return 1
+                fi
+            else
+                return 1
+            fi
+        fi
+        echo "Install GPG manually: use your distro's package manager."
         return 1
     fi
+
+    echo "Install GPG manually: use your OS package manager."
+    return 1
 }
 
 # Import a GPG key from a file path or URL.
@@ -210,7 +253,7 @@ setup_gpg_encryption() {
     if [ "$PROMPT_RESULT" != "yes" ]; then
         echo ""
         echo "WARNING: Session logs will be stored as plaintext in git notes."
-        echo "Run 'ai-session-commit-linker gpg setup' to enable encryption later."
+        echo "Run 'cadence gpg setup' to enable encryption later."
         return 0
     fi
 
@@ -231,7 +274,7 @@ setup_gpg_encryption() {
         print_gpg_manual_steps "$_phases"
         echo ""
         echo "WARNING: Session logs will be stored as plaintext in git notes."
-        echo "Run 'ai-session-commit-linker gpg setup' to enable encryption later."
+        echo "Run 'cadence gpg setup' to enable encryption later."
         return 0
     fi
 
@@ -284,31 +327,43 @@ setup_gpg_encryption() {
     else
         echo ""
         echo "No recipient set. Session logs will be stored as plaintext."
-        echo "Run 'ai-session-commit-linker gpg setup' to configure later."
+        echo "Run 'cadence gpg setup' to configure later."
     fi
 }
 
 # --- Main installer ---
 
 main() {
-    # Must be macOS
-    if [ "$(uname -s)" != "Darwin" ]; then
-        echo "Error: ai-session-commit-linker only supports macOS." >&2
-        exit 1
-    fi
-
-    # Detect architecture
+    # Detect architecture and OS
     arch=$(uname -m)
-    case "$arch" in
-        arm64)  target="aarch64-apple-darwin" ;;
-        x86_64) target="x86_64-apple-darwin" ;;
+    case "$OS_NAME" in
+        Darwin)
+            case "$arch" in
+                arm64)  target="aarch64-apple-darwin" ;;
+                x86_64) target="x86_64-apple-darwin" ;;
+                *)
+                    echo "Error: unsupported architecture: $arch" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        Linux)
+            case "$arch" in
+                arm64|aarch64) target="aarch64-unknown-linux-gnu" ;;
+                x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+                *)
+                    echo "Error: unsupported architecture: $arch" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
         *)
-            echo "Error: unsupported architecture: $arch" >&2
+            echo "Error: cadence-cli only supports macOS and Linux." >&2
             exit 1
             ;;
     esac
 
-    echo "Detected macOS $arch ($target)"
+    echo "Detected $OS_NAME $arch ($target)"
 
     # Get latest release tag
     echo "Fetching latest release..."
@@ -327,7 +382,7 @@ main() {
     echo "Latest release: $tag"
 
     # Download tarball
-    tarball="ai-session-commit-linker-${target}.tar.gz"
+    tarball="cadence-cli-${target}.tar.gz"
     download_url="https://github.com/${REPO}/releases/download/${tag}/${tarball}"
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
@@ -344,20 +399,20 @@ main() {
     tar xzf "${tmpdir}/${tarball}" -C "$tmpdir"
 
     mkdir -p "$INSTALL_DIR"
-    echo "Installing to ${INSTALL_DIR}/ai-session-commit-linker..."
-    cp "${tmpdir}/ai-session-commit-linker" "${INSTALL_DIR}/ai-session-commit-linker"
-    chmod +x "${INSTALL_DIR}/ai-session-commit-linker"
+    echo "Installing to ${INSTALL_DIR}/cadence..."
+    cp "${tmpdir}/cadence" "${INSTALL_DIR}/cadence"
+    chmod +x "${INSTALL_DIR}/cadence"
 
     echo "Running initial setup..."
-    "${INSTALL_DIR}/ai-session-commit-linker" install || {
-        echo "Warning: 'ai-session-commit-linker install' failed. You can run it manually later." >&2
+    "${INSTALL_DIR}/cadence" install || {
+        echo "Warning: 'cadence install' failed. You can run it manually later." >&2
     }
 
     # Optional GPG encryption setup
     setup_gpg_encryption
 
     echo ""
-    echo "ai-session-commit-linker installed successfully!"
+    echo "cadence installed successfully!"
 
     # Check if install dir is on PATH
     case ":${PATH}:" in

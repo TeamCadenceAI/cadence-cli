@@ -2,14 +2,16 @@
 //!
 //! Cursor stores chat sessions in two places:
 //! - VS Code style chatSessions:
-//!   ~/Library/Application Support/Cursor/User/workspaceStorage/*/chatSessions/*.json
+//!   - macOS: ~/Library/Application Support/Cursor/User/workspaceStorage/*/chatSessions/*.json
+//!   - Linux: ~/.config/Cursor/User/workspaceStorage/*/chatSessions/*.json
+//!   - Windows: %APPDATA%\\Cursor\\User\\workspaceStorage\\*\\chatSessions\\*.json
 //! - Cursor projects:
 //!   ~/.cursor/projects/<workspace-id>/*.{json,txt}
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{find_chat_session_dirs, home_dir};
+use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
 
 /// Return all Cursor log directories for use by the post-commit hook.
 pub fn log_dirs() -> Vec<PathBuf> {
@@ -29,10 +31,7 @@ fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     // VS Code style chatSessions.
-    let ws_root = home
-        .join("Library")
-        .join("Application Support")
-        .join("Cursor")
+    let ws_root = app_config_dir_in("Cursor", home)
         .join("User")
         .join("workspaceStorage");
     dirs.extend(find_chat_session_dirs(&ws_root));
@@ -84,16 +83,13 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_cursor_log_dirs_collects_chat_sessions_and_projects() {
         let home = TempDir::new().unwrap();
 
-        let ws_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
+        let ws_root = app_config_dir_in("Cursor", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")

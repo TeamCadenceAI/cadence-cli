@@ -2,20 +2,23 @@ mod agents;
 mod git;
 mod gpg;
 mod note;
+mod output;
 mod pending;
 mod push;
 mod scanner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::process;
 
-/// AI Session Commit Linker: attach AI coding agent session logs to Git commits via git notes.
+/// Cadence CLI: attach AI coding agent session logs to Git commits via git notes.
 ///
 /// Provides provenance and measurement of AI-assisted development
 /// without polluting commit history.
 #[derive(Parser, Debug)]
-#[command(name = "ai-session-commit-linker", version, about)]
+#[command(name = "cadence", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -23,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install AI Session Commit Linker: set up git hooks and run initial hydration.
+    /// Install Cadence CLI: set up git hooks and run initial hydration.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
@@ -50,13 +53,14 @@ enum Command {
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
 
+    /// Show Cadence CLI status for the current repository.
     /// Inspect linked git notes.
     Notes {
         #[command(subcommand)]
         notes_command: NotesCommand,
     },
 
-    /// Show AI Session Commit Linker status for the current repository.
+    /// Show Cadence CLI status for the current repository.
     Status,
 
     /// GPG encryption management.
@@ -80,6 +84,13 @@ enum NotesCommand {
 enum HookCommand {
     /// Post-commit hook: attempt to attach AI session note to HEAD.
     PostCommit,
+    /// Pre-push hook: sync notes with the push remote.
+    PrePush {
+        /// Remote name provided by git.
+        remote: String,
+        /// Remote URL provided by git.
+        url: String,
+    },
     /// Background retry with exponential backoff (hidden, internal use only).
     #[command(hide = true)]
     PostCommitRetry {
@@ -114,7 +125,7 @@ enum HookError {
     /// this as a non-zero exit to block the commit.
     GpgEncryptionFailed(String),
     /// Any other error (session not found, git error, etc.). These are
-    /// logged as warnings and the commit proceeds.
+    /// logged as notes and the commit proceeds.
     Soft(anyhow::Error),
 }
 
@@ -152,9 +163,10 @@ fn maybe_encrypt_note(content: &str, recipient: &Option<String>) -> Result<Strin
 /// 1. Set `git config --global core.hooksPath ~/.git-hooks`
 /// 2. Create `~/.git-hooks/` directory if missing
 /// 3. Write `~/.git-hooks/post-commit` shim script
-/// 4. Make shim executable (chmod +x)
-/// 5. If `--org` provided, persist org filter to global git config
-/// 6. Run hydration for the last 7 days
+/// 4. Write `~/.git-hooks/pre-push` shim script
+/// 5. Make shims executable (chmod +x)
+/// 6. If `--org` provided, persist org filter to global git config
+/// 7. Run hydration for the last 7 days
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
@@ -162,10 +174,54 @@ fn run_install(org: Option<String>) -> Result<()> {
     run_install_inner(org, None)
 }
 
+fn is_cadence_hook(content: &str) -> bool {
+    content.contains("cadence hook") || content.contains("cadence")
+}
+
+fn hook_command_exe() -> String {
+    if cfg!(debug_assertions)
+        && let Some(path) = debug_hook_exe_path()
+    {
+        return path;
+    }
+    "cadence".to_string()
+}
+
+fn debug_hook_exe_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    if let Some(name) = exe.file_name().and_then(|s| s.to_str())
+        && name.starts_with("cadence")
+    {
+        return Some(exe.display().to_string());
+    }
+
+    let dir = exe.parent()?;
+    if dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
+        let candidate = dir.parent()?.join("cadence");
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+
+    None
+}
+
+fn post_commit_hook_content() -> String {
+    format!("#!/bin/sh\nexec {} hook post-commit\n", hook_command_exe())
+}
+
+fn pre_push_hook_content() -> String {
+    format!(
+        "#!/bin/sh\nexec {} hook pre-push \"$1\" \"$2\"\n",
+        hook_command_exe()
+    )
+}
+
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
-    eprintln!("[ai-session-commit-linker] Installing...");
+    output::action("Installing", "hooks");
+    let install_start = std::time::Instant::now();
 
     let home = match home_override {
         Some(h) => h.to_path_buf(),
@@ -182,16 +238,10 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     // Step 1: Set git config --global core.hooksPath ~/.git-hooks
     match git::config_set_global("core.hooksPath", &hooks_dir_str) {
         Ok(()) => {
-            eprintln!(
-                "[ai-session-commit-linker] Set core.hooksPath = {}",
-                hooks_dir_str
-            );
+            output::success("Updated", &format!("core.hooksPath = {}", hooks_dir_str));
         }
         Err(e) => {
-            eprintln!(
-                "[ai-session-commit-linker] error: failed to set core.hooksPath: {}",
-                e
-            );
+            output::fail("Failed", &format!("to set core.hooksPath ({})", e));
             had_errors = true;
         }
     }
@@ -200,63 +250,56 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if !hooks_dir.exists() {
         match std::fs::create_dir_all(&hooks_dir) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Created {}", hooks_dir_str);
+                output::success("Created", &hooks_dir_str);
             }
             Err(e) => {
-                eprintln!(
-                    "[ai-session-commit-linker] error: failed to create {}: {}",
-                    hooks_dir_str, e
-                );
+                output::fail("Failed", &format!("to create {} ({})", hooks_dir_str, e));
                 had_errors = true;
             }
         }
     } else {
-        eprintln!(
-            "[ai-session-commit-linker] {} already exists",
+        output::detail(&format!(
+            "Hooks directory already exists: {}",
             hooks_dir_str
-        );
+        ));
     }
 
     // Step 3 & 4: Write post-commit shim and make it executable
     let shim_path = hooks_dir.join("post-commit");
-    let shim_content = "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n";
+    let shim_content = post_commit_hook_content();
 
     // Check if hook already exists
     let should_write = if shim_path.exists() {
         match std::fs::read_to_string(&shim_path) {
             Ok(existing) => {
-                if existing.contains("ai-session-commit-linker") {
-                    eprintln!(
-                        "[ai-session-commit-linker] post-commit hook already installed, updating"
-                    );
+                if is_cadence_hook(&existing) {
+                    output::detail("Post-commit hook already installed; updating");
                     true
                 } else {
                     // Back up the existing hook before overwriting
-                    let backup_path = hooks_dir.join("post-commit.pre-ai-session-commit-linker");
+                    let backup_path = hooks_dir.join("post-commit.pre-cadence");
                     match std::fs::copy(&shim_path, &backup_path) {
                         Ok(_) => {
-                            eprintln!(
-                                "[ai-session-commit-linker] warning: {} exists but was not created by ai-session-commit-linker; backed up to {}",
-                                shim_path.display(),
+                            output::note(&format!(
+                                "Existing post-commit hook saved to {}",
                                 backup_path.display()
-                            );
+                            ));
                         }
                         Err(e) => {
-                            eprintln!(
-                                "[ai-session-commit-linker] warning: {} exists but was not created by ai-session-commit-linker; failed to back up: {}",
-                                shim_path.display(),
+                            output::note(&format!(
+                                "Could not back up existing post-commit hook ({})",
                                 e
-                            );
+                            ));
                         }
                     }
                     true
                 }
             }
             Err(_) => {
-                eprintln!(
-                    "[ai-session-commit-linker] warning: could not read existing {}; overwriting",
+                output::note(&format!(
+                    "Could not read existing {}; overwriting",
                     shim_path.display()
-                );
+                ));
                 true
             }
         }
@@ -267,7 +310,10 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     if should_write {
         match std::fs::write(&shim_path, shim_content) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Wrote {}", shim_path.display());
+                output::success(
+                    "Wrote",
+                    &format!("post-commit hook ({})", shim_path.display()),
+                );
 
                 // Make executable (Unix only)
                 #[cfg(unix)]
@@ -276,16 +322,12 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                     let perms = std::fs::Permissions::from_mode(0o755);
                     match std::fs::set_permissions(&shim_path, perms) {
                         Ok(()) => {
-                            eprintln!(
-                                "[ai-session-commit-linker] Made {} executable",
-                                shim_path.display()
-                            );
+                            output::detail(&format!("Made {} executable", shim_path.display()));
                         }
                         Err(e) => {
-                            eprintln!(
-                                "[ai-session-commit-linker] error: failed to chmod {}: {}",
-                                shim_path.display(),
-                                e
+                            output::fail(
+                                "Failed",
+                                &format!("to make {} executable ({})", shim_path.display(), e),
                             );
                             had_errors = true;
                         }
@@ -293,10 +335,86 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[ai-session-commit-linker] error: failed to write {}: {}",
-                    shim_path.display(),
-                    e
+                output::fail(
+                    "Failed",
+                    &format!("to write {} ({})", shim_path.display(), e),
+                );
+                had_errors = true;
+            }
+        }
+    }
+
+    // Step 4b: Write pre-push shim and make it executable
+    let pre_push_path = hooks_dir.join("pre-push");
+    let pre_push_content = pre_push_hook_content();
+
+    let should_write_pre_push = if pre_push_path.exists() {
+        match std::fs::read_to_string(&pre_push_path) {
+            Ok(existing) => {
+                if is_cadence_hook(&existing) {
+                    output::detail("Pre-push hook already installed; updating");
+                    true
+                } else {
+                    let backup_path = hooks_dir.join("pre-push.pre-cadence");
+                    match std::fs::copy(&pre_push_path, &backup_path) {
+                        Ok(_) => {
+                            output::note(&format!(
+                                "Existing pre-push hook saved to {}",
+                                backup_path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            output::note(&format!(
+                                "Could not back up existing pre-push hook ({})",
+                                e
+                            ));
+                        }
+                    }
+                    true
+                }
+            }
+            Err(_) => {
+                output::note(&format!(
+                    "Could not read existing {}; overwriting",
+                    pre_push_path.display()
+                ));
+                true
+            }
+        }
+    } else {
+        true
+    };
+
+    if should_write_pre_push {
+        match std::fs::write(&pre_push_path, pre_push_content) {
+            Ok(()) => {
+                output::success(
+                    "Wrote",
+                    &format!("pre-push hook ({})", pre_push_path.display()),
+                );
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o755);
+                    match std::fs::set_permissions(&pre_push_path, perms) {
+                        Ok(()) => {
+                            output::detail(&format!("Made {} executable", pre_push_path.display()));
+                        }
+                        Err(e) => {
+                            output::fail(
+                                "Failed",
+                                &format!("to make {} executable ({})", pre_push_path.display(), e),
+                            );
+                            had_errors = true;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                output::fail(
+                    "Failed",
+                    &format!("to write {} ({})", pre_push_path.display(), e),
                 );
                 had_errors = true;
             }
@@ -305,32 +423,55 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
-        match git::config_set_global("ai.session-commit-linker.org", org_value) {
+        match git::config_set_global("ai.cadence.org", org_value) {
             Ok(()) => {
-                eprintln!("[ai-session-commit-linker] Set org filter: {}", org_value);
+                output::success("Updated", &format!("org filter = {}", org_value));
             }
             Err(e) => {
-                eprintln!(
-                    "[ai-session-commit-linker] error: failed to set org filter: {}",
-                    e
-                );
+                output::fail("Failed", &format!("to set org filter ({})", e));
                 had_errors = true;
             }
         }
     }
 
     // Step 6: Run hydration for the last 7 days
-    eprintln!("[ai-session-commit-linker] Running initial hydration (last 30 days)...");
+    output::action("Hydrating", "recent sessions (last 30 days)");
+    let hydrate_start = std::time::Instant::now();
     if let Err(e) = run_hydrate("30d", false) {
-        eprintln!("[ai-session-commit-linker] error: hydration failed: {}", e);
+        output::fail("Hydration", &format!("stopped ({})", e));
         had_errors = true;
+    }
+    output::success(
+        "Hydration",
+        &format!("done in {} ms", hydrate_start.elapsed().as_millis()),
+    );
+
+    // Optional: sync notes for the current repo if a push remote resolves
+    if let Ok(Some(remote)) = git::resolve_push_remote() {
+        let consented = matches!(
+            git::config_get("ai.cadence.autopush"),
+            Ok(Some(val)) if val == "true"
+        );
+        if consented && push::check_org_filter_remote(&remote) {
+            output::action("Syncing", &format!("notes to {}", remote));
+            let sync_start = std::time::Instant::now();
+            push::sync_notes_for_remote(&remote);
+            output::success(
+                "Sync",
+                &format!("done in {} ms", sync_start.elapsed().as_millis()),
+            );
+        }
     }
 
     if had_errors {
-        eprintln!("[ai-session-commit-linker] Installation completed with errors (see above)");
+        output::fail("Install", "completed with issues");
     } else {
-        eprintln!("[ai-session-commit-linker] Installation complete!");
+        output::success("Install", "complete");
     }
+    output::detail(&format!(
+        "Total time: {} ms",
+        install_start.elapsed().as_millis()
+    ));
 
     Ok(())
 }
@@ -354,21 +495,37 @@ fn run_hook_post_commit() -> Result<()> {
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(HookError::GpgEncryptionFailed(msg))) => {
-            eprintln!(
-                "[ai-session-commit-linker] error: GPG encryption failed: {}",
-                msg
-            );
+            output::fail("GPG", &format!("encryption failed ({})", msg));
             anyhow::bail!("GPG encryption configured but failed: {}", msg);
         }
         Ok(Err(HookError::Soft(e))) => {
-            eprintln!("[ai-session-commit-linker] warning: hook failed: {}", e);
+            output::note(&format!("Hook issue: {}", e));
             Ok(())
         }
         Err(_) => {
-            eprintln!("[ai-session-commit-linker] warning: hook panicked (this is a bug)");
+            output::note("Hook panicked (please report this issue)");
             Ok(())
         }
     }
+}
+
+/// The pre-push hook handler. Must never block the push.
+fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
+    let remote = remote.to_string();
+    let url = url.to_string();
+    let result = std::panic::catch_unwind(|| -> Result<()> { hook_pre_push_inner(&remote, &url) });
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            output::note(&format!("Hook issue: {}", e));
+        }
+        Err(_) => {
+            output::note("Hook panicked (please report this issue)");
+        }
+    }
+
+    Ok(())
 }
 
 /// Inner implementation of the post-commit hook.
@@ -423,17 +580,11 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
             let session_log = match std::fs::read_to_string(&matched.file_path) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!(
-                        "[ai-session-commit-linker] warning: failed to read session log: {}",
-                        e
-                    );
+                    output::note(&format!("Could not read session log ({})", e));
                     if let Err(e) =
                         pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
                     {
-                        eprintln!(
-                            "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                            e
-                        );
+                        output::note(&format!("Could not write pending record ({})", e));
                     }
                     spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
                     // Skip note attachment; retry will pick this up later
@@ -461,15 +612,20 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 }
             })?;
 
-            eprintln!(
-                "[ai-session-commit-linker] attached session {} to commit {}",
-                session_id,
-                &head_hash[..7]
+            output::success(
+                "Attached",
+                &format!("session {} to commit {}", session_id, &head_hash[..7]),
             );
 
-            // Push notes if conditions are met (consent, org filter, remote exists)
-            if push::should_push() {
-                push::attempt_push();
+            if let Ok(Some(remote)) = git::resolve_push_remote()
+                && push::should_push_remote(&remote)
+            {
+                let push_start = std::time::Instant::now();
+                push::attempt_push_remote(&remote);
+                output::detail(&format!(
+                    "Post-commit push in {} ms",
+                    push_start.elapsed().as_millis()
+                ));
             }
 
             attached = true;
@@ -484,17 +640,11 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
             let session_log = match std::fs::read_to_string(&fallback.file_path) {
                 Ok(content) => content,
                 Err(e) => {
-                    eprintln!(
-                        "[ai-session-commit-linker] warning: failed to read session log: {}",
-                        e
-                    );
+                    output::note(&format!("Could not read session log ({})", e));
                     if let Err(e) =
                         pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
                     {
-                        eprintln!(
-                            "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                            e
-                        );
+                        output::note(&format!("Could not write pending record ({})", e));
                     }
                     spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
                     return Ok(());
@@ -518,14 +668,24 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 }
             })?;
 
-            eprintln!(
-                "[ai-session-commit-linker] attached session {} to commit {} (time window match)",
-                fallback.session_id,
-                &head_hash[..7]
+            output::success(
+                "Attached",
+                &format!(
+                    "session {} to commit {} (time window match)",
+                    fallback.session_id,
+                    &head_hash[..7]
+                ),
             );
 
-            if push::should_push() {
-                push::attempt_push();
+            if let Ok(Some(remote)) = git::resolve_push_remote()
+                && push::should_push_remote(&remote)
+            {
+                let push_start = std::time::Instant::now();
+                push::attempt_push_remote(&remote);
+                output::detail(&format!(
+                    "Post-commit push in {} ms",
+                    push_start.elapsed().as_millis()
+                ));
             }
 
             attached = true;
@@ -535,10 +695,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     if !attached {
         // No match found — write pending record
         if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
-            eprintln!(
-                "[ai-session-commit-linker] warning: failed to write pending record: {}",
-                e
-            );
+            output::note(&format!("Could not write pending record ({})", e));
         }
         spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
     }
@@ -549,9 +706,27 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     Ok(())
 }
 
+/// Inner implementation of the pre-push hook.
+fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
+    if !git::check_enabled() {
+        return Ok(());
+    }
+
+    if push::should_push_remote(remote) {
+        let sync_start = std::time::Instant::now();
+        push::sync_notes_for_remote(remote);
+        output::detail(&format!(
+            "Pre-push sync in {} ms",
+            sync_start.elapsed().as_millis()
+        ));
+    }
+
+    Ok(())
+}
+
 /// Maximum number of retry attempts before a pending record is abandoned.
 ///
-/// After this many attempts, the pending record is removed and a warning
+/// After this many attempts, the pending record is removed and a note
 /// is logged. This prevents unbounded retries for commits that can never
 /// be resolved (e.g., the session log was deleted or the commit was from
 /// a different machine).
@@ -821,14 +996,24 @@ fn try_resolve_single_commit(
                 )
                 .is_ok()
                 {
-                    eprintln!(
-                        "[ai-session-commit-linker] retry: attached session {} to commit {} (time window match)",
-                        fallback.session_id,
-                        &commit[..std::cmp::min(7, commit.len())]
+                    output::success(
+                        "Retry",
+                        &format!(
+                            "attached session {} to commit {} (time window match)",
+                            fallback.session_id,
+                            &commit[..std::cmp::min(7, commit.len())]
+                        ),
                     );
 
-                    if push::should_push() {
-                        push::attempt_push();
+                    if let Ok(Some(remote)) = git::resolve_push_remote()
+                        && push::should_push_remote(&remote)
+                    {
+                        let push_start = std::time::Instant::now();
+                        push::attempt_push_remote(&remote);
+                        output::detail(&format!(
+                            "Retry push in {} ms",
+                            push_start.elapsed().as_millis()
+                        ));
                     }
 
                     return ResolveResult::Attached;
@@ -862,14 +1047,24 @@ fn try_resolve_single_commit(
             )
             .is_ok()
             {
-                eprintln!(
-                    "[ai-session-commit-linker] retry: attached session {} to commit {} (time window match)",
-                    fallback.session_id,
-                    &commit[..std::cmp::min(7, commit.len())]
+                output::success(
+                    "Retry",
+                    &format!(
+                        "attached session {} to commit {} (time window match)",
+                        fallback.session_id,
+                        &commit[..std::cmp::min(7, commit.len())]
+                    ),
                 );
 
-                if push::should_push() {
-                    push::attempt_push();
+                if let Ok(Some(remote)) = git::resolve_push_remote()
+                    && push::should_push_remote(&remote)
+                {
+                    let push_start = std::time::Instant::now();
+                    push::attempt_push_remote(&remote);
+                    output::detail(&format!(
+                        "Retry push in {} ms",
+                        push_start.elapsed().as_millis()
+                    ));
                 }
 
                 return ResolveResult::Attached;
@@ -898,15 +1093,25 @@ fn try_resolve_single_commit(
     )
     .is_ok()
     {
-        eprintln!(
-            "[ai-session-commit-linker] retry: attached session {} to commit {}",
-            session_id,
-            &commit[..std::cmp::min(7, commit.len())]
+        output::success(
+            "Retry",
+            &format!(
+                "attached session {} to commit {}",
+                session_id,
+                &commit[..std::cmp::min(7, commit.len())]
+            ),
         );
 
         // Push if conditions are met
-        if push::should_push() {
-            push::attempt_push();
+        if let Ok(Some(remote)) = git::resolve_push_remote()
+            && push::should_push_remote(&remote)
+        {
+            let push_start = std::time::Instant::now();
+            push::attempt_push_remote(&remote);
+            output::detail(&format!(
+                "Retry push in {} ms",
+                push_start.elapsed().as_millis()
+            ));
         }
 
         ResolveResult::Attached
@@ -939,11 +1144,11 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, recipient
     for record in &mut pending_records {
         // Check if max retry attempts exceeded -- abandon the record
         if record.attempts >= MAX_RETRY_ATTEMPTS {
-            eprintln!(
-                "[ai-session-commit-linker] warning: abandoning pending commit {} after {} attempts",
+            output::note(&format!(
+                "Abandoning pending commit {} after {} attempts",
                 &record.commit[..std::cmp::min(7, record.commit.len())],
                 record.attempts
-            );
+            ));
             let _ = pending::remove(&record.commit);
             continue;
         }
@@ -1011,18 +1216,28 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     // Resolve GPG recipient once for this hydration run
     let recipient = gpg::get_recipient().unwrap_or(None);
 
-    // Step 1: Collect all recent session logs (repo-agnostic)
-    eprintln!(
-        "[ai-session-commit-linker] Scanning agent logs (last {} days)...",
-        since_days
-    );
+    let use_progress = output::is_stderr_tty();
+    let spinner = if use_progress {
+        let pb = ProgressBar::new_spinner();
+        pb.set_draw_target(ProgressDrawTarget::stderr());
+        pb.set_style(
+            ProgressStyle::with_template("{spinner} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        pb.set_message(format!("Scanning agent logs (last {} days)", since_days));
+        Some(pb)
+    } else {
+        None
+    };
 
     // Step 2: Find all session files modified within the --since window
     let files = agents::all_recent_files(now, since_secs);
-    eprintln!(
-        "[ai-session-commit-linker] Found {} session logs",
-        files.len()
-    );
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+    output::action("Scanned", &format!("agent logs (last {} days)", since_days));
+    output::detail(&format!("Found {} session logs", files.len()));
     if !files.is_empty() {
         let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
@@ -1035,10 +1250,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             .map(|(agent, count)| format!("{agent}={count}"))
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!(
-            "[ai-session-commit-linker]   Agents with sessions: {}",
-            summary
-        );
+        output::detail(&format!("Agents: {}", summary));
     }
 
     // Counters for final summary
@@ -1057,6 +1269,19 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     let mut sessions_by_repo: std::collections::BTreeMap<String, Vec<SessionInfo>> =
         std::collections::BTreeMap::new();
+
+    let progress = if use_progress {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_draw_target(ProgressDrawTarget::stderr());
+        pb.set_style(
+            ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        pb.set_message("Processing sessions");
+        Some(pb)
+    } else {
+        None
+    };
 
     for file in &files {
         let metadata = scanner::parse_session_metadata(file);
@@ -1104,11 +1329,19 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 repo_root,
                 metadata,
             });
+
+        if let Some(ref pb) = progress {
+            pb.inc(1);
+        }
+    }
+
+    if let Some(pb) = progress {
+        pb.finish_and_clear();
     }
 
     // Step 4: Process sessions grouped by repo
     for (repo_display, sessions) in &sessions_by_repo {
-        eprintln!("[ai-session-commit-linker] {}", repo_display);
+        output::action("Repository", repo_display);
 
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
@@ -1133,7 +1366,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     continue;
                 }
 
-                let header = format!("[ai-session-commit-linker]   {} |", session_display);
+                let header = format!("{} |", session_display);
 
                 let time_range =
                     if let Some((start, end)) = scanner::session_time_range(&session.file) {
@@ -1143,7 +1376,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                         let mtime = match file_mtime_epoch(&session.file) {
                             Some(t) => t,
                             None => {
-                                eprintln!("{} no timestamps and no mtime", header);
+                                output::detail(&format!(
+                                    "{} no timestamps or file mtime; skipping",
+                                    header
+                                ));
                                 continue;
                             }
                         };
@@ -1153,7 +1389,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 let (start_ts, end_ts) = match time_range {
                     Some(r) => r,
                     None => {
-                        eprintln!("{} no timestamps", header);
+                        output::detail(&format!("{} no timestamps; skipping", header));
                         continue;
                     }
                 };
@@ -1162,7 +1398,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("{} error scanning commits: {}", header, e);
+                        output::detail(&format!("{} problem scanning commits: {}", header, e));
                         errors += 1;
                         continue;
                     }
@@ -1174,7 +1410,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     } else {
                         "ambiguous commits in time window"
                     };
-                    eprintln!("{} {}", header, status);
+                    output::detail(&format!("{} {}", header, status));
                     continue;
                 }
 
@@ -1182,12 +1418,21 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 match git::note_exists_at(&session.repo_root, hash) {
                     Ok(true) => {
                         skipped += 1;
-                        eprintln!("{} commit {} already attached", header, &hash[..7]);
+                        output::detail(&format!(
+                            "{} commit {} already attached",
+                            header,
+                            &hash[..7]
+                        ));
                         continue;
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        eprintln!("{} error checking note for {}: {}", header, &hash[..7], e);
+                        output::detail(&format!(
+                            "{} problem checking note for {}: {}",
+                            header,
+                            &hash[..7],
+                            e
+                        ));
                         errors += 1;
                         continue;
                     }
@@ -1196,7 +1441,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 let session_log = match std::fs::read_to_string(&session.file) {
                     Ok(content) => content,
                     Err(e) => {
-                        eprintln!("{} failed to read session log: {}", header, e);
+                        output::detail(&format!("{} could not read session log: {}", header, e));
                         errors += 1;
                         continue;
                     }
@@ -1219,7 +1464,12 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("{} failed to format note for {}: {}", header, &hash[..7], e);
+                        output::detail(&format!(
+                            "{} could not format note for {}: {}",
+                            header,
+                            &hash[..7],
+                            e
+                        ));
                         errors += 1;
                         continue;
                     }
@@ -1229,14 +1479,19 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     Ok(()) => {
                         attached += 1;
                         fallback_attached += 1;
-                        eprintln!(
+                        output::detail(&format!(
                             "{} commit {} attached (time window match)",
                             header,
                             &hash[..7]
-                        );
+                        ));
                     }
                     Err(e) => {
-                        eprintln!("{} failed to attach note to {}: {}", header, &hash[..7], e);
+                        output::detail(&format!(
+                            "{} could not attach note to {}: {}",
+                            header,
+                            &hash[..7],
+                            e
+                        ));
                         errors += 1;
                     }
                 }
@@ -1256,7 +1511,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             let mut session_skipped = 0usize;
             let mut messages: Vec<String> = Vec::new();
 
-            let header = format!("[ai-session-commit-linker]   {} |", session_display);
+            let header = format!("{} |", session_display);
 
             for hash in &commit_hashes {
                 // Verify the commit exists in the resolved repo
@@ -1268,7 +1523,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                         continue;
                     }
                     Err(e) => {
-                        messages.push(format!("error checking commit {}: {}", &hash[..7], e));
+                        messages.push(format!("problem checking commit {}: {}", &hash[..7], e));
                         errors += 1;
                         continue;
                     }
@@ -1283,7 +1538,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     }
                     Ok(false) => {} // Need to attach
                     Err(e) => {
-                        messages.push(format!("error checking note for {}: {}", &hash[..7], e));
+                        messages.push(format!("problem checking note for {}: {}", &hash[..7], e));
                         errors += 1;
                         continue;
                     }
@@ -1293,7 +1548,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 let session_log = match std::fs::read_to_string(&session.file) {
                     Ok(content) => content,
                     Err(e) => {
-                        messages.push(format!("failed to read session log: {}", e));
+                        messages.push(format!("could not read session log: {}", e));
                         errors += 1;
                         continue;
                     }
@@ -1320,7 +1575,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        messages.push(format!("failed to format note for {}: {}", &hash[..7], e));
+                        messages.push(format!("could not format note for {}: {}", &hash[..7], e));
                         errors += 1;
                         continue;
                     }
@@ -1344,7 +1599,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                         attached += 1;
                     }
                     Err(e) => {
-                        messages.push(format!("failed to attach note to {}: {}", &hash[..7], e));
+                        messages.push(format!("could not attach note to {}: {}", &hash[..7], e));
                         errors += 1;
                     }
                 }
@@ -1361,32 +1616,37 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     .first()
                     .map(|s| s.as_str())
                     .unwrap_or("nothing to do");
-                eprintln!("{} {}", header, status);
+                output::detail(&format!("{} {}", header, status));
             } else {
-                eprintln!("{}", header);
+                output::detail(&header);
                 for msg in &messages {
-                    eprintln!("[ai-session-commit-linker]     {}", msg);
+                    output::detail(&format!("  {}", msg));
                 }
             }
         }
 
         // Per-repo summary
-        eprintln!(
-            "[ai-session-commit-linker]   {} sessions, {} with commits, {} without",
+        output::detail(&format!(
+            "{} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
-        );
+        ));
     }
 
     // Final summary
-    eprintln!(
-        "[ai-session-commit-linker] Done. {} attached, {} fallback attached, {} skipped, {} errors.",
-        attached, fallback_attached, skipped, errors
+    output::success(
+        "Hydrate",
+        &format!(
+            "{} attached, {} fallback attached, {} skipped, {} issues",
+            attached, fallback_attached, skipped, errors
+        ),
     );
 
     // Step 7: Push if requested
     if do_push {
-        eprintln!("[ai-session-commit-linker] Pushing notes...");
-        push::attempt_push();
+        output::action("Pushing", "notes");
+        if let Ok(Some(remote)) = git::resolve_push_remote() {
+            push::attempt_push_remote(&remote);
+        }
     }
 
     Ok(())
@@ -1401,69 +1661,55 @@ fn run_retry() -> Result<()> {
         .unwrap_or(0);
 
     if pending_count == 0 {
-        eprintln!("[ai-session-commit-linker] no pending commits for this repo");
+        output::detail("No pending commits for this repo");
         return Ok(());
     }
 
     // Resolve GPG recipient once for this retry run
     let recipient = gpg::get_recipient().unwrap_or(None);
 
-    eprintln!(
-        "[ai-session-commit-linker] retrying {} pending commit(s)...",
-        pending_count
-    );
+    output::action("Retrying", &format!("{} pending commit(s)", pending_count));
     retry_pending_for_repo(&repo_str, &repo_root, &recipient);
 
     let remaining = pending::list_for_repo(&repo_str)
         .map(|r| r.len())
         .unwrap_or(0);
     let resolved = pending_count - remaining;
-    eprintln!(
-        "[ai-session-commit-linker] retry complete: {} resolved, {} still pending",
-        resolved, remaining
+    output::success(
+        "Retry",
+        &format!("{} resolved, {} still pending", resolved, remaining),
     );
 
     Ok(())
 }
 
-/// The status subcommand: show AI Session Commit Linker configuration and state.
+/// The status subcommand: show Cadence CLI configuration and state.
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Hooks path and whether the post-commit shim is installed
+/// - Hooks path and whether the post-commit/pre-push shims are installed
 /// - Number of pending retries for the current repo
 /// - Org filter config (if any)
 /// - Autopush consent status
 /// - Per-repo enabled/disabled status
 ///
-/// All output uses the `[ai-session-commit-linker]` prefix on stderr.
+/// All output is user-facing and written to stderr.
 /// Handles being called outside a git repo gracefully.
 fn run_status() -> Result<()> {
     run_status_inner(&mut std::io::stderr())
 }
 
-/// Inner implementation of `run_status` that writes to a `Write` impl.
-/// This allows tests to capture the output for verification.
 fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
-    writeln!(w, "[ai-session-commit-linker] Status").ok();
+    output::action_to_with_tty(w, "Status", "", false);
 
     // --- Repo root ---
     let repo_root = match git::repo_root() {
         Ok(root) => {
-            writeln!(
-                w,
-                "[ai-session-commit-linker]   Repo: {}",
-                root.to_string_lossy()
-            )
-            .ok();
+            output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
             Some(root)
         }
         Err(_) => {
-            writeln!(
-                w,
-                "[ai-session-commit-linker]   Repo: (not in a git repository)"
-            )
-            .ok();
+            output::detail_to_with_tty(w, "Repo: (not in a git repository)", false);
             None
         }
     };
@@ -1471,25 +1717,29 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     // --- Hooks path and shim status ---
     match git::config_get_global("core.hooksPath") {
         Ok(Some(path)) => {
-            let shim_path = std::path::Path::new(&path).join("post-commit");
-            let shim_installed = match std::fs::read_to_string(&shim_path) {
-                Ok(content) => content.contains("ai-session-commit-linker"),
+            let post_path = std::path::Path::new(&path).join("post-commit");
+            let post_installed = match std::fs::read_to_string(&post_path) {
+                Ok(content) => is_cadence_hook(&content),
                 Err(_) => false,
             };
-            let installed_str = if shim_installed { "yes" } else { "no" };
-            writeln!(
+            let pre_path = std::path::Path::new(&path).join("pre-push");
+            let pre_installed = match std::fs::read_to_string(&pre_path) {
+                Ok(content) => is_cadence_hook(&content),
+                Err(_) => false,
+            };
+            let post_str = if post_installed { "yes" } else { "no" };
+            let pre_str = if pre_installed { "yes" } else { "no" };
+            output::detail_to_with_tty(
                 w,
-                "[ai-session-commit-linker]   Hooks path: {} (shim installed: {})",
-                path, installed_str
-            )
-            .ok();
+                &format!(
+                    "Hooks path: {} (post-commit: {}, pre-push: {})",
+                    path, post_str, pre_str
+                ),
+                false,
+            );
         }
         _ => {
-            writeln!(
-                w,
-                "[ai-session-commit-linker]   Hooks path: (not configured)"
-            )
-            .ok();
+            output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
         }
     }
 
@@ -1499,77 +1749,52 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         let pending_count = pending::list_for_repo(&repo_str)
             .map(|r| r.len())
             .unwrap_or(0);
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Pending retries: {}",
-            pending_count
-        )
-        .ok();
+        output::detail_to_with_tty(w, &format!("Pending retries: {}", pending_count), false);
     } else {
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Pending retries: (n/a - not in a repo)"
-        )
-        .ok();
+        output::detail_to_with_tty(w, "Pending retries: (n/a - not in a repo)", false);
     }
 
     // --- Org filter ---
-    match git::config_get_global("ai.session-commit-linker.org") {
+    match git::config_get_global("ai.cadence.org") {
         Ok(Some(org)) => {
-            writeln!(w, "[ai-session-commit-linker]   Org filter: {}", org).ok();
+            output::detail_to_with_tty(w, &format!("Org filter: {}", org), false);
         }
         _ => {
-            writeln!(w, "[ai-session-commit-linker]   Org filter: (none)").ok();
+            output::detail_to_with_tty(w, "Org filter: (none)", false);
         }
     }
 
     // --- Autopush consent ---
     if repo_root.is_some() {
-        match git::config_get("ai.session-commit-linker.autopush") {
+        match git::config_get("ai.cadence.autopush") {
             Ok(Some(val)) if val == "true" => {
-                writeln!(
-                    w,
-                    "[ai-session-commit-linker]   Auto-push: enabled (consented)"
-                )
-                .ok();
+                output::detail_to_with_tty(w, "Auto-push: enabled (consented)", false);
             }
             Ok(Some(val)) if val == "false" => {
-                writeln!(
-                    w,
-                    "[ai-session-commit-linker]   Auto-push: disabled (opted out)"
-                )
-                .ok();
+                output::detail_to_with_tty(w, "Auto-push: disabled (opted out)", false);
             }
             _ => {
-                writeln!(
+                output::detail_to_with_tty(
                     w,
-                    "[ai-session-commit-linker]   Auto-push: not yet configured (will prompt on first push)"
-                )
-                .ok();
+                    "Auto-push: not yet configured (will prompt on first push)",
+                    false,
+                );
             }
         }
     } else {
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Auto-push: (n/a - not in a repo)"
-        )
-        .ok();
+        output::detail_to_with_tty(w, "Auto-push: (n/a - not in a repo)", false);
     }
 
     // --- Per-repo enabled/disabled ---
     if repo_root.is_some() {
         let enabled = git::check_enabled();
         if enabled {
-            writeln!(w, "[ai-session-commit-linker]   Repo enabled: yes").ok();
+            output::detail_to_with_tty(w, "Repo enabled: yes", false);
         } else {
-            writeln!(w, "[ai-session-commit-linker]   Repo enabled: no").ok();
+            output::detail_to_with_tty(w, "Repo enabled: no", false);
         }
     } else {
-        writeln!(
-            w,
-            "[ai-session-commit-linker]   Repo enabled: (n/a - not in a repo)"
-        )
-        .ok();
+        output::detail_to_with_tty(w, "Repo enabled: (n/a - not in a repo)", false);
     }
 
     Ok(())
@@ -1582,11 +1807,19 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
 /// - `  <short> <date> <subject>` otherwise
 fn run_notes_list(notes_ref: &str) -> Result<()> {
     let entries = git::list_commits_with_note_markers(notes_ref)?;
+    output::action("Notes", "list");
+    output::detail(&format!("Notes ref: {}", notes_ref));
     for entry in entries {
         if entry.has_note {
-            println!("* {} {} {}", entry.short, entry.date, entry.subject);
+            output::detail(&format!(
+                "* {} {} {}",
+                entry.short, entry.date, entry.subject
+            ));
         } else {
-            println!("  {} {} {}", entry.short, entry.date, entry.subject);
+            output::detail(&format!(
+                "  {} {} {}",
+                entry.short, entry.date, entry.subject
+            ));
         }
     }
     Ok(())
@@ -1644,7 +1877,7 @@ impl GpgStatusReport {
             (Some(_), true, Some(false)) => "configured but key not in keyring",
             (Some(_), true, None) => "enabled",
             (Some(_), false, _) => "configured but gpg not available",
-            (None, _, _) if self.recipient_error.is_some() => "unknown (config read error)",
+            (None, _, _) if self.recipient_error.is_some() => "unknown (config read issue)",
             _ => "disabled (plaintext mode)",
         }
     }
@@ -1654,7 +1887,7 @@ impl GpgStatusReport {
 ///
 /// Output lines (stable order):
 /// 1. `gpg binary: found|not found`
-/// 2. `recipient: <email>|not configured|error (<msg>)`
+/// 2. `recipient: <email>|not configured|unavailable (<msg>)`
 /// 3. `key in keyring: yes|no` (only when applicable)
 /// 4. blank line + `Encryption: <summary>`
 fn render_gpg_status(w: &mut dyn std::io::Write, report: &GpgStatusReport) -> std::io::Result<()> {
@@ -1670,7 +1903,7 @@ fn render_gpg_status(w: &mut dyn std::io::Write, report: &GpgStatusReport) -> st
 
     match (&report.recipient, &report.recipient_error) {
         (Some(r), _) => writeln!(w, "recipient: {}", r)?,
-        (None, Some(err)) => writeln!(w, "recipient: error ({})", err)?,
+        (None, Some(err)) => writeln!(w, "recipient: unavailable ({})", err)?,
         (None, None) => writeln!(w, "recipient: not configured")?,
     }
 
@@ -1700,7 +1933,14 @@ fn run_gpg_status() -> Result<()> {
 /// Delegates to `run_gpg_setup_inner` with real stdin/stdout so that the
 /// flow can be tested with scripted input.
 fn run_gpg_setup() -> Result<()> {
-    run_gpg_setup_inner(&mut std::io::stdin().lock(), &mut std::io::stdout())
+    if output::is_stderr_tty() {
+        let mut prompter = DialoguerPrompter::new();
+        run_gpg_setup_inner(&mut prompter, &mut std::io::stdout())
+    } else {
+        let mut input = std::io::stdin().lock();
+        let mut prompter = BufferedPrompter::new(&mut input);
+        run_gpg_setup_inner(&mut prompter, &mut std::io::stdout())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,14 +1994,86 @@ fn prompt_yes_no(
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPG setup: prompter abstraction
+// ---------------------------------------------------------------------------
+
+trait Prompter {
+    fn input(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<String>>;
+    fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>>;
+}
+
+struct BufferedPrompter<'a> {
+    reader: &'a mut dyn std::io::BufRead,
+}
+
+impl<'a> BufferedPrompter<'a> {
+    fn new(reader: &'a mut dyn std::io::BufRead) -> Self {
+        Self { reader }
+    }
+}
+
+impl Prompter for BufferedPrompter<'_> {
+    fn input(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<String>> {
+        prompt_line(self.reader, writer, prompt)
+    }
+
+    fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>> {
+        prompt_yes_no(self.reader, writer, prompt)
+    }
+}
+
+struct DialoguerPrompter {
+    theme: ColorfulTheme,
+}
+
+impl DialoguerPrompter {
+    fn new() -> Self {
+        Self {
+            theme: ColorfulTheme::default(),
+        }
+    }
+}
+
+impl Prompter for DialoguerPrompter {
+    fn input(&mut self, prompt: &str, _writer: &mut dyn std::io::Write) -> Result<Option<String>> {
+        let result = Input::with_theme(&self.theme)
+            .with_prompt(prompt)
+            .allow_empty(true)
+            .interact_text();
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn confirm(&mut self, prompt: &str, _writer: &mut dyn std::io::Write) -> Result<Option<bool>> {
+        let result = Confirm::with_theme(&self.theme)
+            .with_prompt(prompt)
+            .interact();
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
 /// Return platform-specific GPG install guidance.
 fn gpg_install_guidance() -> &'static str {
     if cfg!(target_os = "macos") {
         "Install GPG: brew install gnupg"
+    } else if cfg!(target_os = "windows") {
+        "Install GPG: winget install GnuPG.GnuPG  (or install from the GnuPG website)"
     } else if cfg!(target_os = "linux") {
         "Install GPG: sudo apt install gnupg  (or your distro's package manager)"
     } else {
-        "Install GPG: download from https://gnupg.org/download/"
+        "Install GPG: download from the GnuPG website"
     }
 }
 
@@ -1793,10 +2105,7 @@ enum SetupOutcome {
 /// 3. Prompt for recipient and validate.
 /// 4. Persist global git config (deferred, with rollback on partial failure).
 /// 5. Print summary and run `gpg status`.
-fn run_gpg_setup_inner(
-    reader: &mut dyn std::io::BufRead,
-    writer: &mut dyn std::io::Write,
-) -> Result<()> {
+fn run_gpg_setup_inner(prompter: &mut dyn Prompter, writer: &mut dyn std::io::Write) -> Result<()> {
     writeln!(writer, "=== GPG Encryption Setup ===")?;
     writeln!(writer)?;
 
@@ -1812,7 +2121,7 @@ fn run_gpg_setup_inner(
     writeln!(writer)?;
 
     // Steps 2-3: Collect inputs without writing config
-    let outcome = collect_setup_inputs(reader, writer)?;
+    let outcome = collect_setup_inputs(prompter, writer)?;
 
     let (recipient, key_source) = match outcome {
         SetupOutcome::Completed {
@@ -1848,15 +2157,14 @@ fn run_gpg_setup_inner(
 /// Collect user inputs for key import and recipient (Steps 2-3).
 /// Does not write any config. Returns `SetupOutcome`.
 fn collect_setup_inputs(
-    reader: &mut dyn std::io::BufRead,
+    prompter: &mut dyn Prompter,
     writer: &mut dyn std::io::Write,
 ) -> Result<SetupOutcome> {
     // Step 2: Optional key import
     let key_source = loop {
-        let Some(source) = prompt_line(
-            reader,
-            writer,
+        let Some(source) = prompter.input(
             "Enter path to GPG public key file (or press Enter to skip): ",
+            writer,
         )?
         else {
             return Ok(SetupOutcome::Aborted);
@@ -1873,8 +2181,8 @@ fn collect_setup_inputs(
                 break Some(trimmed);
             }
             Err(e) => {
-                writeln!(writer, "Import failed: {}", e)?;
-                let Some(retry) = prompt_yes_no(reader, writer, "Retry?")? else {
+                writeln!(writer, "Could not import key: {}", e)?;
+                let Some(retry) = prompter.confirm("Retry?", writer)? else {
                     return Ok(SetupOutcome::Aborted);
                 };
                 if !retry {
@@ -1887,10 +2195,9 @@ fn collect_setup_inputs(
 
     // Step 3: Recipient prompt
     let recipient = loop {
-        let Some(input) = prompt_line(
-            reader,
-            writer,
+        let Some(input) = prompter.input(
             "Enter GPG recipient (fingerprint, email, or key ID): ",
+            writer,
         )?
         else {
             return Ok(SetupOutcome::Aborted);
@@ -1907,13 +2214,8 @@ fn collect_setup_inputs(
             break trimmed;
         }
 
-        writeln!(
-            writer,
-            "Warning: key not found in keyring for '{}'.",
-            trimmed
-        )?;
-        let Some(cont) = prompt_yes_no(reader, writer, "Continue with this recipient anyway?")?
-        else {
+        writeln!(writer, "Key not found in keyring for '{}'.", trimmed)?;
+        let Some(cont) = prompter.confirm("Continue with this recipient anyway?", writer)? else {
             return Ok(SetupOutcome::Aborted);
         };
         if cont {
@@ -1956,11 +2258,7 @@ fn persist_setup_config_with(
 
     // Write recipient first
     if let Err(e) = set_global(gpg::GPG_RECIPIENT_KEY, recipient) {
-        writeln!(
-            writer,
-            "Error: failed to save recipient to git config: {}",
-            e
-        )?;
+        writeln!(writer, "Could not save recipient to git config: {}", e)?;
         return Err(e);
     }
 
@@ -1968,11 +2266,7 @@ fn persist_setup_config_with(
     if let Some(source) = key_source
         && let Err(e) = set_global(gpg::GPG_PUBLIC_KEY_SOURCE_KEY, source)
     {
-        writeln!(
-            writer,
-            "Error: failed to save key source to git config: {}",
-            e
-        )?;
+        writeln!(writer, "Could not save key source to git config: {}", e)?;
         // Rollback recipient to its prior state
         writeln!(writer, "Rolling back recipient config...")?;
         match prior_recipient {
@@ -2000,6 +2294,7 @@ fn main() {
         Command::Install { org } => run_install(org),
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit(),
+            HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url),
             HookCommand::PostCommitRetry {
                 commit,
                 repo,
@@ -2019,7 +2314,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("[ai-session-commit-linker] error: {}", e);
+        output::fail("Failed", &format!("{}", e));
         process::exit(1);
     }
 }
@@ -2031,18 +2326,44 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::app_config_dir_in;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
+    use std::path::PathBuf;
+
+    fn run_gpg_setup_with_io(input: &mut dyn std::io::BufRead, output: &mut Vec<u8>) -> Result<()> {
+        let mut prompter = BufferedPrompter::new(input);
+        run_gpg_setup_inner(&mut prompter, output)
+    }
+
+    fn set_isolated_global_git_config(fake_home: &TempDir) -> (PathBuf, Option<String>) {
+        let original = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        let global_config_path = fake_home.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config_path, "").unwrap();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config_path);
+        }
+        (global_config_path, original)
+    }
+
+    fn restore_global_git_config(original: Option<String>) {
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
 
     #[test]
     fn cli_parses_install() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "install"]);
+        let cli = Cli::parse_from(["cadence", "install"]);
         assert!(matches!(cli.command, Command::Install { org: None }));
     }
 
     #[test]
     fn cli_parses_install_with_org() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "install", "--org", "my-org"]);
+        let cli = Cli::parse_from(["cadence", "install", "--org", "my-org"]);
         match cli.command {
             Command::Install { org } => assert_eq!(org.as_deref(), Some("my-org")),
             _ => panic!("expected Install command"),
@@ -2051,7 +2372,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hook_post_commit() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "hook", "post-commit"]);
+        let cli = Cli::parse_from(["cadence", "hook", "post-commit"]);
         assert!(matches!(
             cli.command,
             Command::Hook {
@@ -2061,9 +2382,29 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_hook_pre_push() {
+        let cli = Cli::parse_from([
+            "cadence",
+            "hook",
+            "pre-push",
+            "origin",
+            "git@github.com:org/repo.git",
+        ]);
+        match cli.command {
+            Command::Hook {
+                hook_command: HookCommand::PrePush { remote, url },
+            } => {
+                assert_eq!(remote, "origin");
+                assert_eq!(url, "git@github.com:org/repo.git");
+            }
+            _ => panic!("expected Hook PrePush command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_hook_post_commit_retry() {
         let cli = Cli::parse_from([
-            "ai-session-commit-linker",
+            "cadence",
             "hook",
             "post-commit-retry",
             "abcdef0123456789abcdef0123456789abcdef01",
@@ -2089,7 +2430,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hydrate_defaults() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "hydrate"]);
+        let cli = Cli::parse_from(["cadence", "hydrate"]);
         match cli.command {
             Command::Hydrate { since, push } => {
                 assert_eq!(since, "7d");
@@ -2101,13 +2442,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hydrate_with_flags() {
-        let cli = Cli::parse_from([
-            "ai-session-commit-linker",
-            "hydrate",
-            "--since",
-            "30d",
-            "--push",
-        ]);
+        let cli = Cli::parse_from(["cadence", "hydrate", "--since", "30d", "--push"]);
         match cli.command {
             Command::Hydrate { since, push } => {
                 assert_eq!(since, "30d");
@@ -2119,13 +2454,13 @@ mod tests {
 
     #[test]
     fn cli_parses_retry() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "retry"]);
+        let cli = Cli::parse_from(["cadence", "retry"]);
         assert!(matches!(cli.command, Command::Retry));
     }
 
     #[test]
     fn cli_parses_notes_list_default_ref() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "notes", "list"]);
+        let cli = Cli::parse_from(["cadence", "notes", "list"]);
         match cli.command {
             Command::Notes { notes_command } => match notes_command {
                 NotesCommand::List { notes_ref } => {
@@ -2139,7 +2474,7 @@ mod tests {
     #[test]
     fn cli_parses_notes_list_custom_ref() {
         let cli = Cli::parse_from([
-            "ai-session-commit-linker",
+            "cadence",
             "notes",
             "list",
             "--notes-ref",
@@ -2157,13 +2492,13 @@ mod tests {
 
     #[test]
     fn cli_parses_status() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "status"]);
+        let cli = Cli::parse_from(["cadence", "status"]);
         assert!(matches!(cli.command, Command::Status));
     }
 
     #[test]
     fn cli_parses_gpg_status() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "gpg", "status"]);
+        let cli = Cli::parse_from(["cadence", "gpg", "status"]);
         match cli.command {
             Command::Gpg { gpg_command } => {
                 assert!(matches!(gpg_command, GpgCommands::Status));
@@ -2174,7 +2509,7 @@ mod tests {
 
     #[test]
     fn cli_parses_gpg_setup() {
-        let cli = Cli::parse_from(["ai-session-commit-linker", "gpg", "setup"]);
+        let cli = Cli::parse_from(["cadence", "gpg", "setup"]);
         match cli.command {
             Command::Gpg { gpg_command } => {
                 assert!(matches!(gpg_command, GpgCommands::Setup));
@@ -2185,7 +2520,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_gpg_without_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "gpg"]);
+        let result = Cli::try_parse_from(["cadence", "gpg"]);
         assert!(result.is_err());
     }
 
@@ -2367,25 +2702,25 @@ mod tests {
 
     #[test]
     fn cli_rejects_unknown_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "frobnicate"]);
+        let result = Cli::try_parse_from(["cadence", "frobnicate"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_hook_without_sub_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "hook"]);
+        let result = Cli::try_parse_from(["cadence", "hook"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_hydrate_since_missing_value() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker", "hydrate", "--since"]);
+        let result = Cli::try_parse_from(["cadence", "hydrate", "--since"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_no_subcommand() {
-        let result = Cli::try_parse_from(["ai-session-commit-linker"]);
+        let result = Cli::try_parse_from(["cadence"]);
         assert!(result.is_err());
     }
 
@@ -2445,7 +2780,7 @@ mod tests {
             recipient_error: Some("config read failed".to_string()),
             key_in_keyring: None,
         };
-        assert_eq!(report.summary(), "unknown (config read error)");
+        assert_eq!(report.summary(), "unknown (config read issue)");
     }
 
     #[test]
@@ -2578,12 +2913,12 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
 
         assert!(
-            output.contains("recipient: error (invalid config file)"),
+            output.contains("recipient: unavailable (invalid config file)"),
             "got: {}",
             output
         );
         assert!(
-            output.contains("Encryption: unknown (config read error)"),
+            output.contains("Encryption: unknown (config read issue)"),
             "got: {}",
             output
         );
@@ -2726,7 +3061,7 @@ mod tests {
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
             with_env("PATH", restricted_bin.path().to_str().unwrap(), || {
-                run_gpg_setup_inner(&mut input, &mut output)
+                run_gpg_setup_with_io(&mut input, &mut output)
             })
         });
 
@@ -2765,7 +3100,7 @@ mod tests {
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
-            run_gpg_setup_inner(&mut input, &mut output)
+            run_gpg_setup_with_io(&mut input, &mut output)
         });
 
         // On machines without gpg, this aborts at step 1 (gpg not found).
@@ -2806,7 +3141,7 @@ mod tests {
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
-            run_gpg_setup_inner(&mut input, &mut output)
+            run_gpg_setup_with_io(&mut input, &mut output)
         });
 
         assert!(result.is_ok(), "abort should return Ok: {:?}", result.err());
@@ -2843,7 +3178,7 @@ mod tests {
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
-            run_gpg_setup_inner(&mut input, &mut output)
+            run_gpg_setup_with_io(&mut input, &mut output)
         });
 
         assert!(result.is_ok());
@@ -2881,7 +3216,7 @@ mod tests {
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
             with_env("GNUPGHOME", gnupg_dir.path().to_str().unwrap(), || {
-                run_gpg_setup_inner(&mut input, &mut output)
+                run_gpg_setup_with_io(&mut input, &mut output)
             })
         });
 
@@ -2932,7 +3267,7 @@ mod tests {
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
             with_env("GNUPGHOME", gnupg_dir.path().to_str().unwrap(), || {
-                run_gpg_setup_inner(&mut input, &mut output)
+                run_gpg_setup_with_io(&mut input, &mut output)
             })
         });
 
@@ -2986,7 +3321,7 @@ mod tests {
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
             with_env("GNUPGHOME", gnupg_dir.path().to_str().unwrap(), || {
-                run_gpg_setup_inner(&mut input, &mut output)
+                run_gpg_setup_with_io(&mut input, &mut output)
             })
         });
 
@@ -2994,7 +3329,7 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.contains("Import failed"),
+            output_str.contains("Could not import key"),
             "should show import failure: {output_str}"
         );
 
@@ -3160,6 +3495,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(not(windows))]
     fn gpg_status_collect_with_recipient_configured() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join(".gitconfig");
@@ -3171,7 +3507,7 @@ mod tests {
                 "config",
                 "--file",
                 config_path.to_str().unwrap(),
-                "ai.session-commit-linker.gpg.recipient",
+                "ai.cadence.gpg.recipient",
                 "test-status@example.com",
             ])
             .output()
@@ -3193,7 +3529,6 @@ mod tests {
 
     use serde_json::json;
     use serial_test::serial;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper: create a temporary git repo with one commit.
@@ -3344,6 +3679,7 @@ mod tests {
 
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -3353,11 +3689,7 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
+        let chat_dir = app_config_dir_in("Cursor", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -3409,6 +3741,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -3487,6 +3820,7 @@ mod tests {
 
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -3496,11 +3830,7 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
+        let chat_dir = app_config_dir_in("Code", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -3552,6 +3882,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -3564,6 +3895,7 @@ mod tests {
 
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -3573,11 +3905,7 @@ mod tests {
         let head_ts_str = run_git(repo_path, &["show", "-s", "--format=%ct", "HEAD"]);
         let head_ts: i64 = head_ts_str.parse().unwrap();
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let chat_dir = app_config_dir_in("Antigravity", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -3629,6 +3957,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -3766,7 +4095,7 @@ mod tests {
         // Pending record should exist
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", head_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -3844,7 +4173,7 @@ mod tests {
         let original_cwd = safe_cwd();
 
         // Use a fake HOME so pending records are written to a temp dir
-        // instead of the real ~/.ai-session-commit-linker/pending/.
+        // instead of the real ~/.cadence/cli/pending/.
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
         // SAFETY: This test is #[serial], so no other threads are reading
@@ -3880,7 +4209,7 @@ mod tests {
         // A pending record should have been written inside the fake home
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", head_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -3949,7 +4278,7 @@ mod tests {
         // Verify pending record was created
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", first_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -4052,7 +4381,7 @@ mod tests {
         // increments it to 2 (because retry also fails to find a session log).
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", first_hash));
         let content = std::fs::read_to_string(&pending_path).unwrap();
@@ -4246,6 +4575,7 @@ mod tests {
         let original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -4253,11 +4583,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
+        let chat_dir = app_config_dir_in("Cursor", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -4312,6 +4638,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -4391,6 +4718,7 @@ mod tests {
         let original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -4398,11 +4726,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
+        let chat_dir = app_config_dir_in("Code", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -4457,6 +4781,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -4469,6 +4794,7 @@ mod tests {
         let original_cwd = safe_cwd();
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
+        let (_global_config_path, original_global) = set_isolated_global_git_config(&fake_home);
         unsafe {
             std::env::set_var("HOME", fake_home.path());
         }
@@ -4476,11 +4802,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
         let head_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
-        let chat_dir = fake_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Antigravity")
+        let chat_dir = app_config_dir_in("Antigravity", fake_home.path())
             .join("User")
             .join("workspaceStorage")
             .join("ws1")
@@ -4535,6 +4857,7 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        restore_global_git_config(original_global);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -4929,7 +5252,7 @@ mod tests {
 
         let pending_path = fake_home
             .path()
-            .join(".ai-session-commit-linker")
+            .join(".cadence/cli")
             .join("pending")
             .join(format!("{}.json", first_hash));
         assert!(pending_path.exists(), "pending record should exist");
@@ -5429,8 +5752,20 @@ mod tests {
 
         let shim_content = std::fs::read_to_string(&shim_path).unwrap();
         assert_eq!(
-            shim_content, "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
+            shim_content,
+            post_commit_hook_content(),
             "shim content should match exactly"
+        );
+
+        // Verify pre-push shim was written
+        let pre_push_path = hooks_dir.join("pre-push");
+        assert!(pre_push_path.exists(), "pre-push shim should exist");
+
+        let pre_push_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(
+            pre_push_content,
+            pre_push_hook_content(),
+            "pre-push shim content should match exactly"
         );
 
         // Verify shim is executable
@@ -5443,6 +5778,14 @@ mod tests {
                 mode & 0o111 != 0,
                 "shim should be executable, got mode {:o}",
                 mode
+            );
+
+            let pre_perms = std::fs::metadata(&pre_push_path).unwrap().permissions();
+            let pre_mode = pre_perms.mode();
+            assert!(
+                pre_mode & 0o111 != 0,
+                "pre-push shim should be executable, got mode {:o}",
+                pre_mode
             );
         }
 
@@ -5530,13 +5873,14 @@ mod tests {
         let result2 = run_install_inner(None, Some(fake_home.path()));
         assert!(result2.is_ok());
 
-        // Shim should still be correct
+        // Shims should still be correct
         let shim_path = fake_home.path().join(".git-hooks").join("post-commit");
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(
-            content,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
-        );
+        assert_eq!(content, post_commit_hook_content());
+
+        let pre_push_path = fake_home.path().join(".git-hooks").join("pre-push");
+        let pre_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(pre_content, pre_push_hook_content());
 
         // Restore
         unsafe {
@@ -5554,7 +5898,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_install_detects_existing_non_linker_hook() {
-        // If a post-commit hook exists that was NOT created by ai-session-commit-linker,
+        // If a post-commit hook exists that was NOT created by cadence,
         // install should still overwrite it (with a warning).
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
@@ -5568,32 +5912,45 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        // Pre-create hooks dir and a non-linker hook
+        // Pre-create hooks dir and non-linker hooks
         let hooks_dir = fake_home.path().join(".git-hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let shim_path = hooks_dir.join("post-commit");
         std::fs::write(&shim_path, "#!/bin/sh\necho 'custom hook'\n").unwrap();
+        let pre_push_path = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push_path, "#!/bin/sh\necho 'custom pre-push'\n").unwrap();
 
         let result = run_install_inner(None, Some(fake_home.path()));
         assert!(result.is_ok());
 
-        // The shim should now be the ai-session-commit-linker one (overwritten)
+        // The shim should now be the cadence one (overwritten)
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(
-            content,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
-        );
+        assert_eq!(content, post_commit_hook_content());
+
+        let pre_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(pre_content, pre_push_hook_content());
 
         // The original hook should have been backed up
-        let backup_path = hooks_dir.join("post-commit.pre-ai-session-commit-linker");
+        let backup_path = hooks_dir.join("post-commit.pre-cadence");
         assert!(
             backup_path.exists(),
-            "backup of original hook should exist at post-commit.pre-ai-session-commit-linker"
+            "backup of original hook should exist at post-commit.pre-cadence"
         );
         let backup_content = std::fs::read_to_string(&backup_path).unwrap();
         assert_eq!(
             backup_content, "#!/bin/sh\necho 'custom hook'\n",
             "backup should contain the original hook content"
+        );
+
+        let pre_backup_path = hooks_dir.join("pre-push.pre-cadence");
+        assert!(
+            pre_backup_path.exists(),
+            "backup of original hook should exist at pre-push.pre-cadence"
+        );
+        let pre_backup_content = std::fs::read_to_string(&pre_backup_path).unwrap();
+        assert_eq!(
+            pre_backup_content, "#!/bin/sh\necho 'custom pre-push'\n",
+            "backup should contain the original pre-push hook content"
         );
 
         // Restore
@@ -5612,7 +5969,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_install_detects_existing_linker_hook() {
-        // If a post-commit hook exists that WAS created by ai-session-commit-linker,
+        // If a post-commit hook exists that WAS created by cadence,
         // install should update it silently.
         let fake_home = TempDir::new().expect("failed to create fake home");
         let original_home = std::env::var("HOME").ok();
@@ -5626,25 +5983,23 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        // Pre-create hooks dir with an existing ai-session-commit-linker hook
+        // Pre-create hooks dir with existing cadence hooks
         let hooks_dir = fake_home.path().join(".git-hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let shim_path = hooks_dir.join("post-commit");
-        std::fs::write(
-            &shim_path,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
-        )
-        .unwrap();
+        std::fs::write(&shim_path, post_commit_hook_content()).unwrap();
+        let pre_push_path = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push_path, pre_push_hook_content()).unwrap();
 
         let result = run_install_inner(None, Some(fake_home.path()));
         assert!(result.is_ok());
 
         // The shim should still be correct
         let content = std::fs::read_to_string(&shim_path).unwrap();
-        assert_eq!(
-            content,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n"
-        );
+        assert_eq!(content, post_commit_hook_content());
+
+        let pre_content = std::fs::read_to_string(&pre_push_path).unwrap();
+        assert_eq!(pre_content, pre_push_hook_content());
 
         // Restore
         unsafe {
@@ -5801,7 +6156,12 @@ mod tests {
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
         let mut buf = Vec::new();
-        let result = run_status_inner(&mut buf);
+        let git_dir = repo_path.join(".git");
+        let result = with_env("GIT_DIR", git_dir.to_str().unwrap(), || {
+            with_env("GIT_WORK_TREE", repo_path.to_str().unwrap(), || {
+                run_status_inner(&mut buf)
+            })
+        });
         assert!(result.is_ok());
 
         let output = String::from_utf8(buf).unwrap();
@@ -5842,20 +6202,14 @@ mod tests {
         std::fs::create_dir_all(&hooks_dir).unwrap();
         let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
 
-        // Write the ai-session-commit-linker shim
+        // Write the cadence shims
         let shim_path = hooks_dir.join("post-commit");
-        std::fs::write(
-            &shim_path,
-            "#!/bin/sh\nexec ai-session-commit-linker hook post-commit\n",
-        )
-        .unwrap();
+        std::fs::write(&shim_path, post_commit_hook_content()).unwrap();
+        let pre_push_path = hooks_dir.join("pre-push");
+        std::fs::write(&pre_push_path, pre_push_hook_content()).unwrap();
 
         let global_config = fake_home.path().join("fake-global-gitconfig");
-        std::fs::write(
-            &global_config,
-            format!("[core]\n    hooksPath = {}\n", hooks_dir_str),
-        )
-        .unwrap();
+        std::fs::write(&global_config, "").unwrap();
 
         unsafe {
             std::env::set_var("HOME", fake_home.path());
@@ -5864,14 +6218,30 @@ mod tests {
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
+        // Configure hooksPath using git so Windows path escaping is handled.
+        std::process::Command::new("git")
+            .args(["config", "--global", "core.hooksPath", &hooks_dir_str])
+            .output()
+            .unwrap();
+
         let mut buf = Vec::new();
-        let result = run_status_inner(&mut buf);
+        let git_dir = repo_path.join(".git");
+        let result = with_env("GIT_DIR", git_dir.to_str().unwrap(), || {
+            with_env("GIT_WORK_TREE", repo_path.to_str().unwrap(), || {
+                run_status_inner(&mut buf)
+            })
+        });
         assert!(result.is_ok());
 
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("shim installed: yes"),
-            "should show shim installed, got: {}",
+            output.contains("post-commit: yes"),
+            "should show post-commit installed, got: {}",
+            output
+        );
+        assert!(
+            output.contains("pre-push: yes"),
+            "should show pre-push installed, got: {}",
             output
         );
 
@@ -5905,10 +6275,7 @@ mod tests {
         let git_repo_root = run_git(repo_path, &["rev-parse", "--show-toplevel"]);
 
         // Write some pending records for this repo
-        let pending_dir = fake_home
-            .path()
-            .join(".ai-session-commit-linker")
-            .join("pending");
+        let pending_dir = fake_home.path().join(".cadence/cli").join("pending");
         std::fs::create_dir_all(&pending_dir).unwrap();
 
         for i in 0..3 {
@@ -5963,11 +6330,7 @@ mod tests {
 
         // Create a global config with org filter
         let global_config = fake_home.path().join("fake-global-gitconfig");
-        std::fs::write(
-            &global_config,
-            "[ai \"session-commit-linker\"]\n    org = my-test-org\n",
-        )
-        .unwrap();
+        std::fs::write(&global_config, "[ai \"cadence\"]\n    org = my-test-org\n").unwrap();
 
         unsafe {
             std::env::set_var("HOME", fake_home.path());
@@ -6015,10 +6378,7 @@ mod tests {
         }
 
         // Set autopush to true
-        run_git(
-            repo_path,
-            &["config", "ai.session-commit-linker.autopush", "true"],
-        );
+        run_git(repo_path, &["config", "ai.cadence.autopush", "true"]);
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
@@ -6057,10 +6417,7 @@ mod tests {
         }
 
         // Disable this repo
-        run_git(
-            repo_path,
-            &["config", "ai.session-commit-linker.enabled", "false"],
-        );
+        run_git(repo_path, &["config", "ai.cadence.enabled", "false"]);
 
         std::env::set_current_dir(repo_path).expect("failed to chdir");
 
@@ -6091,7 +6448,7 @@ mod tests {
 
     #[test]
     fn test_existing_notes_from_other_refs_not_affected() {
-        // AI Session Commit Linker uses refs/notes/ai-sessions. Existing notes from
+        // Cadence CLI uses refs/notes/ai-sessions. Existing notes from
         // other refs (e.g., the default refs/notes/commits) should not
         // be affected by our operations.
         let dir = init_temp_repo();
@@ -6199,10 +6556,7 @@ mod tests {
         let first_hash = run_git(repo_path, &["rev-parse", "HEAD"]);
 
         // Create a pending record with attempts >= MAX_RETRY_ATTEMPTS
-        let pending_dir = fake_home
-            .path()
-            .join(".ai-session-commit-linker")
-            .join("pending");
+        let pending_dir = fake_home.path().join(".cadence/cli").join("pending");
         std::fs::create_dir_all(&pending_dir).unwrap();
 
         let record = serde_json::json!({
@@ -6339,7 +6693,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let gnupghome = dir.path();
-        let email = "test-hook-gpg@ai-session-commit-linker.test";
+        let email = "test-hook-gpg@cadence.test";
 
         #[cfg(unix)]
         {
@@ -6468,7 +6822,7 @@ mod tests {
                     "config",
                     "--file",
                     self.global_config_path.to_str().unwrap(),
-                    "ai.session-commit-linker.gpg.recipient",
+                    "ai.cadence.gpg.recipient",
                     recipient,
                 ])
                 .output()
@@ -6630,6 +6984,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(unix)]
     fn test_hook_fails_when_gpg_unavailable_but_recipient_configured() {
         let env = GpgHookTestEnv::setup();
 
@@ -6651,11 +7006,7 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&git_bin, restricted_bin.path().join("git")).unwrap();
-        }
+        std::os::unix::fs::symlink(&git_bin, restricted_bin.path().join("git")).unwrap();
 
         unsafe { std::env::set_var("PATH", restricted_bin.path()) };
 
@@ -6910,7 +7261,7 @@ mod tests {
                 "config",
                 "--file",
                 global_config.to_str().unwrap(),
-                "ai.session-commit-linker.gpg.recipient",
+                "ai.cadence.gpg.recipient",
                 &email,
             ])
             .output()
@@ -7027,7 +7378,7 @@ mod tests {
                 "config",
                 "--file",
                 global_config.to_str().unwrap(),
-                "ai.session-commit-linker.gpg.recipient",
+                "ai.cadence.gpg.recipient",
                 &email,
             ])
             .output()

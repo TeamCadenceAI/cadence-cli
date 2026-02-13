@@ -2,7 +2,7 @@
 //!
 //! Manages pending records for commits that could not be resolved at
 //! hook time. Each unresolved commit is stored as a JSON file in
-//! `~/.ai-session-commit-linker/pending/<commit-hash>.json`. The retry system
+//! `~/.cadence/cli/pending/<commit-hash>.json`. The retry system
 //! attempts to re-resolve these records on subsequent commits.
 //!
 //! Writes are atomic: data is written to a temporary file first, then
@@ -36,7 +36,7 @@ pub struct PendingRecord {
 /// This is the internal implementation that accepts a home path, allowing
 /// tests to use a temp directory instead of the real `$HOME`.
 fn pending_dir_in(home: &Path) -> anyhow::Result<PathBuf> {
-    let dir = home.join(".ai-session-commit-linker").join("pending");
+    let dir = home.join(".cadence/cli").join("pending");
     if !dir.exists() {
         std::fs::create_dir_all(&dir)?;
     }
@@ -47,7 +47,7 @@ fn pending_dir_in(home: &Path) -> anyhow::Result<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Return the pending directory: `~/.ai-session-commit-linker/pending/`.
+/// Return the pending directory: `~/.cadence/cli/pending/`.
 ///
 /// Creates the directory (and parents) if it does not exist.
 pub fn pending_dir() -> anyhow::Result<PathBuf> {
@@ -281,7 +281,7 @@ mod tests {
         let dir = pending_dir_in(home.path()).unwrap();
 
         assert!(dir.exists());
-        assert!(dir.ends_with(".ai-session-commit-linker/pending"));
+        assert!(dir.ends_with(".cadence/cli/pending"));
     }
 
     #[test]
