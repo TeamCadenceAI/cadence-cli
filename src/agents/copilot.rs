@@ -39,15 +39,12 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_copilot_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
-        let ws_root = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
+        let ws_root = app_config_dir_in("Code", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")

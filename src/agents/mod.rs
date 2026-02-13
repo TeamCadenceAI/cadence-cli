@@ -696,6 +696,10 @@ mod tests {
     #[test]
     fn test_app_config_dir_in_platform() {
         let home = PathBuf::from("/home/tester");
+        let xdg_backup = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/home/tester/.config");
+        }
         let dir = app_config_dir_in("Code", &home);
         if cfg!(target_os = "macos") {
             assert_eq!(
@@ -707,6 +711,10 @@ mod tests {
         } else {
             assert!(dir.starts_with(PathBuf::from("/home/tester")));
             assert!(dir.ends_with(PathBuf::from("Code")));
+        }
+        match xdg_backup {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
     }
 }
