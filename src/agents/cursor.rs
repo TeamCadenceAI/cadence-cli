@@ -81,9 +81,9 @@ fn collect_dirs_with_exts(dir: &Path, results: &mut Vec<PathBuf>, exts: &[&str])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::app_config_dir_in;
     use std::fs;
     use tempfile::TempDir;
-    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_cursor_log_dirs_collects_chat_sessions_and_projects() {

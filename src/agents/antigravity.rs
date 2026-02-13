@@ -467,10 +467,10 @@ fn extract_workspace_uri(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::app_config_dir_in;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
-    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_antigravity_log_dirs_collects_chat_sessions() {

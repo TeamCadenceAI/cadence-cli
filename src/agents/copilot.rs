@@ -37,9 +37,9 @@ fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::app_config_dir_in;
     use std::fs;
     use tempfile::TempDir;
-    use crate::agents::app_config_dir_in;
 
     #[test]
     fn test_copilot_log_dirs_collects_chat_sessions() {

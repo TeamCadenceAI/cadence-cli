@@ -7,9 +7,6 @@
 //! 2. **Org filter**: if `git config --global ai.cadence.org` is set,
 //!    the selected remote must belong to that org. Otherwise, notes are
 //!    attached locally only (no push).
-//! 3. **Autopush consent**: `git config ai.cadence.autopush` -- on first
-//!    push for a repo, print a note and record consent. After that,
-//!    push silently.
 //!
 //! Note: The per-repo enabled check (`git config ai.cadence.enabled`) is
 //! handled by [`git::check_enabled()`] in the git module, since it gates
@@ -20,7 +17,7 @@
 
 use crate::{git, output};
 use anyhow::{Context, Result};
-use std::process::Command;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -29,7 +26,7 @@ use std::process::Command;
 /// Determine whether notes should be pushed for a specific remote.
 ///
 /// Orchestrates all checks: enabled (already checked by caller), has upstream,
-/// org filter, and autopush consent.
+/// org filter.
 ///
 /// Returns `true` if all conditions are met and notes should be pushed.
 /// Returns `false` if any condition prevents pushing.
@@ -46,11 +43,6 @@ pub fn should_push_remote(remote: &str) -> bool {
 
     // Check 2: Org filter
     if !check_org_filter_remote(remote) {
-        return false;
-    }
-
-    // Check 3: Autopush consent
-    if !check_or_request_consent(remote) {
         return false;
     }
 
@@ -112,17 +104,7 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
 
     let fetch_start = std::time::Instant::now();
-    let fetch_status = Command::new("git")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=never",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .args(["fetch", remote, &fetch_spec])
-        .output()
+    let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
         .context("failed to execute git fetch for notes")?;
     output::detail(&format!(
         "Fetch in {} ms",
@@ -141,18 +123,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 
     if fetched {
         let merge_start = std::time::Instant::now();
-        let merge_status = Command::new("git")
-            .args([
-                "-c",
-                "credential.helper=",
-                "-c",
-                "credential.interactive=never",
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", "echo")
-            .args(["notes", "--ref", git::NOTES_REF, "merge", &temp_ref])
-            .output()
-            .context("failed to execute git notes merge")?;
+        let merge_status = git::run_git_output_at(
+            None,
+            &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+            &[],
+        )
+        .context("failed to execute git notes merge")?;
         output::detail(&format!(
             "Merge in {} ms",
             merge_start.elapsed().as_millis()
@@ -167,17 +143,7 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
             ));
         }
 
-        let _ = Command::new("git")
-            .args([
-                "-c",
-                "credential.helper=",
-                "-c",
-                "credential.interactive=never",
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", "echo")
-            .args(["update-ref", "-d", &temp_ref])
-            .output();
+        let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
     }
 
     let post_hash_start = std::time::Instant::now();
@@ -196,19 +162,71 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 
     let push_start = std::time::Instant::now();
     output::detail("Pushing notes");
-    let push_status = Command::new("git")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=never",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .args(["push", remote, git::NOTES_REF])
-        .output()
-        .context("failed to execute git push for notes")?;
+    let push_status = git::run_git_output_at(
+        None,
+        &["push", "--no-verify", remote, git::NOTES_REF],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git push for notes")?;
     output::detail(&format!("Push in {} ms", push_start.elapsed().as_millis()));
+
+    if !push_status.status.success() {
+        let stderr = String::from_utf8_lossy(&push_status.stderr);
+        let stderr_trim = stderr.trim();
+        if stderr_trim.contains("cannot lock ref")
+            && stderr_trim.contains(git::NOTES_REF)
+            && stderr_trim.contains("expected")
+        {
+            output::note("Notes ref changed on remote; retrying sync once");
+            return sync_notes_for_remote_retry(remote);
+        }
+        anyhow::bail!("git push notes failed: {}", stderr_trim);
+    }
+
+    Ok(())
+}
+
+fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
+    if remote.is_empty() || remote == "." {
+        anyhow::bail!("invalid remote name");
+    }
+
+    let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
+    let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
+
+    let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
+        .context("failed to execute git fetch for notes")?;
+
+    if !fetch_status.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch_status.stderr);
+        let stderr_trim = stderr.trim();
+        if !(stderr_trim.contains("couldn't find remote ref")
+            && stderr_trim.contains(git::NOTES_REF))
+        {
+            anyhow::bail!("git fetch notes failed: {}", stderr_trim);
+        }
+    }
+
+    let merge_status = git::run_git_output_at(
+        None,
+        &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+        &[],
+    )
+    .context("failed to execute git notes merge")?;
+
+    if !merge_status.status.success() {
+        let stderr = String::from_utf8_lossy(&merge_status.stderr);
+        anyhow::bail!("git notes merge failed: {}", stderr.trim());
+    }
+
+    let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
+
+    let push_status = git::run_git_output_at(
+        None,
+        &["push", "--no-verify", remote, git::NOTES_REF],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git push for notes")?;
 
     if !push_status.status.success() {
         let stderr = String::from_utf8_lossy(&push_status.stderr);
@@ -219,18 +237,12 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
 }
 
 fn local_notes_hash() -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=never",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .args(["show-ref", "--verify", "--hash", git::NOTES_REF])
-        .output()
-        .context("failed to execute git show-ref")?;
+    let output = git::run_git_output_at(
+        None,
+        &["show-ref", "--verify", "--hash", git::NOTES_REF],
+        &[],
+    )
+    .context("failed to execute git show-ref")?;
 
     if !output.status.success() {
         return Ok(None);
@@ -247,18 +259,9 @@ fn local_notes_hash() -> Result<Option<String>> {
 
 fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     let start = std::time::Instant::now();
-    let output = Command::new("git")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=never",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .args(["ls-remote", "--refs", remote, git::NOTES_REF])
-        .output()
-        .context("failed to execute git ls-remote")?;
+    let output =
+        git::run_git_output_at(None, &["ls-remote", "--refs", remote, git::NOTES_REF], &[])
+            .context("failed to execute git ls-remote")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -318,44 +321,55 @@ pub fn org_matches(configured_org: &str, remote_orgs: &[String]) -> bool {
         .any(|org| org.eq_ignore_ascii_case(configured_org))
 }
 
-/// Check autopush consent. On first push for a repo, print a note to
-/// stderr and record consent by setting `git config ai.cadence.autopush true`.
-///
-/// Returns `true` if consent is granted (either already recorded or just granted).
-/// Returns `false` if consent cannot be recorded (config write failure).
-pub fn check_or_request_consent(remote: &str) -> bool {
-    match git::config_get("ai.cadence.autopush") {
-        Ok(Some(val)) if val == "true" => {
-            // Consent already recorded, push silently
-            return true;
-        }
-        Ok(Some(val)) if val == "false" => {
-            // Explicitly opted out of push
-            return false;
-        }
-        _ => {
-            // Not set or error reading: this is the first push for this repo.
-            // Print a consent note and record it.
-        }
+/// Fetch and merge notes from the remote for a specific repository.
+pub fn fetch_merge_notes_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
+    fetch_merge_notes_for_remote_inner(Some(repo), remote)
+}
+
+fn fetch_merge_notes_for_remote_inner(repo: Option<&Path>, remote: &str) -> Result<()> {
+    if remote.is_empty() || remote == "." {
+        anyhow::bail!("invalid remote name");
     }
 
-    // First push for this repo: print an informational note
-    output::note("First time pushing notes for this repository.");
-    output::detail(&format!(
-        "Notes will be pushed via: git push {} {}",
-        remote,
-        git::NOTES_REF
-    ));
-    output::detail("To disable, run: git config ai.cadence.autopush false");
+    let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
+    let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
 
-    // Record consent
-    if let Err(e) = git::config_set("ai.cadence.autopush", "true") {
-        output::note(&format!("Could not record auto-push consent: {}", e));
-        // Still allow this push attempt even if we couldn't save the config
-        return true;
+    let fetch_status = git::run_git_output_at(
+        repo,
+        &["fetch", remote, &fetch_spec],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git fetch for notes")?;
+
+    if !fetch_status.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch_status.stderr);
+        let stderr_trim = stderr.trim();
+        if stderr_trim.contains("couldn't find remote ref") && stderr_trim.contains(git::NOTES_REF)
+        {
+            return Ok(());
+        }
+        anyhow::bail!("git fetch notes failed: {}", stderr_trim);
     }
 
-    true
+    let merge_status = git::run_git_output_at(
+        repo,
+        &["notes", "--ref", git::NOTES_REF, "merge", &temp_ref],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git notes merge")?;
+
+    if !merge_status.status.success() {
+        let stderr = String::from_utf8_lossy(&merge_status.stderr);
+        anyhow::bail!("git notes merge failed: {}", stderr.trim());
+    }
+
+    let _ = git::run_git_output_at(
+        repo,
+        &["update-ref", "-d", &temp_ref],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    );
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -411,68 +425,6 @@ mod tests {
                 fallback
             }
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // check_or_request_consent
-    // -----------------------------------------------------------------------
-
-    #[test]
-    #[serial]
-    fn test_consent_first_time_grants_and_records() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        // No autopush config set -- first time
-        assert!(check_or_request_consent("origin"));
-
-        // Should now have autopush=true recorded
-        let val = run_git(dir.path(), &["config", "--get", "ai.cadence.autopush"]);
-        assert_eq!(val, "true");
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_consent_already_true() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        run_git(dir.path(), &["config", "ai.cadence.autopush", "true"]);
-        assert!(check_or_request_consent("origin"));
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_consent_explicitly_false_denies() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        run_git(dir.path(), &["config", "ai.cadence.autopush", "false"]);
-        assert!(!check_or_request_consent("origin"));
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_consent_second_call_is_silent() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        // First call: grants consent and records it
-        assert!(check_or_request_consent("origin"));
-        // Second call: should still return true (already recorded)
-        assert!(check_or_request_consent("origin"));
-
-        std::env::set_current_dir(original_cwd).unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -607,7 +559,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_should_push_with_remote_and_consent() {
+    fn test_should_push_with_remote() {
         let dir = init_temp_repo();
         let original_cwd = safe_cwd();
         std::env::set_current_dir(dir.path()).expect("failed to chdir");
@@ -623,37 +575,8 @@ mod tests {
             ],
         );
 
-        // Pre-set consent so should_push doesn't need to print the warning
-        run_git(dir.path(), &["config", "ai.cadence.autopush", "true"]);
-
-        // should_push_remote should return true (remote exists, no org filter, consent given)
+        // should_push_remote should return true (remote exists, no org filter)
         assert!(should_push_remote("origin"));
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_should_push_consent_denied_returns_false() {
-        let dir = init_temp_repo();
-        let original_cwd = safe_cwd();
-        std::env::set_current_dir(dir.path()).expect("failed to chdir");
-
-        // Add a remote
-        run_git(
-            dir.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:test-org/test-repo.git",
-            ],
-        );
-
-        // Explicitly deny consent
-        run_git(dir.path(), &["config", "ai.cadence.autopush", "false"]);
-
-        assert!(!should_push_remote("origin"));
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -661,7 +584,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // remote_orgs with multiple remotes
     // -----------------------------------------------------------------------
-
     #[test]
     #[serial]
     fn test_remote_orgs_multiple_remotes() {
@@ -801,9 +723,6 @@ mod tests {
             ],
         );
 
-        // Pre-set consent so we isolate the org filter behavior
-        run_git(dir.path(), &["config", "ai.cadence.autopush", "true"]);
-
         // Create a temp global config file with a different org filter
         let global_config = dir.path().join("fake-global-gitconfig");
         std::fs::write(&global_config, "[ai \"cadence\"]\n    org = required-org\n").unwrap();
@@ -839,9 +758,6 @@ mod tests {
             dir.path(),
             &["remote", "add", "origin", "git@github.com:my-org/repo.git"],
         );
-
-        // Pre-set consent
-        run_git(dir.path(), &["config", "ai.cadence.autopush", "true"]);
 
         // Create a global config file with matching org filter
         let global_config = dir.path().join("fake-global-gitconfig");

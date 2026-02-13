@@ -186,9 +186,7 @@ pub fn home_dir() -> Option<PathBuf> {
 
 pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library")
-            .join("Application Support")
-            .join(app)
+        home.join("Library").join("Application Support").join(app)
     } else if cfg!(target_os = "windows") {
         if let Ok(appdata) = std::env::var("APPDATA") {
             PathBuf::from(appdata).join(app)
