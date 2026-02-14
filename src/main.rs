@@ -153,7 +153,11 @@ enum KeysCommands {
         yes: bool,
     },
     /// Test server-side decryption of an encrypted note.
-    Test,
+    Test {
+        /// GPG key ID or email to use for encryption (default: reads from git config).
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2908,25 +2912,7 @@ fn run_keys_push_inner(
     let resolved = cfg.resolve_api_url(None);
 
     // 2. Resolve key identifier: --key flag, else git config recipient
-    let key_id = match key {
-        Some(k) => {
-            let trimmed = k.trim().to_string();
-            if trimmed.is_empty() {
-                anyhow::bail!(
-                    "No key specified. Use --key <ID> or set git config ai.cadence.gpg.recipient."
-                );
-            }
-            trimmed
-        }
-        None => match gpg::get_recipient()? {
-            Some(r) => r,
-            None => {
-                anyhow::bail!(
-                    "No key specified. Use --key <ID> or set git config ai.cadence.gpg.recipient."
-                );
-            }
-        },
-    };
+    let key_id = resolve_local_key_id(key)?;
 
     // 3. Export armored private key
     let armored_private_key =
@@ -3001,7 +2987,109 @@ fn run_keys_push_inner(
     Ok(())
 }
 
-fn run_keys_test() -> Result<()> {
+/// Resolve a GPG key identifier from a CLI `--key` override or git config fallback.
+///
+/// Precedence:
+/// 1. `--key` flag value (trimmed; blank is rejected).
+/// 2. `gpg::get_recipient()` from git config.
+/// 3. Error with remediation message.
+///
+/// Used by both `keys push` and `keys test` to ensure identical behavior.
+fn resolve_local_key_id(key_override: Option<String>) -> Result<String> {
+    match key_override {
+        Some(k) => {
+            let trimmed = k.trim().to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "No key specified. Use --key <ID> or set git config ai.cadence.gpg.recipient."
+                );
+            }
+            Ok(trimmed)
+        }
+        None => match gpg::get_recipient()? {
+            Some(r) => Ok(r),
+            None => {
+                anyhow::bail!(
+                    "No key specified. Use --key <ID> or set git config ai.cadence.gpg.recipient."
+                );
+            }
+        },
+    }
+}
+
+fn run_keys_test(key: Option<String>) -> Result<()> {
+    let is_tty = output::is_stderr_tty();
+    run_keys_test_inner(&mut std::io::stderr(), is_tty, key)
+}
+
+/// Inner implementation of `keys test` that writes to the provided writer.
+///
+/// Flow:
+/// 1. Load config and check for existing token (FR-7).
+/// 2. Resolve key identifier (--key flag or git config fallback).
+/// 3. Generate random challenge and encrypt locally.
+/// 4. Send encrypted message to API for server-side decryption test.
+/// 5. Print success or failure message.
+fn run_keys_test_inner(
+    w: &mut dyn std::io::Write,
+    is_tty: bool,
+    key_override: Option<String>,
+) -> Result<()> {
+    // 1. Auth gate: load config, verify token
+    let cfg = config::CliConfig::load()?;
+    let token = match &cfg.token {
+        Some(t) if !t.trim().is_empty() => t.clone(),
+        _ => {
+            output::action_to_with_tty(
+                w,
+                "Not currently authenticated.",
+                "Run `cadence auth login` first.",
+                is_tty,
+            );
+            return Ok(());
+        }
+    };
+    let resolved = cfg.resolve_api_url(None);
+
+    // 2. Resolve key identifier
+    let key_id = resolve_local_key_id(key_override)?;
+
+    // 3. Generate random challenge and encrypt locally
+    let challenge: String = {
+        use rand::Rng;
+        rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect()
+    };
+    let encrypted_message = gpg::encrypt_to_recipient(&challenge, &key_id)
+        .context("Unable to encrypt test message with selected key")?;
+
+    // 4. Send to API
+    let client = api_client::ApiClient::new(&resolved.url, Some(token));
+    match client.test_key(&encrypted_message) {
+        Ok(resp) => {
+            if resp.success {
+                output::success_to_with_tty(
+                    w,
+                    "Key verification passed. The server can decrypt notes encrypted with this key.",
+                    "",
+                    is_tty,
+                );
+            } else {
+                let reason = resp
+                    .message
+                    .unwrap_or_else(|| "Unknown failure reason".to_string());
+                output::fail_to_with_tty(w, "Key verification failed", &reason, is_tty);
+            }
+        }
+        Err(e) => {
+            let err_msg = format!("{e:#}");
+            output::fail_to_with_tty(w, "Failed to verify key decryption", &err_msg, is_tty);
+        }
+    }
+
     Ok(())
 }
 
@@ -3041,7 +3129,7 @@ fn main() {
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Status => run_keys_status(),
             KeysCommands::Push { key, yes } => run_keys_push(key, yes),
-            KeysCommands::Test => run_keys_test(),
+            KeysCommands::Test { key } => run_keys_test(key),
         },
     };
 
@@ -3601,9 +3689,20 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Keys {
-                keys_command: Some(KeysCommands::Test)
+                keys_command: Some(KeysCommands::Test { key: None })
             }
         ));
+    }
+
+    #[test]
+    fn cli_parses_keys_test_with_key() {
+        let cli = Cli::parse_from(["cadence", "keys", "test", "--key", "test@example.com"]);
+        match cli.command {
+            Command::Keys {
+                keys_command: Some(KeysCommands::Test { key }),
+            } => assert_eq!(key.as_deref(), Some("test@example.com")),
+            _ => panic!("expected Keys Test with key"),
+        }
     }
 
     #[test]
@@ -5618,9 +5717,592 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Keys test handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a CliConfig to a temp home and run keys test inner against it.
+    /// Returns (output, result).
+    fn run_keys_test_with_config(
+        cfg: &config::CliConfig,
+        key: Option<String>,
+    ) -> (String, Result<()>) {
+        let fake_home = TempDir::new().expect("failed to create fake home");
+        let config_path = fake_home
+            .path()
+            .join(".config")
+            .join("ai-session-commit-linker")
+            .join("config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let toml_str = toml::to_string_pretty(cfg).expect("failed to serialize config");
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_test_inner(&mut buf, false, key);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let output = String::from_utf8(buf).expect("output should be valid UTF-8");
+        (output, result)
+    }
+
     #[test]
-    fn run_keys_test_stub_returns_ok() {
-        assert!(run_keys_test().is_ok());
+    #[serial]
+    fn keys_test_not_authenticated() {
+        let cfg = config::CliConfig::default();
+        let (output, result) = run_keys_test_with_config(&cfg, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "should show not-authenticated message, got: {output}"
+        );
+        assert!(
+            output.contains("Run `cadence auth login` first."),
+            "should show login hint, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_empty_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "empty token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_whitespace_token_treated_as_unauthenticated() {
+        let cfg = config::CliConfig {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, None);
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Not currently authenticated."),
+            "whitespace-only token should be treated as unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_no_key_no_recipient_errors() {
+        let fake_home = TempDir::new().unwrap();
+        let (git_config_path, original_git_config) = set_isolated_global_git_config(&fake_home);
+        let _ = git_config_path;
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) = run_keys_test_with_config(&cfg, None);
+
+        restore_global_git_config(original_git_config);
+
+        assert!(result.is_err(), "should error when no key can be resolved");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("No key specified"),
+            "should mention no key specified, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("--key") && err_msg.contains("ai.cadence.gpg.recipient"),
+            "should suggest both --key and git config, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_empty_key_flag_errors() {
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) = run_keys_test_with_config(&cfg, Some("   ".to_string()));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("No key specified"),
+            "empty --key should error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_no_config_file_shows_unauthenticated() {
+        let fake_home = TempDir::new().unwrap();
+        // Don't create any config file
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let mut buf = Vec::new();
+        let result = run_keys_test_inner(&mut buf, false, None);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Not currently authenticated."),
+            "missing config should show unauthenticated, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_success_with_mock_server() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-success@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        // Start mock server
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut headers = Vec::new();
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                headers.push(trimmed);
+            }
+
+            let mut body_buf = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+            let request_body = String::from_utf8_lossy(&body_buf).to_string();
+
+            let resp_body = r#"{"success":true,"message":"Decryption verified"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            (req_line, headers, request_body)
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test_verify".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "keys test should succeed: {:?}",
+            result.err()
+        );
+        let (req_line, headers, request_body) = handle.join().unwrap();
+
+        // Verify correct endpoint
+        assert!(
+            req_line.contains("POST /api/keys/test"),
+            "should call POST /api/keys/test, got: {req_line}"
+        );
+
+        // Verify auth header
+        let auth_header = headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("authorization:"))
+            .expect("should send Authorization header");
+        assert!(
+            auth_header.contains("Bearer tok_test_verify"),
+            "should send correct Bearer token, got: {auth_header}"
+        );
+
+        // Verify request body has encrypted_message field
+        let sent: serde_json::Value =
+            serde_json::from_str(&request_body).expect("request body should be valid JSON");
+        assert!(
+            sent["encrypted_message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PGP MESSAGE"),
+            "should send encrypted PGP message"
+        );
+
+        // Verify success output
+        assert!(
+            output.contains(
+                "Key verification passed. The server can decrypt notes encrypted with this key."
+            ),
+            "should show exact success message, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_api_success_false_shows_reason() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-fail@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"success":false,"message":"Decryption failed: key mismatch"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test_verify".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "handler should not return Err for API failures"
+        );
+        assert!(
+            output.contains("Key verification failed"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Decryption failed: key mismatch"),
+            "should include server reason, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_api_401_error() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-401@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Unauthorized"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_expired".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "handler should not return Err for API errors"
+        );
+        assert!(
+            output.contains("Failed to verify key decryption"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Not authenticated") || output.contains("auth login"),
+            "should mention auth error, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_api_500_error() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let email = "test-keys-test-500@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_url = format!("http://127.0.0.1:{port}");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = trimmed.split_once(':') {
+                    if key.trim().to_lowercase() == "content-length" {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut body_buf = vec![0u8; content_length];
+                reader.read_exact(&mut body_buf).unwrap();
+            }
+
+            let resp_body = r#"{"message":"Internal server error"}"#;
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some(mock_url),
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        handle.join().unwrap();
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Failed to verify key decryption"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("Server error") || output.contains("Internal server error"),
+            "should include server error details, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_connection_refused() {
+        let email = "test-keys-test-connrefused@cadence.test";
+        let Some(gpg_home) = setup_push_test_gpg_keyring(email) else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (output, result) = run_keys_test_with_config(&cfg, Some(email.to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Failed to verify key decryption"),
+            "should show failure label, got: {output}"
+        );
+        assert!(
+            output.contains("failed to connect"),
+            "should mention connection failure, got: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn keys_test_unknown_key_errors() {
+        if !gpg::gpg_available() {
+            eprintln!("skipping test: gpg not available");
+            return;
+        }
+
+        let gpg_home = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(gpg_home.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+
+        let original_gnupghome = std::env::var("GNUPGHOME").ok();
+        unsafe { std::env::set_var("GNUPGHOME", gpg_home.path()) };
+
+        let cfg = config::CliConfig {
+            token: Some("tok_test".to_string()),
+            ..Default::default()
+        };
+        let (_output, result) =
+            run_keys_test_with_config(&cfg, Some("nonexistent-key@invalid.test".to_string()));
+
+        unsafe {
+            match original_gnupghome {
+                Some(v) => std::env::set_var("GNUPGHOME", v),
+                None => std::env::remove_var("GNUPGHOME"),
+            }
+        }
+
+        assert!(result.is_err(), "unknown key should fail");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("encrypt") || err_msg.contains("Unable to encrypt"),
+            "should mention encryption failure, got: {err_msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
