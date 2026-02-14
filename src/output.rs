@@ -1,5 +1,8 @@
 use console::{Color, Term, style};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 fn stderr_is_tty() -> bool {
     Term::stderr().is_term()
@@ -75,4 +78,12 @@ pub fn detail(msg: &str) {
 
 pub fn is_stderr_tty() -> bool {
     stderr_is_tty()
+}
+
+pub fn set_verbose(enabled: bool) {
+    VERBOSE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
 }

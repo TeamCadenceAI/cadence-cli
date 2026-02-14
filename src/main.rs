@@ -22,6 +22,9 @@ use std::process;
 #[derive(Parser, Debug)]
 #[command(name = "cadence", version, about)]
 struct Cli {
+    /// Enable verbose logging (e.g., git commands and output).
+    #[arg(long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -495,23 +498,6 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         &format!("done in {} ms", hydrate_start.elapsed().as_millis()),
     );
 
-    // Optional: sync notes for the current repo if a push remote resolves
-    if let Ok(Some(remote)) = git::resolve_push_remote() {
-        let consented = matches!(
-            git::config_get("ai.cadence.autopush"),
-            Ok(Some(val)) if val == "true"
-        );
-        if consented && push::check_org_filter_remote(&remote) {
-            output::action("Syncing", &format!("notes to {}", remote));
-            let sync_start = std::time::Instant::now();
-            push::sync_notes_for_remote(&remote);
-            output::success(
-                "Sync",
-                &format!("done in {} ms", sync_start.elapsed().as_millis()),
-            );
-        }
-    }
-
     if had_errors {
         output::fail("Install", "completed with issues");
     } else {
@@ -594,6 +580,13 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     let head_timestamp = git::head_timestamp()?;
     let repo_root_str = repo_root.to_string_lossy().to_string();
 
+    // Step 1.25: Org filter gating — skip all attachment if mismatched
+    match git::repo_matches_org_filter(&repo_root) {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(e) => return Err(HookError::Soft(e)),
+    }
+
     // Step 1.5: Resolve GPG recipient once for this invocation
     let recipient = gpg::get_recipient().map_err(|e| {
         // Config read failure is a soft error — don't block commit
@@ -666,17 +659,6 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 &format!("session {} to commit {}", session_id, &head_hash[..7]),
             );
 
-            if let Ok(Some(remote)) = git::resolve_push_remote()
-                && push::should_push_remote(&remote)
-            {
-                let push_start = std::time::Instant::now();
-                push::attempt_push_remote(&remote);
-                output::detail(&format!(
-                    "Post-commit push in {} ms",
-                    push_start.elapsed().as_millis()
-                ));
-            }
-
             attached = true;
         }
     }
@@ -726,17 +708,6 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 ),
             );
 
-            if let Ok(Some(remote)) = git::resolve_push_remote()
-                && push::should_push_remote(&remote)
-            {
-                let push_start = std::time::Instant::now();
-                push::attempt_push_remote(&remote);
-                output::detail(&format!(
-                    "Post-commit push in {} ms",
-                    push_start.elapsed().as_millis()
-                ));
-            }
-
             attached = true;
         }
     }
@@ -764,10 +735,12 @@ fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     if push::should_push_remote(remote) {
         let sync_start = std::time::Instant::now();
         push::sync_notes_for_remote(remote);
-        output::detail(&format!(
-            "Pre-push sync in {} ms",
-            sync_start.elapsed().as_millis()
-        ));
+        if output::is_verbose() {
+            output::detail(&format!(
+                "Pre-push sync in {} ms",
+                sync_start.elapsed().as_millis()
+            ));
+        }
     }
 
     Ok(())
@@ -1054,17 +1027,6 @@ fn try_resolve_single_commit(
                         ),
                     );
 
-                    if let Ok(Some(remote)) = git::resolve_push_remote()
-                        && push::should_push_remote(&remote)
-                    {
-                        let push_start = std::time::Instant::now();
-                        push::attempt_push_remote(&remote);
-                        output::detail(&format!(
-                            "Retry push in {} ms",
-                            push_start.elapsed().as_millis()
-                        ));
-                    }
-
                     return ResolveResult::Attached;
                 }
                 return ResolveResult::TransientError;
@@ -1105,17 +1067,6 @@ fn try_resolve_single_commit(
                     ),
                 );
 
-                if let Ok(Some(remote)) = git::resolve_push_remote()
-                    && push::should_push_remote(&remote)
-                {
-                    let push_start = std::time::Instant::now();
-                    push::attempt_push_remote(&remote);
-                    output::detail(&format!(
-                        "Retry push in {} ms",
-                        push_start.elapsed().as_millis()
-                    ));
-                }
-
                 return ResolveResult::Attached;
             }
             return ResolveResult::TransientError;
@@ -1151,18 +1102,6 @@ fn try_resolve_single_commit(
             ),
         );
 
-        // Push if conditions are met
-        if let Ok(Some(remote)) = git::resolve_push_remote()
-            && push::should_push_remote(&remote)
-        {
-            let push_start = std::time::Instant::now();
-            push::attempt_push_remote(&remote);
-            output::detail(&format!(
-                "Retry push in {} ms",
-                push_start.elapsed().as_millis()
-            ));
-        }
-
         ResolveResult::Attached
     } else {
         ResolveResult::TransientError
@@ -1185,6 +1124,15 @@ fn try_resolve_single_commit(
 /// The `recipient` parameter controls optional GPG encryption. Encryption
 /// failures in the retry path are treated as transient errors.
 fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, recipient: &Option<String>) {
+    match git::repo_matches_org_filter(repo_root) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            output::note(&format!("Org filter check failed: {}", e));
+            return;
+        }
+    }
+
     let mut pending_records = match pending::list_for_repo(repo_str) {
         Ok(records) => records,
         Err(_) => return,
@@ -1391,6 +1339,39 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     // Step 4: Process sessions grouped by repo
     for (repo_display, sessions) in &sessions_by_repo {
         output::action("Repository", repo_display);
+
+        let repo_root = match sessions.first() {
+            Some(session) => session.repo_root.clone(),
+            None => continue,
+        };
+
+        match git::repo_matches_org_filter(&repo_root) {
+            Ok(true) => {}
+            Ok(false) => {
+                output::detail("Org filter does not match; skipping");
+                continue;
+            }
+            Err(e) => {
+                output::detail(&format!("Org filter check failed: {}", e));
+                continue;
+            }
+        }
+
+        if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
+            let fetch_start = std::time::Instant::now();
+            match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
+                Ok(()) => {
+                    output::detail(&format!(
+                        "Fetched notes from {} in {} ms",
+                        remote,
+                        fetch_start.elapsed().as_millis()
+                    ));
+                }
+                Err(e) => {
+                    output::note(&format!("Could not fetch notes from {}: {}", remote, e));
+                }
+            }
+        }
 
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
@@ -1693,7 +1674,9 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     // Step 7: Push if requested
     if do_push {
         output::action("Pushing", "notes");
-        if let Ok(Some(remote)) = git::resolve_push_remote() {
+        if let Ok(Some(remote)) = git::resolve_push_remote()
+            && push::should_push_remote(&remote)
+        {
             push::attempt_push_remote(&remote);
         }
     }
@@ -1739,7 +1722,6 @@ fn run_retry() -> Result<()> {
 /// - Hooks path and whether the post-commit/pre-push shims are installed
 /// - Number of pending retries for the current repo
 /// - Org filter config (if any)
-/// - Autopush consent status
 /// - Per-repo enabled/disabled status
 ///
 /// All output is user-facing and written to stderr.
@@ -1811,27 +1793,6 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         _ => {
             output::detail_to_with_tty(w, "Org filter: (none)", false);
         }
-    }
-
-    // --- Autopush consent ---
-    if repo_root.is_some() {
-        match git::config_get("ai.cadence.autopush") {
-            Ok(Some(val)) if val == "true" => {
-                output::detail_to_with_tty(w, "Auto-push: enabled (consented)", false);
-            }
-            Ok(Some(val)) if val == "false" => {
-                output::detail_to_with_tty(w, "Auto-push: disabled (opted out)", false);
-            }
-            _ => {
-                output::detail_to_with_tty(
-                    w,
-                    "Auto-push: not yet configured (will prompt on first push)",
-                    false,
-                );
-            }
-        }
-    } else {
-        output::detail_to_with_tty(w, "Auto-push: (n/a - not in a repo)", false);
     }
 
     // --- Per-repo enabled/disabled ---
@@ -3099,6 +3060,7 @@ fn run_keys_test_inner(
 
 fn main() {
     let cli = Cli::parse();
+    output::set_verbose(cli.verbose);
 
     let result = match cli.command {
         Command::Install { org } => run_install(org),
@@ -3490,11 +3452,6 @@ mod tests {
         assert!(
             output.contains("Pending retries: (n/a - not in a repo)"),
             "pending should show n/a outside repo, got: {}",
-            output
-        );
-        assert!(
-            output.contains("Auto-push: (n/a - not in a repo)"),
-            "autopush should show n/a outside repo, got: {}",
             output
         );
         assert!(
@@ -10591,45 +10548,6 @@ mod tests {
             match original_global {
                 Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
                 None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
-            }
-        }
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_status_shows_autopush_status() {
-        let dir = init_temp_repo();
-        let repo_path = dir.path();
-        let original_cwd = safe_cwd();
-
-        let fake_home = TempDir::new().expect("failed to create fake home");
-        let original_home = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", fake_home.path());
-        }
-
-        // Set autopush to true
-        run_git(repo_path, &["config", "ai.cadence.autopush", "true"]);
-
-        std::env::set_current_dir(repo_path).expect("failed to chdir");
-
-        let mut buf = Vec::new();
-        let result = run_status_inner(&mut buf);
-        assert!(result.is_ok());
-
-        let output = String::from_utf8(buf).unwrap();
-        assert!(
-            output.contains("Auto-push: enabled"),
-            "should show autopush enabled, got: {}",
-            output
-        );
-
-        // Restore
-        unsafe {
-            match original_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
             }
         }
         std::env::set_current_dir(original_cwd).unwrap();

@@ -3,6 +3,7 @@
 //! All functions shell out to `git` via `std::process::Command`.
 //! The notes ref used throughout is `refs/notes/ai-sessions`.
 
+use crate::output;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::io::Write;
@@ -35,10 +36,7 @@ pub(crate) fn validate_commit_hash(commit: &str) -> Result<()> {
 /// Run a git command and return its stdout as a trimmed `String`.
 /// Returns an error if the command exits with a non-zero status.
 fn git_output(args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .context("failed to execute git")?;
+    let output = run_git_output_at(None, args, &[])?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -54,15 +52,135 @@ fn git_output(args: &[&str]) -> Result<String> {
     Ok(stdout.trim().to_string())
 }
 
+fn git_output_in(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = run_git_output_at(Some(repo), args, &[])?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    Ok(stdout.trim().to_string())
+}
+
+pub(crate) fn run_git_output_at(
+    repo: Option<&Path>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    let mut display_parts = vec!["git".to_string()];
+
+    if let Some(repo) = repo {
+        let repo_str = repo.to_string_lossy().to_string();
+        cmd.args(["-C", &repo_str]);
+        display_parts.push("-C".to_string());
+        display_parts.push(repo_str);
+    }
+
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+
+    display_parts.extend(args.iter().map(|s| s.to_string()));
+    if output::is_verbose() {
+        output::detail(&display_parts.join(" "));
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.args(args).spawn().context("failed to execute git")?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let (tx, rx) = std::sync::mpsc::channel::<(Stream, Vec<u8>)>();
+        if let Some(stdout) = stdout {
+            let tx = tx.clone();
+            std::thread::spawn(move || read_stream(Stream::Stdout, stdout, tx));
+        }
+        if let Some(stderr) = stderr {
+            let tx = tx.clone();
+            std::thread::spawn(move || read_stream(Stream::Stderr, stderr, tx));
+        }
+        drop(tx);
+
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let mut saw_stdout = false;
+        let mut saw_stderr = false;
+
+        while let Ok((stream, chunk)) = rx.recv() {
+            match stream {
+                Stream::Stdout => {
+                    if !saw_stdout {
+                        output::detail("stdout:");
+                        saw_stdout = true;
+                    }
+                    stdout_buf.extend_from_slice(&chunk);
+                    emit_stream_chunk(&chunk);
+                }
+                Stream::Stderr => {
+                    if !saw_stderr {
+                        output::detail("stderr:");
+                        saw_stderr = true;
+                    }
+                    stderr_buf.extend_from_slice(&chunk);
+                    emit_stream_chunk(&chunk);
+                }
+            }
+        }
+
+        let status = child.wait().context("failed to wait on git")?;
+        return Ok(std::process::Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        });
+    }
+
+    let output = cmd.args(args).output().context("failed to execute git")?;
+    Ok(output)
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+fn read_stream<R: std::io::Read>(
+    stream: Stream,
+    mut reader: R,
+    tx: std::sync::mpsc::Sender<(Stream, Vec<u8>)>,
+) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = tx.send((stream, buf[..n].to_vec()));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn emit_stream_chunk(chunk: &[u8]) {
+    let text = String::from_utf8_lossy(chunk);
+    for segment in text.split('\n') {
+        if segment.is_empty() {
+            continue;
+        }
+        let line = segment.trim_end_matches('\r');
+        output::detail(&format!("  {}", line));
+    }
+}
+
 /// Run a git command and return whether it succeeded (exit code 0).
 /// Does not treat non-zero exit as an error — just returns `false`.
 fn git_succeeds(args: &[&str]) -> Result<bool> {
-    let status = Command::new("git")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("failed to execute git")?;
+    let output = run_git_output_at(None, args, &[])?;
+    let status = output.status;
     Ok(status.success())
 }
 
@@ -95,18 +213,18 @@ pub fn check_enabled() -> bool {
 /// Reads `git -C <repo> config ai.cadence.enabled`. If the value is exactly
 /// `"false"`, returns `false`. Any other value (including unset) returns `true`.
 pub(crate) fn check_enabled_at(repo: &Path) -> bool {
-    let repo_str = repo.to_string_lossy();
-    let output = Command::new("git")
-        .args(["-C", &repo_str, "config", "--get", "ai.cadence.enabled"])
-        .output();
+    let output =
+        match run_git_output_at(Some(repo), &["config", "--get", "ai.cadence.enabled"], &[]) {
+            Ok(o) => o,
+            Err(_) => return true,
+        };
 
-    match output {
-        Ok(o) if o.status.success() => {
-            let value = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            value != "false"
-        }
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        value != "false"
+    } else {
         // Unset (exit code 1) or error: default to enabled
-        _ => true,
+        true
     }
 }
 
@@ -121,10 +239,7 @@ pub fn repo_root() -> Result<PathBuf> {
 /// Runs `git -C <dir> rev-parse --show-toplevel`. This handles the case
 /// where `dir` is a subdirectory of the repo.
 pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
-    let dir_str = dir.to_string_lossy();
-    let output = Command::new("git")
-        .args(["-C", &dir_str, "rev-parse", "--show-toplevel"])
-        .output()
+    let output = run_git_output_at(Some(dir), &["rev-parse", "--show-toplevel"], &[])
         .context("failed to execute git rev-parse --show-toplevel")?;
 
     if !output.status.success() {
@@ -143,16 +258,13 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 /// by commands that operate on repos other than the CWD (e.g., `hydrate`).
 pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     validate_commit_hash(commit)?;
-    let repo_str = repo.to_string_lossy();
-    let status = Command::new("git")
-        .args([
-            "-C", &repo_str, "notes", "--ref", NOTES_REF, "show", "--", commit,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("failed to execute git notes show")?;
-    Ok(status.success())
+    let output = run_git_output_at(
+        Some(repo),
+        &["notes", "--ref", NOTES_REF, "show", "--", commit],
+        &[],
+    )
+    .context("failed to execute git notes show")?;
+    Ok(output.status.success())
 }
 
 /// Attach an AI-session note to a commit in a specific repository directory.
@@ -172,13 +284,14 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
     tmp.flush().context("failed to flush note temp file")?;
     let tmp_path = tmp.path().to_string_lossy().to_string();
 
-    let repo_str = repo.to_string_lossy();
-    let output = Command::new("git")
-        .args([
-            "-C", &repo_str, "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
-        ])
-        .output()
-        .context("failed to execute git notes add")?;
+    let output = run_git_output_at(
+        Some(repo),
+        &[
+            "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
+        ],
+        &[],
+    )
+    .context("failed to execute git notes add")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -193,14 +306,9 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
 /// The `--` separator prevents the commit argument from being interpreted
 /// as a flag.
 pub(crate) fn commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
-    let repo_str = repo.to_string_lossy();
-    let status = Command::new("git")
-        .args(["-C", &repo_str, "cat-file", "-t", "--", commit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    let output = run_git_output_at(Some(repo), &["cat-file", "-t", "--", commit], &[])
         .context("failed to execute git cat-file")?;
-    Ok(status.success())
+    Ok(output.status.success())
 }
 
 /// Return full commit hashes within the given time range for a repository.
@@ -211,7 +319,6 @@ pub(crate) fn commits_in_time_range(
     start_ts: i64,
     end_ts: i64,
 ) -> Result<Vec<String>> {
-    let repo_str = repo.to_string_lossy();
     let (start, end) = if start_ts <= end_ts {
         (start_ts, end_ts)
     } else {
@@ -221,19 +328,12 @@ pub(crate) fn commits_in_time_range(
     let since = format!("@{}", start);
     let until = format!("@{}", end);
 
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &repo_str,
-            "log",
-            "--since",
-            &since,
-            "--until",
-            &until,
-            "--format=%H",
-        ])
-        .output()
-        .context("failed to execute git log")?;
+    let output = run_git_output_at(
+        Some(repo),
+        &["log", "--since", &since, "--until", &until, "--format=%H"],
+        &[],
+    )
+    .context("failed to execute git log")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -287,12 +387,14 @@ pub fn add_note(commit: &str, content: &str) -> Result<()> {
     tmp.flush().context("failed to flush note temp file")?;
     let tmp_path = tmp.path().to_string_lossy().to_string();
 
-    let output = Command::new("git")
-        .args([
+    let output = run_git_output_at(
+        None,
+        &[
             "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
-        ])
-        .output()
-        .context("failed to execute git notes add")?;
+        ],
+        &[],
+    )
+    .context("failed to execute git notes add")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -316,19 +418,19 @@ pub struct CommitNoteMarker {
 /// `git log --date=short --format='%H%x09%h%x09%ad%x09%s'`
 /// plus a per-commit note existence check against `notes_ref`.
 pub fn list_commits_with_note_markers(notes_ref: &str) -> Result<Vec<CommitNoteMarker>> {
-    let log_output = Command::new("git")
-        .args(["log", "--date=short", "--format=%H%x09%h%x09%ad%x09%s"])
-        .output()
-        .context("failed to execute git log")?;
+    let log_output = run_git_output_at(
+        None,
+        &["log", "--date=short", "--format=%H%x09%h%x09%ad%x09%s"],
+        &[],
+    )
+    .context("failed to execute git log")?;
 
     if !log_output.status.success() {
         let stderr = String::from_utf8_lossy(&log_output.stderr);
         bail!("git log failed: {}", stderr.trim());
     }
 
-    let notes_output = Command::new("git")
-        .args(["notes", "--ref", notes_ref, "list"])
-        .output()
+    let notes_output = run_git_output_at(None, &["notes", "--ref", notes_ref, "list"], &[])
         .context("failed to execute git notes list")?;
 
     if !notes_output.status.success() {
@@ -389,18 +491,12 @@ fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
 
 /// Push the AI-session notes ref to the provided remote.
 pub fn push_notes(remote: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.interactive=never",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .args(["push", remote, NOTES_REF])
-        .output()
-        .context("failed to execute git push")?;
+    let output = run_git_output_at(
+        None,
+        &["push", "--no-verify", remote, NOTES_REF],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git push")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -433,9 +529,7 @@ pub fn has_upstream() -> Result<bool> {
 ///
 /// Returns `Ok(None)` when HEAD is detached or the remote is "."/empty.
 pub fn resolve_push_remote() -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
+    let output = run_git_output_at(None, &["symbolic-ref", "--quiet", "--short", "HEAD"], &[])
         .context("failed to execute git symbolic-ref")?;
 
     if !output.status.success() {
@@ -487,9 +581,7 @@ pub fn resolve_push_remote() -> Result<Option<String>> {
 
 /// Return the URL for a named remote (if any).
 pub fn remote_url(remote: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", remote])
-        .output()
+    let output = run_git_output_at(None, &["remote", "get-url", remote], &[])
         .context("failed to execute git remote get-url")?;
 
     if !output.status.success() {
@@ -501,16 +593,69 @@ pub fn remote_url(remote: &str) -> Result<Option<String>> {
     Ok(Some(url.trim().to_string()))
 }
 
+/// Resolve the push remote for a specific repository.
+pub fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
+    let output = run_git_output_at(
+        Some(repo),
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &[],
+    )
+    .context("failed to execute git symbolic-ref")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let branch =
+        String::from_utf8(output.stdout).context("git symbolic-ref output was not valid UTF-8")?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Ok(None);
+    }
+
+    let push_remote_key = format!("branch.{}.pushRemote", branch);
+    if let Ok(Some(remote)) = config_get_at(repo, &push_remote_key)
+        && !remote.is_empty()
+        && remote != "."
+    {
+        return Ok(Some(remote));
+    }
+
+    if let Ok(Some(remote)) = config_get_at(repo, "remote.pushDefault")
+        && !remote.is_empty()
+        && remote != "."
+    {
+        return Ok(Some(remote));
+    }
+
+    let branch_remote_key = format!("branch.{}.remote", branch);
+    if let Ok(Some(remote)) = config_get_at(repo, &branch_remote_key)
+        && !remote.is_empty()
+        && remote != "."
+    {
+        return Ok(Some(remote));
+    }
+
+    let remotes = match git_output_in(repo, &["remote"]) {
+        Ok(list) => list,
+        Err(_) => return Ok(None),
+    };
+    let mut names = remotes.lines().filter(|r| !r.is_empty());
+    let first = names.next();
+    if first.is_none() || names.next().is_some() {
+        return Ok(None);
+    }
+
+    Ok(first.map(|s| s.to_string()))
+}
+
 /// Return the URL of the first configured remote for the repo at `repo`.
 ///
 /// Returns `None` if no remotes are configured. Returns an error only if
 /// the git commands themselves fail unexpectedly.
 pub(crate) fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
-    let repo_str = repo.to_string_lossy();
-    let output = Command::new("git")
-        .args(["-C", &repo_str, "remote"])
-        .output()
-        .context("failed to execute git remote")?;
+    let output =
+        run_git_output_at(Some(repo), &["remote"], &[]).context("failed to execute git remote")?;
 
     if !output.status.success() {
         return Ok(None);
@@ -523,9 +668,7 @@ pub(crate) fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
         _ => return Ok(None),
     };
 
-    let url_output = Command::new("git")
-        .args(["-C", &repo_str, "remote", "get-url", first])
-        .output()
+    let url_output = run_git_output_at(Some(repo), &["remote", "get-url", first], &[])
         .context("failed to execute git remote get-url")?;
 
     if !url_output.status.success() {
@@ -557,6 +700,31 @@ pub fn remote_orgs() -> Result<Vec<String>> {
             continue;
         }
         if let Ok(url) = git_output(&["remote", "get-url", remote_name])
+            && let Some(org) = parse_org_from_url(&url)
+            && !orgs
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&org))
+        {
+            orgs.push(org);
+        }
+    }
+
+    Ok(orgs)
+}
+
+/// Extract owner/org from ALL remote URLs in a specific repository.
+///
+/// Returns a deduplicated list of org names extracted from all configured
+/// remotes. Deduplication is case-insensitive.
+pub fn remote_orgs_at(repo: &Path) -> Result<Vec<String>> {
+    let remotes = git_output_in(repo, &["remote"])?;
+    let mut orgs = Vec::new();
+
+    for remote_name in remotes.lines() {
+        if remote_name.is_empty() {
+            continue;
+        }
+        if let Ok(url) = git_output_in(repo, &["remote", "get-url", remote_name])
             && let Some(org) = parse_org_from_url(&url)
             && !orgs
                 .iter()
@@ -608,9 +776,7 @@ pub fn parse_org_from_url(url: &str) -> Option<String> {
 /// Distinguishes exit code 1 (key not set) from other exit codes (e.g., 2 for
 /// invalid config file) to avoid silently swallowing genuine errors.
 pub fn config_get(key: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["config", "--get", key])
-        .output()
+    let output = run_git_output_at(None, &["config", "--get", key], &[])
         .context("failed to execute git config --get")?;
 
     if !output.status.success() {
@@ -634,14 +800,36 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
     Ok(Some(value.trim().to_string()))
 }
 
+/// Read a git config value from a specific repo. Returns `Ok(None)` if unset.
+pub fn config_get_at(repo: &Path, key: &str) -> Result<Option<String>> {
+    let output = run_git_output_at(Some(repo), &["config", "--get", key], &[])
+        .context("failed to execute git config --get")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --get {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+        return Ok(None);
+    }
+
+    let value =
+        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
+    Ok(Some(value.trim().to_string()))
+}
+
 /// Read a git config value from global scope. Returns `Ok(None)` if the key is not set.
 ///
 /// Uses `--global` flag to read only the global config, not repo-local.
 /// This is used for settings like `ai.cadence.org` that are set at install time.
 pub fn config_get_global(key: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["config", "--global", "--get", key])
-        .output()
+    let output = run_git_output_at(None, &["config", "--global", "--get", key], &[])
         .context("failed to execute git config --global --get")?;
 
     if !output.status.success() {
@@ -663,11 +851,24 @@ pub fn config_get_global(key: &str) -> Result<Option<String>> {
     Ok(Some(value.trim().to_string()))
 }
 
+/// Check org filter for a specific repository. If a global org is configured,
+/// verify that at least one remote matches that org (case-insensitive).
+pub fn repo_matches_org_filter(repo: &Path) -> Result<bool> {
+    let configured_org = match config_get_global("ai.cadence.org") {
+        Ok(Some(org)) => org,
+        _ => return Ok(true),
+    };
+
+    let remote_orgs = remote_orgs_at(repo)?;
+    Ok(remote_orgs
+        .iter()
+        .any(|org| org.eq_ignore_ascii_case(&configured_org)))
+}
+
 /// Write a git config value (repo-local scope).
+#[cfg(test)]
 pub fn config_set(key: &str, value: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["config", key, value])
-        .output()
+    let output = run_git_output_at(None, &["config", key, value], &[])
         .context("failed to execute git config set")?;
 
     if !output.status.success() {
@@ -682,9 +883,7 @@ pub fn config_set(key: &str, value: &str) -> Result<()> {
 /// Used by the `install` subcommand to persist settings like
 /// `core.hooksPath` and `ai.cadence.org` globally.
 pub fn config_set_global(key: &str, value: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["config", "--global", key, value])
-        .output()
+    let output = run_git_output_at(None, &["config", "--global", key, value], &[])
         .context("failed to execute git config --global set")?;
 
     if !output.status.success() {
@@ -699,9 +898,7 @@ pub fn config_set_global(key: &str, value: &str) -> Result<()> {
 /// Returns `Ok(())` if the key was removed or was already absent.
 /// Returns an error only on genuine git failures.
 pub fn config_unset_global(key: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["config", "--global", "--unset", key])
-        .output()
+    let output = run_git_output_at(None, &["config", "--global", "--unset", key], &[])
         .context("failed to execute git config --global --unset")?;
 
     if !output.status.success() {
@@ -1017,10 +1214,10 @@ mod tests {
         let path = dir.path();
 
         // Set a config value
-        run_git(path, &["config", "ai.cadence.autopush", "true"]);
+        run_git(path, &["config", "ai.cadence.enabled", "true"]);
 
         // Read it back
-        let value = git_output_in(path, &["config", "--get", "ai.cadence.autopush"]).unwrap();
+        let value = git_output_in(path, &["config", "--get", "ai.cadence.enabled"]).unwrap();
         assert_eq!(value, "true");
     }
 
@@ -1389,8 +1586,8 @@ mod tests {
     #[serial]
     fn test_api_config_set_then_get() {
         let (_dir, original_cwd) = enter_temp_repo();
-        config_set("ai.cadence.autopush", "true").expect("config_set failed");
-        let val = config_get("ai.cadence.autopush").expect("config_get failed");
+        config_set("ai.cadence.enabled", "true").expect("config_set failed");
+        let val = config_get("ai.cadence.enabled").expect("config_get failed");
         assert_eq!(val, Some("true".to_string()));
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -1523,5 +1720,64 @@ mod tests {
         assert!(orgs.is_empty());
 
         std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_remote_orgs_at_collects_orgs() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        run_git(
+            path,
+            &["remote", "add", "origin", "git@github.com:org-one/repo.git"],
+        );
+        run_git(
+            path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/org-two/repo.git",
+            ],
+        );
+
+        let orgs = remote_orgs_at(path).expect("remote_orgs_at failed");
+        assert_eq!(orgs.len(), 2);
+        assert!(orgs.contains(&"org-one".to_string()));
+        assert!(orgs.contains(&"org-two".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_repo_matches_org_filter() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+
+        run_git(
+            path,
+            &["remote", "add", "origin", "git@github.com:my-org/repo.git"],
+        );
+
+        let global_config = path.join("fake-global-gitconfig");
+        std::fs::write(&global_config, "[ai \"cadence\"]\n    org = my-org\n").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let matches = repo_matches_org_filter(path).expect("repo_matches_org_filter failed");
+        assert!(matches);
+
+        std::fs::write(&global_config, "[ai \"cadence\"]\n    org = other-org\n").unwrap();
+        let matches = repo_matches_org_filter(path).expect("repo_matches_org_filter failed");
+        assert!(!matches);
+
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
     }
 }
