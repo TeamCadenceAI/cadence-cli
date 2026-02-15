@@ -100,6 +100,7 @@ pub fn format_with_confidence(
     note.push_str(&format!("repo: {}\n", repo));
     note.push_str(&format!("commit: {}\n", commit));
     note.push_str(&format!("confidence: {}\n", confidence));
+    note.push_str(&format!("uploaded_data_sha256: {}\n", sha));
     note.push_str(&format!("payload_sha256: {}\n", sha));
     note.push_str("---\n");
     note.push_str(session_log);
@@ -334,6 +335,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "log",
+            None,
         )
         .unwrap();
         assert!(note.contains("agent: cursor\n"));
@@ -347,6 +349,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "log",
+            None,
         )
         .unwrap();
         assert!(note.contains("agent: copilot\n"));
@@ -360,6 +363,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "log",
+            None,
         )
         .unwrap();
         assert!(note.contains("agent: antigravity\n"));
@@ -484,6 +488,7 @@ mod tests {
             "/repo",
             "abcdef0123456789abcdef0123456789abcdef01",
             "payload",
+            None,
             Confidence::TimeWindowMatch,
         )
         .unwrap();

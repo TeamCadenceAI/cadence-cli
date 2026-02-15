@@ -1864,7 +1864,11 @@ fn run_reset() -> Result<()> {
             if dir.exists()
                 && let Err(e) = std::fs::remove_dir_all(&dir)
             {
-                output::note(&format!("Warning: failed to remove {}: {}", dir.display(), e));
+                output::note(&format!(
+                    "Warning: failed to remove {}: {}",
+                    dir.display(),
+                    e
+                ));
             }
         }
     }
@@ -1875,7 +1879,6 @@ fn run_reset() -> Result<()> {
 }
 
 /// The status subcommand: show Cadence CLI configuration and state.
-
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
@@ -1954,7 +1957,6 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
             output::detail_to_with_tty(w, "Org filter: (none)", false);
         }
     }
-
 
     // --- Onboarding email ---
     match onboarding::get_email() {
@@ -3381,11 +3383,7 @@ mod tests {
 
     #[test]
     fn cli_parses_install_first_time_experience() {
-        let cli = Cli::parse_from([
-            "cadence",
-            "install",
-            "--first-time-experience",
-        ]);
+        let cli = Cli::parse_from(["cadence", "install", "--first-time-experience"]);
         assert!(matches!(
             cli.command,
             Command::Install {
@@ -3491,12 +3489,7 @@ mod tests {
 
     #[test]
     fn cli_parses_onboard_with_email() {
-        let cli = Cli::parse_from([
-            "cadence",
-            "onboard",
-            "--email",
-            "user@example.com",
-        ]);
+        let cli = Cli::parse_from(["cadence", "onboard", "--email", "user@example.com"]);
         match cli.command {
             Command::Onboard { email } => assert_eq!(email.as_deref(), Some("user@example.com")),
             _ => panic!("expected Onboard command"),
