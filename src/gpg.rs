@@ -8,9 +8,13 @@
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::git;
+
+/// Filename for the cached armored public key used by rpgp note encryption.
+const PUBLIC_KEY_CACHE_FILENAME: &str = "public_key.asc";
 
 /// The PGP ASCII armor header used to detect encrypted content.
 #[allow(dead_code)]
@@ -333,6 +337,115 @@ fn parse_fingerprint_from_colons(output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Return the path to the cached public key file: `$HOME/.cadence/cli/public_key.asc`.
+///
+/// Returns `None` if `$HOME` cannot be determined.
+pub fn public_key_cache_path() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|h| {
+        PathBuf::from(h)
+            .join(".cadence")
+            .join("cli")
+            .join(PUBLIC_KEY_CACHE_FILENAME)
+    })
+}
+
+/// Load the cached armored public key from disk.
+///
+/// Returns `Ok(Some(key))` if the cache file exists and is non-empty,
+/// `Ok(None)` if the file is missing or empty, and `Err` on I/O errors
+/// other than file-not-found.
+pub fn load_cached_public_key() -> Result<Option<String>> {
+    let path = match public_key_cache_path() {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) if contents.trim().is_empty() => Ok(None),
+        Ok(contents) => Ok(Some(contents)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e)
+            .with_context(|| format!("failed to read cached public key at {}", path.display())),
+    }
+}
+
+/// Extract an armored public key from an armored private key.
+///
+/// Parses the `SignedSecretKey`, converts it to a `SignedPublicKey`, and
+/// serializes the result as an ASCII-armored string.
+pub fn extract_public_key_armored(armored_private_key: &str) -> Result<String> {
+    use pgp::ArmorOptions;
+    use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
+
+    let trimmed = armored_private_key.trim();
+    if trimmed.is_empty() {
+        bail!("extract public key: private key material must not be blank");
+    }
+
+    let (secret_key, _headers) =
+        SignedSecretKey::from_string(trimmed).context("extract public key: key parse error")?;
+
+    let public_key: SignedPublicKey = secret_key.into();
+
+    // Verify the public key has at least one subkey
+    if public_key.public_subkeys.is_empty() {
+        bail!("extract public key: no public subkeys found");
+    }
+
+    public_key
+        .to_armored_string(ArmorOptions::default())
+        .context("extract public key: armored serialization error")
+}
+
+/// Save an armored public key to the cache file.
+///
+/// Creates parent directories if needed. Overwrites any existing cache file.
+pub fn save_public_key_cache(armored_public_key: &str) -> Result<()> {
+    let path = public_key_cache_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create cache directory at {}", parent.display()))?;
+    }
+    std::fs::write(&path, armored_public_key)
+        .with_context(|| format!("failed to write cached public key at {}", path.display()))?;
+    Ok(())
+}
+
+/// Encrypt plaintext using an armored public key via pure-Rust OpenPGP (rpgp).
+///
+/// Parses the `SignedPublicKey`, selects the first public subkey, and encrypts
+/// the plaintext using SEIPDv1 (the same format the server's rpgp decryption expects).
+pub fn encrypt_to_public_key(plaintext: &str, armored_public_key: &str) -> Result<String> {
+    use pgp::ArmorOptions;
+    use pgp::composed::{Deserializable, Message, SignedPublicKey};
+    use pgp::crypto::sym::SymmetricKeyAlgorithm;
+
+    let trimmed = armored_public_key.trim();
+    if trimmed.is_empty() {
+        bail!("rpgp encrypt: public key material must not be blank");
+    }
+
+    let (public_key, _headers) = SignedPublicKey::from_string(trimmed)
+        .context("rpgp encrypt failed: public key parse error")?;
+
+    let enc_subkey = public_key
+        .public_subkeys
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("rpgp encrypt failed: no encryption subkey found"))?;
+
+    let literal = pgp::packet::LiteralData::from_bytes((&[]).into(), plaintext.as_bytes());
+    let message = Message::Literal(literal);
+
+    let mut rng = rand08::thread_rng();
+    let encrypted = message
+        .encrypt_to_keys_seipdv1(&mut rng, SymmetricKeyAlgorithm::AES128, &[enc_subkey])
+        .context("rpgp encrypt failed: encryption error")?;
+
+    encrypted
+        .to_armored_string(ArmorOptions::default())
+        .context("rpgp encrypt failed: armored serialization error")
 }
 
 /// Check if a key for the given recipient exists in the GPG keyring.
@@ -1110,5 +1223,210 @@ mod tests {
         let output = "fpr::::";
         let fpr = parse_fingerprint_from_colons(output);
         assert!(fpr.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: public key cache path
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_public_key_cache_path_uses_home() {
+        let path = with_env("HOME", "/tmp/fake-home", || public_key_cache_path());
+        assert_eq!(
+            path,
+            Some(PathBuf::from("/tmp/fake-home/.cadence/cli/public_key.asc"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_public_key_cache_path_returns_none_when_home_missing() {
+        let orig = std::env::var("HOME").ok();
+        unsafe { std::env::remove_var("HOME") };
+        let path = public_key_cache_path();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("HOME", v),
+                None => {}
+            }
+        }
+        assert!(path.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: load_cached_public_key
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_load_cached_public_key_missing_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let result = with_env("HOME", dir.path().to_str().unwrap(), || {
+            load_cached_public_key()
+        });
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_cached_public_key_empty_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let cache_dir = dir.path().join(".cadence").join("cli");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("public_key.asc"), "").unwrap();
+
+        let result = with_env("HOME", dir.path().to_str().unwrap(), || {
+            load_cached_public_key()
+        });
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_cached_public_key_whitespace_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let cache_dir = dir.path().join(".cadence").join("cli");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("public_key.asc"), "   \n  ").unwrap();
+
+        let result = with_env("HOME", dir.path().to_str().unwrap(), || {
+            load_cached_public_key()
+        });
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: save_public_key_cache + load roundtrip
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_save_and_load_public_key_cache_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let key_data = "-----BEGIN PGP PUBLIC KEY BLOCK-----\nfake-key-data\n-----END PGP PUBLIC KEY BLOCK-----";
+
+        let result = with_env("HOME", dir.path().to_str().unwrap(), || {
+            save_public_key_cache(key_data)?;
+            load_cached_public_key()
+        });
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(key_data.to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_public_key_cache_creates_dirs() {
+        let dir = TempDir::new().unwrap();
+        let key_data = "test-key";
+
+        let result = with_env("HOME", dir.path().to_str().unwrap(), || {
+            save_public_key_cache(key_data)
+        });
+        assert!(result.is_ok());
+        assert!(
+            dir.path()
+                .join(".cadence")
+                .join("cli")
+                .join("public_key.asc")
+                .exists()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: extract_public_key_armored
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_public_key_blank_input_fails() {
+        let result = extract_public_key_armored("");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("private key material must not be blank"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_extract_public_key_invalid_input_fails() {
+        let result = extract_public_key_armored("not a valid key");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("key parse error"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_extract_public_key_from_generated_keypair() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            let armored_private = export_secret_key(&email)?;
+            let armored_public = extract_public_key_armored(&armored_private)?;
+            assert!(
+                armored_public.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+                "should contain public key header"
+            );
+            Ok::<(), anyhow::Error>(())
+        });
+
+        result.unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Unit tests: encrypt_to_public_key
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_encrypt_to_public_key_blank_key_fails() {
+        let result = encrypt_to_public_key("hello", "");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("public key material must not be blank"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_to_public_key_invalid_key_fails() {
+        let result = encrypt_to_public_key("hello", "not a valid key");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("rpgp encrypt failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_encrypt_to_public_key_roundtrip() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let plaintext = "rpgp-public-key-encrypt-test";
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            let armored_private = export_secret_key(&email)?;
+            let armored_public = extract_public_key_armored(&armored_private)?;
+            let ciphertext = encrypt_to_public_key(plaintext, &armored_public)?;
+            assert!(is_encrypted(&ciphertext));
+
+            // Decrypt with gpg CLI (which has the private key in the test keyring)
+            let decrypted = decrypt(&ciphertext)?;
+            assert_eq!(decrypted.trim(), plaintext);
+            Ok::<(), anyhow::Error>(())
+        });
+
+        result.unwrap();
     }
 }

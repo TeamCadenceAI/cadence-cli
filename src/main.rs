@@ -191,17 +191,55 @@ impl From<anyhow::Error> for HookError {
 // Shared encryption helper
 // ---------------------------------------------------------------------------
 
+/// How note content should be encrypted before storage.
+///
+/// Precedence: cached rpgp public key > legacy gpg CLI recipient > plaintext.
+enum EncryptionMethod {
+    /// Pure-Rust rpgp encryption using a cached armored public key.
+    Rpgp(String),
+    /// Legacy path: shell out to the `gpg` CLI with a recipient email/fingerprint.
+    GpgCli(String),
+    /// No encryption configured — notes are stored as plaintext.
+    None,
+}
+
+impl EncryptionMethod {
+    /// Returns `true` when encryption is configured (either rpgp or gpg-cli).
+    fn is_configured(&self) -> bool {
+        !matches!(self, EncryptionMethod::None)
+    }
+}
+
+/// Resolve how note encryption should be performed.
+///
+/// Precedence:
+/// 1. Cached rpgp public key at `~/.cadence/cli/public_key.asc` → `Rpgp(key)`
+/// 2. `ai.cadence.gpg.recipient` in git config → `GpgCli(recipient)`
+/// 3. Neither → `None`
+fn resolve_encryption_method() -> Result<EncryptionMethod> {
+    if let Some(key) = gpg::load_cached_public_key()? {
+        return Ok(EncryptionMethod::Rpgp(key));
+    }
+    match gpg::get_recipient()? {
+        Some(r) => Ok(EncryptionMethod::GpgCli(r)),
+        None => Ok(EncryptionMethod::None),
+    }
+}
+
 /// Optionally encrypt note content before storage.
 ///
-/// If `recipient` is `Some`, encrypts the note using GPG and returns the
-/// ciphertext. If `recipient` is `None`, returns the plaintext unchanged.
+/// Dispatches to the appropriate encryption backend based on `method`:
+/// - `Rpgp` → pure-Rust rpgp encryption via public key
+/// - `GpgCli` → shell out to `gpg --encrypt`
+/// - `None` → return plaintext unchanged
 ///
 /// This is the single place that maps "should encrypt" to "do encrypt",
 /// used by hook, retry, and hydrate paths.
-fn maybe_encrypt_note(content: &str, recipient: &Option<String>) -> Result<String> {
-    match recipient {
-        Some(r) => gpg::encrypt_to_recipient(content, r),
-        None => Ok(content.to_string()),
+fn maybe_encrypt_note(content: &str, method: &EncryptionMethod) -> Result<String> {
+    match method {
+        EncryptionMethod::Rpgp(key) => gpg::encrypt_to_public_key(content, key),
+        EncryptionMethod::GpgCli(r) => gpg::encrypt_to_recipient(content, r),
+        EncryptionMethod::None => Ok(content.to_string()),
     }
 }
 
@@ -587,8 +625,8 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
         Err(e) => return Err(HookError::Soft(e)),
     }
 
-    // Step 1.5: Resolve GPG recipient once for this invocation
-    let recipient = gpg::get_recipient().map_err(|e| {
+    // Step 1.5: Resolve encryption method once for this invocation
+    let encryption_method = resolve_encryption_method().map_err(|e| {
         // Config read failure is a soft error — don't block commit
         HookError::Soft(e)
     })?;
@@ -644,10 +682,10 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 &head_hash,
                 &session_log,
                 note::Confidence::ExactHashMatch,
-                &recipient,
+                &encryption_method,
             )
             .map_err(|e| {
-                if recipient.is_some() {
+                if encryption_method.is_configured() {
                     HookError::GpgEncryptionFailed(format!("{}", e))
                 } else {
                     HookError::Soft(e)
@@ -689,10 +727,10 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 &head_hash,
                 &session_log,
                 note::Confidence::TimeWindowMatch,
-                &recipient,
+                &encryption_method,
             )
             .map_err(|e| {
-                if recipient.is_some() {
+                if encryption_method.is_configured() {
                     HookError::GpgEncryptionFailed(format!("{}", e))
                 } else {
                     HookError::Soft(e)
@@ -720,8 +758,8 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
         spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
     }
 
-    // Step 7: Retry pending commits for this repo (uses same recipient)
-    retry_pending_for_repo(&repo_root_str, &repo_root, &recipient);
+    // Step 7: Retry pending commits for this repo (uses same encryption method)
+    retry_pending_for_repo(&repo_root_str, &repo_root, &encryption_method);
 
     Ok(())
 }
@@ -869,7 +907,7 @@ fn attach_note_from_log(
     commit: &str,
     session_log: &str,
     confidence: note::Confidence,
-    recipient: &Option<String>,
+    method: &EncryptionMethod,
 ) -> Result<()> {
     let note_content = note::format_with_confidence(
         agent_type,
@@ -879,7 +917,7 @@ fn attach_note_from_log(
         session_log,
         confidence,
     )?;
-    let final_content = maybe_encrypt_note(&note_content, recipient)?;
+    let final_content = maybe_encrypt_note(&note_content, method)?;
     git::add_note(commit, &final_content)?;
     Ok(())
 }
@@ -926,13 +964,14 @@ fn spawn_background_retry(commit: &str, repo: &str, timestamp: i64) {
 fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Result<()> {
     let repo_root = std::path::Path::new(repo);
 
-    // Resolve recipient once for this retry process
-    let recipient = gpg::get_recipient().unwrap_or(None);
+    // Resolve encryption method once for this retry process
+    let encryption_method = resolve_encryption_method().unwrap_or(EncryptionMethod::None);
 
     for delay in BACKGROUND_RETRY_DELAYS {
         std::thread::sleep(std::time::Duration::from_secs(*delay));
 
-        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600, &recipient) {
+        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600, &encryption_method)
+        {
             ResolveResult::Attached => {
                 let _ = pending::remove(commit);
                 return Ok(());
@@ -974,7 +1013,7 @@ enum ResolveResult {
 /// window is (in seconds). The initial hook uses 600s (±10 min), retries
 /// use 86400s (±24 hours).
 ///
-/// The `recipient` parameter controls optional GPG encryption. In the retry
+/// The `method` parameter controls optional encryption. In the retry
 /// path, encryption failure is treated as a transient error (not commit-blocking).
 fn try_resolve_single_commit(
     commit: &str,
@@ -982,7 +1021,7 @@ fn try_resolve_single_commit(
     repo_root: &std::path::Path,
     commit_time: i64,
     time_window: i64,
-    recipient: &Option<String>,
+    method: &EncryptionMethod,
 ) -> ResolveResult {
     // Check if note already exists
     match git::note_exists(commit) {
@@ -1014,7 +1053,7 @@ fn try_resolve_single_commit(
                     commit,
                     &session_log,
                     note::Confidence::TimeWindowMatch,
-                    recipient,
+                    method,
                 )
                 .is_ok()
                 {
@@ -1054,7 +1093,7 @@ fn try_resolve_single_commit(
                 commit,
                 &session_log,
                 note::Confidence::TimeWindowMatch,
-                recipient,
+                method,
             )
             .is_ok()
             {
@@ -1089,7 +1128,7 @@ fn try_resolve_single_commit(
         commit,
         &session_log,
         note::Confidence::ExactHashMatch,
-        recipient,
+        method,
     )
     .is_ok()
     {
@@ -1121,9 +1160,9 @@ fn try_resolve_single_commit(
 /// (24 hours instead of 10 minutes) because the commit could be old and
 /// the session log file may have been modified since the commit was created.
 ///
-/// The `recipient` parameter controls optional GPG encryption. Encryption
+/// The `method` parameter controls optional encryption. Encryption
 /// failures in the retry path are treated as transient errors.
-fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, recipient: &Option<String>) {
+fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, method: &EncryptionMethod) {
     match git::repo_matches_org_filter(repo_root) {
         Ok(true) => {}
         Ok(false) => return,
@@ -1156,7 +1195,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, recipient
             repo_root,
             record.commit_time,
             86_400,
-            recipient,
+            method,
         ) {
             ResolveResult::Attached | ResolveResult::AlreadyExists => {
                 let _ = pending::remove(&record.commit);
@@ -1210,8 +1249,8 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Resolve GPG recipient once for this hydration run
-    let recipient = gpg::get_recipient().unwrap_or(None);
+    // Resolve encryption method once for this hydration run
+    let encryption_method = resolve_encryption_method().unwrap_or(EncryptionMethod::None);
 
     let use_progress = output::is_stderr_tty();
     let spinner = if use_progress {
@@ -1612,7 +1651,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 };
 
                 // Optionally encrypt — in hydrate, encryption failure is non-fatal
-                let final_content = match maybe_encrypt_note(&note_content, &recipient) {
+                let final_content = match maybe_encrypt_note(&note_content, &encryption_method) {
                     Ok(c) => c,
                     Err(e) => {
                         messages.push(format!("encryption failed for {}: {}", &hash[..7], e));
@@ -1697,11 +1736,11 @@ fn run_retry() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve GPG recipient once for this retry run
-    let recipient = gpg::get_recipient().unwrap_or(None);
+    // Resolve encryption method once for this retry run
+    let encryption_method = resolve_encryption_method().unwrap_or(EncryptionMethod::None);
 
     output::action("Retrying", &format!("{} pending commit(s)", pending_count));
-    retry_pending_for_repo(&repo_str, &repo_root, &recipient);
+    retry_pending_for_repo(&repo_str, &repo_root, &encryption_method);
 
     let remaining = pending::list_for_repo(&repo_str)
         .map(|r| r.len())
@@ -1854,6 +1893,8 @@ struct GpgStatusReport {
     /// `Some(true/false)` when both gpg and recipient are available;
     /// `None` when the check was skipped (gpg missing or no recipient).
     key_in_keyring: Option<bool>,
+    /// Whether a cached rpgp public key exists at `~/.cadence/cli/public_key.asc`.
+    rpgp_key_cached: bool,
 }
 
 impl GpgStatusReport {
@@ -1872,20 +1913,26 @@ impl GpgStatusReport {
             None
         };
 
+        let rpgp_key_cached = gpg::load_cached_public_key().ok().flatten().is_some();
+
         GpgStatusReport {
             gpg_available,
             recipient,
             recipient_error,
             key_in_keyring,
+            rpgp_key_cached,
         }
     }
 
     /// Derive the summary line from probe results.
     fn summary(&self) -> &'static str {
+        if self.rpgp_key_cached {
+            return "enabled (rpgp)";
+        }
         match (&self.recipient, self.gpg_available, self.key_in_keyring) {
-            (Some(_), true, Some(true)) => "enabled",
+            (Some(_), true, Some(true)) => "enabled (gpg-cli)",
             (Some(_), true, Some(false)) => "configured but key not in keyring",
-            (Some(_), true, None) => "enabled",
+            (Some(_), true, None) => "enabled (gpg-cli)",
             (Some(_), false, _) => "configured but gpg not available",
             (None, _, _) if self.recipient_error.is_some() => "unknown (config read issue)",
             _ => "disabled (plaintext mode)",
@@ -1896,11 +1943,18 @@ impl GpgStatusReport {
 /// Render GPG status report to the given writer.
 ///
 /// Output lines (stable order):
-/// 1. `gpg binary: found|not found`
-/// 2. `recipient: <email>|not configured|unavailable (<msg>)`
-/// 3. `key in keyring: yes|no` (only when applicable)
-/// 4. blank line + `Encryption: <summary>`
+/// 1. `rpgp key cached: yes|no`
+/// 2. `gpg binary: found|not found`
+/// 3. `recipient: <email>|not configured|unavailable (<msg>)`
+/// 4. `key in keyring: yes|no` (only when applicable)
+/// 5. blank line + `Encryption: <summary>`
 fn render_gpg_status(w: &mut dyn std::io::Write, report: &GpgStatusReport) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "rpgp key cached: {}",
+        if report.rpgp_key_cached { "yes" } else { "no" }
+    )?;
+
     writeln!(
         w,
         "gpg binary: {}",
@@ -3085,6 +3139,18 @@ fn run_keys_push_inner(
     // 3. Export armored private key
     let armored_private_key =
         gpg::export_secret_key(&key_id).context("Failed to export private key from GPG keyring")?;
+
+    // 3b. Extract and cache public key for rpgp note encryption
+    match gpg::extract_public_key_armored(&armored_private_key) {
+        Ok(armored_public_key) => {
+            if let Err(e) = gpg::save_public_key_cache(&armored_public_key) {
+                output::note_to_with_tty(w, &format!("Could not cache public key: {e}"), is_tty);
+            }
+        }
+        Err(e) => {
+            output::note_to_with_tty(w, &format!("Could not extract public key: {e}"), is_tty);
+        }
+    }
 
     // 4. Extract fingerprint
     let fingerprint = gpg::get_fingerprint(&key_id).context("Failed to extract key fingerprint")?;
@@ -7137,19 +7203,21 @@ mod tests {
             recipient: None,
             recipient_error: None,
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         assert_eq!(report.summary(), "disabled (plaintext mode)");
     }
 
     #[test]
-    fn gpg_status_report_summary_enabled() {
+    fn gpg_status_report_summary_enabled_gpg_cli() {
         let report = GpgStatusReport {
             gpg_available: true,
             recipient: Some("test@example.com".to_string()),
             recipient_error: None,
             key_in_keyring: Some(true),
+            rpgp_key_cached: false,
         };
-        assert_eq!(report.summary(), "enabled");
+        assert_eq!(report.summary(), "enabled (gpg-cli)");
     }
 
     #[test]
@@ -7159,6 +7227,7 @@ mod tests {
             recipient: Some("test@example.com".to_string()),
             recipient_error: None,
             key_in_keyring: Some(false),
+            rpgp_key_cached: false,
         };
         assert_eq!(report.summary(), "configured but key not in keyring");
     }
@@ -7170,6 +7239,7 @@ mod tests {
             recipient: Some("test@example.com".to_string()),
             recipient_error: None,
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         assert_eq!(report.summary(), "configured but gpg not available");
     }
@@ -7181,6 +7251,7 @@ mod tests {
             recipient: None,
             recipient_error: Some("config read failed".to_string()),
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         assert_eq!(report.summary(), "unknown (config read issue)");
     }
@@ -7192,8 +7263,33 @@ mod tests {
             recipient: None,
             recipient_error: None,
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         assert_eq!(report.summary(), "disabled (plaintext mode)");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_rpgp_cached() {
+        let report = GpgStatusReport {
+            gpg_available: false,
+            recipient: None,
+            recipient_error: None,
+            key_in_keyring: None,
+            rpgp_key_cached: true,
+        };
+        assert_eq!(report.summary(), "enabled (rpgp)");
+    }
+
+    #[test]
+    fn gpg_status_report_summary_rpgp_cached_overrides_gpg_cli() {
+        let report = GpgStatusReport {
+            gpg_available: true,
+            recipient: Some("test@example.com".to_string()),
+            recipient_error: None,
+            key_in_keyring: Some(true),
+            rpgp_key_cached: true,
+        };
+        assert_eq!(report.summary(), "enabled (rpgp)");
     }
 
     // -----------------------------------------------------------------------
@@ -7207,11 +7303,13 @@ mod tests {
             recipient: None,
             recipient_error: None,
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         let mut buf = Vec::new();
         render_gpg_status(&mut buf, &report).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
+        assert!(output.contains("rpgp key cached: no"), "got: {}", output);
         assert!(output.contains("gpg binary: found"), "got: {}", output);
         assert!(
             output.contains("recipient: not configured"),
@@ -7237,6 +7335,7 @@ mod tests {
             recipient: Some("user@example.com".to_string()),
             recipient_error: None,
             key_in_keyring: Some(true),
+            rpgp_key_cached: false,
         };
         let mut buf = Vec::new();
         render_gpg_status(&mut buf, &report).unwrap();
@@ -7249,7 +7348,11 @@ mod tests {
             output
         );
         assert!(output.contains("key in keyring: yes"), "got: {}", output);
-        assert!(output.contains("Encryption: enabled"), "got: {}", output);
+        assert!(
+            output.contains("Encryption: enabled (gpg-cli)"),
+            "got: {}",
+            output
+        );
     }
 
     #[test]
@@ -7259,6 +7362,7 @@ mod tests {
             recipient: Some("user@example.com".to_string()),
             recipient_error: None,
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         let mut buf = Vec::new();
         render_gpg_status(&mut buf, &report).unwrap();
@@ -7289,6 +7393,7 @@ mod tests {
             recipient: Some("user@example.com".to_string()),
             recipient_error: None,
             key_in_keyring: Some(false),
+            rpgp_key_cached: false,
         };
         let mut buf = Vec::new();
         render_gpg_status(&mut buf, &report).unwrap();
@@ -7309,6 +7414,7 @@ mod tests {
             recipient: None,
             recipient_error: Some("invalid config file".to_string()),
             key_in_keyring: None,
+            rpgp_key_cached: false,
         };
         let mut buf = Vec::new();
         render_gpg_status(&mut buf, &report).unwrap();
@@ -10941,7 +11047,11 @@ mod tests {
 
         // Run retry -- should abandon the record since it exceeded max attempts
         std::env::set_current_dir(repo_path).expect("failed to chdir");
-        retry_pending_for_repo(&git_repo_root, std::path::Path::new(&git_repo_root), &None);
+        retry_pending_for_repo(
+            &git_repo_root,
+            std::path::Path::new(&git_repo_root),
+            &EncryptionMethod::None,
+        );
 
         // The pending record should have been removed
         assert!(
@@ -11439,15 +11549,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_maybe_encrypt_note_no_recipient_returns_plaintext() {
+    fn test_maybe_encrypt_note_none_returns_plaintext() {
         let content = "agent: claude-code\nsession_id: test";
-        let result = maybe_encrypt_note(content, &None).unwrap();
+        let result = maybe_encrypt_note(content, &EncryptionMethod::None).unwrap();
         assert_eq!(result, content);
     }
 
     #[test]
     #[serial]
-    fn test_maybe_encrypt_note_with_recipient_encrypts() {
+    fn test_maybe_encrypt_note_with_gpg_cli_encrypts() {
         let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
             eprintln!("skipping test: gpg not available or key generation failed");
             return;
@@ -11455,7 +11565,7 @@ mod tests {
 
         let content = "agent: claude-code\nsession_id: test";
         let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
-            maybe_encrypt_note(content, &Some(email.clone()))
+            maybe_encrypt_note(content, &EncryptionMethod::GpgCli(email.clone()))
         })
         .unwrap();
 
@@ -11467,7 +11577,29 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_maybe_encrypt_note_with_invalid_recipient_returns_error() {
+    fn test_maybe_encrypt_note_with_rpgp_encrypts() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let content = "agent: claude-code\nsession_id: test";
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            let armored_private = gpg::export_secret_key(&email)?;
+            let armored_public = gpg::extract_public_key_armored(&armored_private)?;
+            maybe_encrypt_note(content, &EncryptionMethod::Rpgp(armored_public))
+        })
+        .unwrap();
+
+        assert!(
+            result.starts_with("-----BEGIN PGP MESSAGE-----"),
+            "rpgp-encrypted result should start with PGP header"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_maybe_encrypt_note_with_invalid_gpg_cli_recipient_returns_error() {
         if !gpg::gpg_available() {
             eprintln!("skipping test: gpg not available");
             return;
@@ -11488,7 +11620,12 @@ mod tests {
         let result = with_env(
             "GNUPGHOME",
             empty_gnupghome.path().to_str().unwrap(),
-            || maybe_encrypt_note(content, &Some("bad@invalid.test".to_string())),
+            || {
+                maybe_encrypt_note(
+                    content,
+                    &EncryptionMethod::GpgCli("bad@invalid.test".to_string()),
+                )
+            },
         );
 
         assert!(
