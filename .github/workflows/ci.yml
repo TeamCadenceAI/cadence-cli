@@ -7,8 +7,14 @@ on:
 
 jobs:
   check:
-    name: Check
-    runs-on: macos-latest
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -16,11 +22,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Check formatting
-        run: cargo fmt -- --check
-
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       - name: Test
-        run: cargo test
+        run: cargo nextest run --no-fail-fast

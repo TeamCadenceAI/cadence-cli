@@ -3,8 +3,11 @@
 //! Discovers AI coding agent session logs (Claude Code, Codex) on disk
 //! and filters candidate files by modification time relative to a commit.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod copilot;
+pub mod cursor;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,19 +21,23 @@ use std::time::UNIX_EPOCH;
 /// - `/Users/foo/bar` -> `-Users-foo-bar`
 /// - `/home/user/dev/my-repo` -> `-home-user-dev-my-repo`
 pub fn encode_repo_path(path: &Path) -> String {
-    let path_str = path.to_string_lossy();
+    let mut path_str = path.to_string_lossy().replace('\\', "/");
+    if path_str.contains(':') && !path_str.starts_with('/') {
+        path_str = format!("/{}", path_str.replace(':', ""));
+    } else {
+        path_str = path_str.replace(':', "");
+    }
     path_str.replace('/', "-")
 }
 
-/// Filter `.jsonl` files in the given directories whose modification time
-/// falls within +/- `window_secs` of `commit_time`.
-///
-/// - `dirs`: directories to search for `.jsonl` files
-/// - `commit_time`: Unix epoch timestamp of the commit
-/// - `window_secs`: maximum absolute difference in seconds between file mtime and commit_time
-///
-/// Files that cannot be read or whose metadata is unavailable are silently skipped.
-pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> Vec<PathBuf> {
+/// Filter files in the given directories whose modification time falls within
+/// +/- `window_secs` of `commit_time`, and whose extension matches `exts`.
+pub fn candidate_files_with_exts(
+    dirs: &[PathBuf],
+    commit_time: i64,
+    window_secs: i64,
+    exts: &[&str],
+) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
     for dir in dirs {
@@ -47,15 +54,22 @@ pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> 
 
             let path = entry.path();
 
-            // Only consider .jsonl files
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            // Only consider files with matching extensions
+            let ext = match path.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_ascii_lowercase(),
+                None => continue,
+            };
+            if !exts
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&ext))
+            {
                 continue;
             }
 
             // Only consider regular files (not directories).
             // Use fs::metadata instead of entry.metadata() so that symlinks
             // are followed -- entry.metadata() uses lstat on Unix, which
-            // would cause symlinked .jsonl files to be skipped.
+            // would cause symlinked files to be skipped.
             let metadata = match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -85,16 +99,14 @@ pub fn candidate_files(dirs: &[PathBuf], commit_time: i64, window_secs: i64) -> 
     results
 }
 
-/// Find all `.jsonl` files in the given directories whose modification time
-/// is within `since_secs` seconds of `now`.
-///
-/// This is used by the `hydrate` command to find recently-modified session
-/// logs regardless of any specific commit time. Unlike `candidate_files`,
-/// which filters by a symmetric window around a commit timestamp, this
-/// filters by `mtime >= now - since_secs`.
-///
-/// Files that cannot be read or whose metadata is unavailable are silently skipped.
-pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf> {
+/// Find files in the given directories whose modification time is within
+/// `since_secs` of `now`, and whose extension matches `exts`.
+pub fn recent_files_with_exts(
+    dirs: &[PathBuf],
+    now: i64,
+    since_secs: i64,
+    exts: &[&str],
+) -> Vec<PathBuf> {
     let cutoff = now - since_secs;
     let mut results = Vec::new();
 
@@ -112,8 +124,15 @@ pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf>
 
             let path = entry.path();
 
-            // Only consider .jsonl files
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            // Only consider files with matching extensions
+            let ext = match path.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_ascii_lowercase(),
+                None => continue,
+            };
+            if !exts
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&ext))
+            {
                 continue;
             }
 
@@ -149,9 +168,164 @@ pub fn recent_files(dirs: &[PathBuf], now: i64, since_secs: i64) -> Vec<PathBuf>
 /// Resolve the user's home directory.
 ///
 /// Returns `None` if the home directory cannot be determined.
-/// Uses the `HOME` environment variable, which works on Unix/macOS.
+/// Uses `HOME` on Unix/macOS and `USERPROFILE`/`HOMEDRIVE`+`HOMEPATH` on Windows.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    let drive = std::env::var("HOMEDRIVE").ok();
+    let path = std::env::var("HOMEPATH").ok();
+    match (drive, path) {
+        (Some(drive), Some(path)) => Some(PathBuf::from(format!("{}{}", drive, path))),
+        _ => None,
+    }
+}
+
+pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support").join(app)
+    } else if cfg!(target_os = "windows") {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            PathBuf::from(appdata).join(app)
+        } else {
+            home.join("AppData").join("Roaming").join(app)
+        }
+    } else {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        base.join(app)
+    }
+}
+
+/// Recursively find directories named `chatSessions` under a workspaceStorage root.
+pub fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("chatSessions") {
+                    results.push(path);
+                } else {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Collect candidate files across all supported agents for a specific commit.
+pub fn all_candidate_files(repo_root: &Path, commit_time: i64, window_secs: i64) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+
+    let mut claude_dirs = Vec::new();
+    claude_dirs.extend(claude::log_dirs(repo_root));
+    results.extend(candidate_files_with_exts(
+        &claude_dirs,
+        commit_time,
+        window_secs,
+        &["jsonl"],
+    ));
+
+    let codex_dirs = codex::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &codex_dirs,
+        commit_time,
+        window_secs,
+        &["jsonl"],
+    ));
+
+    let cursor_dirs = cursor::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &cursor_dirs,
+        commit_time,
+        window_secs,
+        &["json", "txt"],
+    ));
+
+    let copilot_dirs = copilot::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &copilot_dirs,
+        commit_time,
+        window_secs,
+        &["json"],
+    ));
+
+    let antigravity_dirs = antigravity::log_dirs();
+    results.extend(candidate_files_with_exts(
+        &antigravity_dirs,
+        commit_time,
+        window_secs,
+        &["json"],
+    ));
+
+    results
+}
+
+/// Collect recent files across all supported agents.
+pub fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+
+    let claude_dirs = claude::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &claude_dirs,
+        now,
+        since_secs,
+        &["jsonl"],
+    ));
+
+    let codex_dirs = codex::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &codex_dirs,
+        now,
+        since_secs,
+        &["jsonl"],
+    ));
+
+    let cursor_dirs = cursor::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &cursor_dirs,
+        now,
+        since_secs,
+        &["json", "txt"],
+    ));
+
+    let copilot_dirs = copilot::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &copilot_dirs,
+        now,
+        since_secs,
+        &["json"],
+    ));
+
+    let antigravity_dirs = antigravity::all_log_dirs();
+    results.extend(recent_files_with_exts(
+        &antigravity_dirs,
+        now,
+        since_secs,
+        &["json"],
+    ));
+
+    results
 }
 
 /// Set a file's modification time to a specific Unix epoch timestamp.
@@ -172,6 +346,7 @@ pub(crate) fn set_file_mtime(path: &Path, epoch_secs: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
@@ -215,6 +390,12 @@ mod tests {
         assert_eq!(encode_repo_path(path), "-Users-foo-bar.baz");
     }
 
+    #[test]
+    fn test_encode_windows_path_normalizes_drive_and_separators() {
+        let path = Path::new("C:\\Users\\foo\\bar");
+        assert_eq!(encode_repo_path(path), "-C-Users-foo-bar");
+    }
+
     // -----------------------------------------------------------------------
     // candidate_files
     // -----------------------------------------------------------------------
@@ -229,7 +410,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], file);
     }
@@ -245,7 +427,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time + window);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert_eq!(result.len(), 1);
     }
 
@@ -260,7 +443,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time + window + 1);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -275,7 +459,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, commit_time - window - 1);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -294,7 +479,8 @@ mod tests {
         fs::write(&json_file, "{}").unwrap();
         set_file_mtime(&json_file, commit_time);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -312,26 +498,28 @@ mod tests {
         fs::write(&file2, "{}").unwrap();
         set_file_mtime(&file2, commit_time);
 
-        let result = candidate_files(
+        let result = candidate_files_with_exts(
             &[dir1.path().to_path_buf(), dir2.path().to_path_buf()],
             commit_time,
             600,
+            &["jsonl"],
         );
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_candidate_files_empty_dirs() {
-        let result = candidate_files(&[], 1_700_000_000, 600);
+        let result = candidate_files_with_exts(&[], 1_700_000_000, 600, &["jsonl"]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_candidate_files_nonexistent_dir() {
-        let result = candidate_files(
+        let result = candidate_files_with_exts(
             &[PathBuf::from("/nonexistent/dir/that/does/not/exist")],
             1_700_000_000,
             600,
+            &["jsonl"],
         );
         assert!(result.is_empty());
     }
@@ -352,7 +540,8 @@ mod tests {
         fs::write(&out_file, "{}").unwrap();
         set_file_mtime(&out_file, commit_time + 1000);
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, window);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], in_file);
     }
@@ -366,7 +555,8 @@ mod tests {
         let fake_dir = dir.path().join("sneaky.jsonl");
         fs::create_dir(&fake_dir).unwrap();
 
-        let result = candidate_files(&[dir.path().to_path_buf()], commit_time, 600);
+        let result =
+            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -385,7 +575,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, now - 3 * 86_400); // 3 days ago
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], file);
     }
@@ -401,7 +592,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, now - 10 * 86_400); // 10 days ago
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
         assert!(result.is_empty());
     }
 
@@ -416,7 +608,8 @@ mod tests {
         fs::write(&file, "{}").unwrap();
         set_file_mtime(&file, now - since_secs); // exactly at the cutoff
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, since_secs);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
         assert_eq!(result.len(), 1, "file at exact cutoff should be included");
     }
 
@@ -429,19 +622,24 @@ mod tests {
         fs::write(&txt_file, "{}").unwrap();
         set_file_mtime(&txt_file, now);
 
-        let result = recent_files(&[dir.path().to_path_buf()], now, 86_400);
+        let result = recent_files_with_exts(&[dir.path().to_path_buf()], now, 86_400, &["jsonl"]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_recent_files_empty_dirs() {
-        let result = recent_files(&[], 1_700_000_000, 86_400);
+        let result = recent_files_with_exts(&[], 1_700_000_000, 86_400, &["jsonl"]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_recent_files_nonexistent_dir() {
-        let result = recent_files(&[PathBuf::from("/nonexistent/dir")], 1_700_000_000, 86_400);
+        let result = recent_files_with_exts(
+            &[PathBuf::from("/nonexistent/dir")],
+            1_700_000_000,
+            86_400,
+            &["jsonl"],
+        );
         assert!(result.is_empty());
     }
 
@@ -455,5 +653,66 @@ mod tests {
         let home = home_dir();
         assert!(home.is_some());
         assert!(home.unwrap().is_absolute());
+    }
+
+    #[test]
+    #[serial]
+    fn test_home_dir_falls_back_to_userprofile() {
+        let home_backup = std::env::var("HOME").ok();
+        let userprofile_backup = std::env::var("USERPROFILE").ok();
+        let homedrive_backup = std::env::var("HOMEDRIVE").ok();
+        let homepath_backup = std::env::var("HOMEPATH").ok();
+
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("HOMEDRIVE");
+            std::env::remove_var("HOMEPATH");
+            std::env::set_var("USERPROFILE", "/tmp/test-userprofile");
+        }
+
+        let result = home_dir();
+        assert_eq!(result, Some(PathBuf::from("/tmp/test-userprofile")));
+
+        match home_backup {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match userprofile_backup {
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match homedrive_backup {
+            Some(v) => unsafe { std::env::set_var("HOMEDRIVE", v) },
+            None => unsafe { std::env::remove_var("HOMEDRIVE") },
+        }
+        match homepath_backup {
+            Some(v) => unsafe { std::env::set_var("HOMEPATH", v) },
+            None => unsafe { std::env::remove_var("HOMEPATH") },
+        }
+    }
+
+    #[test]
+    fn test_app_config_dir_in_platform() {
+        let home = PathBuf::from("/home/tester");
+        let xdg_backup = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/home/tester/.config");
+        }
+        let dir = app_config_dir_in("Code", &home);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                dir,
+                PathBuf::from("/home/tester/Library/Application Support/Code")
+            );
+        } else if cfg!(target_os = "windows") {
+            assert!(dir.ends_with(PathBuf::from("Code")));
+        } else {
+            assert!(dir.starts_with(PathBuf::from("/home/tester")));
+            assert!(dir.ends_with(PathBuf::from("Code")));
+        }
+        match xdg_backup {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
     }
 }
