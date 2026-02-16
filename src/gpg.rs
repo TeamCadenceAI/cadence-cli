@@ -121,6 +121,44 @@ pub fn encrypt_to_recipient(plaintext: &str, recipient: &str) -> Result<String> 
     .context("gpg encrypt failed")
 }
 
+/// Encrypt plaintext using an armored private key via pure-Rust OpenPGP.
+///
+/// This is used for API challenge/test payloads so the ciphertext format
+/// matches what the backend's OpenPGP parser supports.
+pub fn encrypt_to_armored_private_key(
+    plaintext: &str,
+    armored_private_key: &str,
+) -> Result<String> {
+    use pgp::ArmorOptions;
+    use pgp::composed::{Deserializable, Message, SignedSecretKey};
+    use pgp::crypto::sym::SymmetricKeyAlgorithm;
+
+    let trimmed = armored_private_key.trim();
+    if trimmed.is_empty() {
+        bail!("gpg encrypt: private key material must not be blank");
+    }
+
+    let (signed_key, _headers) =
+        SignedSecretKey::from_string(trimmed).context("rpgp encrypt failed: key parse error")?;
+
+    let enc_subkey = signed_key
+        .secret_subkeys
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("rpgp encrypt failed: no encryption subkey found"))?;
+
+    let literal = pgp::packet::LiteralData::from_bytes((&[]).into(), plaintext.as_bytes());
+    let message = Message::Literal(literal);
+
+    let mut rng = rand08::thread_rng();
+    let encrypted = message
+        .encrypt_to_keys_seipdv1(&mut rng, SymmetricKeyAlgorithm::AES128, &[enc_subkey])
+        .context("rpgp encrypt failed: encryption error")?;
+
+    encrypted
+        .to_armored_string(ArmorOptions::default())
+        .context("rpgp encrypt failed: armored serialization error")
+}
+
 /// Decrypt an ASCII-armored PGP message.
 ///
 /// Spawns `gpg --batch --yes --decrypt`, pipes `ciphertext` to stdin, and
@@ -519,6 +557,50 @@ mod tests {
             err_msg.contains("recipient must not be blank"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_encrypt_to_armored_private_key_blank_key_fails() {
+        let result = encrypt_to_armored_private_key("hello", "");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("private key material must not be blank"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_to_armored_private_key_invalid_key_fails() {
+        let result = encrypt_to_armored_private_key("hello", "not a valid key");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("rpgp encrypt failed"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_encrypt_to_armored_private_key_roundtrip() {
+        let Some((gpg_home, email)) = setup_test_gpg_keyring() else {
+            eprintln!("skipping test: gpg not available or key generation failed");
+            return;
+        };
+
+        let plaintext = "rpgp-compatibility-test";
+        let result = with_env("GNUPGHOME", gpg_home.path().to_str().unwrap(), || {
+            let armored = export_secret_key(&email)?;
+            let ciphertext = encrypt_to_armored_private_key(plaintext, &armored)?;
+            assert!(is_encrypted(&ciphertext));
+
+            let decrypted = decrypt(&ciphertext)?;
+            assert_eq!(decrypted.trim(), plaintext);
+            Ok::<(), anyhow::Error>(())
+        });
+
+        result.unwrap();
     }
 
     // -------------------------------------------------------------------

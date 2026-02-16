@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -71,7 +72,7 @@ pub struct PushKeyResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TestKeyResponse {
     pub success: bool,
-    #[serde(default)]
+    #[serde(default, alias = "error")]
     pub message: Option<String>,
 }
 
@@ -83,6 +84,27 @@ pub struct ExchangeCodeResponse {
     pub login: Option<String>,
     #[serde(default)]
     pub expires_at: Option<String>,
+}
+
+/// Backward-compatible key status payloads.
+///
+/// Supports both:
+/// - legacy flat payload: `{ "fingerprint": "...", "created_at": "..." }`
+/// - current API payload: `{ "active_key": { ... } }`
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum KeyStatusPayload {
+    Flat(KeyStatus),
+    WithActiveKey {
+        #[serde(default)]
+        active_key: Option<KeyStatus>,
+    },
+}
+
+/// Standard API response envelope used by current backend endpoints.
+#[derive(Debug, Deserialize)]
+struct ApiResponseEnvelope<T> {
+    data: T,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,9 +161,12 @@ impl ApiClient {
             return Ok(None);
         }
 
-        let key: KeyStatus =
-            serde_json::from_str(&body).context("failed to parse key status response")?;
-        Ok(Some(key))
+        let payload: KeyStatusPayload =
+            parse_response_payload(&body, "failed to parse key status response")?;
+        match payload {
+            KeyStatusPayload::Flat(key) => Ok(Some(key)),
+            KeyStatusPayload::WithActiveKey { active_key } => Ok(active_key),
+        }
     }
 
     /// Push a GPG private key to the server.
@@ -167,7 +192,7 @@ impl ApiClient {
 
         let body = map_http_error(resp)?;
         let parsed: PushKeyResponse =
-            serde_json::from_str(&body).context("failed to parse push key response")?;
+            parse_response_payload(&body, "failed to parse push key response")?;
         Ok(parsed)
     }
 
@@ -183,7 +208,7 @@ impl ApiClient {
 
         let body = map_http_error(resp)?;
         let parsed: TestKeyResponse =
-            serde_json::from_str(&body).context("failed to parse test key response")?;
+            parse_response_payload(&body, "failed to parse test key response")?;
         Ok(parsed)
     }
 
@@ -220,7 +245,7 @@ impl ApiClient {
 
         let body = map_http_error(resp)?;
         let parsed: ExchangeCodeResponse =
-            serde_json::from_str(&body).context("failed to parse auth exchange response")?;
+            parse_response_payload(&body, "failed to parse auth exchange response")?;
         Ok(parsed)
     }
 
@@ -284,6 +309,19 @@ fn map_http_error(resp: reqwest::blocking::Response) -> Result<String> {
             anyhow::bail!("Unexpected response (HTTP {status}): {body}");
         }
     }
+}
+
+/// Parse either an enveloped API response (`{"data": ...}`) or a legacy
+/// direct payload (`{...}`) for backward compatibility.
+fn parse_response_payload<T>(body: &str, context: &'static str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(enveloped) = serde_json::from_str::<ApiResponseEnvelope<T>>(body) {
+        return Ok(enveloped.data);
+    }
+
+    serde_json::from_str::<T>(body).context(context)
 }
 
 /// Try to extract a `message` or `error` field from a JSON error body.
@@ -518,6 +556,38 @@ mod tests {
     }
 
     #[test]
+    fn test_get_key_status_success_enveloped_active_key() {
+        let server = MockServer::new();
+        let url = server.url().to_string();
+        let client = ApiClient::new(&url, Some("tok_abc".into()));
+
+        let body = r#"{"data":{"active_key":{"fingerprint":"ABCD1234","created_at":"2025-01-01T00:00:00Z"}}}"#;
+        let handle = std::thread::spawn(move || server.respond(200, body));
+
+        let result = client.get_key_status().unwrap();
+        let _req = handle.join().unwrap();
+
+        let status = result.unwrap();
+        assert_eq!(status.fingerprint, "ABCD1234");
+        assert_eq!(status.created_at, Some("2025-01-01T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_get_key_status_enveloped_no_active_key_returns_none() {
+        let server = MockServer::new();
+        let url = server.url().to_string();
+        let client = ApiClient::new(&url, Some("tok_abc".into()));
+
+        let body = r#"{"data":{"active_key":null}}"#;
+        let handle = std::thread::spawn(move || server.respond(200, body));
+
+        let result = client.get_key_status().unwrap();
+        let _req = handle.join().unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_get_key_status_no_key_returns_none() {
         let server = MockServer::new();
         let url = server.url().to_string();
@@ -589,6 +659,24 @@ mod tests {
     }
 
     #[test]
+    fn test_push_key_success_enveloped() {
+        let server = MockServer::new();
+        let url = server.url().to_string();
+        let client = ApiClient::new(&url, Some("tok_abc".into()));
+
+        let body = r#"{"data":{"id":"123e4567-e89b-12d3-a456-426614174000","fingerprint":"NEW_FP","created_at":"2025-01-01T00:00:00Z"}}"#;
+        let handle = std::thread::spawn(move || server.respond(200, body));
+
+        let result = client
+            .push_key("NEW_FP", "-----BEGIN PGP PRIVATE KEY-----", "encrypted_msg")
+            .unwrap();
+        let _req = handle.join().unwrap();
+
+        assert!(result.message.is_none());
+        assert!(result.superseded.is_none());
+    }
+
+    #[test]
     fn test_push_key_requires_auth() {
         let client = ApiClient::new("https://api.example.com", None);
         let result = client.push_key("FP", "key", "msg");
@@ -630,6 +718,22 @@ mod tests {
         let client = ApiClient::new(&url, Some("tok_abc".into()));
 
         let body = r#"{"success":false,"message":"Decryption failed"}"#;
+        let handle = std::thread::spawn(move || server.respond(200, body));
+
+        let result = client.test_key("bad_data").unwrap();
+        let _req = handle.join().unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.message, Some("Decryption failed".to_string()));
+    }
+
+    #[test]
+    fn test_test_key_failure_enveloped_with_error_field() {
+        let server = MockServer::new();
+        let url = server.url().to_string();
+        let client = ApiClient::new(&url, Some("tok_abc".into()));
+
+        let body = r#"{"data":{"success":false,"error":"Decryption failed"}}"#;
         let handle = std::thread::spawn(move || server.respond(200, body));
 
         let result = client.test_key("bad_data").unwrap();
@@ -722,6 +826,24 @@ mod tests {
         assert_eq!(resp.token, "tok_new");
         assert!(resp.login.is_none());
         assert!(resp.expires_at.is_none());
+    }
+
+    #[test]
+    fn test_exchange_code_success_enveloped() {
+        let server = MockServer::new();
+        let url = server.url().to_string();
+        let client = ApiClient::new(&url, None);
+
+        let body =
+            r#"{"data":{"token":"tok_new","login":"octocat","expires_at":"2026-01-01T00:00:00Z"}}"#;
+        let handle = std::thread::spawn(move || server.respond(200, body));
+
+        let result = client.exchange_code("auth_code_123").unwrap();
+        let _req = handle.join().unwrap();
+
+        assert_eq!(result.token, "tok_new");
+        assert_eq!(result.login, Some("octocat".to_string()));
+        assert_eq!(result.expires_at, Some("2026-01-01T00:00:00Z".to_string()));
     }
 
     // -------------------------------------------------------------------
