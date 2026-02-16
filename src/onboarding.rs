@@ -155,14 +155,12 @@ pub fn run_install_onboarding(force_first_time_experience: bool) -> Result<()> {
 /// Uses `git config --global user.email` (the GitHub-associated email)
 /// rather than prompting the user. Falls back gracefully if not set.
 pub fn ensure_email_on_install(force_prompt: bool) -> Result<()> {
-    if !force_prompt {
-        if let Some(existing) = get_email() {
-            eprintln!(
-                "[ai-session-commit-linker] Onboarding: using existing email {}",
-                existing
-            );
-            return Ok(());
-        }
+    if !force_prompt && let Some(existing) = get_email() {
+        eprintln!(
+            "[ai-session-commit-linker] Onboarding: using existing email {}",
+            existing
+        );
+        return Ok(());
     }
 
     // Auto-detect from git config user.email
@@ -267,10 +265,10 @@ fn collect_selected_repos_interactively() -> Result<()> {
         );
         let mut yn = String::new();
         io::stdin().read_line(&mut yn)?;
-        if yn.trim().is_empty() || yn.trim().eq_ignore_ascii_case("y") {
-            if !selected.contains(&current) {
-                selected.push(current);
-            }
+        if (yn.trim().is_empty() || yn.trim().eq_ignore_ascii_case("y"))
+            && !selected.contains(&current)
+        {
+            selected.push(current);
         }
     }
 
@@ -325,9 +323,8 @@ fn save_selected_repos(repos: &[String]) -> Result<()> {
 }
 
 fn current_scope_repo() -> Option<String> {
-    match crate::git::config_get_global(SCOPE_CURRENT_REPO_KEY) {
-        Ok(Some(v)) => return Some(v),
-        _ => {}
+    if let Ok(Some(v)) = crate::git::config_get_global(SCOPE_CURRENT_REPO_KEY) {
+        return Some(v);
     }
     // Legacy fallback for development snapshots that used an underscore key.
     match crate::git::config_get_global(SCOPE_CURRENT_REPO_KEY_LEGACY) {
