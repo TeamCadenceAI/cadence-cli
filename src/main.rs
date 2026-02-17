@@ -11,7 +11,8 @@ mod scanner;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use console::Term;
+use dialoguer::{Confirm, Input, Password, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::process;
 
@@ -524,6 +525,18 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         }
     }
 
+    // Step 5.5: Optional encryption setup (before hydration)
+    match run_install_encryption_setup() {
+        Ok(true) => {
+            had_errors = true;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            output::fail("Install", &format!("stopped ({})", e));
+            return Err(e);
+        }
+    }
+
     // Step 6: Run hydration for the last 7 days
     output::action("Hydrating", "recent sessions (last 30 days)");
     let hydrate_start = std::time::Instant::now();
@@ -692,10 +705,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 }
             })?;
 
-            output::success(
-                "Attached",
-                &format!("session {} to commit {}", session_id, &head_hash[..7]),
-            );
+            log_attached_session(&matched.agent_type, session_id, &head_hash, false);
 
             attached = true;
         }
@@ -737,14 +747,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 }
             })?;
 
-            output::success(
-                "Attached",
-                &format!(
-                    "session {} to commit {} (time window match)",
-                    fallback.session_id,
-                    &head_hash[..7]
-                ),
-            );
+            log_attached_session(&fallback.agent_type, &fallback.session_id, &head_hash, true);
 
             attached = true;
         }
@@ -782,6 +785,34 @@ fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn agent_display_name(agent: &scanner::AgentType) -> &'static str {
+    match agent {
+        scanner::AgentType::Claude => "Claude Code",
+        scanner::AgentType::Codex => "Codex",
+        scanner::AgentType::Cursor => "Cursor",
+        scanner::AgentType::Copilot => "GitHub Copilot",
+        scanner::AgentType::Antigravity => "Antigravity",
+    }
+}
+
+fn log_attached_session(
+    agent: &scanner::AgentType,
+    session_id: &str,
+    commit_hash: &str,
+    is_fallback: bool,
+) {
+    let mut message = format!(
+        "Attached {} session {} to commit {}",
+        agent_display_name(agent),
+        session_id,
+        &commit_hash[..7]
+    );
+    if is_fallback {
+        message.push_str(" (time window match)");
+    }
+    output::success("[Cadence]", &message);
 }
 
 /// Maximum number of retry attempts before a pending record is abandoned.
@@ -1943,36 +1974,36 @@ impl GpgStatusReport {
 /// Render GPG status report to the given writer.
 ///
 /// Output lines (stable order):
-/// 1. `rpgp key cached: yes|no`
-/// 2. `gpg binary: found|not found`
-/// 3. `recipient: <email>|not configured|unavailable (<msg>)`
-/// 4. `key in keyring: yes|no` (only when applicable)
+/// 1. `Saved encryption key: yes|no`
+/// 2. `Encryption tool installed: yes|no`
+/// 3. `Who can read encrypted notes: <email>|not set|unavailable (<msg>)`
+/// 4. `Key available on this computer: yes|no` (only when applicable)
 /// 5. blank line + `Encryption: <summary>`
 fn render_gpg_status(w: &mut dyn std::io::Write, report: &GpgStatusReport) -> std::io::Result<()> {
     writeln!(
         w,
-        "rpgp key cached: {}",
+        "Saved encryption key: {}",
         if report.rpgp_key_cached { "yes" } else { "no" }
     )?;
 
     writeln!(
         w,
-        "gpg binary: {}",
-        if report.gpg_available {
-            "found"
-        } else {
-            "not found"
-        }
+        "Encryption tool installed: {}",
+        if report.gpg_available { "yes" } else { "no" }
     )?;
 
     match (&report.recipient, &report.recipient_error) {
-        (Some(r), _) => writeln!(w, "recipient: {}", r)?,
-        (None, Some(err)) => writeln!(w, "recipient: unavailable ({})", err)?,
-        (None, None) => writeln!(w, "recipient: not configured")?,
+        (Some(r), _) => writeln!(w, "Who can read encrypted notes: {}", r)?,
+        (None, Some(err)) => writeln!(w, "Who can read encrypted notes: unavailable ({})", err)?,
+        (None, None) => writeln!(w, "Who can read encrypted notes: not set")?,
     }
 
     if let Some(key_ok) = report.key_in_keyring {
-        writeln!(w, "key in keyring: {}", if key_ok { "yes" } else { "no" })?;
+        writeln!(
+            w,
+            "Key available on this computer: {}",
+            if key_ok { "yes" } else { "no" }
+        )?;
     }
 
     writeln!(w)?;
@@ -2005,6 +2036,126 @@ fn run_gpg_setup() -> Result<()> {
         let mut prompter = BufferedPrompter::new(&mut input);
         run_gpg_setup_inner(&mut prompter, &mut std::io::stdout())
     }
+}
+
+/// Optional encryption setup during install. Returns `Ok(true)` if a non-fatal
+/// error occurred, `Ok(false)` if setup was skipped or completed, and `Err`
+/// for fatal errors that should abort install.
+fn run_install_encryption_setup() -> Result<bool> {
+    if !output::is_stderr_tty() || !Term::stdout().is_term() {
+        return Ok(false);
+    }
+
+    let mut stdout = std::io::stdout();
+    let is_tty = Term::stdout().is_term();
+    let mut prompter = DialoguerPrompter::new();
+
+    output::action_to_with_tty(&mut stdout, "Encryption", "setup", is_tty);
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Protect attached session notes so only you can read them.",
+        is_tty,
+    );
+
+    let Some(enable) =
+        prompter.confirm("Encrypt attached session notes? (Recommended)", &mut stdout)?
+    else {
+        output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
+        return Ok(false);
+    };
+
+    if !enable {
+        output::note_to_with_tty(
+            &mut stdout,
+            "Notes will be stored in plaintext. You can enable encryption later with `cadence gpg setup`.",
+            is_tty,
+        );
+        return Ok(false);
+    }
+
+    if !gpg::gpg_available() {
+        output::note_to_with_tty(
+            &mut stdout,
+            "Encryption tool not found on this machine.",
+            is_tty,
+        );
+        let Some(manager) = detect_package_manager() else {
+            output::fail_to_with_tty(
+                &mut stdout,
+                "Encryption",
+                "No supported package manager found for automatic install.",
+                is_tty,
+            );
+            output::detail_to_with_tty(&mut stdout, gpg_install_guidance(), is_tty);
+            output::detail_to_with_tty(
+                &mut stdout,
+                "Install GPG manually, then rerun `cadence install` or `cadence gpg setup`.",
+                is_tty,
+            );
+            anyhow::bail!("GPG not available for encryption");
+        };
+
+        let prompt = format!(
+            "Install the encryption tool now with {}?",
+            manager.display_name()
+        );
+        let Some(install_now) = prompter.confirm(&prompt, &mut stdout)? else {
+            output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
+            return Ok(false);
+        };
+
+        if !install_now {
+            output::note_to_with_tty(
+                &mut stdout,
+                "Skipping encryption setup. You can enable it later with `cadence gpg setup`.",
+                is_tty,
+            );
+            return Ok(false);
+        }
+
+        if let Err(e) = install_gpg_with(manager, &mut stdout, is_tty) {
+            output::fail_to_with_tty(
+                &mut stdout,
+                "Encryption",
+                &format!("Failed to install encryption tool ({})", e),
+                is_tty,
+            );
+            anyhow::bail!("GPG install failed");
+        }
+
+        if !gpg::gpg_available() {
+            output::fail_to_with_tty(
+                &mut stdout,
+                "Encryption",
+                "GPG installed, but the `gpg` command is still not available.",
+                is_tty,
+            );
+            anyhow::bail!("GPG not available after install");
+        }
+    }
+
+    if let Err(e) = run_gpg_setup_inner(&mut prompter, &mut stdout) {
+        output::note_to_with_tty(
+            &mut stdout,
+            &format!("Encryption setup incomplete: {}", e),
+            is_tty,
+        );
+        return Ok(true);
+    }
+
+    if let Ok(Some(recipient)) = git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        && !recipient.trim().is_empty()
+    {
+        output::action_to_with_tty(&mut stdout, "Next", "connect your account", is_tty);
+        output::detail_to_with_tty(&mut stdout, "Run `cadence auth login`", is_tty);
+        output::detail_to_with_tty(
+            &mut stdout,
+            "Then run `cadence keys push` to upload your public key",
+            is_tty,
+        );
+    }
+
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2065,6 +2216,7 @@ fn prompt_yes_no(
 trait Prompter {
     fn input(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<String>>;
     fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>>;
+    fn secret(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<String>>;
 }
 
 struct BufferedPrompter<'a> {
@@ -2084,6 +2236,10 @@ impl Prompter for BufferedPrompter<'_> {
 
     fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>> {
         prompt_yes_no(self.reader, writer, prompt)
+    }
+
+    fn secret(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<String>> {
+        prompt_line(self.reader, writer, prompt)
     }
 }
 
@@ -2126,6 +2282,20 @@ impl Prompter for DialoguerPrompter {
             Err(err) => Err(err.into()),
         }
     }
+
+    fn secret(&mut self, prompt: &str, _writer: &mut dyn std::io::Write) -> Result<Option<String>> {
+        let result = Password::with_theme(&self.theme)
+            .with_prompt(prompt)
+            .allow_empty_password(true)
+            .interact();
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
 }
 
 /// Return platform-specific GPG install guidance.
@@ -2139,6 +2309,287 @@ fn gpg_install_guidance() -> &'static str {
     } else {
         "Install GPG: download from the GnuPG website"
     }
+}
+
+fn git_user_value(key: &str) -> Option<String> {
+    let value = git::config_get_global(key).ok().flatten()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PackageManager {
+    Brew,
+    Winget,
+    Apt,
+    Dnf,
+    Yum,
+    Pacman,
+    Zypper,
+}
+
+impl PackageManager {
+    fn display_name(self) -> &'static str {
+        match self {
+            PackageManager::Brew => "Homebrew",
+            PackageManager::Winget => "winget",
+            PackageManager::Apt => "apt-get",
+            PackageManager::Dnf => "dnf",
+            PackageManager::Yum => "yum",
+            PackageManager::Pacman => "pacman",
+            PackageManager::Zypper => "zypper",
+        }
+    }
+}
+
+fn command_exists(cmd: &str) -> bool {
+    process::Command::new(cmd)
+        .arg("--version")
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn detect_package_manager() -> Option<PackageManager> {
+    if cfg!(target_os = "macos") {
+        if command_exists("brew") {
+            return Some(PackageManager::Brew);
+        }
+        return None;
+    }
+
+    if cfg!(target_os = "windows") {
+        if command_exists("winget") {
+            return Some(PackageManager::Winget);
+        }
+        return None;
+    }
+
+    if cfg!(target_os = "linux") {
+        if command_exists("apt-get") {
+            return Some(PackageManager::Apt);
+        }
+        if command_exists("dnf") {
+            return Some(PackageManager::Dnf);
+        }
+        if command_exists("yum") {
+            return Some(PackageManager::Yum);
+        }
+        if command_exists("pacman") {
+            return Some(PackageManager::Pacman);
+        }
+        if command_exists("zypper") {
+            return Some(PackageManager::Zypper);
+        }
+        return None;
+    }
+
+    None
+}
+
+fn install_gpg_with(
+    manager: PackageManager,
+    writer: &mut dyn std::io::Write,
+    is_tty: bool,
+) -> Result<()> {
+    output::action_to_with_tty(
+        writer,
+        "Encryption",
+        &format!("Installing support via {}", manager.display_name()),
+        is_tty,
+    );
+
+    let mut command = match manager {
+        PackageManager::Brew => process::Command::new("brew"),
+        PackageManager::Winget => process::Command::new("winget"),
+        PackageManager::Apt => {
+            if command_exists("sudo") {
+                let mut cmd = process::Command::new("sudo");
+                cmd.arg("apt-get");
+                cmd
+            } else {
+                process::Command::new("apt-get")
+            }
+        }
+        PackageManager::Dnf => {
+            if command_exists("sudo") {
+                let mut cmd = process::Command::new("sudo");
+                cmd.arg("dnf");
+                cmd
+            } else {
+                process::Command::new("dnf")
+            }
+        }
+        PackageManager::Yum => {
+            if command_exists("sudo") {
+                let mut cmd = process::Command::new("sudo");
+                cmd.arg("yum");
+                cmd
+            } else {
+                process::Command::new("yum")
+            }
+        }
+        PackageManager::Pacman => {
+            if command_exists("sudo") {
+                let mut cmd = process::Command::new("sudo");
+                cmd.arg("pacman");
+                cmd
+            } else {
+                process::Command::new("pacman")
+            }
+        }
+        PackageManager::Zypper => {
+            if command_exists("sudo") {
+                let mut cmd = process::Command::new("sudo");
+                cmd.arg("zypper");
+                cmd
+            } else {
+                process::Command::new("zypper")
+            }
+        }
+    };
+
+    let args: &[&str] = match manager {
+        PackageManager::Brew => &["install", "gnupg"],
+        PackageManager::Winget => &[
+            "install",
+            "--id",
+            "GnuPG.GnuPG",
+            "-e",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+        ],
+        PackageManager::Apt => &["install", "-y", "gnupg"],
+        PackageManager::Dnf => &["install", "-y", "gnupg2"],
+        PackageManager::Yum => &["install", "-y", "gnupg2"],
+        PackageManager::Pacman => &["-S", "--noconfirm", "gnupg"],
+        PackageManager::Zypper => &["install", "-y", "gnupg2"],
+    };
+
+    let status = command
+        .args(args)
+        .stdin(process::Stdio::inherit())
+        .stdout(process::Stdio::inherit())
+        .stderr(process::Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to run {} for GPG install", manager.display_name()))?;
+
+    if !status.success() {
+        anyhow::bail!("{} exited with status {}", manager.display_name(), status);
+    }
+
+    Ok(())
+}
+
+fn generate_gpg_key(
+    prompter: &mut dyn Prompter,
+    writer: &mut dyn std::io::Write,
+    is_tty: bool,
+) -> Result<Option<String>> {
+    writeln!(writer)?;
+    output::action_to_with_tty(writer, "Encryption", "create a new key", is_tty);
+    output::detail_to_with_tty(
+        writer,
+        "This key will be used to lock and unlock your attached session notes.",
+        is_tty,
+    );
+
+    let name = match git_user_value("user.name") {
+        Some(value) => {
+            output::detail_to_with_tty(writer, &format!("Using Git name: {value}"), is_tty);
+            value
+        }
+        None => loop {
+            let Some(input) = prompter.input("Your full name: ", writer)? else {
+                return Ok(None);
+            };
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                writeln!(writer, "Please enter a name.")?;
+                continue;
+            }
+            break trimmed.to_string();
+        },
+    };
+
+    let email = match git_user_value("user.email") {
+        Some(value) => {
+            output::detail_to_with_tty(writer, &format!("Using Git email: {value}"), is_tty);
+            value
+        }
+        None => loop {
+            let Some(input) = prompter.input("Email address for this key: ", writer)? else {
+                return Ok(None);
+            };
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                writeln!(writer, "Please enter an email address.")?;
+                continue;
+            }
+            break trimmed.to_string();
+        },
+    };
+
+    let protect = match prompter.confirm("Protect this key with a passphrase?", writer)? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let passphrase = if protect {
+        loop {
+            let Some(pass) = prompter.secret("Passphrase: ", writer)? else {
+                return Ok(None);
+            };
+            let Some(confirm) = prompter.secret("Confirm passphrase: ", writer)? else {
+                return Ok(None);
+            };
+            if pass != confirm {
+                writeln!(writer, "Passphrases did not match. Try again.")?;
+                continue;
+            }
+            break Some(pass);
+        }
+    } else {
+        None
+    };
+
+    output::detail_to_with_tty(
+        writer,
+        "Creating your key (this may take a moment)...",
+        is_tty,
+    );
+    let identity = format!("{} <{}>", name.trim(), email.trim());
+
+    let mut cmd = process::Command::new("gpg");
+    cmd.args(["--batch", "--yes"]);
+
+    if let Some(ref pass) = passphrase {
+        cmd.args(["--pinentry-mode", "loopback", "--passphrase", pass]);
+    } else if !is_tty {
+        // Non-tty keygen without a passphrase still needs a loopback pinentry.
+        cmd.args(["--pinentry-mode", "loopback", "--passphrase", ""]);
+    }
+
+    cmd.args(["--quick-generate-key", &identity, "default", "default", "0"]);
+
+    let status = cmd
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::inherit())
+        .stderr(process::Stdio::inherit())
+        .status()
+        .context("failed to run gpg to generate a key")?;
+
+    if !status.success() {
+        anyhow::bail!("gpg exited with status {}", status);
+    }
+
+    output::success_to_with_tty(writer, "Encryption", "key created.", is_tty);
+    Ok(Some(email))
 }
 
 // ---------------------------------------------------------------------------
@@ -2170,18 +2621,27 @@ enum SetupOutcome {
 /// 4. Persist global git config (deferred, with rollback on partial failure).
 /// 5. Print summary and run `gpg status`.
 fn run_gpg_setup_inner(prompter: &mut dyn Prompter, writer: &mut dyn std::io::Write) -> Result<()> {
-    writeln!(writer, "=== GPG Encryption Setup ===")?;
+    let is_tty = Term::stdout().is_term();
+    output::action_to_with_tty(writer, "Encryption", "setup", is_tty);
+    output::detail_to_with_tty(
+        writer,
+        "Encrypt attached session notes so only you can read them.",
+        is_tty,
+    );
     writeln!(writer)?;
 
     // Step 1: Check gpg binary
     if !gpg::gpg_available() {
-        writeln!(writer, "gpg binary: not found")?;
-        writeln!(writer)?;
-        writeln!(writer, "{}", gpg_install_guidance())?;
-        writeln!(writer, "Please install GPG and run this command again.")?;
+        output::fail_to_with_tty(writer, "Encryption", "tool not found.", is_tty);
+        output::detail_to_with_tty(writer, gpg_install_guidance(), is_tty);
+        output::detail_to_with_tty(
+            writer,
+            "Install it, then run `cadence gpg setup` again.",
+            is_tty,
+        );
         return Ok(());
     }
-    writeln!(writer, "gpg binary: found")?;
+    output::success_to_with_tty(writer, "Encryption", "tool found.", is_tty);
     writeln!(writer)?;
 
     // Steps 2-3: Collect inputs without writing config
@@ -2194,7 +2654,7 @@ fn run_gpg_setup_inner(prompter: &mut dyn Prompter, writer: &mut dyn std::io::Wr
         } => (recipient, key_source),
         SetupOutcome::Aborted => {
             writeln!(writer)?;
-            writeln!(writer, "Setup aborted. No configuration was changed.")?;
+            output::note_to_with_tty(writer, "Setup cancelled. No changes were made.", is_tty);
             return Ok(());
         }
     };
@@ -2204,10 +2664,10 @@ fn run_gpg_setup_inner(prompter: &mut dyn Prompter, writer: &mut dyn std::io::Wr
 
     // Step 5: Summary and verification
     writeln!(writer)?;
-    writeln!(writer, "=== Setup Complete ===")?;
-    writeln!(writer, "recipient: {}", recipient)?;
+    output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
+    writeln!(writer, "Key: {}", recipient)?;
     if let Some(ref src) = key_source {
-        writeln!(writer, "key source: {}", src)?;
+        writeln!(writer, "Key file: {}", src)?;
     }
     writeln!(writer)?;
 
@@ -2225,68 +2685,100 @@ fn collect_setup_inputs(
     writer: &mut dyn std::io::Write,
 ) -> Result<SetupOutcome> {
     // Step 2: Optional key import
-    let key_source = loop {
-        let Some(source) = prompter.input(
-            "Enter path to GPG public key file (or press Enter to skip): ",
-            writer,
-        )?
-        else {
-            return Ok(SetupOutcome::Aborted);
-        };
-
-        let trimmed = source.trim().to_string();
-        if trimmed.is_empty() {
-            break None;
-        }
-
-        match gpg::import_key(&trimmed) {
-            Ok(()) => {
-                writeln!(writer, "Key imported successfully.")?;
-                break Some(trimmed);
-            }
-            Err(e) => {
-                writeln!(writer, "Could not import key: {}", e)?;
-                let Some(retry) = prompter.confirm("Retry?", writer)? else {
-                    return Ok(SetupOutcome::Aborted);
-                };
-                if !retry {
-                    return Ok(SetupOutcome::Aborted);
-                }
-                // Loop back to prompt again
-            }
-        }
+    let wants_key = match prompter.confirm("Do you already have a public key file?", writer)? {
+        Some(value) => value,
+        None => return Ok(SetupOutcome::Aborted),
     };
 
-    // Step 3: Recipient prompt
-    let recipient = loop {
-        let Some(input) = prompter.input(
-            "Enter GPG recipient (fingerprint, email, or key ID): ",
-            writer,
-        )?
+    let mut key_source = None;
+    let mut generated_email: Option<String> = None;
+
+    if wants_key {
+        loop {
+            let Some(source) = prompter.input("Path to the public key file: ", writer)? else {
+                return Ok(SetupOutcome::Aborted);
+            };
+
+            let trimmed = source.trim().to_string();
+            if trimmed.is_empty() {
+                writeln!(writer, "Please enter a file path.")?;
+                continue;
+            }
+
+            match gpg::import_key(&trimmed) {
+                Ok(()) => {
+                    writeln!(writer, "Key added successfully.")?;
+                    key_source = Some(trimmed);
+                    break;
+                }
+                Err(e) => {
+                    writeln!(writer, "Could not add that key file: {}", e)?;
+                    let Some(retry) = prompter.confirm("Try a different file?", writer)? else {
+                        return Ok(SetupOutcome::Aborted);
+                    };
+                    if !retry {
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        let Some(create_now) = prompter.confirm("Create a new key now? (Recommended)", writer)?
         else {
             return Ok(SetupOutcome::Aborted);
         };
-
-        let trimmed = input.trim().to_string();
-        if trimmed.is_empty() {
-            writeln!(writer, "Recipient must not be blank.")?;
-            continue;
+        if create_now {
+            let is_tty = Term::stdout().is_term();
+            generated_email = generate_gpg_key(prompter, writer, is_tty)?;
         }
+    }
 
-        if gpg::key_exists(&trimmed) {
-            writeln!(writer, "Key found in keyring.")?;
-            break trimmed;
-        }
-
-        writeln!(writer, "Key not found in keyring for '{}'.", trimmed)?;
-        let Some(cont) = prompter.confirm("Continue with this recipient anyway?", writer)? else {
+    // Step 3: Key identifier prompt
+    let recipient = if let Some(email) = generated_email {
+        let prompt = format!("Use {} to encrypt and decrypt your notes?", email.trim());
+        let Some(use_generated) = prompter.confirm(&prompt, writer)? else {
             return Ok(SetupOutcome::Aborted);
         };
-        if cont {
-            break trimmed;
-        } else {
-            return Ok(SetupOutcome::Aborted);
+        if use_generated { email } else { String::new() }
+    } else {
+        String::new()
+    };
+
+    let recipient = if recipient.is_empty() {
+        loop {
+            let Some(input) = prompter.input(
+                "Email address on the key that should be able to read these notes: ",
+                writer,
+            )?
+            else {
+                return Ok(SetupOutcome::Aborted);
+            };
+
+            let trimmed = input.trim().to_string();
+            if trimmed.is_empty() {
+                writeln!(writer, "Please enter an email address.")?;
+                continue;
+            }
+
+            if gpg::key_exists(&trimmed) {
+                writeln!(writer, "Key found.")?;
+                break trimmed;
+            }
+
+            writeln!(
+                writer,
+                "I couldn't find a matching key for '{}' on this computer.",
+                trimmed
+            )?;
+            let Some(cont) = prompter.confirm("Use it anyway?", writer)? else {
+                return Ok(SetupOutcome::Aborted);
+            };
+            if cont {
+                break trimmed;
+            }
         }
+    } else {
+        recipient
     };
 
     Ok(SetupOutcome::Completed {
@@ -7309,10 +7801,18 @@ mod tests {
         render_gpg_status(&mut buf, &report).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
-        assert!(output.contains("rpgp key cached: no"), "got: {}", output);
-        assert!(output.contains("gpg binary: found"), "got: {}", output);
         assert!(
-            output.contains("recipient: not configured"),
+            output.contains("Saved encryption key: no"),
+            "got: {}",
+            output
+        );
+        assert!(
+            output.contains("Encryption tool installed: yes"),
+            "got: {}",
+            output
+        );
+        assert!(
+            output.contains("Who can read encrypted notes: not set"),
             "got: {}",
             output
         );
@@ -7341,13 +7841,21 @@ mod tests {
         render_gpg_status(&mut buf, &report).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
-        assert!(output.contains("gpg binary: found"), "got: {}", output);
         assert!(
-            output.contains("recipient: user@example.com"),
+            output.contains("Encryption tool installed: yes"),
             "got: {}",
             output
         );
-        assert!(output.contains("key in keyring: yes"), "got: {}", output);
+        assert!(
+            output.contains("Who can read encrypted notes: user@example.com"),
+            "got: {}",
+            output
+        );
+        assert!(
+            output.contains("Key available on this computer: yes"),
+            "got: {}",
+            output
+        );
         assert!(
             output.contains("Encryption: enabled (gpg-cli)"),
             "got: {}",
@@ -7368,9 +7876,13 @@ mod tests {
         render_gpg_status(&mut buf, &report).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
-        assert!(output.contains("gpg binary: not found"), "got: {}", output);
         assert!(
-            output.contains("recipient: user@example.com"),
+            output.contains("Encryption tool installed: no"),
+            "got: {}",
+            output
+        );
+        assert!(
+            output.contains("Who can read encrypted notes: user@example.com"),
             "got: {}",
             output
         );
@@ -7399,7 +7911,11 @@ mod tests {
         render_gpg_status(&mut buf, &report).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
-        assert!(output.contains("key in keyring: no"), "got: {}", output);
+        assert!(
+            output.contains("Key available on this computer: no"),
+            "got: {}",
+            output
+        );
         assert!(
             output.contains("Encryption: configured but key not in keyring"),
             "got: {}",
@@ -7421,7 +7937,7 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
 
         assert!(
-            output.contains("recipient: unavailable (invalid config file)"),
+            output.contains("Who can read encrypted notes: unavailable (invalid config file)"),
             "got: {}",
             output
         );
@@ -7644,8 +8160,8 @@ mod tests {
         let config_path = dir.path().join(".gitconfig");
         std::fs::write(&config_path, "").unwrap();
 
-        // Skip import (enter), then EOF at recipient prompt
-        let mut input = std::io::Cursor::new(b"\n".to_vec());
+        // Skip key file, skip key generation, then EOF at recipient prompt
+        let mut input = std::io::Cursor::new(b"n\nn\n".to_vec());
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
@@ -7656,10 +8172,10 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.contains("aborted")
-                || output_str.contains("Aborted")
-                || output_str.contains("No configuration"),
-            "should mention abort/no changes in output: {output_str}"
+            output_str.contains("cancelled")
+                || output_str.contains("Cancelled")
+                || output_str.contains("No changes"),
+            "should mention cancel/no changes in output: {output_str}"
         );
 
         // No config should be written
@@ -7681,8 +8197,8 @@ mod tests {
         let config_path = dir.path().join(".gitconfig");
         std::fs::write(&config_path, "").unwrap();
 
-        // Skip import, then blank recipient, then EOF
-        let mut input = std::io::Cursor::new(b"\n\n".to_vec());
+        // Skip key file, skip key generation, then blank recipient, then EOF
+        let mut input = std::io::Cursor::new(b"n\nn\n\n".to_vec());
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
@@ -7693,7 +8209,7 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.contains("must not be blank"),
+            output_str.contains("Please enter an email"),
             "should reject blank recipient: {output_str}"
         );
     }
@@ -7718,8 +8234,8 @@ mod tests {
                 .unwrap();
         }
 
-        // Skip import, enter nonexistent recipient, then say "no" to continue
-        let mut input = std::io::Cursor::new(b"\nnonexistent@example.invalid\nn\n".to_vec());
+        // Skip key file, skip key generation, enter nonexistent recipient, then say "no" to continue
+        let mut input = std::io::Cursor::new(b"n\nn\nnonexistent@example.invalid\nn\n".to_vec());
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
@@ -7732,14 +8248,16 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.contains("not found in keyring"),
+            output_str.contains("couldn't find")
+                || output_str.contains("Couldn't find")
+                || output_str.contains("matching key"),
             "should warn about missing key: {output_str}"
         );
         assert!(
-            output_str.contains("aborted")
-                || output_str.contains("Aborted")
-                || output_str.contains("No configuration"),
-            "should indicate abort: {output_str}"
+            output_str.contains("cancelled")
+                || output_str.contains("Cancelled")
+                || output_str.contains("No changes"),
+            "should indicate cancel: {output_str}"
         );
 
         // No config saved
@@ -7769,8 +8287,8 @@ mod tests {
                 .unwrap();
         }
 
-        // Skip import, enter nonexistent recipient, say "yes" to continue anyway
-        let mut input = std::io::Cursor::new(b"\nnonexistent@example.invalid\ny\n".to_vec());
+        // Skip key file, skip key generation, enter nonexistent recipient, say "yes" to continue anyway
+        let mut input = std::io::Cursor::new(b"n\nn\nnonexistent@example.invalid\ny\n".to_vec());
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
@@ -7783,7 +8301,7 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.contains("Setup Complete"),
+            output_str.contains("Encryption ready"),
             "should show completion: {output_str}"
         );
 
@@ -7823,8 +8341,8 @@ mod tests {
                 .unwrap();
         }
 
-        // Enter invalid path, then decline retry
-        let mut input = std::io::Cursor::new(b"/nonexistent/key.asc\nn\n".to_vec());
+        // Say yes to key file, enter invalid path, then decline retry
+        let mut input = std::io::Cursor::new(b"y\n/nonexistent/key.asc\nn\n".to_vec());
         let mut output = Vec::new();
 
         let result = with_env("GIT_CONFIG_GLOBAL", config_path.to_str().unwrap(), || {
@@ -7837,7 +8355,7 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.contains("Could not import key"),
+            output_str.contains("Could not add that key file"),
             "should show import failure: {output_str}"
         );
 

@@ -60,7 +60,3 @@ try {
 
 Write-Host ""
 Write-Host "cadence installed successfully!"
-Write-Host ""
-Write-Host "Optional: Enable GPG encryption"
-Write-Host "  winget install GnuPG.GnuPG"
-Write-Host "  cadence gpg setup"

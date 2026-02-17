@@ -17,6 +17,7 @@
 
 use crate::{git, output};
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -63,14 +64,44 @@ pub fn attempt_push_remote(remote: &str) {
 /// fetch notes, merge into local notes ref, then push notes to the remote.
 pub fn sync_notes_for_remote(remote: &str) {
     let start = std::time::Instant::now();
-    output::action("Cadence", &format!("Syncing notes with {}", remote));
-    if let Err(e) = sync_notes_for_remote_inner(remote) {
-        output::note(&format!("Could not sync notes with {}: {}", remote, e));
+    let use_progress = output::is_stderr_tty() && !output::is_verbose();
+    let progress = if use_progress {
+        let pb = ProgressBar::new_spinner();
+        pb.set_draw_target(ProgressDrawTarget::stderr());
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        pb.set_message(format!(
+            "[Cadence] Syncing attached agent sessions with {}",
+            remote
+        ));
+        Some(pb)
+    } else {
+        output::action("Cadence", &format!("Syncing notes with {}", remote));
+        None
+    };
+
+    let result = sync_notes_for_remote_inner(remote);
+    if let Some(pb) = progress {
+        match &result {
+            Ok(()) => pb.finish_with_message(format!(
+                "[Cadence] Synced attached agent sessions with {}",
+                remote
+            )),
+            Err(_) => pb.finish_and_clear(),
+        }
     }
-    output::success(
-        "Cadence",
-        &format!("Notes sync done in {} ms", start.elapsed().as_millis()),
-    );
+
+    if let Err(e) = result {
+        output::note(&format!("Could not sync notes with {}: {}", remote, e));
+    } else if !use_progress {
+        output::success(
+            "Cadence",
+            &format!("Notes sync done in {} ms", start.elapsed().as_millis()),
+        );
+    }
 }
 
 fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
