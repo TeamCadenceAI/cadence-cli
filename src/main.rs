@@ -526,15 +526,9 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     }
 
     // Step 5.5: Optional encryption setup (before hydration)
-    match run_install_encryption_setup() {
-        Ok(true) => {
-            had_errors = true;
-        }
-        Ok(false) => {}
-        Err(e) => {
-            output::fail("Install", &format!("stopped ({})", e));
-            return Err(e);
-        }
+    if let Err(e) = run_install_encryption_setup() {
+        output::fail("Install", &format!("stopped ({})", e));
+        return Err(e);
     }
 
     // Step 6: Run hydration for the last 7 days
@@ -1974,40 +1968,93 @@ impl GpgStatusReport {
 /// Render GPG status report to the given writer.
 ///
 /// Output lines (stable order):
-/// 1. `Saved encryption key: yes|no`
-/// 2. `Encryption tool installed: yes|no`
-/// 3. `Who can read encrypted notes: <email>|not set|unavailable (<msg>)`
-/// 4. `Key available on this computer: yes|no` (only when applicable)
-/// 5. blank line + `Encryption: <summary>`
+/// 1. `Encryption tool installed: yes|no`
+/// 2. `Who can read encrypted notes: <email>|not set|unavailable (<msg>)`
+/// 3. `Key available on this computer: yes|no` (only when applicable)
+/// 4. `Encryption: <summary>`
 fn render_gpg_status(w: &mut dyn std::io::Write, report: &GpgStatusReport) -> std::io::Result<()> {
-    writeln!(
-        w,
-        "Saved encryption key: {}",
-        if report.rpgp_key_cached { "yes" } else { "no" }
-    )?;
+    let is_tty = Term::stdout().is_term();
+    let label = |text: &str| {
+        if is_tty {
+            console::style(text).bold().to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    let value = |text: &str, color: console::Color| {
+        if is_tty {
+            console::style(text).fg(color).to_string()
+        } else {
+            text.to_string()
+        }
+    };
 
     writeln!(
         w,
-        "Encryption tool installed: {}",
-        if report.gpg_available { "yes" } else { "no" }
+        "{} {}",
+        label("Encryption tool installed:"),
+        value(
+            if report.gpg_available { "yes" } else { "no" },
+            if report.gpg_available {
+                console::Color::Green
+            } else {
+                console::Color::Red
+            }
+        )
     )?;
 
     match (&report.recipient, &report.recipient_error) {
-        (Some(r), _) => writeln!(w, "Who can read encrypted notes: {}", r)?,
-        (None, Some(err)) => writeln!(w, "Who can read encrypted notes: unavailable ({})", err)?,
-        (None, None) => writeln!(w, "Who can read encrypted notes: not set")?,
+        (Some(r), _) => writeln!(
+            w,
+            "{} {}",
+            label("Who can read encrypted notes:"),
+            value(r, console::Color::Cyan)
+        )?,
+        (None, Some(err)) => writeln!(
+            w,
+            "{} {}",
+            label("Who can read encrypted notes:"),
+            value(&format!("unavailable ({})", err), console::Color::Red)
+        )?,
+        (None, None) => writeln!(
+            w,
+            "{} {}",
+            label("Who can read encrypted notes:"),
+            value("not set", console::Color::Yellow)
+        )?,
     }
 
     if let Some(key_ok) = report.key_in_keyring {
         writeln!(
             w,
-            "Key available on this computer: {}",
-            if key_ok { "yes" } else { "no" }
+            "{} {}",
+            label("Key available on this computer:"),
+            value(
+                if key_ok { "yes" } else { "no" },
+                if key_ok {
+                    console::Color::Green
+                } else {
+                    console::Color::Yellow
+                }
+            )
         )?;
     }
-
-    writeln!(w)?;
-    writeln!(w, "Encryption: {}", report.summary())?;
+    let summary = report.summary();
+    let summary_color = if summary.contains("enabled") {
+        console::Color::Green
+    } else if summary.contains("configured") {
+        console::Color::Yellow
+    } else if summary.contains("unknown") {
+        console::Color::Red
+    } else {
+        console::Color::Yellow
+    };
+    writeln!(
+        w,
+        "{} {}",
+        label("Encryption:"),
+        value(summary, summary_color)
+    )?;
 
     Ok(())
 }
@@ -2038,12 +2085,11 @@ fn run_gpg_setup() -> Result<()> {
     }
 }
 
-/// Optional encryption setup during install. Returns `Ok(true)` if a non-fatal
-/// error occurred, `Ok(false)` if setup was skipped or completed, and `Err`
-/// for fatal errors that should abort install.
-fn run_install_encryption_setup() -> Result<bool> {
+/// Optional encryption setup during install. Returns `Ok(())` if setup was
+/// skipped or completed, and `Err` if install should abort before hydration.
+fn run_install_encryption_setup() -> Result<()> {
     if !output::is_stderr_tty() || !Term::stdout().is_term() {
-        return Ok(false);
+        return Ok(());
     }
 
     let mut stdout = std::io::stdout();
@@ -2061,7 +2107,7 @@ fn run_install_encryption_setup() -> Result<bool> {
         prompter.confirm("Encrypt attached session notes? (Recommended)", &mut stdout)?
     else {
         output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
-        return Ok(false);
+        return Ok(());
     };
 
     if !enable {
@@ -2070,7 +2116,7 @@ fn run_install_encryption_setup() -> Result<bool> {
             "Notes will be stored in plaintext. You can enable encryption later with `cadence gpg setup`.",
             is_tty,
         );
-        return Ok(false);
+        return Ok(());
     }
 
     if !gpg::gpg_available() {
@@ -2101,7 +2147,7 @@ fn run_install_encryption_setup() -> Result<bool> {
         );
         let Some(install_now) = prompter.confirm(&prompt, &mut stdout)? else {
             output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
-            return Ok(false);
+            return Ok(());
         };
 
         if !install_now {
@@ -2110,7 +2156,7 @@ fn run_install_encryption_setup() -> Result<bool> {
                 "Skipping encryption setup. You can enable it later with `cadence gpg setup`.",
                 is_tty,
             );
-            return Ok(false);
+            return Ok(());
         }
 
         if let Err(e) = install_gpg_with(manager, &mut stdout, is_tty) {
@@ -2140,22 +2186,32 @@ fn run_install_encryption_setup() -> Result<bool> {
             &format!("Encryption setup incomplete: {}", e),
             is_tty,
         );
-        return Ok(true);
+        anyhow::bail!("encryption setup failed");
     }
 
-    if let Ok(Some(recipient)) = git::config_get_global(gpg::GPG_RECIPIENT_KEY)
-        && !recipient.trim().is_empty()
-    {
-        output::action_to_with_tty(&mut stdout, "Next", "connect your account", is_tty);
-        output::detail_to_with_tty(&mut stdout, "Run `cadence auth login`", is_tty);
-        output::detail_to_with_tty(
+    let recipient = git::config_get_global(gpg::GPG_RECIPIENT_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if recipient.trim().is_empty() {
+        output::fail_to_with_tty(
             &mut stdout,
-            "Then run `cadence keys push` to upload your public key",
+            "Encryption",
+            "setup did not complete. Install will stop before hydration.",
             is_tty,
         );
+        anyhow::bail!("encryption setup incomplete");
     }
 
-    Ok(false)
+    output::action_to_with_tty(&mut stdout, "Next", "connect your account", is_tty);
+    output::detail_to_with_tty(&mut stdout, "Run `cadence auth login`", is_tty);
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Then run `cadence keys push` to upload your public key",
+        is_tty,
+    );
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2565,31 +2621,105 @@ fn generate_gpg_key(
     );
     let identity = format!("{} <{}>", name.trim(), email.trim());
 
+    let mut output = run_gpg_keygen(&identity, passphrase.as_deref(), is_tty)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Inappropriate ioctl for device")
+            || stderr.contains("agent_genkey failed")
+            || stderr.contains("pinentry")
+        {
+            output::note_to_with_tty(
+                writer,
+                "Your system needs a small GPG setting change for non-interactive key creation.",
+                is_tty,
+            );
+            if apply_gpg_loopback_fix(writer, is_tty)? {
+                output = run_gpg_keygen(&identity, passphrase.as_deref(), false)?;
+            }
+        }
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "gpg exited with status {}{}",
+            output.status,
+            if stderr.trim().is_empty() {
+                "".to_string()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        );
+    }
+
+    output::success_to_with_tty(writer, "Encryption", "key created.", is_tty);
+    Ok(Some(email))
+}
+
+fn run_gpg_keygen(
+    identity: &str,
+    passphrase: Option<&str>,
+    is_tty: bool,
+) -> Result<std::process::Output> {
     let mut cmd = process::Command::new("gpg");
     cmd.args(["--batch", "--yes"]);
 
-    if let Some(ref pass) = passphrase {
+    if let Some(pass) = passphrase {
         cmd.args(["--pinentry-mode", "loopback", "--passphrase", pass]);
     } else if !is_tty {
         // Non-tty keygen without a passphrase still needs a loopback pinentry.
         cmd.args(["--pinentry-mode", "loopback", "--passphrase", ""]);
     }
 
-    cmd.args(["--quick-generate-key", &identity, "default", "default", "0"]);
+    cmd.args(["--quick-generate-key", identity, "default", "default", "0"]);
 
-    let status = cmd
-        .stdin(process::Stdio::null())
-        .stdout(process::Stdio::inherit())
-        .stderr(process::Stdio::inherit())
-        .status()
-        .context("failed to run gpg to generate a key")?;
+    cmd.stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::piped())
+        .output()
+        .context("failed to run gpg to generate a key")
+}
 
-    if !status.success() {
-        anyhow::bail!("gpg exited with status {}", status);
+fn apply_gpg_loopback_fix(writer: &mut dyn std::io::Write, is_tty: bool) -> Result<bool> {
+    let Some(home) = agents::home_dir() else {
+        return Ok(false);
+    };
+    let gnupg_dir = home.join(".gnupg");
+    let agent_conf = gnupg_dir.join("gpg-agent.conf");
+
+    if !gnupg_dir.exists() {
+        std::fs::create_dir_all(&gnupg_dir)
+            .context("failed to create ~/.gnupg for loopback fix")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&gnupg_dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
-    output::success_to_with_tty(writer, "Encryption", "key created.", is_tty);
-    Ok(Some(email))
+    let mut contents = std::fs::read_to_string(&agent_conf).unwrap_or_default();
+    if !contents.contains("allow-loopback-pinentry") {
+        if !contents.ends_with('\n') && !contents.is_empty() {
+            contents.push('\n');
+        }
+        contents.push_str("allow-loopback-pinentry\n");
+        std::fs::write(&agent_conf, contents).context("failed to update gpg-agent.conf")?;
+        output::detail_to_with_tty(
+            writer,
+            "Updated ~/.gnupg/gpg-agent.conf to allow loopback pinentry.",
+            is_tty,
+        );
+    }
+
+    if command_exists("gpgconf") {
+        let _ = process::Command::new("gpgconf")
+            .args(["--reload", "gpg-agent"])
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .status();
+    }
+
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -7801,11 +7931,6 @@ mod tests {
         render_gpg_status(&mut buf, &report).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
-        assert!(
-            output.contains("Saved encryption key: no"),
-            "got: {}",
-            output
-        );
         assert!(
             output.contains("Encryption tool installed: yes"),
             "got: {}",
