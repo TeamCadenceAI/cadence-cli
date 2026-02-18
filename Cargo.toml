@@ -3,6 +3,10 @@ name = "cadence-cli"
 version = "0.2.1"
 edition = "2024"
 
+[lib]
+name = "cadence_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cadence"
 path = "src/main.rs"
@@ -21,8 +25,13 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 rand = "0.9"
 rand08 = { package = "rand", version = "0.8" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+semver = "1"
 toml = "0.8"
 pgp = "0.14"
+self-replace = "1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 keyring = "2.3"
 
 [dev-dependencies]

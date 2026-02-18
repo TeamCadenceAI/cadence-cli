@@ -9,6 +9,7 @@ mod pending;
 mod pgp_keys;
 mod push;
 mod scanner;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -72,6 +73,17 @@ enum Command {
 
     /// Show Cadence CLI status for the current repository.
     Status,
+
+    /// Check for and install updates.
+    Update {
+        /// Only check if a newer version is available; do not download or install.
+        #[arg(long)]
+        check: bool,
+
+        /// Skip confirmation prompt when installing an update.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 
     /// Manage encryption for local + API recipients.
     Keys {
@@ -2361,6 +2373,17 @@ fn run_keys_setup_inner(
     Ok(())
 }
 
+/// Check for or install updates.
+///
+/// With `--check`: queries GitHub for the latest release and reports whether
+/// an update is available. Never downloads or writes files.
+///
+/// Without `--check`: downloads, verifies, and replaces the running binary.
+/// Use `--yes` / `-y` to skip the confirmation prompt.
+fn run_update(check: bool, yes: bool) -> Result<()> {
+    update::run_update(check, yes)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2368,6 +2391,8 @@ fn run_keys_setup_inner(
 fn main() {
     let cli = Cli::parse();
     output::set_verbose(cli.verbose);
+
+    let is_update_command = matches!(cli.command, Command::Update { .. });
 
     let result = match cli.command {
         Command::Install { org } => run_install(org),
@@ -2386,6 +2411,7 @@ fn main() {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
         },
         Command::Status => run_status(),
+        Command::Update { check, yes } => run_update(check, yes),
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Setup => run_keys_setup(),
             KeysCommands::Status => run_keys_status(),
@@ -2393,6 +2419,12 @@ fn main() {
             KeysCommands::Refresh => run_keys_refresh(),
         },
     };
+
+    // Passive background version check: run after successful command execution
+    // on all non-Update commands. Failures are silently ignored.
+    if result.is_ok() && !is_update_command {
+        update::passive_version_check();
+    }
 
     if let Err(e) = result {
         output::fail("Failed", &format!("{}", e));
@@ -2427,6 +2459,82 @@ mod tests {
                 assert!(matches!(keys_command, None));
             }
             _ => panic!("expected Keys command"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Update command parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_update_defaults() {
+        let cli = Cli::parse_from(["cadence", "update"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(!check);
+                assert!(!yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check() {
+        let cli = Cli::parse_from(["cadence", "update", "--check"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(check);
+                assert!(!yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_yes_long() {
+        let cli = Cli::parse_from(["cadence", "update", "--yes"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(!check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_yes_short() {
+        let cli = Cli::parse_from(["cadence", "update", "-y"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(!check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check_and_yes() {
+        let cli = Cli::parse_from(["cadence", "update", "--check", "--yes"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check_and_short_yes() {
+        let cli = Cli::parse_from(["cadence", "update", "--check", "-y"]);
+        match cli.command {
+            Command::Update { check, yes } => {
+                assert!(check);
+                assert!(yes);
+            }
+            _ => panic!("expected Update command"),
         }
     }
 

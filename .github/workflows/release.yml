@@ -76,8 +76,68 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate checksums
+        run: |
+          CHECKSUM_FILE="checksums-sha256.txt"
+
+          # Collect all release archives (tar.gz and zip) from downloaded artifacts
+          mapfile -t ARCHIVES < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+
+          # Fail fast if no artifacts were found
+          if [ "${#ARCHIVES[@]}" -eq 0 ]; then
+            echo "::error::No release artifacts (*.tar.gz, *.zip) found in artifacts/"
+            exit 1
+          fi
+
+          echo "Found ${#ARCHIVES[@]} release artifacts:"
+          printf '  %s\n' "${ARCHIVES[@]}"
+
+          # Generate SHA256 checksums with basename-only filenames in GNU coreutils format
+          for archive in "${ARCHIVES[@]}"; do
+            HASH=$(sha256sum "$archive" | cut -d' ' -f1)
+            BASENAME=$(basename "$archive")
+            printf '%s  %s\n' "$HASH" "$BASENAME"
+          done > "artifacts/${CHECKSUM_FILE}"
+
+          echo "Generated artifacts/${CHECKSUM_FILE}:"
+          cat "artifacts/${CHECKSUM_FILE}"
+
+      - name: Validate checksums
+        run: |
+          CHECKSUM_FILE="artifacts/checksums-sha256.txt"
+
+          # Ensure checksum file exists and is non-empty
+          if [ ! -s "$CHECKSUM_FILE" ]; then
+            echo "::error::Checksum file is missing or empty: ${CHECKSUM_FILE}"
+            exit 1
+          fi
+
+          LINE_COUNT=$(wc -l < "$CHECKSUM_FILE" | tr -d ' ')
+          ARTIFACT_COUNT=$(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l | tr -d ' ')
+
+          # Verify line count matches artifact count
+          if [ "$LINE_COUNT" -ne "$ARTIFACT_COUNT" ]; then
+            echo "::error::Checksum line count ($LINE_COUNT) does not match artifact count ($ARTIFACT_COUNT)"
+            exit 1
+          fi
+
+          # Validate each line matches GNU coreutils sha256sum format: <64-hex>  <filename>
+          LINE_NUM=0
+          while IFS= read -r line; do
+            LINE_NUM=$((LINE_NUM + 1))
+            if ! echo "$line" | grep -qE '^[0-9a-f]{64}  [^ ]+$'; then
+              echo "::error::Malformed checksum line ${LINE_NUM}: ${line}"
+              exit 1
+            fi
+          done < "$CHECKSUM_FILE"
+
+          echo "Checksum validation passed: ${LINE_COUNT} artifacts verified"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*.{tar.gz,zip}
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/checksums-sha256.txt

@@ -11,9 +11,10 @@
 // be consumed once those command handlers are added. Suppress dead_code until then.
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Hardcoded default API URL for the AI Barometer service.
 pub const DEFAULT_API_URL: &str = "https://dash.teamcadence.ai";
@@ -29,6 +30,12 @@ const CONFIG_SUBDIR_NAME: &str = "cli";
 
 /// Config file name.
 const CONFIG_FILE_NAME: &str = "config.toml";
+
+/// Default update check interval: 8 hours in seconds.
+const DEFAULT_UPDATE_CHECK_INTERVAL_SECS: u64 = 8 * 60 * 60;
+
+/// Cache file for the latest known release version.
+pub const LATEST_VERSION_CACHE_FILE: &str = "latest-available-version";
 
 /// Result of resolving the effective API URL through the layered config system.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +59,10 @@ pub struct CliConfig {
     pub github_login: Option<String>,
     /// Token expiry timestamp (ISO 8601 string).
     pub expires_at: Option<String>,
+    /// When true, `cadence update` skips the confirmation prompt.
+    pub auto_update: Option<bool>,
+    /// How often the passive background version check runs (e.g., "8h", "24h", "1d").
+    pub update_check_interval: Option<String>,
 }
 
 impl CliConfig {
@@ -136,6 +147,37 @@ impl CliConfig {
         self.save_to(path)
     }
 
+    /// Returns whether auto-update is enabled.
+    ///
+    /// Defaults to `false` when `auto_update` is absent from config.
+    pub fn auto_update_enabled(&self) -> bool {
+        self.auto_update.unwrap_or(false)
+    }
+
+    /// Resolves the update check interval as a `Duration`.
+    ///
+    /// Uses the configured `update_check_interval` if present and valid,
+    /// otherwise falls back to the default of 8 hours.
+    /// Returns an error if the configured value is present but malformed.
+    pub fn resolved_update_check_interval(&self) -> Result<Duration> {
+        match &self.update_check_interval {
+            Some(s) => parse_duration_string(s),
+            None => Ok(Duration::from_secs(DEFAULT_UPDATE_CHECK_INTERVAL_SECS)),
+        }
+    }
+
+    /// Returns the config directory path: `$HOME/.cadence/cli/`.
+    ///
+    /// Returns `None` if `$HOME` cannot be determined.
+    pub fn config_dir() -> Option<PathBuf> {
+        Self::config_dir_with_home(home_dir()?.as_path())
+    }
+
+    /// Returns the config directory path relative to a given home directory.
+    pub fn config_dir_with_home(home: &Path) -> Option<PathBuf> {
+        Some(home.join(CONFIG_ROOT_DIR_NAME).join(CONFIG_SUBDIR_NAME))
+    }
+
     /// Resolve the effective API URL using layered config precedence.
     ///
     /// Priority (highest wins):
@@ -167,6 +209,113 @@ impl CliConfig {
         let is_non_https = !url.starts_with("https://");
         ResolvedApiUrl { url, is_non_https }
     }
+}
+
+/// Parses a human-readable duration string into a `Duration`.
+///
+/// Accepted formats: `<positive-integer>h` (hours) or `<positive-integer>d` (days).
+/// Whitespace around the value is trimmed. Zero and negative values are rejected.
+/// Only lowercase suffixes are accepted to keep the format unambiguous.
+///
+/// # Examples
+///
+/// ```
+/// # use std::time::Duration;
+/// assert_eq!(cadence_cli::config::parse_duration_string("8h").unwrap(), Duration::from_secs(28800));
+/// assert_eq!(cadence_cli::config::parse_duration_string("1d").unwrap(), Duration::from_secs(86400));
+/// assert!(cadence_cli::config::parse_duration_string("0h").is_err());
+/// ```
+pub fn parse_duration_string(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("Duration string is empty");
+    }
+
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let multiplier: u64 = match unit {
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("Invalid duration unit '{unit}' in '{s}'. Expected 'h' (hours) or 'd' (days)"),
+    };
+
+    if num_str.is_empty() {
+        bail!("Missing numeric value in duration '{s}'");
+    }
+
+    let value: u64 = num_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid numeric value in duration '{s}': {e}"))?;
+
+    if value == 0 {
+        bail!("Duration must be positive, got '{s}'");
+    }
+
+    value
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Duration overflow: '{s}' exceeds maximum representable duration")
+        })
+}
+
+/// Reads the cached latest-available version from the config directory.
+///
+/// Returns `None` if the cache file is absent, empty, or unreadable.
+/// This is intentionally non-failing to keep `cadence status` resilient.
+pub fn read_cached_latest_version() -> Option<String> {
+    let dir = CliConfig::config_dir()?;
+    read_cached_latest_version_from_dir(&dir)
+}
+
+/// Reads the cached latest-available version from a specific directory.
+///
+/// Trims whitespace and strips a leading `v`/`V` prefix if present.
+/// Returns `None` if the file is absent, empty, or not valid UTF-8.
+pub fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
+    let path = dir.join(LATEST_VERSION_CACHE_FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip optional v prefix for consistency
+    let version = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+/// Writes the latest discovered release version to the cache file.
+///
+/// The version is trimmed and written as a single line. The `v` prefix, if present,
+/// is preserved in the file; the reader strips it on read.
+///
+/// Creates the config directory if it doesn't exist. Returns an error if
+/// the home directory can't be resolved or the file can't be written.
+pub fn write_cached_latest_version(version: &str) -> Result<()> {
+    let dir = CliConfig::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config directory: $HOME is not set"))?;
+    write_cached_latest_version_to_dir(version, &dir)
+}
+
+/// Writes the latest discovered release version to a specific directory.
+///
+/// Exposed for testing with temp directories.
+pub fn write_cached_latest_version_to_dir(version: &str, dir: &Path) -> Result<()> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        bail!("cannot cache empty version string");
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create config directory at {}", dir.display()))?;
+    let path = dir.join(LATEST_VERSION_CACHE_FILE);
+    std::fs::write(&path, format!("{trimmed}\n"))
+        .with_context(|| format!("failed to write version cache at {}", path.display()))?;
+    Ok(())
 }
 
 /// Return the trimmed value if non-empty after trimming, otherwise `None`.
@@ -363,6 +512,7 @@ mod tests {
             token: Some("tok_abc123".to_string()),
             github_login: Some("octocat".to_string()),
             expires_at: Some("2025-12-31T23:59:59Z".to_string()),
+            ..Default::default()
         };
         cfg.save_to(&path).unwrap();
 
@@ -418,6 +568,7 @@ mod tests {
             token: Some("tok_abc".to_string()),
             github_login: Some("user".to_string()),
             expires_at: Some("2025-01-01T00:00:00Z".to_string()),
+            ..Default::default()
         };
         cfg.save_to(&path).unwrap();
         cfg.clear_token_to(&path).unwrap();
@@ -696,5 +847,370 @@ mod tests {
         assert_eq!(resolved.url, DEFAULT_API_URL);
 
         drop(guard);
+    }
+
+    // -----------------------------------------------------------------------
+    // auto_update defaults and resolver
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_update_default_is_none() {
+        let cfg = CliConfig::default();
+        assert_eq!(cfg.auto_update, None);
+    }
+
+    #[test]
+    fn test_auto_update_enabled_defaults_false() {
+        let cfg = CliConfig::default();
+        assert!(!cfg.auto_update_enabled());
+    }
+
+    #[test]
+    fn test_auto_update_enabled_explicit_true() {
+        let cfg = CliConfig {
+            auto_update: Some(true),
+            ..Default::default()
+        };
+        assert!(cfg.auto_update_enabled());
+    }
+
+    #[test]
+    fn test_auto_update_enabled_explicit_false() {
+        let cfg = CliConfig {
+            auto_update: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.auto_update_enabled());
+    }
+
+    #[test]
+    fn test_auto_update_roundtrip_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_path_in(tmp.path());
+
+        let cfg = CliConfig {
+            auto_update: Some(true),
+            update_check_interval: Some("24h".to_string()),
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        let loaded = CliConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.auto_update, Some(true));
+        assert_eq!(loaded.update_check_interval, Some("24h".to_string()));
+    }
+
+    #[test]
+    fn test_auto_update_absent_in_toml_loads_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "api_url = \"https://example.com\"\n").unwrap();
+
+        let loaded = CliConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.auto_update, None);
+        assert_eq!(loaded.update_check_interval, None);
+        assert!(!loaded.auto_update_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // update_check_interval resolver
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_check_interval_default_8h() {
+        let cfg = CliConfig::default();
+        let interval = cfg.resolved_update_check_interval().unwrap();
+        assert_eq!(interval, Duration::from_secs(8 * 3600));
+    }
+
+    #[test]
+    fn test_update_check_interval_explicit_24h() {
+        let cfg = CliConfig {
+            update_check_interval: Some("24h".to_string()),
+            ..Default::default()
+        };
+        let interval = cfg.resolved_update_check_interval().unwrap();
+        assert_eq!(interval, Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn test_update_check_interval_explicit_1d() {
+        let cfg = CliConfig {
+            update_check_interval: Some("1d".to_string()),
+            ..Default::default()
+        };
+        let interval = cfg.resolved_update_check_interval().unwrap();
+        assert_eq!(interval, Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_update_check_interval_invalid_returns_error() {
+        let cfg = CliConfig {
+            update_check_interval: Some("invalid".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.resolved_update_check_interval().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_duration_string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_duration_8h() {
+        assert_eq!(
+            parse_duration_string("8h").unwrap(),
+            Duration::from_secs(28800)
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_24h() {
+        assert_eq!(
+            parse_duration_string("24h").unwrap(),
+            Duration::from_secs(86400)
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_1d() {
+        assert_eq!(
+            parse_duration_string("1d").unwrap(),
+            Duration::from_secs(86400)
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_7d() {
+        assert_eq!(
+            parse_duration_string("7d").unwrap(),
+            Duration::from_secs(7 * 86400)
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_trims_whitespace() {
+        assert_eq!(
+            parse_duration_string("  8h  ").unwrap(),
+            Duration::from_secs(28800)
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_zero_hours_rejected() {
+        let result = parse_duration_string("0h");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("positive"),
+            "should mention 'positive'"
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_zero_days_rejected() {
+        let result = parse_duration_string("0d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_negative_rejected() {
+        let result = parse_duration_string("-1h");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_empty_rejected() {
+        let result = parse_duration_string("");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("empty"),
+            "should mention 'empty'"
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_unit() {
+        let result = parse_duration_string("8m");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid duration unit"),
+            "should mention invalid unit"
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_uppercase_rejected() {
+        let result = parse_duration_string("8H");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid duration unit"),
+            "uppercase should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_uppercase_d_rejected() {
+        let result = parse_duration_string("1D");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_no_number() {
+        let result = parse_duration_string("h");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Missing numeric"),
+            "should mention missing number"
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_overflow() {
+        let result = parse_duration_string("999999999999999999999999h");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_non_numeric() {
+        let result = parse_duration_string("abch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_float_rejected() {
+        let result = parse_duration_string("1.5h");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Latest version cache reader
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_cached_latest_version_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+    }
+
+    #[test]
+    fn test_read_cached_latest_version_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "").unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+    }
+
+    #[test]
+    fn test_read_cached_latest_version_whitespace_only() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "  \n  ").unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+    }
+
+    #[test]
+    fn test_read_cached_latest_version_valid() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "0.3.0\n").unwrap();
+        assert_eq!(
+            read_cached_latest_version_from_dir(tmp.path()),
+            Some("0.3.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_cached_latest_version_with_v_prefix() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v0.3.0\n").unwrap();
+        assert_eq!(
+            read_cached_latest_version_from_dir(tmp.path()),
+            Some("0.3.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_cached_latest_version_just_v() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v").unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // config_dir helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_dir_with_home() {
+        let home = PathBuf::from("/home/tester");
+        let dir = CliConfig::config_dir_with_home(&home).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/tester/.cadence/cli"));
+    }
+
+    // -----------------------------------------------------------------------
+    // write_cached_latest_version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_cached_latest_version_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        write_cached_latest_version_to_dir("0.4.0", tmp.path()).unwrap();
+        assert_eq!(
+            read_cached_latest_version_from_dir(tmp.path()),
+            Some("0.4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_write_cached_latest_version_with_v_prefix() {
+        let tmp = TempDir::new().unwrap();
+        write_cached_latest_version_to_dir("v0.4.0", tmp.path()).unwrap();
+        // Reader strips the v prefix
+        assert_eq!(
+            read_cached_latest_version_from_dir(tmp.path()),
+            Some("0.4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_write_cached_latest_version_creates_dir() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("nested").join("dir");
+        write_cached_latest_version_to_dir("1.0.0", &sub).unwrap();
+        assert_eq!(
+            read_cached_latest_version_from_dir(&sub),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_write_cached_latest_version_empty_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let result = write_cached_latest_version_to_dir("", tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_write_cached_latest_version_whitespace_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let result = write_cached_latest_version_to_dir("  \n  ", tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_write_cached_latest_version_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        write_cached_latest_version_to_dir("0.3.0", tmp.path()).unwrap();
+        write_cached_latest_version_to_dir("0.4.0", tmp.path()).unwrap();
+        assert_eq!(
+            read_cached_latest_version_from_dir(tmp.path()),
+            Some("0.4.0".to_string())
+        );
     }
 }
