@@ -49,9 +49,19 @@ fn run_gpg_with_input(args: &[&str], input: &str) -> Result<String> {
             .stdin
             .as_mut()
             .context("gpg: failed to open stdin pipe")?;
-        stdin
-            .write_all(input.as_bytes())
-            .context("gpg: failed to write to stdin")?;
+        if let Err(e) = stdin.write_all(input.as_bytes()) {
+            let output = child.wait_with_output().ok();
+            if let Some(output) = output {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let code = output.status.code().unwrap_or(-1);
+                bail!(
+                    "gpg failed while writing input (exit {}): {}",
+                    code,
+                    stderr.trim()
+                );
+            }
+            return Err(e).context("gpg: failed to write to stdin");
+        }
     }
 
     let output = child
@@ -215,6 +225,38 @@ pub fn import_key(source: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Export an ASCII-armored public key for a given key identifier.
+///
+/// Runs `gpg --batch --yes --armor --export <recipient>` and returns stdout.
+/// Returns an error if gpg exits non-zero or output is empty/non-UTF-8.
+pub fn export_public_key(recipient: &str) -> Result<String> {
+    let trimmed = recipient.trim();
+    if trimmed.is_empty() {
+        bail!("gpg export: recipient must not be blank");
+    }
+
+    let output = Command::new("gpg")
+        .args(["--batch", "--yes", "--armor", "--export", trimmed])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("gpg: failed to spawn gpg binary for export")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        bail!("gpg --export failed (exit {}): {}", code, stderr.trim());
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("gpg: export output was not valid UTF-8")?;
+    if stdout.trim().is_empty() {
+        bail!("gpg --export returned empty output for {}", trimmed);
+    }
+    Ok(stdout)
 }
 
 /// Export the ASCII-armored private key for a given key identifier.

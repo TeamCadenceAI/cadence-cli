@@ -693,7 +693,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
             )
             .map_err(|e| {
                 if encryption_method.is_configured() {
-                    HookError::GpgEncryptionFailed(format!("{}", e))
+                    HookError::GpgEncryptionFailed(format!("{:#}", e))
                 } else {
                     HookError::Soft(e)
                 }
@@ -735,7 +735,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
             )
             .map_err(|e| {
                 if encryption_method.is_configured() {
-                    HookError::GpgEncryptionFailed(format!("{}", e))
+                    HookError::GpgEncryptionFailed(format!("{:#}", e))
                 } else {
                     HookError::Soft(e)
                 }
@@ -2791,6 +2791,23 @@ fn run_gpg_setup_inner(prompter: &mut dyn Prompter, writer: &mut dyn std::io::Wr
 
     // Step 4: Persist config (deferred writes with rollback)
     persist_setup_config(writer, &recipient, key_source.as_deref())?;
+
+    // Step 4.5: Cache public key for rpgp note encryption (best-effort)
+    if let Ok(armored_public_key) = gpg::export_public_key(&recipient) {
+        if let Err(e) = gpg::save_public_key_cache(&armored_public_key) {
+            output::note_to_with_tty(
+                writer,
+                &format!("Could not cache public key locally: {e}"),
+                is_tty,
+            );
+        }
+    } else {
+        output::note_to_with_tty(
+            writer,
+            "Could not export public key for local cache; hooks will use gpg directly.",
+            is_tty,
+        );
+    }
 
     // Step 5: Summary and verification
     writeln!(writer)?;
