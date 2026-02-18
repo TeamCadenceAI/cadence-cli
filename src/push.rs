@@ -107,7 +107,7 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     }
 
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
-    let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
+    let fetch_spec = format!("+{}:{}", git::NOTES_REF, temp_ref);
 
     let fetch_start = std::time::Instant::now();
     let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
@@ -191,10 +191,11 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     if !push_status.status.success() {
         let stderr = String::from_utf8_lossy(&push_status.stderr);
         let stderr_trim = stderr.trim();
-        if stderr_trim.contains("cannot lock ref")
+        let is_lock_conflict = stderr_trim.contains("cannot lock ref")
             && stderr_trim.contains(git::NOTES_REF)
-            && stderr_trim.contains("expected")
-        {
+            && stderr_trim.contains("expected");
+        let is_non_fast_forward = stderr_trim.contains("non-fast-forward");
+        if is_lock_conflict || is_non_fast_forward {
             output::note("Notes ref changed on remote; retrying sync once");
             return sync_notes_for_remote_retry(remote);
         }
@@ -210,7 +211,7 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
     }
 
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
-    let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
+    let fetch_spec = format!("+{}:{}", git::NOTES_REF, temp_ref);
 
     let fetch_status = git::run_git_output_at(None, &["fetch", remote, &fetch_spec], &[])
         .context("failed to execute git fetch for notes")?;
@@ -350,7 +351,7 @@ fn fetch_merge_notes_for_remote_inner(repo: Option<&Path>, remote: &str) -> Resu
     }
 
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
-    let fetch_spec = format!("{}:{}", git::NOTES_REF, temp_ref);
+    let fetch_spec = format!("+{}:{}", git::NOTES_REF, temp_ref);
 
     let fetch_status = git::run_git_output_at(
         repo,
