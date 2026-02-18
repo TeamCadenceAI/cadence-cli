@@ -17,6 +17,8 @@
 
 use crate::{git, output};
 use anyhow::{Context, Result};
+use console::style;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -63,14 +65,51 @@ pub fn attempt_push_remote(remote: &str) {
 /// fetch notes, merge into local notes ref, then push notes to the remote.
 pub fn sync_notes_for_remote(remote: &str) {
     let start = std::time::Instant::now();
-    output::action("Cadence", &format!("Syncing notes with {}", remote));
-    if let Err(e) = sync_notes_for_remote_inner(remote) {
-        output::note(&format!("Could not sync notes with {}: {}", remote, e));
+    let use_progress = output::is_stderr_tty() && !output::is_verbose();
+    let cadence_label = if output::is_stderr_tty() {
+        style("[Cadence]").bold().green().to_string()
+    } else {
+        "[Cadence]".to_string()
+    };
+    let progress = if use_progress {
+        let pb = ProgressBar::new_spinner();
+        pb.set_draw_target(ProgressDrawTarget::stderr());
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        pb.set_message(format!(
+            "{} Syncing attached agent sessions with {}",
+            cadence_label, remote
+        ));
+        Some(pb)
+    } else {
+        output::success("Cadence", &format!("Syncing notes with {}", remote));
+        None
+    };
+
+    let result = sync_notes_for_remote_inner(remote);
+    if let Some(pb) = progress {
+        match &result {
+            Ok(()) => pb.finish_with_message(format!(
+                "✔ {} Synced attached agent sessions with {}",
+                cadence_label, remote
+            )),
+            Err(_) => pb.finish_and_clear(),
+        }
+        eprintln!();
     }
-    output::success(
-        "Cadence",
-        &format!("Notes sync done in {} ms", start.elapsed().as_millis()),
-    );
+
+    if let Err(e) = result {
+        output::note(&format!("Could not sync notes with {}: {}", remote, e));
+    } else if !use_progress {
+        output::success(
+            "Cadence",
+            &format!("Notes sync done in {} ms", start.elapsed().as_millis()),
+        );
+        eprintln!();
+    }
 }
 
 fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
@@ -277,9 +316,19 @@ fn local_notes_hash() -> Result<Option<String>> {
 
 fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     let start = std::time::Instant::now();
-    let output =
-        git::run_git_output_at(None, &["ls-remote", "--refs", remote, git::NOTES_REF], &[])
-            .context("failed to execute git ls-remote")?;
+    let output = git::run_git_output_at(
+        None,
+        &[
+            "-c",
+            "protocol.version=2",
+            "ls-remote",
+            "--refs",
+            remote,
+            git::NOTES_REF,
+        ],
+        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
+    )
+    .context("failed to execute git ls-remote")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -287,7 +336,9 @@ fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
     }
 
     let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-    output::detail(&format!("ls-remote in {} ms", start.elapsed().as_millis()));
+    if output::is_verbose() {
+        output::detail(&format!("ls-remote in {} ms", start.elapsed().as_millis()));
+    }
     let line = stdout.lines().next().unwrap_or("");
     let hash = line.split_whitespace().next().unwrap_or("");
     if hash.is_empty() {

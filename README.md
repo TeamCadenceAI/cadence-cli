@@ -7,7 +7,6 @@ It adds provenance for AI-assisted development without altering your commit hist
 
 Prerequisites:
 - Git
-- GPG is optional for encryption
 
 macOS and Linux:
 ```sh
@@ -56,17 +55,15 @@ Notes can be synced alongside commits without modifying commit history.
 - GitHub Copilot
 - Antigravity
 
-## Optional: GPG Encryption
+## Optional: Encryption
 
-To encrypt session logs before attaching:
+To encrypt session logs before attaching (local + API recipients):
 ```sh
-cadence gpg setup
+cadence keys setup
 ```
 
-GPG install hints:
-- macOS: `brew install gnupg`
-- Linux: use your distro's package manager
-- Windows: `winget install GnuPG.GnuPG`
+Cadence uses built-in OpenPGP (Rust) and stores an encrypted private key in `~/.cadence/cli/`.
+The passphrase is stored in your OS keychain.
 
 ## Uninstall
 
