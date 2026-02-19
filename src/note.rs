@@ -7,6 +7,8 @@
 
 use crate::scanner::AgentType;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -38,6 +40,7 @@ impl std::fmt::Display for Confidence {
 /// repo: <path>
 /// commit: <full hash>
 /// confidence: exact_hash_match
+/// session_start: 2025-01-15T10:30:00Z   (omitted when unknown)
 /// payload_sha256: <hash>
 /// ---
 /// <verbatim session log (JSONL)>
@@ -45,6 +48,8 @@ impl std::fmt::Display for Confidence {
 ///
 /// The `confidence` field is always `exact_hash_match` for now.
 /// The `payload_sha256` is computed from `session_log`.
+/// The `session_start` field is an RFC 3339 timestamp of when the session
+/// began; it is omitted if not available.
 ///
 /// The `commit` parameter is validated via [`crate::git::validate_commit_hash`]
 /// and must be 7-40 hex characters. Returns an error if validation fails.
@@ -63,6 +68,7 @@ pub fn format(
     repo: &str,
     commit: &str,
     session_log: &str,
+    session_start: Option<i64>,
 ) -> anyhow::Result<String> {
     format_with_confidence(
         agent,
@@ -71,6 +77,7 @@ pub fn format(
         commit,
         session_log,
         Confidence::ExactHashMatch,
+        session_start,
     )
 }
 
@@ -82,6 +89,7 @@ pub fn format_with_confidence(
     commit: &str,
     session_log: &str,
     confidence: Confidence,
+    session_start: Option<i64>,
 ) -> anyhow::Result<String> {
     crate::git::validate_commit_hash(commit)?;
     let sha = payload_sha256(session_log);
@@ -93,6 +101,12 @@ pub fn format_with_confidence(
     note.push_str(&format!("repo: {}\n", repo));
     note.push_str(&format!("commit: {}\n", commit));
     note.push_str(&format!("confidence: {}\n", confidence));
+    if let Some(epoch) = session_start
+        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(epoch)
+        && let Ok(formatted) = dt.format(&Rfc3339)
+    {
+        note.push_str(&format!("session_start: {}\n", formatted));
+    }
     note.push_str(&format!("payload_sha256: {}\n", sha));
     note.push_str("---\n");
     note.push_str(session_log);
@@ -171,7 +185,15 @@ mod tests {
 {"type":"tool_result","content":"done"}
 "#;
 
-        let note = format(&AgentType::Claude, session_id, repo, commit, session_log).unwrap();
+        let note = format(
+            &AgentType::Claude,
+            session_id,
+            repo,
+            commit,
+            session_log,
+            None,
+        )
+        .unwrap();
 
         // Verify the note starts with ---
         assert!(note.starts_with("---\n"));
@@ -207,6 +229,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "payload",
+            None,
         )
         .unwrap();
 
@@ -230,6 +253,7 @@ mod tests {
             "/repo",
             "0000000000000000000000000000000000000000",
             "",
+            None,
         )
         .unwrap();
 
@@ -259,6 +283,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -282,6 +307,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -291,7 +317,15 @@ mod tests {
 
     #[test]
     fn test_format_codex_agent() {
-        let note = format(&AgentType::Codex, "sid", "/repo", "aabbccdd00112233", "log").unwrap();
+        let note = format(
+            &AgentType::Codex,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+            None,
+        )
+        .unwrap();
         assert!(note.contains("agent: codex\n"));
     }
 
@@ -303,6 +337,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "log",
+            None,
         )
         .unwrap();
         assert!(note.contains("agent: cursor\n"));
@@ -316,6 +351,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "log",
+            None,
         )
         .unwrap();
         assert!(note.contains("agent: copilot\n"));
@@ -329,6 +365,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             "log",
+            None,
         )
         .unwrap();
         assert!(note.contains("agent: antigravity\n"));
@@ -343,6 +380,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -366,6 +404,7 @@ mod tests {
             "/foo",
             "655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -396,6 +435,7 @@ mod tests {
             "/repo",
             "aabbccdd00112233",
             session_log,
+            None,
         )
         .unwrap();
 
@@ -419,19 +459,26 @@ mod tests {
 
     #[test]
     fn test_format_rejects_invalid_commit_hash() {
-        let result = format(&AgentType::Claude, "sid", "/repo", "not-a-hash", "log");
+        let result = format(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "not-a-hash",
+            "log",
+            None,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_format_rejects_empty_commit_hash() {
-        let result = format(&AgentType::Claude, "sid", "/repo", "", "log");
+        let result = format(&AgentType::Claude, "sid", "/repo", "", "log", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_format_rejects_short_commit_hash() {
-        let result = format(&AgentType::Claude, "sid", "/repo", "abcdef", "log");
+        let result = format(&AgentType::Claude, "sid", "/repo", "abcdef", "log", None);
         assert!(result.is_err());
     }
 
@@ -444,9 +491,71 @@ mod tests {
             "abcdef0123456789abcdef0123456789abcdef01",
             "payload",
             Confidence::TimeWindowMatch,
+            None,
         )
         .unwrap();
 
         assert!(note.contains("confidence: time_window_match\n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // format — session_start
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_session_start_renders_rfc3339() {
+        // 2023-11-14T22:13:20Z
+        let epoch = 1_700_000_000_i64;
+        let note = format(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+            Some(epoch),
+        )
+        .unwrap();
+
+        assert!(note.contains("session_start: 2023-11-14T22:13:20Z\n"));
+    }
+
+    #[test]
+    fn test_format_session_start_none_omits_field() {
+        let note = format(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "log",
+            None,
+        )
+        .unwrap();
+
+        assert!(!note.contains("session_start:"));
+    }
+
+    #[test]
+    fn test_format_session_start_field_order() {
+        let epoch = 1_700_000_000_i64;
+        let note = format(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            "payload",
+            Some(epoch),
+        )
+        .unwrap();
+
+        let lines: Vec<&str> = note.lines().collect();
+        assert_eq!(lines[0], "---");
+        assert!(lines[1].starts_with("agent: "));
+        assert!(lines[2].starts_with("session_id: "));
+        assert!(lines[3].starts_with("repo: "));
+        assert!(lines[4].starts_with("commit: "));
+        assert!(lines[5].starts_with("confidence: "));
+        assert!(lines[6].starts_with("session_start: "));
+        assert!(lines[7].starts_with("payload_sha256: "));
+        assert_eq!(lines[8], "---");
     }
 }

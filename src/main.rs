@@ -721,6 +721,8 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
             };
 
             let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
+            let session_start =
+                scanner::session_time_range(&matched.file_path).map(|(start, _)| start);
 
             // Attach the note (encryption failure blocks the commit when configured)
             attach_note_from_log(
@@ -731,6 +733,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 &session_log,
                 note::Confidence::ExactHashMatch,
                 &encryption_method,
+                session_start,
             )
             .map_err(|e| {
                 if encryption_method.is_configured() {
@@ -765,6 +768,9 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 }
             };
 
+            let session_start =
+                scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
+
             attach_note_from_log(
                 &fallback.agent_type,
                 &fallback.session_id,
@@ -773,6 +779,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
                 &session_log,
                 note::Confidence::TimeWindowMatch,
                 &encryption_method,
+                session_start,
             )
             .map_err(|e| {
                 if encryption_method.is_configured() {
@@ -966,6 +973,7 @@ fn fallback_match_for_commit(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_note_from_log(
     agent_type: &scanner::AgentType,
     session_id: &str,
@@ -974,6 +982,7 @@ fn attach_note_from_log(
     session_log: &str,
     confidence: note::Confidence,
     method: &EncryptionMethod,
+    session_start: Option<i64>,
 ) -> Result<()> {
     let note_content = note::format_with_confidence(
         agent_type,
@@ -982,6 +991,7 @@ fn attach_note_from_log(
         commit,
         session_log,
         confidence,
+        session_start,
     )?;
     let final_content = maybe_encrypt_note(&note_content, method)?;
     git::add_note(commit, &final_content)?;
@@ -1115,6 +1125,9 @@ fn try_resolve_single_commit(
                     Err(_) => return ResolveResult::TransientError,
                 };
 
+                let session_start =
+                    scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
+
                 if attach_note_from_log(
                     &fallback.agent_type,
                     &fallback.session_id,
@@ -1123,6 +1136,7 @@ fn try_resolve_single_commit(
                     &session_log,
                     note::Confidence::TimeWindowMatch,
                     method,
+                    session_start,
                 )
                 .is_ok()
                 {
@@ -1155,6 +1169,9 @@ fn try_resolve_single_commit(
                 Err(_) => return ResolveResult::TransientError,
             };
 
+            let session_start =
+                scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
+
             if attach_note_from_log(
                 &fallback.agent_type,
                 &fallback.session_id,
@@ -1163,6 +1180,7 @@ fn try_resolve_single_commit(
                 &session_log,
                 note::Confidence::TimeWindowMatch,
                 method,
+                session_start,
             )
             .is_ok()
             {
@@ -1189,6 +1207,7 @@ fn try_resolve_single_commit(
     };
 
     let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
+    let session_start = scanner::session_time_range(&matched.file_path).map(|(start, _)| start);
 
     if attach_note_from_log(
         &matched.agent_type,
@@ -1198,6 +1217,7 @@ fn try_resolve_single_commit(
         &session_log,
         note::Confidence::ExactHashMatch,
         method,
+        session_start,
     )
     .is_ok()
     {
@@ -1594,6 +1614,8 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     .clone()
                     .unwrap_or(scanner::AgentType::Claude);
                 let repo_str = session.repo_root.to_string_lossy().to_string();
+                let session_start =
+                    scanner::session_time_range(&session.file).map(|(start, _)| start);
 
                 let note_content = match note::format_with_confidence(
                     &agent_type,
@@ -1602,6 +1624,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     hash,
                     &session_log,
                     note::Confidence::TimeWindowMatch,
+                    session_start,
                 ) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1705,6 +1728,8 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     .unwrap_or(scanner::AgentType::Claude);
 
                 let repo_str = session.repo_root.to_string_lossy().to_string();
+                let session_start =
+                    scanner::session_time_range(&session.file).map(|(start, _)| start);
 
                 // Format the note
                 let note_content = match note::format(
@@ -1713,6 +1738,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     &repo_str,
                     hash,
                     &session_log,
+                    session_start,
                 ) {
                     Ok(c) => c,
                     Err(e) => {
