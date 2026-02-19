@@ -75,7 +75,7 @@ jobs:
             cadence-cli-${{ matrix.target }}.tar.gz
             cadence-cli-${{ matrix.target }}.zip
 
-  release:
+  publish-release:
     name: Publish GitHub release
     needs: build
     runs-on: ubuntu-latest
@@ -142,43 +142,10 @@ jobs:
 
           echo "Checksum validation passed: ${LINE_COUNT} artifacts verified"
 
-      - name: Generate release notes from changelog
-        shell: bash
-        env:
-          CURRENT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          changelog="CHANGELOG.md"
-          if [ ! -f "$changelog" ]; then
-            echo "::error::Missing changelog at $changelog"
-            exit 1
-          fi
-
-          version="$CURRENT_TAG"
-          version="${version#v}"
-
-          awk -v version="$version" '
-            BEGIN { in_section=0; found=0 }
-            $0 ~ "^## \\[" version "\\]" {
-              in_section=1; found=1; print; next
-            }
-            in_section && $0 ~ "^## \\[" { exit }
-            in_section { print }
-            END {
-              if (!found) {
-                printf "Missing changelog section for version %s\n", version > "/dev/stderr"
-                exit 1
-              }
-            }
-          ' "$changelog" > RELEASE_NOTES.md
-
       - name: Update GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          body_path: RELEASE_NOTES.md
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
