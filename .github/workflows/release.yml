@@ -80,6 +80,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
