@@ -22,9 +22,12 @@ use crate::config::CliConfig;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Production GitHub Releases API endpoint for cadence-cli.
+/// Production GitHub Releases URL for cadence-cli.
+///
+/// Uses the web URL (not the API) so that the redirect to the latest tag
+/// can be followed without hitting GitHub API rate limits.
 pub const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/TeamCadenceAI/cadence-cli/releases/latest";
+    "https://github.com/TeamCadenceAI/cadence-cli/releases/latest";
 
 /// User-Agent header sent with GitHub API requests.
 const USER_AGENT: &str = "cadence-cli";
@@ -104,7 +107,7 @@ pub fn compare_versions(local: &str, remote: &str) -> Result<Ordering> {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub API fetch
+// Release discovery via HTTP redirect
 // ---------------------------------------------------------------------------
 
 /// Fetches the latest release metadata from the production GitHub endpoint.
@@ -114,45 +117,105 @@ pub fn check_latest_version() -> Result<LatestRelease> {
 
 /// Fetches the latest release metadata from a given URL.
 ///
-/// This is the injectable entry point used by tests to avoid hitting the real
-/// GitHub API. The URL should return JSON matching the GitHub Releases schema.
+/// Discovers the latest version by following the HTTP redirect from a GitHub
+/// releases/latest page, then constructs download URLs for all platform
+/// artifacts. This avoids the GitHub API and its rate limits.
+///
+/// This is the injectable entry point used by tests. The URL should return
+/// a 3xx redirect whose Location header ends with the version tag.
 pub fn check_latest_version_from_url(url: &str) -> Result<LatestRelease> {
+    let tag = discover_latest_tag(url, REQUEST_TIMEOUT)?;
+    let repo_base = repo_base_from_releases_url(url);
+    Ok(build_release_from_tag(&tag, repo_base))
+}
+
+/// Discovers the latest release tag by following the GitHub redirect.
+///
+/// Sends a request to the releases/latest URL and extracts the version tag
+/// from the redirect `Location` header without actually following it. This
+/// is efficient (single request) and avoids the GitHub API entirely.
+fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to build HTTP client")?;
 
     let response = client
         .get(url)
-        .header("Accept", "application/vnd.github+json")
         .send()
         .context("Failed to connect to release server")?;
 
     let status = response.status();
-    if !status.is_success() {
-        bail!(
-            "Release server returned HTTP {status} — check your network connection or try again later"
-        );
+    if !status.is_redirection() {
+        bail!("Release server returned HTTP {status} — expected a redirect to the latest release");
     }
 
-    let body = response.text().context("Failed to read response body")?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?
+        .to_str()
+        .context("Location header is not valid UTF-8")?;
 
-    parse_latest_release_json(&body)
+    // Extract tag from URL like: https://github.com/REPO/releases/tag/v0.4.1
+    let tag = location
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Could not extract version tag from redirect URL: {location}")
+        })?;
+
+    Ok(tag.to_string())
 }
 
-/// Parses a JSON string into a `LatestRelease`.
+/// Constructs a `LatestRelease` from a discovered tag and repo base URL.
 ///
-/// Exposed publicly for unit testing without network access.
-pub fn parse_latest_release_json(json: &str) -> Result<LatestRelease> {
-    let release: LatestRelease =
-        serde_json::from_str(json).context("Unable to parse release metadata")?;
+/// Builds download URLs for all supported platform artifacts and the checksums
+/// file using the pattern: `{repo_base}/releases/download/{tag}/{filename}`.
+pub fn build_release_from_tag(tag: &str, repo_base_url: &str) -> LatestRelease {
+    let download_base = format!("{repo_base_url}/releases/download/{tag}");
 
-    if release.tag_name.is_empty() {
-        bail!("Release metadata missing tag_name");
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    ];
+
+    let mut assets: Vec<ReleaseAsset> = targets
+        .iter()
+        .map(|t| {
+            let name = expected_artifact_name(t);
+            ReleaseAsset {
+                browser_download_url: format!("{download_base}/{name}"),
+                name,
+            }
+        })
+        .collect();
+
+    assets.push(ReleaseAsset {
+        name: CHECKSUMS_FILENAME.to_string(),
+        browser_download_url: format!("{download_base}/{CHECKSUMS_FILENAME}"),
+    });
+
+    LatestRelease {
+        tag_name: tag.to_string(),
+        assets,
     }
+}
 
-    Ok(release)
+/// Strips `/releases/latest` suffix to derive the repository base URL.
+///
+/// For production URLs like `https://github.com/REPO/releases/latest`, this
+/// returns `https://github.com/REPO`. For test URLs without that suffix, the
+/// URL is returned unchanged.
+fn repo_base_from_releases_url(url: &str) -> &str {
+    url.strip_suffix("/releases/latest").unwrap_or(url)
 }
 
 // ---------------------------------------------------------------------------
@@ -866,25 +929,9 @@ fn check_latest_version_from_url_with_timeout(
     url: &str,
     timeout: Duration,
 ) -> Result<LatestRelease> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(timeout)
-        .build()
-        .context("Failed to build HTTP client")?;
-
-    let response = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .context("Failed to connect to release server")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        bail!("Release server returned HTTP {status}");
-    }
-
-    let body = response.text().context("Failed to read response body")?;
-    parse_latest_release_json(&body)
+    let tag = discover_latest_tag(url, timeout)?;
+    let repo_base = repo_base_from_releases_url(url);
+    Ok(build_release_from_tag(&tag, repo_base))
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,110 +1068,73 @@ mod tests {
         );
     }
 
-    // -- parse_latest_release_json -------------------------------------------
+    // -- build_release_from_tag -----------------------------------------------
 
     #[test]
-    fn parse_standard_release_json() {
-        let json = r#"{
-            "tag_name": "v0.3.0",
-            "assets": [
-                {
-                    "name": "cadence-x86_64-unknown-linux-gnu.tar.gz",
-                    "browser_download_url": "https://example.com/cadence-x86_64.tar.gz"
-                }
-            ]
-        }"#;
-        let release = parse_latest_release_json(json).unwrap();
+    fn build_release_includes_all_targets_and_checksums() {
+        let release = build_release_from_tag("v0.3.0", "https://github.com/Org/Repo");
         assert_eq!(release.tag_name, "v0.3.0");
-        assert_eq!(release.assets.len(), 1);
+        // 6 platform assets + 1 checksums
+        assert_eq!(release.assets.len(), 7);
+
+        // Checksums asset
+        let checksums = release
+            .assets
+            .iter()
+            .find(|a| a.name == "checksums-sha256.txt");
+        assert!(checksums.is_some());
         assert_eq!(
-            release.assets[0].name,
-            "cadence-x86_64-unknown-linux-gnu.tar.gz"
+            checksums.unwrap().browser_download_url,
+            "https://github.com/Org/Repo/releases/download/v0.3.0/checksums-sha256.txt"
         );
     }
 
     #[test]
-    fn parse_release_json_missing_assets() {
-        let json = r#"{"tag_name": "v0.3.0"}"#;
-        let release = parse_latest_release_json(json).unwrap();
-        assert_eq!(release.tag_name, "v0.3.0");
-        assert!(release.assets.is_empty());
-    }
-
-    #[test]
-    fn parse_release_json_extra_fields_ignored() {
-        let json = r#"{
-            "tag_name": "v0.3.0",
-            "name": "Release 0.3.0",
-            "body": "Some markdown description",
-            "draft": false,
-            "prerelease": false,
-            "assets": []
-        }"#;
-        let release = parse_latest_release_json(json).unwrap();
-        assert_eq!(release.tag_name, "v0.3.0");
-    }
-
-    #[test]
-    fn parse_release_json_empty_tag_name() {
-        let json = r#"{"tag_name": ""}"#;
-        let result = parse_latest_release_json(json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing tag_name"));
-    }
-
-    #[test]
-    fn parse_release_json_missing_tag_name() {
-        let json = r#"{"assets": []}"#;
-        let result = parse_latest_release_json(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_release_json_not_json() {
-        let result = parse_latest_release_json("<html>Not JSON</html>");
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unable to parse release metadata")
+    fn build_release_constructs_correct_download_urls() {
+        let release = build_release_from_tag("v1.2.3", "https://github.com/Org/Repo");
+        let linux = release
+            .assets
+            .iter()
+            .find(|a| a.name.contains("x86_64-unknown-linux-gnu"))
+            .unwrap();
+        assert_eq!(
+            linux.browser_download_url,
+            "https://github.com/Org/Repo/releases/download/v1.2.3/cadence-cli-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
 
     #[test]
-    fn parse_release_json_empty_body() {
-        let result = parse_latest_release_json("");
-        assert!(result.is_err());
+    fn build_release_works_with_test_base_url() {
+        let release = build_release_from_tag("v0.5.0", "http://127.0.0.1:12345");
+        let checksums = release
+            .assets
+            .iter()
+            .find(|a| a.name == "checksums-sha256.txt")
+            .unwrap();
+        assert_eq!(
+            checksums.browser_download_url,
+            "http://127.0.0.1:12345/releases/download/v0.5.0/checksums-sha256.txt"
+        );
+    }
+
+    // -- repo_base_from_releases_url ------------------------------------------
+
+    #[test]
+    fn repo_base_strips_releases_latest() {
+        assert_eq!(
+            repo_base_from_releases_url(
+                "https://github.com/TeamCadenceAI/cadence-cli/releases/latest"
+            ),
+            "https://github.com/TeamCadenceAI/cadence-cli"
+        );
     }
 
     #[test]
-    fn parse_release_json_array_instead_of_object() {
-        let result = parse_latest_release_json("[]");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_release_json_multiple_assets() {
-        let json = r#"{
-            "tag_name": "v0.3.0",
-            "assets": [
-                {
-                    "name": "cadence-aarch64-apple-darwin.tar.gz",
-                    "browser_download_url": "https://example.com/aarch64-darwin.tar.gz"
-                },
-                {
-                    "name": "cadence-x86_64-unknown-linux-gnu.tar.gz",
-                    "browser_download_url": "https://example.com/x86_64-linux.tar.gz"
-                },
-                {
-                    "name": "SHA256SUMS",
-                    "browser_download_url": "https://example.com/SHA256SUMS"
-                }
-            ]
-        }"#;
-        let release = parse_latest_release_json(json).unwrap();
-        assert_eq!(release.assets.len(), 3);
+    fn repo_base_preserves_url_without_suffix() {
+        assert_eq!(
+            repo_base_from_releases_url("http://127.0.0.1:9999"),
+            "http://127.0.0.1:9999"
+        );
     }
 
     // -- artifact selection ---------------------------------------------------
@@ -1889,7 +1899,7 @@ mod tests {
     // -- check_latest_version_from_url_with_timeout ---------------------------
 
     #[test]
-    fn check_with_timeout_invalid_url() {
+    fn check_with_timeout_connection_refused() {
         let result = check_latest_version_from_url_with_timeout(
             "http://127.0.0.1:1/nonexistent",
             Duration::from_millis(100),

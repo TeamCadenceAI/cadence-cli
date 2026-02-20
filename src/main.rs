@@ -1802,9 +1802,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         ));
 
         // Push notes for this repo if requested
-        if do_push
-            && let Some(ref remote) = repo_remote
-        {
+        if do_push && let Some(ref remote) = repo_remote {
             push::attempt_push_remote_at(&repo_root, remote);
         }
     }
