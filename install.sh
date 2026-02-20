@@ -40,31 +40,16 @@ main() {
 
     echo "Detected $OS_NAME $arch ($target)"
 
-    # Get latest release tag
-    echo "Fetching latest release..."
-    release_url="https://api.github.com/repos/${REPO}/releases/latest"
-    release_json=$(curl -sSf "$release_url") || {
-        echo "Error: could not fetch latest release from GitHub." >&2
-        echo "Check that ${REPO} has at least one published release." >&2
-        exit 1
-    }
-
-    tag=$(echo "$release_json" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')
-    if [ -z "$tag" ]; then
-        echo "Error: could not determine latest release tag." >&2
-        exit 1
-    fi
-    echo "Latest release: $tag"
-
-    # Download tarball
+    # Download tarball (uses /releases/latest/download/ redirect to avoid API rate limits)
     tarball="cadence-cli-${target}.tar.gz"
-    download_url="https://github.com/${REPO}/releases/download/${tag}/${tarball}"
+    download_url="https://github.com/${REPO}/releases/latest/download/${tarball}"
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
 
     echo "Downloading ${tarball}..."
     curl -sSfL -o "${tmpdir}/${tarball}" "$download_url" || {
         echo "Error: download failed." >&2
+        echo "Check that ${REPO} has at least one published release." >&2
         echo "URL: $download_url" >&2
         exit 1
     }
