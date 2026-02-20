@@ -571,7 +571,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     // Step 6: Run hydration for the last 7 days
     output::action("Hydrating", "recent sessions (last 30 days)");
     let hydrate_start = std::time::Instant::now();
-    if let Err(e) = run_hydrate("30d", false) {
+    if let Err(e) = run_hydrate("30d", true) {
         output::fail("Hydration", &format!("stopped ({})", e));
         had_errors = true;
     }
