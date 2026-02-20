@@ -365,6 +365,152 @@ pub fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+// ---------------------------------------------------------------------------
+// Plumbing helpers for notes ref squashing (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// List all notes in the AI-session notes ref.
+///
+/// Returns `Vec<(note_blob_sha, commit_sha)>` — one entry per attached note.
+/// Returns an empty vec if the notes ref doesn't exist.
+pub(crate) fn list_notes_at(repo: Option<&Path>) -> Result<Vec<(String, String)>> {
+    let output = run_git_output_at(repo, &["notes", "--ref", NOTES_REF, "list"], &[])
+        .context("failed to execute git notes list")?;
+
+    if !output.status.success() {
+        // Empty notes ref returns exit 1 — not an error for us.
+        return Ok(Vec::new());
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("git notes list output was not valid UTF-8")?;
+
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(note_sha), Some(commit_sha)) = (parts.next(), parts.next()) {
+            entries.push((note_sha.to_string(), commit_sha.to_string()));
+        }
+    }
+    Ok(entries)
+}
+
+/// List top-level tree entries for a treeish (commit, tree, or ref).
+///
+/// Returns raw `git ls-tree` output lines, one per entry, in the format:
+/// `<mode> <type> <sha>\t<name>`
+pub(crate) fn ls_tree_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<String>> {
+    let output = run_git_output_at(repo, &["ls-tree", treeish], &[])
+        .context("failed to execute git ls-tree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git ls-tree failed: {}", stderr.trim());
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("git ls-tree output was not valid UTF-8")?;
+
+    Ok(stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect())
+}
+
+/// Create a tree object from `ls-tree`-formatted entry lines.
+///
+/// Each entry must be: `<mode> <type> <sha>\t<name>`
+/// Returns the 40-char SHA of the new tree.
+pub(crate) fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    if let Some(repo) = repo {
+        cmd.args(["-C", &repo.to_string_lossy()]);
+    }
+    cmd.arg("mktree");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn git mktree")?;
+    if let Some(ref mut stdin) = child.stdin {
+        let input = entries.join("\n");
+        stdin
+            .write_all(input.as_bytes())
+            .context("failed to write to git mktree stdin")?;
+        if !input.is_empty() {
+            stdin
+                .write_all(b"\n")
+                .context("failed to write trailing newline to mktree")?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git mktree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git mktree failed: {}", stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git mktree output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(sha)
+}
+
+/// Create an orphan commit (no parents) from a tree object.
+///
+/// Returns the 40-char SHA of the new commit.
+pub(crate) fn commit_tree_at(repo: Option<&Path>, tree: &str, message: &str) -> Result<String> {
+    let output = run_git_output_at(repo, &["commit-tree", tree, "-m", message], &[])
+        .context("failed to execute git commit-tree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git commit-tree failed: {}", stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git commit-tree output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(sha)
+}
+
+/// Update a ref to point to a new commit.
+pub(crate) fn update_ref_at(repo: Option<&Path>, ref_name: &str, commit: &str) -> Result<()> {
+    let output = run_git_output_at(repo, &["update-ref", ref_name, commit], &[])
+        .context("failed to execute git update-ref")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git update-ref failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Resolve a revision expression to its SHA.
+pub(crate) fn rev_parse_at(repo: Option<&Path>, rev: &str) -> Result<String> {
+    let output = run_git_output_at(repo, &["rev-parse", rev], &[])
+        .context("failed to execute git rev-parse")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git rev-parse {:?} failed: {}", rev, stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git rev-parse output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(sha)
+}
+
 /// Check whether a commit exists in a given repository.
 ///
 /// Runs `git -C <repo> cat-file -t -- <commit>` and checks for success.
@@ -555,10 +701,15 @@ fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
 }
 
 /// Push the AI-session notes ref to the provided remote.
+///
+/// Note: Production push paths now use inline force-with-lease pushes
+/// (see `push.rs`). This function is retained for test use.
+#[allow(dead_code)]
 pub fn push_notes(remote: &str) -> Result<()> {
     push_notes_at(None, remote)
 }
 
+#[allow(dead_code)]
 pub fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
     let output = run_git_output_at(
         repo,
@@ -1901,5 +2052,124 @@ mod tests {
         let dir = init_temp_repo();
         let result = read_blob_at(Some(dir.path()), "0000000000000000000000000000000000000000");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 plumbing: list_notes_at, ls_tree_at, mktree_at, commit_tree_at,
+    //                    update_ref_at, rev_parse_at
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_notes_at_empty() {
+        let dir = init_temp_repo();
+        let notes = list_notes_at(Some(dir.path())).expect("list_notes_at failed");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn test_list_notes_at_with_notes() {
+        let dir = init_temp_repo();
+        let commit = run_git(dir.path(), &["rev-parse", "HEAD"]);
+
+        run_git(
+            dir.path(),
+            &[
+                "notes",
+                "--ref",
+                NOTES_REF,
+                "add",
+                "-m",
+                "test note",
+                &commit,
+            ],
+        );
+
+        let notes = list_notes_at(Some(dir.path())).expect("list_notes_at failed");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].1, commit);
+        // note blob SHA should be 40 hex chars
+        assert_eq!(notes[0].0.len(), 40);
+    }
+
+    #[test]
+    fn test_ls_tree_at() {
+        let dir = init_temp_repo();
+        let commit = run_git(dir.path(), &["rev-parse", "HEAD"]);
+
+        run_git(
+            dir.path(),
+            &["notes", "--ref", NOTES_REF, "add", "-m", "hi", &commit],
+        );
+
+        let tree_rev = format!("{}^{{tree}}", NOTES_REF);
+        let entries = ls_tree_at(Some(dir.path()), &tree_rev).expect("ls_tree_at failed");
+        assert!(!entries.is_empty());
+        // Each entry should have a tab-separated name
+        assert!(entries[0].contains('\t'));
+    }
+
+    #[test]
+    fn test_mktree_at_roundtrip() {
+        let dir = init_temp_repo();
+
+        // Store a blob and create a tree containing it.
+        let sha = store_blob_at(Some(dir.path()), b"content").expect("store_blob failed");
+        let entry = format!("100644 blob {}\tfile.txt", sha);
+        let tree_sha = mktree_at(Some(dir.path()), &[entry.clone()]).expect("mktree failed");
+
+        // Read it back.
+        let entries = ls_tree_at(Some(dir.path()), &tree_sha).expect("ls_tree failed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], entry);
+    }
+
+    #[test]
+    fn test_commit_tree_at_creates_orphan() {
+        let dir = init_temp_repo();
+
+        // Create a tree.
+        let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
+        let entry = format!("100644 blob {}\tfile.txt", sha);
+        let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
+
+        // Create orphan commit.
+        let commit =
+            commit_tree_at(Some(dir.path()), &tree, "test commit").expect("commit_tree failed");
+        assert_eq!(commit.len(), 40);
+
+        // Verify no parents.
+        let parents = git_output_in(dir.path(), &["log", "--format=%P", &commit]).unwrap();
+        assert!(
+            parents.is_empty(),
+            "orphan commit should have no parents, got: {:?}",
+            parents
+        );
+    }
+
+    #[test]
+    fn test_update_ref_at() {
+        let dir = init_temp_repo();
+
+        // Create a tree and commit.
+        let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
+        let entry = format!("100644 blob {}\tfile.txt", sha);
+        let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
+        let commit = commit_tree_at(Some(dir.path()), &tree, "test").expect("commit_tree failed");
+
+        // Update a ref.
+        update_ref_at(Some(dir.path()), "refs/test/foo", &commit).expect("update_ref_at failed");
+
+        // Verify.
+        let resolved =
+            rev_parse_at(Some(dir.path()), "refs/test/foo").expect("rev_parse_at failed");
+        assert_eq!(resolved, commit);
+    }
+
+    #[test]
+    fn test_rev_parse_at() {
+        let dir = init_temp_repo();
+        let head = run_git(dir.path(), &["rev-parse", "HEAD"]);
+        let resolved = rev_parse_at(Some(dir.path()), "HEAD").expect("rev_parse_at failed");
+        assert_eq!(resolved, head);
     }
 }
