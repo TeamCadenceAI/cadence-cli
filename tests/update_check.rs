@@ -1,8 +1,9 @@
 //! Integration tests for `cadence update --check`.
 //!
-//! These tests use a local HTTP server to avoid hitting the real GitHub API.
-//! They exercise the full update-check flow including JSON parsing, version
-//! comparison, and error handling by controlling the server responses.
+//! These tests use a local HTTP server to avoid hitting the real GitHub server.
+//! They exercise the full update-check flow including redirect-based tag
+//! discovery, version comparison, and error handling by controlling the server
+//! responses.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -11,24 +12,23 @@ use std::thread;
 /// The current version compiled into the binary.
 const LOCAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Start a minimal HTTP server that returns the given status code and body
-/// for exactly one request, then shuts down. Returns the URL to connect to.
-fn spawn_one_shot_server(status: u16, body: &str) -> String {
+/// Start a minimal HTTP server that returns a 302 redirect to a release tag URL.
+/// The `Location` header ends with the tag, mimicking GitHub's releases/latest redirect.
+fn spawn_redirect_server(tag: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
 
-    let body = body.to_string();
+    let tag = tag.to_string();
+    let url_clone = url.clone();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("failed to accept");
         let mut buf = [0u8; 4096];
-        // Read the request (we don't care about its contents)
         let _ = stream.read(&mut buf);
 
+        let location = format!("{url_clone}/releases/tag/{tag}");
         let response = format!(
-            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
@@ -37,26 +37,76 @@ fn spawn_one_shot_server(status: u16, body: &str) -> String {
     url
 }
 
-/// Helper: create a GitHub-style release JSON with a given tag and optional assets.
-fn release_json(tag: &str) -> String {
-    format!(
-        r#"{{"tag_name":"{}","assets":[{{"name":"cadence-aarch64-apple-darwin.tar.gz","browser_download_url":"https://example.com/a.tar.gz"}}]}}"#,
-        tag
-    )
+/// Start a minimal HTTP server that returns a given status code (non-redirect).
+fn spawn_status_server(status: u16) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+
+        let response =
+            format!("HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+
+    url
+}
+
+/// Start a minimal HTTP server that returns a 302 redirect with a custom Location header.
+fn spawn_redirect_server_with_location(location: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+
+    let location = location.to_string();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+
+    url
+}
+
+/// Start a minimal HTTP server that returns a 302 redirect without a Location header.
+fn spawn_redirect_server_no_location() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+
+        let response =
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+
+    url
 }
 
 // ---------------------------------------------------------------------------
 // Tests using the update module's injectable URL helper
 // ---------------------------------------------------------------------------
 
-// Note: These tests call the update module functions directly rather than
-// spawning the cadence binary, since we need URL injection. The binary
-// integration path is verified by the CLI parsing tests in main.rs.
-
 #[test]
 fn check_reports_update_available_when_remote_newer() {
     // Use a version that's definitely newer than any real release
-    let url = spawn_one_shot_server(200, &release_json("v99.0.0"));
+    let url = spawn_redirect_server("v99.0.0");
 
     let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
     let result = cadence_cli::update::compare_versions(LOCAL_VERSION, &release.tag_name).unwrap();
@@ -76,7 +126,7 @@ fn check_reports_update_available_when_remote_newer() {
 #[test]
 fn check_reports_up_to_date_when_versions_equal() {
     let tag = format!("v{LOCAL_VERSION}");
-    let url = spawn_one_shot_server(200, &release_json(&tag));
+    let url = spawn_redirect_server(&tag);
 
     let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
     let result = cadence_cli::update::compare_versions(LOCAL_VERSION, &release.tag_name).unwrap();
@@ -89,7 +139,7 @@ fn check_reports_up_to_date_when_versions_equal() {
 
 #[test]
 fn check_reports_up_to_date_when_local_newer() {
-    let url = spawn_one_shot_server(200, &release_json("v0.0.1"));
+    let url = spawn_redirect_server("v0.0.1");
 
     let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
     let result = cadence_cli::update::compare_versions(LOCAL_VERSION, &release.tag_name).unwrap();
@@ -98,7 +148,7 @@ fn check_reports_up_to_date_when_local_newer() {
 
 #[test]
 fn check_handles_http_error_gracefully() {
-    let url = spawn_one_shot_server(404, r#"{"message":"Not Found"}"#);
+    let url = spawn_status_server(404);
 
     let result = cadence_cli::update::check_latest_version_from_url(&url);
     assert!(result.is_err());
@@ -110,43 +160,29 @@ fn check_handles_http_error_gracefully() {
 }
 
 #[test]
-fn check_handles_malformed_json_gracefully() {
-    let url = spawn_one_shot_server(200, "<html>Not JSON at all</html>");
+fn check_handles_missing_location_header() {
+    let url = spawn_redirect_server_no_location();
 
     let result = cadence_cli::update::check_latest_version_from_url(&url);
     assert!(result.is_err());
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Unable to parse release metadata")
+        result.unwrap_err().to_string().contains("Location header"),
+        "Error should mention missing Location header"
     );
 }
 
 #[test]
-fn check_handles_missing_tag_name() {
-    let url = spawn_one_shot_server(200, r#"{"assets":[]}"#);
+fn check_handles_empty_tag_in_redirect() {
+    // Redirect to a URL ending with / (empty tag segment)
+    let url = spawn_redirect_server_with_location("http://example.com/releases/tag/");
 
     let result = cadence_cli::update::check_latest_version_from_url(&url);
     assert!(result.is_err());
-}
-
-#[test]
-fn check_handles_empty_tag_name() {
-    let url = spawn_one_shot_server(200, r#"{"tag_name":"","assets":[]}"#);
-
-    let result = cadence_cli::update::check_latest_version_from_url(&url);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("missing tag_name"));
-}
-
-#[test]
-fn check_handles_invalid_semver_tag() {
-    let url = spawn_one_shot_server(200, &release_json("not-a-version"));
-
-    let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
-    let result = cadence_cli::update::compare_versions(LOCAL_VERSION, &release.tag_name);
-    assert!(result.is_err(), "non-semver tag should produce error");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("version tag"),
+        "Error should mention version tag, got: {err_msg}"
+    );
 }
 
 #[test]
@@ -164,47 +200,60 @@ fn check_handles_connection_refused() {
 
 #[test]
 fn check_handles_rate_limit_response() {
-    // GitHub returns 403 with a JSON body for rate limits.
-    let url = spawn_one_shot_server(
-        403,
-        r#"{"message":"API rate limit exceeded","documentation_url":"https://docs.github.com"}"#,
-    );
+    // GitHub returns 403 for rate limits — this is not a redirect.
+    let url = spawn_status_server(403);
 
     let result = cadence_cli::update::check_latest_version_from_url(&url);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("HTTP 403"),);
+    assert!(result.unwrap_err().to_string().contains("HTTP 403"));
 }
 
 #[test]
-fn check_parses_release_with_multiple_assets() {
-    let json = r#"{
-        "tag_name": "v99.0.0",
-        "assets": [
-            {"name": "cadence-aarch64-apple-darwin.tar.gz", "browser_download_url": "https://example.com/a"},
-            {"name": "cadence-x86_64-unknown-linux-gnu.tar.gz", "browser_download_url": "https://example.com/b"},
-            {"name": "SHA256SUMS", "browser_download_url": "https://example.com/sums"}
-        ]
-    }"#;
-    let url = spawn_one_shot_server(200, json);
+fn check_handles_invalid_semver_tag() {
+    let url = spawn_redirect_server("not-a-version");
 
     let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
-    assert_eq!(release.tag_name, "v99.0.0");
-    assert_eq!(release.assets.len(), 3);
+    let result = cadence_cli::update::compare_versions(LOCAL_VERSION, &release.tag_name);
+    assert!(result.is_err(), "non-semver tag should produce error");
 }
 
 #[test]
-fn check_ignores_extra_json_fields() {
-    let json = r#"{
-        "tag_name": "v99.0.0",
-        "name": "Release 99.0.0",
-        "body": "Some markdown",
-        "draft": false,
-        "prerelease": false,
-        "html_url": "https://github.com/...",
-        "assets": []
-    }"#;
-    let url = spawn_one_shot_server(200, json);
+fn check_constructs_assets_for_all_platforms() {
+    let url = spawn_redirect_server("v99.0.0");
 
     let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
     assert_eq!(release.tag_name, "v99.0.0");
+    // 6 platform artifacts + 1 checksums file
+    assert_eq!(release.assets.len(), 7);
+
+    // Verify download URLs are constructed correctly
+    let checksums = release
+        .assets
+        .iter()
+        .find(|a| a.name == "checksums-sha256.txt")
+        .unwrap();
+    assert!(
+        checksums
+            .browser_download_url
+            .contains("/releases/download/v99.0.0/checksums-sha256.txt"),
+        "checksums URL should use direct download path"
+    );
+}
+
+#[test]
+fn check_constructs_download_urls_from_base() {
+    let url = spawn_redirect_server("v1.2.3");
+
+    let release = cadence_cli::update::check_latest_version_from_url(&url).unwrap();
+    // All download URLs should be rooted at the server base
+    for asset in &release.assets {
+        assert!(
+            asset
+                .browser_download_url
+                .contains("/releases/download/v1.2.3/"),
+            "Asset '{}' URL should contain download path: {}",
+            asset.name,
+            asset.browser_download_url
+        );
+    }
 }

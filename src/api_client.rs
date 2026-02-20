@@ -87,7 +87,6 @@ impl ApiClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
-
 }
 
 fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
