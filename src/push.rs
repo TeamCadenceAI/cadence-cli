@@ -67,13 +67,16 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
                 .unwrap_or_else(|_| ProgressStyle::default_spinner()),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
-        pb.set_message(format!("Pushing notes to {}", remote));
+        pb.set_message(format!("Syncing notes with {}", remote));
         Some(pb)
     } else {
         None
     };
 
-    let result = git::push_notes_at(Some(repo), remote);
+    // Fetch and merge remote notes before pushing to avoid overwriting
+    // notes pushed by other users.
+    let result = fetch_merge_notes_for_remote_at(repo, remote)
+        .and_then(|()| git::push_notes_at(Some(repo), remote));
 
     if let Some(pb) = spinner {
         pb.finish_and_clear();
@@ -82,13 +85,13 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
     match result {
         Ok(()) => {
             output::detail(&format!(
-                "Pushed notes to {} in {} ms",
+                "Synced notes with {} in {} ms",
                 remote,
                 push_start.elapsed().as_millis()
             ));
         }
         Err(e) => {
-            output::note(&format!("Could not push notes to {}: {}", remote, e));
+            output::note(&format!("Could not sync notes with {}: {}", remote, e));
         }
     }
 }
@@ -931,6 +934,143 @@ mod tests {
             }
         }
         std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // attempt_push — fetch-merge-push
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a bare remote and clone it to get a local repo with a
+    /// proper origin.  Returns (local_dir, bare_dir) — both TempDirs so they
+    /// stay alive for the duration of the test.
+    fn init_repo_with_remote() -> (TempDir, TempDir) {
+        // Create bare remote
+        let bare = TempDir::new().expect("failed to create bare dir");
+        run_git(bare.path(), &["init", "--bare"]);
+
+        // Clone it to get a local repo with origin pointing at the bare
+        let local = TempDir::new().expect("failed to create local dir");
+        let bare_url = format!("file://{}", bare.path().display());
+        // Clone into the tempdir (clone creates a subdir, so we use '.' trick)
+        let output = Command::new("git")
+            .args(["clone", &bare_url, local.path().to_str().unwrap()])
+            .output()
+            .expect("failed to clone");
+        // Clone may fail because the bare repo is empty — that's fine, we'll
+        // re-init the local directory in that case.
+        if !output.status.success() {
+            run_git(local.path(), &["init"]);
+            run_git(
+                local.path(),
+                &["remote", "add", "origin", &bare_url],
+            );
+        }
+
+        run_git(local.path(), &["config", "user.email", "test@test.com"]);
+        run_git(local.path(), &["config", "user.name", "Test User"]);
+        run_git(local.path(), &["config", "core.hooksPath", "/dev/null"]);
+
+        // Create an initial commit and push it so the remote is non-empty.
+        std::fs::write(local.path().join("README.md"), "hello").unwrap();
+        run_git(local.path(), &["add", "README.md"]);
+        run_git(local.path(), &["commit", "-m", "initial commit"]);
+        run_git(local.path(), &["push", "-u", "origin", "HEAD"]);
+
+        (local, bare)
+    }
+
+    /// Return the commit hash of HEAD in the given repo.
+    fn head_hash(dir: &Path) -> String {
+        run_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    #[serial]
+    fn test_attempt_push_merges_remote_notes() {
+        let (local, bare) = init_repo_with_remote();
+
+        // Create two commits so we can attach different notes to each.
+        let commit1 = head_hash(local.path());
+
+        std::fs::write(local.path().join("file2.txt"), "second").unwrap();
+        run_git(local.path(), &["add", "file2.txt"]);
+        run_git(local.path(), &["commit", "-m", "second commit"]);
+        let commit2 = head_hash(local.path());
+        run_git(local.path(), &["push", "origin", "HEAD"]);
+
+        // Simulate another user: clone the bare repo into a second working
+        // copy, attach a note to commit1, and push it to the shared remote.
+        let other = TempDir::new().expect("failed to create other dir");
+        let bare_url = format!("file://{}", bare.path().display());
+        let output = Command::new("git")
+            .args(["clone", &bare_url, other.path().to_str().unwrap()])
+            .output()
+            .expect("failed to clone for other user");
+        assert!(output.status.success(), "other clone failed");
+        run_git(other.path(), &["config", "user.email", "other@test.com"]);
+        run_git(other.path(), &["config", "user.name", "Other User"]);
+        run_git(other.path(), &["config", "core.hooksPath", "/dev/null"]);
+
+        run_git(
+            other.path(),
+            &[
+                "notes",
+                "--ref",
+                crate::git::NOTES_REF,
+                "add",
+                "-m",
+                "note-from-other-user",
+                &commit1,
+            ],
+        );
+        run_git(
+            other.path(),
+            &["push", "origin", crate::git::NOTES_REF],
+        );
+
+        // Meanwhile, the local user attaches a note to commit2 (only).
+        run_git(
+            local.path(),
+            &[
+                "notes",
+                "--ref",
+                crate::git::NOTES_REF,
+                "add",
+                "-m",
+                "note-from-local-user",
+                &commit2,
+            ],
+        );
+
+        // At this point:
+        //   remote has: commit1 -> "note-from-other-user"
+        //   local  has: commit2 -> "note-from-local-user"
+        // A blind push would overwrite the remote note on commit1.
+
+        // Use attempt_push_remote_at — should fetch-merge-push.
+        attempt_push_remote_at(local.path(), "origin");
+
+        // Fetch back from remote and verify both notes are present.
+        run_git(
+            local.path(),
+            &[
+                "fetch",
+                "origin",
+                &format!("+{}:{}", crate::git::NOTES_REF, crate::git::NOTES_REF),
+            ],
+        );
+
+        let note1 = run_git(
+            local.path(),
+            &["notes", "--ref", crate::git::NOTES_REF, "show", &commit1],
+        );
+        let note2 = run_git(
+            local.path(),
+            &["notes", "--ref", crate::git::NOTES_REF, "show", &commit2],
+        );
+
+        assert_eq!(note1, "note-from-other-user");
+        assert_eq!(note2, "note-from-local-user");
     }
 
     // -----------------------------------------------------------------------
