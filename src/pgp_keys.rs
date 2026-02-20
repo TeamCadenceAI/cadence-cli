@@ -4,6 +4,7 @@ use pgp::KeyType;
 use pgp::composed::key::{SecretKeyParamsBuilder, SubkeyParamsBuilder};
 use pgp::composed::{Deserializable, Message, SignedPublicKey};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::ser::Serialize;
 use pgp::types::PublicKeyTrait;
 use std::path::{Path, PathBuf};
 
@@ -309,4 +310,51 @@ pub fn encrypt_to_public_keys(plaintext: &str, armored_public_keys: &[String]) -
     encrypted
         .to_armored_string(ArmorOptions::default())
         .context("rpgp encrypt failed: armored serialization error")
+}
+
+/// Encrypt binary data to multiple armored public keys, returning raw bytes (not armored).
+///
+/// Same as [`encrypt_to_public_keys`] but operates on `&[u8]` input and returns
+/// `Vec<u8>` output (binary PGP packets). This avoids the ~33% overhead of
+/// ASCII armor for large payloads stored as git blobs.
+pub fn encrypt_to_public_keys_binary(
+    data: &[u8],
+    armored_public_keys: &[String],
+) -> Result<Vec<u8>> {
+    if armored_public_keys.is_empty() {
+        bail!("rpgp encrypt: at least one public key is required");
+    }
+
+    let mut public_keys: Vec<SignedPublicKey> = Vec::new();
+
+    for armored in armored_public_keys {
+        let trimmed = armored.trim();
+        if trimmed.is_empty() {
+            bail!("rpgp encrypt: public key material must not be blank");
+        }
+        let (public_key, _headers) = SignedPublicKey::from_string(trimmed)
+            .context("rpgp encrypt failed: public key parse error")?;
+        public_keys.push(public_key);
+    }
+
+    let mut enc_subkeys: Vec<&pgp::composed::SignedPublicSubKey> = Vec::new();
+    for public_key in &public_keys {
+        let enc_subkey = public_key
+            .public_subkeys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("rpgp encrypt failed: no encryption subkey found"))?;
+        enc_subkeys.push(enc_subkey);
+    }
+
+    let literal = pgp::packet::LiteralData::from_bytes((&[]).into(), data);
+    let message = Message::Literal(literal);
+
+    let mut rng = rand08::thread_rng();
+    let encrypted = message
+        .encrypt_to_keys_seipdv1(&mut rng, SymmetricKeyAlgorithm::AES128, &enc_subkeys)
+        .context("rpgp encrypt failed: encryption error")?;
+
+    encrypted
+        .to_bytes()
+        .context("rpgp encrypt failed: binary serialization error")
 }

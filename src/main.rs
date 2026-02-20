@@ -232,6 +232,51 @@ fn maybe_encrypt_note(content: &str, method: &EncryptionMethod) -> Result<String
     }
 }
 
+/// Encode a session log payload: compress with zstd, optionally encrypt
+/// (binary, not armored), store as a git blob in the current repo.
+///
+/// Returns `(blob_sha, payload_sha256, encoding)`.
+fn encode_and_store_payload(
+    session_log: &str,
+    method: &EncryptionMethod,
+) -> Result<(String, String, note::PayloadEncoding)> {
+    encode_and_store_payload_at(None, session_log, method)
+}
+
+/// Same as [`encode_and_store_payload`] but for a specific repository.
+fn encode_and_store_payload_at(
+    repo: Option<&std::path::Path>,
+    session_log: &str,
+    method: &EncryptionMethod,
+) -> Result<(String, String, note::PayloadEncoding)> {
+    let payload_sha256 = note::payload_sha256(session_log);
+
+    // Step 1: Compress with zstd
+    let compressed =
+        note::compress_payload(session_log.as_bytes()).context("payload compression failed")?;
+
+    // Step 2: Optionally encrypt (binary, not armored)
+    let (encoded, encoding) = match method {
+        EncryptionMethod::RpgpMulti { user_key, api_key } => {
+            let encrypted = pgp_keys::encrypt_to_public_keys_binary(
+                &compressed,
+                &[user_key.clone(), api_key.clone()],
+            )
+            .context("payload encryption failed")?;
+            (encrypted, note::PayloadEncoding::ZstdPgp)
+        }
+        EncryptionMethod::Unavailable(reason) => {
+            anyhow::bail!("encryption unavailable: {}", reason);
+        }
+        EncryptionMethod::None => (compressed, note::PayloadEncoding::Zstd),
+    };
+
+    // Step 3: Store as a git blob
+    let blob_sha = git::store_blob_at(repo, &encoded).context("failed to store payload blob")?;
+
+    Ok((blob_sha, payload_sha256, encoding))
+}
+
 const API_PUBLIC_KEY_MAX_AGE_DAYS: i64 = 7;
 
 fn now_rfc3339() -> String {
@@ -973,6 +1018,16 @@ fn fallback_match_for_commit(
     })
 }
 
+/// Pre-computed payload blob info for deduplication across commits.
+///
+/// When a session produces multiple commits, the payload is stored once and
+/// the same `PayloadInfo` is reused for each pointer note.
+struct PayloadInfo {
+    blob_sha: String,
+    payload_sha256: String,
+    encoding: note::PayloadEncoding,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach_note_from_log(
     agent_type: &scanner::AgentType,
@@ -984,17 +1039,67 @@ fn attach_note_from_log(
     method: &EncryptionMethod,
     session_start: Option<i64>,
 ) -> Result<()> {
-    let note_content = note::format_with_confidence(
+    attach_note_from_log_v2(
         agent_type,
         session_id,
         repo_str,
         commit,
         session_log,
         confidence,
+        method,
         session_start,
+        None, // no pre-stored payload — will store a new blob
+        None, // use CWD repo
+    )
+}
+
+/// V2 attach: stores payload as a separate blob, attaches a lightweight pointer note.
+///
+/// If `existing_payload` is provided, reuses the already-stored blob (dedup).
+/// If `repo` is provided, operates in that repo instead of CWD.
+#[allow(clippy::too_many_arguments)]
+fn attach_note_from_log_v2(
+    agent_type: &scanner::AgentType,
+    session_id: &str,
+    repo_str: &str,
+    commit: &str,
+    session_log: &str,
+    confidence: note::Confidence,
+    method: &EncryptionMethod,
+    session_start: Option<i64>,
+    existing_payload: Option<&PayloadInfo>,
+    repo: Option<&std::path::Path>,
+) -> Result<()> {
+    // Reuse existing payload blob or create a new one
+    let (blob_sha, payload_sha256, encoding) = match existing_payload {
+        Some(info) => (
+            info.blob_sha.clone(),
+            info.payload_sha256.clone(),
+            info.encoding,
+        ),
+        None => encode_and_store_payload_at(repo, session_log, method)?,
+    };
+
+    // Build the v2 pointer note
+    let note_content = note::format_v2(
+        agent_type,
+        session_id,
+        repo_str,
+        commit,
+        confidence,
+        session_start,
+        &blob_sha,
+        &payload_sha256,
+        encoding,
     )?;
+
+    // Optionally encrypt the pointer note itself (small, armored is fine)
     let final_content = maybe_encrypt_note(&note_content, method)?;
-    git::add_note(commit, &final_content)?;
+
+    match repo {
+        Some(r) => git::add_note_at(r, commit, &final_content)?,
+        None => git::add_note(commit, &final_content)?,
+    }
     Ok(())
 }
 
@@ -1659,45 +1764,18 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     let session_start =
                         scanner::session_time_range(&session.file).map(|(start, _)| start);
 
-                    let note_content = match note::format_with_confidence(
+                    match attach_note_from_log_v2(
                         &agent_type,
                         &session.session_id,
                         &repo_str,
                         hash,
                         &session_log,
                         note::Confidence::TimeWindowMatch,
+                        &encryption_method,
                         session_start,
+                        None,
+                        Some(&session.repo_root),
                     ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            print_detail(&format!(
-                                "{} could not format note for {}: {}",
-                                header,
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                            break 'process_session;
-                        }
-                    };
-
-                    // Optionally encrypt — encryption failure is non-fatal
-                    let final_content = match maybe_encrypt_note(&note_content, &encryption_method)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            print_detail(&format!(
-                                "{} encryption failed for {}: {}",
-                                header,
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                            break 'process_session;
-                        }
-                    };
-
-                    match git::add_note_at(&session.repo_root, hash, &final_content) {
                         Ok(()) => {
                             attached += 1;
                             fallback_attached += 1;
@@ -1739,6 +1817,20 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                     pb.set_message(format!("{} — attaching notes", session_display));
                 }
 
+                // Pre-compute metadata shared across all commits in this session
+                let agent_type = session
+                    .metadata
+                    .agent_type
+                    .clone()
+                    .unwrap_or(scanner::AgentType::Claude);
+                let repo_str = session.repo_root.to_string_lossy().to_string();
+                let session_start =
+                    scanner::session_time_range(&session.file).map(|(start, _)| start);
+
+                // Lazily store the payload blob once for this session.
+                // We defer reading until we know at least one commit needs a note.
+                let mut payload_info: Option<PayloadInfo> = None;
+
                 for hash in &commit_hashes {
                     // Verify the commit exists in the resolved repo
                     match git::commit_exists_at(&session.repo_root, hash) {
@@ -1774,63 +1866,51 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                         }
                     }
 
-                    // Read the full session log
-                    let session_log = match std::fs::read_to_string(&session.file) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            messages.push(format!("could not read session log: {}", e));
-                            errors += 1;
-                            continue;
+                    // Lazily encode and store the payload blob on first need
+                    if payload_info.is_none() {
+                        let session_log = match std::fs::read_to_string(&session.file) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                messages.push(format!("could not read session log: {}", e));
+                                errors += 1;
+                                break;
+                            }
+                        };
+                        match encode_and_store_payload_at(
+                            Some(&session.repo_root),
+                            &session_log,
+                            &encryption_method,
+                        ) {
+                            Ok((blob_sha, sha256, encoding)) => {
+                                payload_info = Some(PayloadInfo {
+                                    blob_sha,
+                                    payload_sha256: sha256,
+                                    encoding,
+                                });
+                            }
+                            Err(e) => {
+                                messages.push(format!("could not store payload: {}", e));
+                                errors += 1;
+                                break;
+                            }
                         }
-                    };
+                    }
 
-                    // Use agent type from parsed metadata (already inferred by
-                    // parse_session_metadata via infer_agent_type). Fall back to
-                    // Claude if metadata didn't determine it.
-                    let agent_type = session
-                        .metadata
-                        .agent_type
-                        .clone()
-                        .unwrap_or(scanner::AgentType::Claude);
+                    let info = payload_info.as_ref().unwrap();
 
-                    let repo_str = session.repo_root.to_string_lossy().to_string();
-                    let session_start =
-                        scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                    // Format the note
-                    let note_content = match note::format(
+                    // Attach v2 pointer note reusing the shared blob
+                    match attach_note_from_log_v2(
                         &agent_type,
                         &session.session_id,
                         &repo_str,
                         hash,
-                        &session_log,
+                        "", // session_log not used when existing_payload is provided
+                        note::Confidence::ExactHashMatch,
+                        &encryption_method,
                         session_start,
+                        Some(info),
+                        Some(&session.repo_root),
                     ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            messages.push(format!(
-                                "could not format note for {}: {}",
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                            continue;
-                        }
-                    };
-
-                    // Optionally encrypt — in hydrate, encryption failure is non-fatal
-                    let final_content = match maybe_encrypt_note(&note_content, &encryption_method)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            messages.push(format!("encryption failed for {}: {}", &hash[..7], e));
-                            errors += 1;
-                            continue;
-                        }
-                    };
-
-                    // Attach the note
-                    match git::add_note_at(&session.repo_root, hash, &final_content) {
                         Ok(()) => {
                             messages.push(format!("commit {} attached", &hash[..7]));
                             session_attached += 1;

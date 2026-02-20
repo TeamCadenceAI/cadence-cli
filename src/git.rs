@@ -300,6 +300,71 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
     Ok(())
 }
 
+/// Store arbitrary bytes as a git blob object and return its 40-char SHA-1 hash.
+///
+/// Uses `git hash-object -w --stdin` to write the blob to the object store.
+pub fn store_blob(data: &[u8]) -> Result<String> {
+    store_blob_at(None, data)
+}
+
+/// Store arbitrary bytes as a git blob in a specific repository.
+pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    if let Some(repo) = repo {
+        cmd.args(["-C", &repo.to_string_lossy()]);
+    }
+    cmd.args(["hash-object", "-w", "--stdin"]);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn git hash-object")?;
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(data)
+            .context("failed to write blob data to git hash-object stdin")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git hash-object")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git hash-object failed: {}", stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git hash-object output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("git hash-object returned invalid SHA: {}", sha);
+    }
+
+    Ok(sha)
+}
+
+/// Read a git blob by its SHA and return the raw bytes.
+///
+/// Uses `git cat-file blob <sha>`.
+pub fn read_blob(sha: &str) -> Result<Vec<u8>> {
+    read_blob_at(None, sha)
+}
+
+/// Read a git blob by its SHA from a specific repository.
+pub fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
+    let output = run_git_output_at(repo, &["cat-file", "blob", sha], &[])
+        .context("failed to execute git cat-file blob")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git cat-file blob failed: {}", stderr.trim());
+    }
+
+    Ok(output.stdout)
+}
+
 /// Check whether a commit exists in a given repository.
 ///
 /// Runs `git -C <repo> cat-file -t -- <commit>` and checks for success.
@@ -1783,5 +1848,58 @@ mod tests {
                 None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // store_blob / read_blob
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_store_and_read_blob_roundtrip() {
+        let dir = init_temp_repo();
+        let data = b"hello, this is a test blob";
+
+        let sha = store_blob_at(Some(dir.path()), data).expect("store_blob_at failed");
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn test_store_blob_binary_data() {
+        let dir = init_temp_repo();
+        // Binary data including null bytes
+        let data: Vec<u8> = (0..=255).collect();
+
+        let sha = store_blob_at(Some(dir.path()), &data).expect("store_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn test_store_blob_empty() {
+        let dir = init_temp_repo();
+        let sha = store_blob_at(Some(dir.path()), b"").expect("store_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        assert!(read_back.is_empty());
+    }
+
+    #[test]
+    fn test_store_blob_deterministic() {
+        let dir = init_temp_repo();
+        let data = b"same content";
+
+        let sha1 = store_blob_at(Some(dir.path()), data).expect("first store failed");
+        let sha2 = store_blob_at(Some(dir.path()), data).expect("second store failed");
+        assert_eq!(sha1, sha2, "same content should produce same SHA");
+    }
+
+    #[test]
+    fn test_read_blob_nonexistent() {
+        let dir = init_temp_repo();
+        let result = read_blob_at(Some(dir.path()), "0000000000000000000000000000000000000000");
+        assert!(result.is_err());
     }
 }
