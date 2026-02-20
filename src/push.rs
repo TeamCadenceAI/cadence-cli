@@ -960,10 +960,7 @@ mod tests {
         // re-init the local directory in that case.
         if !output.status.success() {
             run_git(local.path(), &["init"]);
-            run_git(
-                local.path(),
-                &["remote", "add", "origin", &bare_url],
-            );
+            run_git(local.path(), &["remote", "add", "origin", &bare_url]);
         }
 
         run_git(local.path(), &["config", "user.email", "test@test.com"]);
@@ -1023,10 +1020,7 @@ mod tests {
                 &commit1,
             ],
         );
-        run_git(
-            other.path(),
-            &["push", "origin", crate::git::NOTES_REF],
-        );
+        run_git(other.path(), &["push", "origin", crate::git::NOTES_REF]);
 
         // Meanwhile, the local user attaches a note to commit2 (only).
         run_git(

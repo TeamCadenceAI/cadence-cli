@@ -1507,6 +1507,27 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             None
         };
 
+        let session_progress = if use_progress && sessions.len() > 1 {
+            let pb = ProgressBar::new(sessions.len() as u64);
+            pb.set_draw_target(ProgressDrawTarget::stderr());
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {pos}/{len} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_bar()),
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(120));
+            Some(pb)
+        } else {
+            None
+        };
+
+        let print_detail = |msg: &str| {
+            if let Some(ref pb) = session_progress {
+                pb.println(output::format_detail(msg));
+            } else {
+                output::detail(msg);
+            }
+        };
+
         let mut repo_total = 0usize;
         let mut repo_with_commits = 0usize;
         let mut repo_without_commits = 0usize;
@@ -1520,297 +1541,343 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 &session.session_id
             };
 
-            // Extract all commit hashes from the session log
-            let commit_hashes = scanner::extract_commit_hashes(&session.file);
+            // Use a labeled block so all exit paths reach the progress increment
+            'process_session: {
+                // Update progress bar with current session
+                if let Some(ref pb) = session_progress {
+                    pb.set_message(format!("{} — extracting commits", session_display));
+                }
 
-            if commit_hashes.is_empty() {
-                repo_without_commits += 1;
+                // Extract all commit hashes from the session log
+                let commit_hashes = scanner::extract_commit_hashes(&session.file);
+
+                if commit_hashes.is_empty() {
+                    repo_without_commits += 1;
+
+                    if !git::check_enabled_at(&session.repo_root) {
+                        break 'process_session;
+                    }
+
+                    let header = format!("{} |", session_display);
+
+                    if let Some(ref pb) = session_progress {
+                        pb.set_message(format!("{} — scanning timestamps", session_display));
+                    }
+
+                    let time_range =
+                        if let Some((start, end)) = scanner::session_time_range(&session.file) {
+                            Some((start, end))
+                        } else {
+                            // Fall back to file mtime ± 24 hours
+                            let mtime = match file_mtime_epoch(&session.file) {
+                                Some(t) => t,
+                                None => {
+                                    print_detail(&format!(
+                                        "{} no timestamps or file mtime; skipping",
+                                        header
+                                    ));
+                                    break 'process_session;
+                                }
+                            };
+                            Some((mtime - 86_400, mtime + 86_400))
+                        };
+
+                    let (start_ts, end_ts) = match time_range {
+                        Some(r) => r,
+                        None => {
+                            print_detail(&format!("{} no timestamps; skipping", header));
+                            break 'process_session;
+                        }
+                    };
+
+                    let commits =
+                        match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                print_detail(&format!(
+                                    "{} problem scanning commits: {}",
+                                    header, e
+                                ));
+                                errors += 1;
+                                break 'process_session;
+                            }
+                        };
+
+                    if commits.len() != 1 {
+                        let status = if commits.is_empty() {
+                            "no commits in time window"
+                        } else {
+                            "ambiguous commits in time window"
+                        };
+                        print_detail(&format!("{} {}", header, status));
+                        break 'process_session;
+                    }
+
+                    let hash = &commits[0];
+                    match git::note_exists_at(&session.repo_root, hash) {
+                        Ok(true) => {
+                            skipped += 1;
+                            print_detail(&format!(
+                                "{} commit {} already attached",
+                                header,
+                                &hash[..7]
+                            ));
+                            break 'process_session;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            print_detail(&format!(
+                                "{} problem checking note for {}: {}",
+                                header,
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            break 'process_session;
+                        }
+                    }
+
+                    if let Some(ref pb) = session_progress {
+                        pb.set_message(format!("{} — reading session log", session_display));
+                    }
+
+                    let session_log = match std::fs::read_to_string(&session.file) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            print_detail(&format!("{} could not read session log: {}", header, e));
+                            errors += 1;
+                            break 'process_session;
+                        }
+                    };
+
+                    let agent_type = session
+                        .metadata
+                        .agent_type
+                        .clone()
+                        .unwrap_or(scanner::AgentType::Claude);
+                    let repo_str = session.repo_root.to_string_lossy().to_string();
+                    let session_start =
+                        scanner::session_time_range(&session.file).map(|(start, _)| start);
+
+                    let note_content = match note::format_with_confidence(
+                        &agent_type,
+                        &session.session_id,
+                        &repo_str,
+                        hash,
+                        &session_log,
+                        note::Confidence::TimeWindowMatch,
+                        session_start,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            print_detail(&format!(
+                                "{} could not format note for {}: {}",
+                                header,
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            break 'process_session;
+                        }
+                    };
+
+                    // Optionally encrypt — encryption failure is non-fatal
+                    let final_content = match maybe_encrypt_note(&note_content, &encryption_method)
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            print_detail(&format!(
+                                "{} encryption failed for {}: {}",
+                                header,
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            break 'process_session;
+                        }
+                    };
+
+                    match git::add_note_at(&session.repo_root, hash, &final_content) {
+                        Ok(()) => {
+                            attached += 1;
+                            fallback_attached += 1;
+                            print_detail(&format!(
+                                "{} commit {} attached (time window match)",
+                                header,
+                                &hash[..7]
+                            ));
+                        }
+                        Err(e) => {
+                            print_detail(&format!(
+                                "{} could not attach note to {}: {}",
+                                header,
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                        }
+                    }
+
+                    break 'process_session;
+                }
+
+                repo_with_commits += 1;
 
                 if !git::check_enabled_at(&session.repo_root) {
-                    continue;
+                    break 'process_session;
                 }
+
+                // For each hash, attach note if missing.
+                // Buffer messages so we can combine a single status with the header.
+                let mut session_attached = 0usize;
+                let mut session_skipped = 0usize;
+                let mut messages: Vec<String> = Vec::new();
 
                 let header = format!("{} |", session_display);
 
-                let time_range =
-                    if let Some((start, end)) = scanner::session_time_range(&session.file) {
-                        Some((start, end))
-                    } else {
-                        // Fall back to file mtime ± 24 hours
-                        let mtime = match file_mtime_epoch(&session.file) {
-                            Some(t) => t,
-                            None => {
-                                output::detail(&format!(
-                                    "{} no timestamps or file mtime; skipping",
-                                    header
-                                ));
-                                continue;
-                            }
-                        };
-                        Some((mtime - 86_400, mtime + 86_400))
+                if let Some(ref pb) = session_progress {
+                    pb.set_message(format!("{} — attaching notes", session_display));
+                }
+
+                for hash in &commit_hashes {
+                    // Verify the commit exists in the resolved repo
+                    match git::commit_exists_at(&session.repo_root, hash) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // Commit does not exist in this repo -- could be from a
+                            // different repo or could be rebased away. Skip silently.
+                            continue;
+                        }
+                        Err(e) => {
+                            messages.push(format!("problem checking commit {}: {}", &hash[..7], e));
+                            errors += 1;
+                            continue;
+                        }
+                    }
+
+                    // Check dedup: skip if note already exists
+                    match git::note_exists_at(&session.repo_root, hash) {
+                        Ok(true) => {
+                            session_skipped += 1;
+                            skipped += 1;
+                            continue;
+                        }
+                        Ok(false) => {} // Need to attach
+                        Err(e) => {
+                            messages.push(format!(
+                                "problem checking note for {}: {}",
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            continue;
+                        }
+                    }
+
+                    // Read the full session log
+                    let session_log = match std::fs::read_to_string(&session.file) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            messages.push(format!("could not read session log: {}", e));
+                            errors += 1;
+                            continue;
+                        }
                     };
 
-                let (start_ts, end_ts) = match time_range {
-                    Some(r) => r,
-                    None => {
-                        output::detail(&format!("{} no timestamps; skipping", header));
-                        continue;
-                    }
-                };
+                    // Use agent type from parsed metadata (already inferred by
+                    // parse_session_metadata via infer_agent_type). Fall back to
+                    // Claude if metadata didn't determine it.
+                    let agent_type = session
+                        .metadata
+                        .agent_type
+                        .clone()
+                        .unwrap_or(scanner::AgentType::Claude);
 
-                let commits = match git::commits_in_time_range(&session.repo_root, start_ts, end_ts)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        output::detail(&format!("{} problem scanning commits: {}", header, e));
-                        errors += 1;
-                        continue;
-                    }
-                };
+                    let repo_str = session.repo_root.to_string_lossy().to_string();
+                    let session_start =
+                        scanner::session_time_range(&session.file).map(|(start, _)| start);
 
-                if commits.len() != 1 {
-                    let status = if commits.is_empty() {
-                        "no commits in time window"
-                    } else {
-                        "ambiguous commits in time window"
+                    // Format the note
+                    let note_content = match note::format(
+                        &agent_type,
+                        &session.session_id,
+                        &repo_str,
+                        hash,
+                        &session_log,
+                        session_start,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            messages.push(format!(
+                                "could not format note for {}: {}",
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            continue;
+                        }
                     };
-                    output::detail(&format!("{} {}", header, status));
-                    continue;
-                }
 
-                let hash = &commits[0];
-                match git::note_exists_at(&session.repo_root, hash) {
-                    Ok(true) => {
-                        skipped += 1;
-                        output::detail(&format!(
-                            "{} commit {} already attached",
-                            header,
-                            &hash[..7]
-                        ));
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} problem checking note for {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
-                        continue;
-                    }
-                }
+                    // Optionally encrypt — in hydrate, encryption failure is non-fatal
+                    let final_content = match maybe_encrypt_note(&note_content, &encryption_method)
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            messages.push(format!("encryption failed for {}: {}", &hash[..7], e));
+                            errors += 1;
+                            continue;
+                        }
+                    };
 
-                let session_log = match std::fs::read_to_string(&session.file) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        output::detail(&format!("{} could not read session log: {}", header, e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                let agent_type = session
-                    .metadata
-                    .agent_type
-                    .clone()
-                    .unwrap_or(scanner::AgentType::Claude);
-                let repo_str = session.repo_root.to_string_lossy().to_string();
-                let session_start =
-                    scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                let note_content = match note::format_with_confidence(
-                    &agent_type,
-                    &session.session_id,
-                    &repo_str,
-                    hash,
-                    &session_log,
-                    note::Confidence::TimeWindowMatch,
-                    session_start,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} could not format note for {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Optionally encrypt — encryption failure is non-fatal
-                let final_content = match maybe_encrypt_note(&note_content, &encryption_method) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} encryption failed for {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                match git::add_note_at(&session.repo_root, hash, &final_content) {
-                    Ok(()) => {
-                        attached += 1;
-                        fallback_attached += 1;
-                        output::detail(&format!(
-                            "{} commit {} attached (time window match)",
-                            header,
-                            &hash[..7]
-                        ));
-                    }
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} could not attach note to {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
+                    // Attach the note
+                    match git::add_note_at(&session.repo_root, hash, &final_content) {
+                        Ok(()) => {
+                            messages.push(format!("commit {} attached", &hash[..7]));
+                            session_attached += 1;
+                            attached += 1;
+                        }
+                        Err(e) => {
+                            messages.push(format!(
+                                "could not attach note to {}: {}",
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                        }
                     }
                 }
 
-                continue;
-            }
-
-            repo_with_commits += 1;
-
-            if !git::check_enabled_at(&session.repo_root) {
-                continue;
-            }
-
-            // For each hash, attach note if missing.
-            // Buffer messages so we can combine a single status with the header.
-            let mut session_attached = 0usize;
-            let mut session_skipped = 0usize;
-            let mut messages: Vec<String> = Vec::new();
-
-            let header = format!("{} |", session_display);
-
-            for hash in &commit_hashes {
-                // Verify the commit exists in the resolved repo
-                match git::commit_exists_at(&session.repo_root, hash) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Commit does not exist in this repo -- could be from a
-                        // different repo or could be rebased away. Skip silently.
-                        continue;
-                    }
-                    Err(e) => {
-                        messages.push(format!("problem checking commit {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
+                // Summarise skipped commits as a single message
+                if session_attached == 0 && session_skipped > 0 {
+                    messages.push(format!("{} already attached", session_skipped));
                 }
 
-                // Check dedup: skip if note already exists
-                match git::note_exists_at(&session.repo_root, hash) {
-                    Ok(true) => {
-                        session_skipped += 1;
-                        skipped += 1;
-                        continue;
-                    }
-                    Ok(false) => {} // Need to attach
-                    Err(e) => {
-                        messages.push(format!("problem checking note for {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                }
-
-                // Read the full session log
-                let session_log = match std::fs::read_to_string(&session.file) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        messages.push(format!("could not read session log: {}", e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Use agent type from parsed metadata (already inferred by
-                // parse_session_metadata via infer_agent_type). Fall back to
-                // Claude if metadata didn't determine it.
-                let agent_type = session
-                    .metadata
-                    .agent_type
-                    .clone()
-                    .unwrap_or(scanner::AgentType::Claude);
-
-                let repo_str = session.repo_root.to_string_lossy().to_string();
-                let session_start =
-                    scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                // Format the note
-                let note_content = match note::format(
-                    &agent_type,
-                    &session.session_id,
-                    &repo_str,
-                    hash,
-                    &session_log,
-                    session_start,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        messages.push(format!("could not format note for {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Optionally encrypt — in hydrate, encryption failure is non-fatal
-                let final_content = match maybe_encrypt_note(&note_content, &encryption_method) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        messages.push(format!("encryption failed for {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Attach the note
-                match git::add_note_at(&session.repo_root, hash, &final_content) {
-                    Ok(()) => {
-                        messages.push(format!("commit {} attached", &hash[..7]));
-                        session_attached += 1;
-                        attached += 1;
-                    }
-                    Err(e) => {
-                        messages.push(format!("could not attach note to {}: {}", &hash[..7], e));
-                        errors += 1;
+                // Print: combine header + single message on one line, or multi-line
+                if messages.len() <= 1 {
+                    let status = messages
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("nothing to do");
+                    print_detail(&format!("{} {}", header, status));
+                } else {
+                    print_detail(&header);
+                    for msg in &messages {
+                        print_detail(&format!("  {}", msg));
                     }
                 }
             }
 
-            // Summarise skipped commits as a single message
-            if session_attached == 0 && session_skipped > 0 {
-                messages.push(format!("{} already attached", session_skipped));
-            }
-
-            // Print: combine header + single message on one line, or multi-line
-            if messages.len() <= 1 {
-                let status = messages
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("nothing to do");
-                output::detail(&format!("{} {}", header, status));
-            } else {
-                output::detail(&header);
-                for msg in &messages {
-                    output::detail(&format!("  {}", msg));
-                }
+            // Always increment progress after processing each session
+            if let Some(ref pb) = session_progress {
+                pb.inc(1);
             }
         }
 
-        // Per-repo summary
+        if let Some(ref pb) = session_progress {
+            pb.finish_and_clear();
+        }
+
+        // Per-repo summary (printed after progress bar is cleared)
         output::detail(&format!(
             "{} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
