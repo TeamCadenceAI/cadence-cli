@@ -85,6 +85,12 @@ enum Command {
         yes: bool,
     },
 
+    /// View or modify CLI configuration.
+    Config {
+        #[command(subcommand)]
+        config_command: Option<ConfigCommand>,
+    },
+
     /// Manage encryption for local + API recipients.
     Keys {
         #[command(subcommand)]
@@ -104,6 +110,24 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Set a configuration value.
+    Set {
+        /// Configuration key (e.g. auto_update, update_check_interval, api_url).
+        key: String,
+        /// Value to set.
+        value: String,
+    },
+    /// Get a configuration value.
+    Get {
+        /// Configuration key to read.
+        key: String,
+    },
+    /// List all configuration keys and their current values.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -605,6 +629,9 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         output::fail("Install", &format!("stopped ({})", e));
         return Err(e);
     }
+
+    // Step 5.6: Optional auto-update preference prompt
+    run_install_auto_update_prompt();
 
     // Step 6: Run hydration for the last 7 days
     output::action("Hydrating", "recent sessions (last 30 days)");
@@ -2418,6 +2445,89 @@ fn run_install_encryption_setup() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Install: auto-update preference prompt
+// ---------------------------------------------------------------------------
+
+/// Prompt the user to enable automatic updates during install.
+///
+/// This is non-critical: failures are logged but never abort install.
+/// Skipped silently if stdin is not a TTY or auto_update is already configured.
+fn run_install_auto_update_prompt() {
+    let cfg = match config::CliConfig::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let config_path = match config::CliConfig::config_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut prompter = DialoguerPrompter::new();
+    run_install_auto_update_prompt_inner(&mut prompter, &cfg, &config_path);
+}
+
+/// Testable inner implementation of the auto-update prompt.
+///
+/// Accepts injectable prompter and config path for testing.
+fn run_install_auto_update_prompt_inner(
+    prompter: &mut dyn Prompter,
+    cfg: &config::CliConfig,
+    config_path: &std::path::Path,
+) {
+    // Skip if not a TTY
+    if !output::is_stderr_tty() || !Term::stdout().is_term() {
+        return;
+    }
+
+    // Skip if auto_update is already set (user already made a choice)
+    if cfg.auto_update.is_some() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+    let is_tty = Term::stdout().is_term();
+
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Cadence can automatically install updates when available.",
+        is_tty,
+    );
+
+    let response = prompter.confirm("Enable automatic updates?", &mut stdout);
+    match response {
+        Ok(Some(enabled)) => {
+            let value = if enabled { "true" } else { "false" };
+            let mut cfg = cfg.clone();
+            if let Err(e) = cfg
+                .set_key(config::ConfigKey::AutoUpdate, value)
+                .and_then(|()| cfg.save_to(config_path))
+            {
+                output::note_to_with_tty(
+                    &mut stdout,
+                    &format!("Could not save auto-update preference: {e}"),
+                    is_tty,
+                );
+            } else if enabled {
+                output::success_to_with_tty(
+                    &mut stdout,
+                    "Auto-update",
+                    "enabled. Change anytime with `cadence config set auto_update false`.",
+                    is_tty,
+                );
+            } else {
+                output::detail_to_with_tty(
+                    &mut stdout,
+                    "Auto-update disabled. Run `cadence update` to check manually.",
+                    is_tty,
+                );
+            }
+        }
+        Ok(None) | Err(_) => {
+            // User cancelled or error — skip silently
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Keys setup: prompter abstraction
 // ---------------------------------------------------------------------------
 
@@ -2571,6 +2681,38 @@ fn run_keys_setup_inner(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Config subcommand handlers
+// ---------------------------------------------------------------------------
+
+/// Set a configuration value and persist to disk.
+fn run_config_set(key_str: &str, value: &str) -> Result<()> {
+    let key: config::ConfigKey = key_str.parse()?;
+    let mut cfg = config::CliConfig::load()?;
+    cfg.set_key(key, value)?;
+    cfg.save()?;
+    output::success("Set", &format!("{} = {}", key.name(), cfg.get_key(key)));
+    Ok(())
+}
+
+/// Print a single configuration value to stdout (machine-readable).
+fn run_config_get(key_str: &str) -> Result<()> {
+    let key: config::ConfigKey = key_str.parse()?;
+    let cfg = config::CliConfig::load()?;
+    println!("{}", cfg.get_key(key));
+    Ok(())
+}
+
+/// List all user-settable configuration keys with their current values.
+fn run_config_list() -> Result<()> {
+    let cfg = config::CliConfig::load()?;
+    for key in config::ALL_CONFIG_KEYS {
+        let value = cfg.get_key(*key);
+        println!("{} = {}", key.name(), value);
+    }
+    Ok(())
+}
+
 /// Check for or install updates.
 ///
 /// With `--check`: queries GitHub for the latest release and reports whether
@@ -2667,6 +2809,11 @@ fn main() {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
         },
         Command::Status => run_status(),
+        Command::Config { config_command } => match config_command.unwrap_or(ConfigCommand::List) {
+            ConfigCommand::Set { key, value } => run_config_set(&key, &value),
+            ConfigCommand::Get { key } => run_config_get(&key),
+            ConfigCommand::List => run_config_list(),
+        },
         Command::Update { check, yes } => run_update(check, yes),
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Setup => run_keys_setup(),
@@ -2815,5 +2962,120 @@ mod tests {
             }
             _ => panic!("expected Keys command"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Config command parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_config_set() {
+        let cli = Cli::parse_from(["cadence", "config", "set", "auto_update", "true"]);
+        match cli.command {
+            Command::Config { config_command } => match config_command {
+                Some(ConfigCommand::Set { key, value }) => {
+                    assert_eq!(key, "auto_update");
+                    assert_eq!(value, "true");
+                }
+                other => panic!("expected Config Set, got {:?}", other),
+            },
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_get() {
+        let cli = Cli::parse_from(["cadence", "config", "get", "auto_update"]);
+        match cli.command {
+            Command::Config { config_command } => match config_command {
+                Some(ConfigCommand::Get { key }) => {
+                    assert_eq!(key, "auto_update");
+                }
+                other => panic!("expected Config Get, got {:?}", other),
+            },
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_list() {
+        let cli = Cli::parse_from(["cadence", "config", "list"]);
+        match cli.command {
+            Command::Config { config_command } => {
+                assert!(matches!(config_command, Some(ConfigCommand::List)));
+            }
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_bare_config_defaults_to_none() {
+        let cli = Cli::parse_from(["cadence", "config"]);
+        match cli.command {
+            Command::Config { config_command } => {
+                assert!(config_command.is_none());
+            }
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Install auto-update prompt tests (mock prompter)
+    // -----------------------------------------------------------------------
+
+    /// Mock prompter that returns a preconfigured answer.
+    struct MockPrompter {
+        response: Option<bool>,
+    }
+
+    impl Prompter for MockPrompter {
+        fn confirm(
+            &mut self,
+            _prompt: &str,
+            _writer: &mut dyn std::io::Write,
+        ) -> Result<Option<bool>> {
+            Ok(self.response)
+        }
+    }
+
+    #[test]
+    fn install_auto_update_prompt_skips_when_already_set() {
+        let cfg = config::CliConfig {
+            auto_update: Some(true),
+            ..Default::default()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        cfg.save_to(&path).unwrap();
+
+        // The prompter should never be called — but even if the TTY check
+        // short-circuits first, the function should not modify config.
+        let mut prompter = MockPrompter {
+            response: Some(true),
+        };
+        run_install_auto_update_prompt_inner(&mut prompter, &cfg, &path);
+
+        // Config unchanged (auto_update was already Some(true))
+        let loaded = config::CliConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.auto_update, Some(true));
+    }
+
+    #[test]
+    fn install_auto_update_prompt_skips_when_already_set_false() {
+        let cfg = config::CliConfig {
+            auto_update: Some(false),
+            ..Default::default()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        cfg.save_to(&path).unwrap();
+
+        let mut prompter = MockPrompter {
+            response: Some(true),
+        };
+        run_install_auto_update_prompt_inner(&mut prompter, &cfg, &path);
+
+        let loaded = config::CliConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.auto_update, Some(false));
     }
 }
