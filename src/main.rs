@@ -17,6 +17,7 @@ use console::Term;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use crate::keychain::KeychainStore;
@@ -73,6 +74,9 @@ enum Command {
 
     /// Show Cadence CLI status for the current repository.
     Status,
+
+    /// Diagnose hook and notes-rewrite configuration issues.
+    Doctor,
 
     /// Check for and install updates.
     Update {
@@ -327,12 +331,13 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
 ///
 /// Steps:
 /// 1. Set `git config --global core.hooksPath ~/.git-hooks`
-/// 2. Create `~/.git-hooks/` directory if missing
-/// 3. Write `~/.git-hooks/post-commit` shim script
-/// 4. Write `~/.git-hooks/pre-push` shim script
-/// 5. Make shims executable (chmod +x)
-/// 6. If `--org` provided, persist org filter to global git config
-/// 7. Run hydration for the last 7 days
+/// 2. Configure git-notes rewrite safety for rebase/amend
+/// 3. Create `~/.git-hooks/` directory if missing
+/// 4. Write `~/.git-hooks/post-commit` shim script
+/// 5. Write `~/.git-hooks/pre-push` shim script
+/// 6. Make shims executable (chmod +x)
+/// 7. If `--org` provided, persist org filter to global git config
+/// 8. Run hydration for the last 30 days
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
@@ -383,6 +388,68 @@ fn pre_push_hook_content() -> String {
     )
 }
 
+fn config_bool_or_default(value: Option<&str>, default: bool) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("true" | "yes" | "on" | "1") => true,
+        Some("false" | "no" | "off" | "0") => false,
+        Some(_) => default,
+        None => default,
+    }
+}
+
+fn notes_rewrite_ref_present(refs: &[String], target: &str) -> bool {
+    refs.iter().any(|value| value.trim() == target)
+}
+
+fn resolve_hooks_path(repo_root: Option<&Path>, configured_path: &str) -> PathBuf {
+    let path = Path::new(configured_path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match repo_root {
+        Some(root) => root.join(path),
+        None => path.to_path_buf(),
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left_norm = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right_norm = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left_norm == right_norm
+}
+
+fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
+    let post_path = hooks_dir.join("post-commit");
+    let post_installed = match std::fs::read_to_string(&post_path) {
+        Ok(content) => is_cadence_hook(&content),
+        Err(_) => false,
+    };
+
+    let pre_path = hooks_dir.join("pre-push");
+    let pre_installed = match std::fs::read_to_string(&pre_path) {
+        Ok(content) => is_cadence_hook(&content),
+        Err(_) => false,
+    };
+
+    (post_installed, pre_installed)
+}
+
+fn ensure_notes_rewrite_config() -> Result<()> {
+    git::config_set_global("notes.rewrite.rebase", "true")
+        .context("failed to set notes.rewrite.rebase=true")?;
+    git::config_set_global("notes.rewrite.amend", "true")
+        .context("failed to set notes.rewrite.amend=true")?;
+
+    let refs = git::config_get_global_all("notes.rewriteRef")
+        .context("failed to inspect notes.rewriteRef")?;
+    if !notes_rewrite_ref_present(&refs, git::NOTES_REF) {
+        git::config_add_global("notes.rewriteRef", git::NOTES_REF)
+            .context("failed to add Cadence notes rewrite ref")?;
+    }
+
+    Ok(())
+}
+
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
@@ -408,6 +475,20 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         }
         Err(e) => {
             output::fail("Failed", &format!("to set core.hooksPath ({})", e));
+            had_errors = true;
+        }
+    }
+
+    // Step 1.5: Ensure notes survive commit rewrites (rebase/amend).
+    match ensure_notes_rewrite_config() {
+        Ok(()) => {
+            output::success(
+                "Updated",
+                &format!("notes rewrite configured for {}", git::NOTES_REF),
+            );
+        }
+        Err(e) => {
+            output::fail("Failed", &format!("to configure notes rewrite ({})", e));
             had_errors = true;
         }
     }
@@ -1544,10 +1625,10 @@ fn run_hydrate_inner(
         };
 
         // If a repo filter is set, skip sessions that don't match.
-        if let Some(filter) = repo_filter {
-            if repo_root != filter {
-                continue;
-            }
+        if let Some(filter) = repo_filter
+            && repo_root != filter
+        {
+            continue;
         }
 
         let session_id = metadata
@@ -2031,7 +2112,9 @@ fn run_retry() -> Result<()> {
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Hooks path and whether the post-commit/pre-push shims are installed
+/// - Effective hooks path and whether the post-commit/pre-push shims are installed
+/// - Warning when a repo-local hooksPath overrides global Cadence hooks
+/// - Notes rewrite safety for rebase/amend
 /// - Number of pending retries for the current repo
 /// - Org filter config (if any)
 /// - Per-repo enabled/disabled status
@@ -2058,31 +2141,124 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     };
 
     // --- Hooks path and shim status ---
-    match git::config_get_global("core.hooksPath") {
-        Ok(Some(path)) => {
-            let post_path = std::path::Path::new(&path).join("post-commit");
-            let post_installed = match std::fs::read_to_string(&post_path) {
-                Ok(content) => is_cadence_hook(&content),
-                Err(_) => false,
-            };
-            let pre_path = std::path::Path::new(&path).join("pre-push");
-            let pre_installed = match std::fs::read_to_string(&pre_path) {
-                Ok(content) => is_cadence_hook(&content),
-                Err(_) => false,
-            };
-            let post_str = if post_installed { "yes" } else { "no" };
-            let pre_str = if pre_installed { "yes" } else { "no" };
+    let global_hooks_path = git::config_get_global("core.hooksPath").ok().flatten();
+    if let Some(ref root) = repo_root {
+        match git::config_get_at(root, "core.hooksPath").ok().flatten() {
+            Some(path) => {
+                let hooks_dir = resolve_hooks_path(Some(root), &path);
+                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+                let post_str = if post_installed { "yes" } else { "no" };
+                let pre_str = if pre_installed { "yes" } else { "no" };
+                output::detail_to_with_tty(
+                    w,
+                    &format!(
+                        "Hooks path: {} (post-commit: {}, pre-push: {})",
+                        path, post_str, pre_str
+                    ),
+                    false,
+                );
+
+                if !post_installed || !pre_installed {
+                    output::note_to_with_tty(
+                        w,
+                        "Cadence hooks are not fully installed in the active hooksPath.",
+                        false,
+                    );
+                }
+            }
+            None => {
+                output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
+            }
+        }
+
+        if let Ok(Some(local_hooks_path)) = git::config_get_local_at(root, "core.hooksPath")
+            && let Some(global_path) = &global_hooks_path
+        {
+            let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
+            let global_resolved = resolve_hooks_path(Some(root), global_path);
+            if !paths_equivalent(&local_resolved, &global_resolved) {
+                output::note_to_with_tty(
+                    w,
+                    &format!(
+                        "Repo-local core.hooksPath overrides global Cadence hooks: {}",
+                        local_hooks_path
+                    ),
+                    false,
+                );
+                output::detail_to_with_tty(
+                    w,
+                    "Run `git config --unset core.hooksPath` in this repo to use global hooks.",
+                    false,
+                );
+            }
+        }
+    } else if let Some(path) = global_hooks_path {
+        let hooks_dir = resolve_hooks_path(None, &path);
+        let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+        let post_str = if post_installed { "yes" } else { "no" };
+        let pre_str = if pre_installed { "yes" } else { "no" };
+        output::detail_to_with_tty(
+            w,
+            &format!(
+                "Hooks path: {} (post-commit: {}, pre-push: {})",
+                path, post_str, pre_str
+            ),
+            false,
+        );
+    } else {
+        output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
+    }
+
+    // --- Notes rewrite safety (rebase/amend) ---
+    let rewrite_refs = git::config_get_global_all("notes.rewriteRef").unwrap_or_default();
+    let rewrite_ref_enabled = notes_rewrite_ref_present(&rewrite_refs, git::NOTES_REF);
+    let rebase_value = git::config_get_global("notes.rewrite.rebase")
+        .ok()
+        .flatten();
+    let amend_value = git::config_get_global("notes.rewrite.amend").ok().flatten();
+    let rebase_enabled = config_bool_or_default(rebase_value.as_deref(), true);
+    let amend_enabled = config_bool_or_default(amend_value.as_deref(), true);
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Notes rewrite: {}={} rebase={} amend={}",
+            git::NOTES_REF,
+            if rewrite_ref_enabled { "yes" } else { "no" },
+            if rebase_enabled { "on" } else { "off" },
+            if amend_enabled { "on" } else { "off" }
+        ),
+        false,
+    );
+
+    if !rewrite_ref_enabled || !rebase_enabled || !amend_enabled {
+        output::note_to_with_tty(
+            w,
+            "Rebase/amend may orphan Cadence notes until rewrite settings are fixed.",
+            false,
+        );
+        if !rewrite_ref_enabled {
             output::detail_to_with_tty(
                 w,
                 &format!(
-                    "Hooks path: {} (post-commit: {}, pre-push: {})",
-                    path, post_str, pre_str
+                    "Run `git config --global --add notes.rewriteRef {}`",
+                    git::NOTES_REF
                 ),
                 false,
             );
         }
-        _ => {
-            output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
+        if !rebase_enabled {
+            output::detail_to_with_tty(
+                w,
+                "Run `git config --global notes.rewrite.rebase true`",
+                false,
+            );
+        }
+        if !amend_enabled {
+            output::detail_to_with_tty(
+                w,
+                "Run `git config --global notes.rewrite.amend true`",
+                false,
+            );
         }
     }
 
@@ -2120,6 +2296,236 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_doctor() -> Result<()> {
+    run_doctor_inner(&mut std::io::stderr())
+}
+
+fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
+    output::action_to_with_tty(w, "Doctor", "", false);
+
+    let mut issues = 0usize;
+
+    let repo_root = match git::repo_root() {
+        Ok(root) => {
+            output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
+            Some(root)
+        }
+        Err(_) => {
+            output::detail_to_with_tty(w, "Repo: (not in a git repository)", false);
+            None
+        }
+    };
+
+    let global_hooks_path = match git::config_get_global("core.hooksPath") {
+        Ok(path) => path,
+        Err(e) => {
+            output::fail_to_with_tty(
+                w,
+                "Failed",
+                &format!("could not read global core.hooksPath ({e})"),
+                false,
+            );
+            issues += 1;
+            None
+        }
+    };
+
+    match &global_hooks_path {
+        Some(path) => {
+            let hooks_dir = resolve_hooks_path(repo_root.as_deref(), path);
+            let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+            output::detail_to_with_tty(
+                w,
+                &format!(
+                    "Global hooks: {} (post-commit: {}, pre-push: {})",
+                    path,
+                    if post_installed { "yes" } else { "no" },
+                    if pre_installed { "yes" } else { "no" }
+                ),
+                false,
+            );
+            if !post_installed || !pre_installed {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    "Cadence global hooks are not fully installed",
+                    false,
+                );
+                output::detail_to_with_tty(w, "Run `cadence install` to repair hooks.", false);
+                issues += 1;
+            }
+        }
+        None => {
+            output::fail_to_with_tty(w, "Fail", "Global core.hooksPath is not configured", false);
+            output::detail_to_with_tty(w, "Run `cadence install` to configure hooks.", false);
+            issues += 1;
+        }
+    }
+
+    if let Some(ref root) = repo_root {
+        match git::config_get_at(root, "core.hooksPath") {
+            Ok(Some(active_path)) => {
+                let hooks_dir = resolve_hooks_path(Some(root), &active_path);
+                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+                output::detail_to_with_tty(
+                    w,
+                    &format!(
+                        "Active hooks: {} (post-commit: {}, pre-push: {})",
+                        active_path,
+                        if post_installed { "yes" } else { "no" },
+                        if pre_installed { "yes" } else { "no" }
+                    ),
+                    false,
+                );
+                if !post_installed || !pre_installed {
+                    output::fail_to_with_tty(
+                        w,
+                        "Fail",
+                        "Active hooksPath does not contain Cadence hooks",
+                        false,
+                    );
+                    output::detail_to_with_tty(w, "Run `cadence install` or fix hooksPath.", false);
+                    issues += 1;
+                }
+            }
+            Ok(None) => {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    "No effective hooksPath found for this repository",
+                    false,
+                );
+                issues += 1;
+            }
+            Err(e) => {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    &format!("could not read repo hooksPath ({e})"),
+                    false,
+                );
+                issues += 1;
+            }
+        }
+
+        if let (Ok(Some(local_hooks_path)), Some(global_path)) = (
+            git::config_get_local_at(root, "core.hooksPath"),
+            global_hooks_path.as_ref(),
+        ) {
+            let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
+            let global_resolved = resolve_hooks_path(Some(root), global_path);
+            if !paths_equivalent(&local_resolved, &global_resolved) {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    &format!(
+                        "Repo-local core.hooksPath overrides global Cadence hooks: {}",
+                        local_hooks_path
+                    ),
+                    false,
+                );
+                output::detail_to_with_tty(
+                    w,
+                    "Run `git config --unset core.hooksPath` in this repo to use global hooks.",
+                    false,
+                );
+                issues += 1;
+            }
+        }
+    } else {
+        output::note_to_with_tty(
+            w,
+            "Skipped repo-local hook checks because current directory is not a git repository.",
+            false,
+        );
+    }
+
+    let rewrite_refs = match git::config_get_global_all("notes.rewriteRef") {
+        Ok(refs) => refs,
+        Err(e) => {
+            output::fail_to_with_tty(
+                w,
+                "Fail",
+                &format!("could not read notes.rewriteRef ({e})"),
+                false,
+            );
+            issues += 1;
+            Vec::new()
+        }
+    };
+    let rewrite_ref_enabled = notes_rewrite_ref_present(&rewrite_refs, git::NOTES_REF);
+    let rebase_enabled = config_bool_or_default(
+        git::config_get_global("notes.rewrite.rebase")
+            .ok()
+            .flatten()
+            .as_deref(),
+        true,
+    );
+    let amend_enabled = config_bool_or_default(
+        git::config_get_global("notes.rewrite.amend")
+            .ok()
+            .flatten()
+            .as_deref(),
+        true,
+    );
+
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Notes rewrite: {}={} rebase={} amend={}",
+            git::NOTES_REF,
+            if rewrite_ref_enabled { "yes" } else { "no" },
+            if rebase_enabled { "on" } else { "off" },
+            if amend_enabled { "on" } else { "off" }
+        ),
+        false,
+    );
+
+    if !rewrite_ref_enabled {
+        output::fail_to_with_tty(
+            w,
+            "Fail",
+            &format!("notes.rewriteRef missing {}", git::NOTES_REF),
+            false,
+        );
+        output::detail_to_with_tty(
+            w,
+            &format!(
+                "Run `git config --global --add notes.rewriteRef {}`",
+                git::NOTES_REF
+            ),
+            false,
+        );
+        issues += 1;
+    }
+    if !rebase_enabled {
+        output::fail_to_with_tty(w, "Fail", "notes.rewrite.rebase is disabled", false);
+        output::detail_to_with_tty(
+            w,
+            "Run `git config --global notes.rewrite.rebase true`",
+            false,
+        );
+        issues += 1;
+    }
+    if !amend_enabled {
+        output::fail_to_with_tty(w, "Fail", "notes.rewrite.amend is disabled", false);
+        output::detail_to_with_tty(
+            w,
+            "Run `git config --global notes.rewrite.amend true`",
+            false,
+        );
+        issues += 1;
+    }
+
+    if issues == 0 {
+        output::success_to_with_tty(w, "Doctor", "all checks passed", false);
+        Ok(())
+    } else {
+        output::fail_to_with_tty(w, "Doctor", &format!("{} issue(s) found", issues), false);
+        anyhow::bail!("doctor found {} issue(s)", issues);
+    }
 }
 
 /// The notes list subcommand: show recent commits with note markers.
@@ -2667,6 +3073,7 @@ fn main() {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
         },
         Command::Status => run_status(),
+        Command::Doctor => run_doctor(),
         Command::Update { check, yes } => run_update(check, yes),
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Setup => run_keys_setup(),
@@ -2696,6 +3103,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn cli_parses_keys_setup() {
@@ -2713,7 +3121,7 @@ mod tests {
         let cli = Cli::parse_from(["cadence", "keys"]);
         match cli.command {
             Command::Keys { keys_command } => {
-                assert!(matches!(keys_command, None));
+                assert!(keys_command.is_none());
             }
             _ => panic!("expected Keys command"),
         }
@@ -2815,5 +3223,52 @@ mod tests {
             }
             _ => panic!("expected Keys command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_doctor() {
+        let cli = Cli::parse_from(["cadence", "doctor"]);
+        match cli.command {
+            Command::Doctor => {}
+            _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn config_bool_or_default_parses_common_values() {
+        assert!(config_bool_or_default(Some("true"), false));
+        assert!(config_bool_or_default(Some("YES"), false));
+        assert!(!config_bool_or_default(Some("false"), true));
+        assert!(!config_bool_or_default(Some("0"), true));
+        assert!(config_bool_or_default(Some("unexpected"), true));
+        assert!(!config_bool_or_default(None, false));
+    }
+
+    #[test]
+    fn notes_rewrite_ref_present_checks_exact_ref() {
+        let refs = vec![
+            "refs/notes/commits".to_string(),
+            "refs/notes/ai-sessions".to_string(),
+        ];
+        assert!(notes_rewrite_ref_present(&refs, "refs/notes/ai-sessions"));
+        assert!(!notes_rewrite_ref_present(&refs, "refs/notes/other"));
+    }
+
+    #[test]
+    fn resolve_hooks_path_uses_repo_root_for_relative_paths() {
+        let repo = TempDir::new().expect("tempdir");
+        let resolved = resolve_hooks_path(Some(repo.path()), ".git/hooks");
+        assert_eq!(resolved, repo.path().join(".git/hooks"));
+    }
+
+    #[test]
+    fn paths_equivalent_matches_relative_and_absolute_same_target() {
+        let repo = TempDir::new().expect("tempdir");
+        let hooks_dir = repo.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+
+        let absolute = hooks_dir.clone();
+        let relative = repo.path().join(".git/./hooks");
+        assert!(paths_equivalent(&absolute, &relative));
     }
 }

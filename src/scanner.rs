@@ -696,7 +696,7 @@ mod tests {
             &format!("{}\n{{\"type\":\"other\"}}\n", content),
         );
 
-        let result = find_session_for_commit(commit_hash, &[file.clone()]);
+        let result = find_session_for_commit(commit_hash, std::slice::from_ref(&file));
 
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1326,11 +1326,7 @@ also not json {{{{
             agent_type: Some(AgentType::Claude),
         };
 
-        assert!(!verify_match(
-            &metadata,
-            &dir1.path().to_path_buf(),
-            &commit_hash
-        ));
+        assert!(!verify_match(&metadata, dir1.path(), &commit_hash));
     }
 
     #[test]
@@ -1389,7 +1385,7 @@ also not json {{{{
     fn test_extract_commit_hashes_finds_short_hash() {
         let dir = TempDir::new().unwrap();
         let content = r#"{"content":"[main abcdef0] fix bug"}"#;
-        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
         assert_eq!(hashes.len(), 1);
@@ -1414,7 +1410,7 @@ also not json {{{{
         let content = r#"{"content":"[main abcdef0] first commit"}
 {"content":"[main 1234567] second commit"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
         assert_eq!(hashes.len(), 2);
@@ -1428,7 +1424,7 @@ also not json {{{{
         let content = r#"{"content":"[main abcdef0] fix bug"}
 {"content":"[main abcdef0] fix bug"}
 "#;
-        let file = write_temp_file(dir.path(), "session.jsonl", &content);
+        let file = write_temp_file(dir.path(), "session.jsonl", content);
 
         let hashes = extract_commit_hashes(&file);
         assert_eq!(hashes.len(), 1);
@@ -1563,7 +1559,7 @@ also not json {{{{
         let file = write_temp_file(&claude_dir, "session.jsonl", &content);
 
         // Step 1: Find the session
-        let session_match = find_session_for_commit(&commit_hash, &[file.clone()]);
+        let session_match = find_session_for_commit(&commit_hash, std::slice::from_ref(&file));
         assert!(session_match.is_some());
         let session_match = session_match.unwrap();
         assert_eq!(session_match.agent_type, AgentType::Claude);

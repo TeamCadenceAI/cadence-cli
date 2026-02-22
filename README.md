@@ -42,9 +42,15 @@ cadence install
 git notes --ref refs/notes/ai-sessions show HEAD
 ```
 
+4. Diagnose install issues (hooks, rewrite safety):
+```sh
+cadence doctor
+```
+
 ## How It Works
 
 Cadence installs global Git hooks that scan for recent AI session logs, then attaches matching logs as Git notes after each commit.
+It also configures Git note rewrite settings so notes follow rewritten commits during rebase/amend.
 Notes can be synced alongside commits without modifying commit history.
 
 ## Supported Agents

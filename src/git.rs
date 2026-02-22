@@ -1093,6 +1093,30 @@ pub fn config_get_at(repo: &Path, key: &str) -> Result<Option<String>> {
     Ok(Some(value.trim().to_string()))
 }
 
+/// Read a repo-local git config value (ignores global/system). Returns `Ok(None)` if unset.
+pub fn config_get_local_at(repo: &Path, key: &str) -> Result<Option<String>> {
+    let output = run_git_output_at(Some(repo), &["config", "--local", "--get", key], &[])
+        .context("failed to execute git config --local --get")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --local --get {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+        return Ok(None);
+    }
+
+    let value =
+        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
+    Ok(Some(value.trim().to_string()))
+}
+
 /// Read a git config value from global scope. Returns `Ok(None)` if the key is not set.
 ///
 /// Uses `--global` flag to read only the global config, not repo-local.
@@ -1118,6 +1142,37 @@ pub fn config_get_global(key: &str) -> Result<Option<String>> {
     let value =
         String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
     Ok(Some(value.trim().to_string()))
+}
+
+/// Read all values for a global git config key (`--global --get-all`).
+///
+/// Returns an empty vector if the key is not set.
+pub fn config_get_global_all(key: &str) -> Result<Vec<String>> {
+    let output = run_git_output_at(None, &["config", "--global", "--get-all", key], &[])
+        .context("failed to execute git config --global --get-all")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --global --get-all {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+        return Ok(Vec::new());
+    }
+
+    let value =
+        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
+    Ok(value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// Check org filter for a specific repository. If a global org is configured,
@@ -1158,6 +1213,18 @@ pub fn config_set_global(key: &str, value: &str) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git config --global set failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Add a git config value in global scope (`--global --add`).
+pub fn config_add_global(key: &str, value: &str) -> Result<()> {
+    let output = run_git_output_at(None, &["config", "--global", "--add", key, value], &[])
+        .context("failed to execute git config --global --add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git config --global --add failed: {}", stderr.trim());
     }
     Ok(())
 }
@@ -1500,6 +1567,60 @@ mod tests {
 
         let value = git_output_in(path, &["config", "--get", "ai.cadence.org"]).unwrap();
         assert_eq!(value, "second-org");
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_get_global_all_returns_empty_when_unset() {
+        let dir = init_temp_repo();
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let values = config_get_global_all("notes.rewriteRef").expect("config_get_global_all");
+        assert!(values.is_empty());
+
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_add_global_and_get_all_roundtrip() {
+        let dir = init_temp_repo();
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        config_add_global("notes.rewriteRef", "refs/notes/commits").expect("first add");
+        config_add_global("notes.rewriteRef", "refs/notes/ai-sessions").expect("second add");
+        let values = config_get_global_all("notes.rewriteRef").expect("config_get_global_all");
+        assert_eq!(
+            values,
+            vec![
+                "refs/notes/commits".to_string(),
+                "refs/notes/ai-sessions".to_string()
+            ]
+        );
+
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2164,7 +2285,8 @@ mod tests {
         // Store a blob and create a tree containing it.
         let sha = store_blob_at(Some(dir.path()), b"content").expect("store_blob failed");
         let entry = format!("100644 blob {}\tfile.txt", sha);
-        let tree_sha = mktree_at(Some(dir.path()), &[entry.clone()]).expect("mktree failed");
+        let tree_sha =
+            mktree_at(Some(dir.path()), std::slice::from_ref(&entry)).expect("mktree failed");
 
         // Read it back.
         let entries = ls_tree_at(Some(dir.path()), &tree_sha).expect("ls_tree failed");
