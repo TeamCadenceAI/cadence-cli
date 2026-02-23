@@ -19,3 +19,38 @@ m/vwrZKgq8PrBB57C8mqI89MBLSGA3Svwx9nNjyIymb8QuTx+CRUkDUPitNVWtuH
 +vTkWpWfWY7KmzV/Ubee9PVQkjMB+g==
 =YZmv
 -----END PGP MESSAGE-----
+
+-----BEGIN PGP MESSAGE-----
+
+wcBMA4YbXFgwJ7A5AQf+MSYv/y3Nc4RdY42kRnVGLyZaCQHIEV8+UDLV1pZoY1eD
+OJGLUhCP7XmBYSYWKc5PekowWFZkUNv5oWBNIkDJCIufQK3vNgpqaV449Qzuygbq
+wgmcV21/NNhZ4hmjxHpIOPD1h+uqJp/MMA+WrMq1OO5p3G8tOcIaprn+2v0ms6e+
+JQDhXyNaqtRBh6xqKO9WPFM4cs7rVrnPKZJLtZhuo/BgPLXAX2jfI4DIy61tzI5O
+FeMGx7xY2yelUu8QAprxkKHNepdLfbN71xelqH953sR9qhVHcm4Se4egEcaL6IkW
+yZKGGqquBA05bJunzQVs5esOzvGipFllk7Xzm0ClJ8FOA/LjZYhw8pnOEgEHQPLl
+c9SYF4e3j9Jkhr9n8t69eKvHbpBtajtrw2jGM2IWIESVvqbNiSyWE/W4mFAE2QUO
+4oRns3NPjc1ngJ6V7NIy0sD0AUFmAu//otaRatBa4sXwr2rUcdXDVHepZzu86nyT
+RHDXcNBN6ffblGTPQBNLNV00RzvrwVpK0hJAij8eHQ1FL5rTNDzLKEN+UTcF3j9E
+xoVQoXl/JHkqvdH3UT3A85jmS9fITVPJ4MTRQCH72GejQrOez2MV7nbmq5Q10ld+
+Nux98p3hDGZFUffYbtFkuJtycsgyH1CxurfUlRJEz5u5v8xoOff7DuCT5+qGMVpt
+bu39fg8bbYA/VuoGG/E1y3mcEHWHOMZ2Silroy5ztihYjEO3Al/AxmVq5cEbd2ue
+UOYgL3OifjZY0Moi8JjnxX24jMC84I4lHeZdSVMlbePxGapvkTS5MwvHXZIVvLIn
+aMkroBdTTrQWfiibdKXnsHkH6XfGe40RS9jAsu288cnGkb8sjb6tUsAAvprscPwj
+kyGHJO0SRAxD6x9hC8YNtCT/KeUreUtjweaCm9PFA+s2RhKlowNC+gWX+/0sQXyg
+m/vwrZKgq8PrBB57C8mqI89MBLSGA3Svwx9nNjyIymb8QuTx+CRUkDUPitNVWtuH
++vTkWpWfWY7KmzV/Ubee9PVQkjMB+g==
+=YZmv
+-----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: 1a13eac8-b77a-442a-acf0-13e1cca3a2ed
+repo: /Users/chrisraethke/projects/cadence-cli
+commit: 22ad56d
+confidence: exact_hash_match
+session_start: 2026-02-13T21:23:39Z
+payload_blob: 6269d3a10244b92331a7fab45f6ea7d4751d6792
+payload_sha256: 85a7fc1d20a70ddcda818bf1513a845ef751b94a7489ddfe29706e1597ecf6f3
+payload_encoding: zstd+pgp
+---

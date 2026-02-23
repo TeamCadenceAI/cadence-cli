@@ -19,3 +19,38 @@ R+OnqJSeTrNl1rWTHlfcfN2qjSDo9q3a236g2XdRP2Fd9cHODgX3nM522VULGC85
 QEpT34M2DYGX8x/muSl1XVg=
 =mRmA
 -----END PGP MESSAGE-----
+
+-----BEGIN PGP MESSAGE-----
+
+wcBMAyp5qAy0FqZ8AQf+MzRr5yggtybAcsxyPZpzuWpadOib3tzQqoa41XDw4ZF4
+ihqtq1KsUY7G9aQp1jrotMvoJFLrdyOV/n7Mmy3Tw3xQIw8zDksrCtzPp2TYp+w0
+V2YGxndG/B7DMzbVEMQ+yQuHpvJFoq0QZwXTUcMu84ILtqA15Gq7zkgdUlaTKk6z
+vVJHbnSRqIeH6i50UyJnQ6wSVJG/oqoLqOiFBuXTYQGzO5pNSB0zVvf1hrRAoht/
+uIlX5J2js/k7AWfLy8Iz+KYZXqtJ2Dnxssii6YzG4flAMkM8v/lAF9Ef9PJ9oKi/
+YVAW5jhkx9Qm4aeSevKwrjvE4wOElrpI5vYZ2v/FNMFOA/LjZYhw8pnOEgEHQKsw
+IrFcAy5L+EM2/aaMf4BdBpWAjUKLwJpP3pK3fjEpIJi8l0I/0z4OcNNcjXFH+NEg
+BgrETt8WNDzM5pMRqdBa0sDvAa8cSN/MTXxHxkPPg62eHQT8bk9XrZGzBS39gJng
+DgGNAwGQiEu+zDHzkciUx3heX9B8DgnteHJZp6V/YHniWk8x6W5uV9PAK3+CIJA9
+Cnokl6qXGYrjVbGh8Ok0ut0UAf49P1N0yHvkY8hBIMunM5ka28ilNV0pmKFrcPne
+2s8efg7q/jN1eMYP4OCpzT97E9QXtsX4bYTmwPFVtavtbvDI3o4tc/JAbXEVLnns
+9OIyduTcvqzoyLPgIA0Fqi3/yGtMd6Njxf0pX5Zzy/F+OIdQ/8AFN2r495EAgOaM
+c28Sps3MfwN1NstCuoclBcPxTtzHeGuEkcZVCE8YeGaLYcWctfKDWr1z8Yq2yeR1
+EfeT2n2t6HiDjLgnyM1s9h+99GiXn5OVxOyTWEPf8P3/udodkKtOmK13ltfRlPUs
+CP8NtalGI5Tp8gwcxj7DrrHI3vqEwpvLCS9pwKvUzWPmXsLVb+gmFLsi4wYlkpum
+R+OnqJSeTrNl1rWTHlfcfN2qjSDo9q3a236g2XdRP2Fd9cHODgX3nM522VULGC85
+QEpT34M2DYGX8x/muSl1XVg=
+=mRmA
+-----END PGP MESSAGE-----
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: f727bdfd-ea32-4a2c-a8bb-990c8da2e929
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 36cc926
+confidence: exact_hash_match
+session_start: 2026-02-20T09:50:17Z
+payload_blob: ac9b2b3f11e4158d54c2c806ba7f32a687872e92
+payload_sha256: 42802fe1fd0f603552d5bfba92876ecbcbe1c2bc2e46556919abb1098f2d9c35
+payload_encoding: zstd+pgp
+---
