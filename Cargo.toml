@@ -34,6 +34,7 @@ tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 keyring = "2.3"
 zstd = "0.13"
+open = "5"
 
 [dev-dependencies]
 serial_test = "3"

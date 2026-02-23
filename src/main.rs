@@ -3,6 +3,7 @@ mod api_client;
 mod config;
 mod git;
 mod keychain;
+mod login;
 mod note;
 mod output;
 mod pending;
@@ -19,8 +20,15 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use crate::keychain::KeychainStore;
+
+const KEYCHAIN_SERVICE: &str = "cadence-cli";
+const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
+const LOGIN_TIMEOUT_SECS: u64 = 120;
+const API_TIMEOUT_SECS: u64 = 5;
+const CADENCE_DASHBOARD_URL: &str = "https://dash.teamcadence.ai/";
 
 /// Cadence CLI: attach AI coding agent session logs to Git commits via git notes.
 ///
@@ -61,6 +69,12 @@ enum Command {
         #[arg(long)]
         push: bool,
     },
+
+    /// Sign in via browser OAuth and store a CLI token locally.
+    Login,
+
+    /// Revoke and clear local CLI authentication token.
+    Logout,
 
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
@@ -687,10 +701,10 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         return Err(e);
     }
 
-    // Step 6: Run hydration for the last 7 days
+    // Step 6: Run hydration for the last 30 days
     output::action("Hydrating", "recent sessions (last 30 days)");
     let hydrate_start = std::time::Instant::now();
-    if let Err(e) = run_hydrate("30d", true) {
+    if let Err(e) = run_hydrate_inner("30d", true, None, false) {
         output::fail("Hydration", &format!("stopped ({})", e));
         had_errors = true;
     }
@@ -708,8 +722,149 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         "Total time: {} ms",
         install_start.elapsed().as_millis()
     ));
+    print_start_insights_link();
 
     Ok(())
+}
+
+fn run_login() -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+    let resolved = cfg.resolve_api_url(None);
+    if resolved.is_non_https {
+        output::note(&format!(
+            "Using non-HTTPS API URL for login: {}",
+            resolved.url
+        ));
+    }
+
+    output::action("Login", "opening browser for authentication");
+    let exchanged =
+        login::login_via_browser(&resolved.url, Duration::from_secs(LOGIN_TIMEOUT_SECS))?;
+
+    cfg.token = Some(exchanged.token.clone());
+    cfg.github_login = Some(exchanged.login.clone());
+    cfg.expires_at = Some(exchanged.expires_at.clone());
+    cfg.save()?;
+
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    if let Err(e) = keychain.set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token) {
+        output::note(&format!(
+            "Could not store token in OS keychain (using config fallback): {e}"
+        ));
+    }
+
+    output::success("Login", &format!("authenticated as {}", exchanged.login));
+    output::detail(&format!("Token expires at {}", exchanged.expires_at));
+    Ok(())
+}
+
+fn run_logout() -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+    let resolved = cfg.resolve_api_url(None);
+
+    if let Some(token) = resolve_cli_auth_token(&cfg) {
+        let client = api_client::ApiClient::new(&resolved.url);
+        match client.revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS)) {
+            Ok(()) => output::detail("Revoked token on server."),
+            Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+                output::note("Token was already invalid or expired.");
+            }
+            Err(err) => {
+                output::note(&format!("Could not revoke token on server ({err})"));
+            }
+        }
+    } else {
+        output::note("No local token found; clearing local auth state.");
+    }
+
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+        output::note(&format!("Could not clear OS keychain token: {e}"));
+    }
+
+    cfg.clear_token()?;
+    output::success("Logout", "authentication cleared");
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct HydrateSyncStats {
+    notes_attached: i64,
+    notes_skipped: i64,
+    issues: Vec<String>,
+    repos_scanned: i32,
+}
+
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
+        Ok(_) | Err(_) => cfg.token.clone().filter(|t| !t.trim().is_empty()),
+    }
+}
+
+fn report_hydrate_completion(window_days: i32, stats: HydrateSyncStats) {
+    let cfg = match config::CliConfig::load() {
+        Ok(cfg) => cfg,
+        Err(_) => return,
+    };
+
+    let token = match resolve_cli_auth_token(&cfg) {
+        Some(token) => token,
+        None => {
+            output::note("Run `cadence login` to sync results");
+            return;
+        }
+    };
+
+    let resolved = cfg.resolve_api_url(None);
+    let client = api_client::ApiClient::new(&resolved.url);
+    let finished_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    let request = api_client::HydrateCompleteRequest {
+        window_days,
+        notes_attached: stats.notes_attached,
+        notes_skipped: stats.notes_skipped,
+        issues: stats.issues,
+        repos_scanned: stats.repos_scanned,
+        finished_at,
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    match client.report_hydrate_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS)) {
+        Ok(response) => {
+            if response.recorded {
+                output::detail(&format!(
+                    "Hydration results synced to Cadence onboarding at {}.",
+                    response.hydrate_completed_at
+                ));
+            } else {
+                output::detail("Hydration sync already recorded.");
+            }
+            output::detail(&response.next_step);
+        }
+        Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+            output::note("Run `cadence login` to re-authenticate");
+        }
+        Err(api_client::AuthenticatedRequestError::Network(_)) => {
+            output::note("Notes are safely stored locally");
+        }
+        Err(api_client::AuthenticatedRequestError::NotFound) => {
+            output::note("API does not support this yet");
+        }
+        Err(api_client::AuthenticatedRequestError::Server(_)) => {
+            output::note("API returned an error");
+        }
+        Err(other) => {
+            output::detail(&format!("Hydrate sync skipped: {other}"));
+        }
+    }
+}
+
+fn print_start_insights_link() {
+    output::note("Next step: Open Cadence and click Start Insights when ready.");
+    output::detail(CADENCE_DASHBOARD_URL);
 }
 
 /// The post-commit hook handler. This is the critical hot path.
@@ -1508,7 +1663,7 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - All errors are non-fatal (logged and continued)
 /// - Does NOT auto-push by default (use `--push` flag)
 fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
-    run_hydrate_inner(since, do_push, None)
+    run_hydrate_inner(since, do_push, None, true)
 }
 
 /// Inner implementation of hydrate that accepts an optional repo filter.
@@ -1520,6 +1675,7 @@ fn run_hydrate_inner(
     since: &str,
     do_push: bool,
     repo_filter: Option<&std::path::Path>,
+    show_next_step_link: bool,
 ) -> Result<()> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
@@ -2070,6 +2226,23 @@ fn run_hydrate_inner(
             attached, fallback_attached, skipped, errors
         ),
     );
+    let issues = if errors > 0 {
+        vec![format!("{errors} issue(s) encountered during hydrate")]
+    } else {
+        Vec::new()
+    };
+    report_hydrate_completion(
+        since_days as i32,
+        HydrateSyncStats {
+            notes_attached: attached as i64,
+            notes_skipped: skipped as i64,
+            issues,
+            repos_scanned: sessions_by_repo.len() as i32,
+        },
+    );
+    if show_next_step_link {
+        print_start_insights_link();
+    }
 
     Ok(())
 }
@@ -3040,7 +3213,7 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
         "GC",
         &format!("Re-hydrating (last {} days) with push", since_days),
     );
-    run_hydrate_inner(since, true, Some(&repo_root))?;
+    run_hydrate_inner(since, true, Some(&repo_root), false)?;
 
     output::success("GC", "Complete. Notes have been regenerated in v2 format.");
     Ok(())
@@ -3068,6 +3241,8 @@ fn main() {
             } => run_hook_post_commit_retry(&commit, &repo, timestamp),
         },
         Command::Hydrate { since, push } => run_hydrate(&since, push),
+        Command::Login => run_login(),
+        Command::Logout => run_logout(),
         Command::Retry => run_retry(),
         Command::Notes { notes_command } => match notes_command {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
@@ -3125,6 +3300,18 @@ mod tests {
             }
             _ => panic!("expected Keys command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_login_command() {
+        let cli = Cli::parse_from(["cadence", "login"]);
+        assert!(matches!(cli.command, Command::Login));
+    }
+
+    #[test]
+    fn cli_parses_logout_command() {
+        let cli = Cli::parse_from(["cadence", "logout"]);
+        assert!(matches!(cli.command, Command::Logout));
     }
 
     // -----------------------------------------------------------------------
