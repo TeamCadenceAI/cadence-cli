@@ -181,9 +181,7 @@ fn write_http_response(
     status_text: &str,
     body_text: &str,
 ) -> Result<()> {
-    let html = format!(
-        "<!doctype html><html><body style=\"font-family:system-ui; padding:24px\"><h2>{body_text}</h2></body></html>"
-    );
+    let html = render_callback_html(status_code, body_text);
     let response = format!(
         "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         html.len(),
@@ -196,6 +194,119 @@ fn write_http_response(
         .flush()
         .context("failed to flush callback response")?;
     Ok(())
+}
+
+fn render_callback_html(status_code: u16, body_text: &str) -> String {
+    let is_success = (200..300).contains(&status_code);
+    let title = if is_success {
+        "Authentication Complete"
+    } else {
+        "Authentication Failed"
+    };
+    let badge = if is_success { "OK" } else { "ERR" };
+    let accent = if is_success { "#10b981" } else { "#ef4444" };
+    let accent_bg = if is_success {
+        "rgba(16, 185, 129, 0.14)"
+    } else {
+        "rgba(239, 68, 68, 0.14)"
+    };
+    let follow_up = if is_success {
+        "You can close this tab and return to your terminal."
+    } else {
+        "Return to your terminal for details, then run cadence login again."
+    };
+
+    let escaped_body = escape_html(body_text);
+    let escaped_title = escape_html(title);
+    let escaped_follow_up = escape_html(follow_up);
+
+    format!(
+        "<!doctype html>\
+<html lang=\"en\">\
+<head>\
+<meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>{escaped_title}</title>\
+<style>\
+* {{ box-sizing: border-box; }}\
+html, body {{ height: 100%; margin: 0; }}\
+body {{\
+  font-family: 'Work Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;\
+  color: #1a1a2e;\
+  background: radial-gradient(circle at 15% 10%, rgba(79, 70, 229, 0.14) 0%, rgba(79, 70, 229, 0) 42%), #fafafa;\
+}}\
+.wrap {{\
+  min-height: 100%;\
+  display: flex;\
+  align-items: center;\
+  justify-content: center;\
+  padding: 24px;\
+}}\
+.card {{\
+  width: min(560px, 100%);\
+  background: #ffffff;\
+  border: 1px solid #e8eaed;\
+  border-radius: 16px;\
+  box-shadow: 0 10px 36px rgba(15, 23, 42, 0.08);\
+  padding: 26px 24px;\
+}}\
+.badge {{\
+  display: inline-flex;\
+  align-items: center;\
+  justify-content: center;\
+  height: 28px;\
+  padding: 0 12px;\
+  border-radius: 999px;\
+  font-size: 12px;\
+  font-weight: 700;\
+  letter-spacing: 0.08em;\
+  color: {accent};\
+  background: {accent_bg};\
+}}\
+h1 {{\
+  margin: 14px 0 10px;\
+  font-size: 28px;\
+  line-height: 1.15;\
+  color: #16213e;\
+}}\
+p {{\
+  margin: 0;\
+  line-height: 1.55;\
+  color: #334155;\
+}}\
+.follow-up {{\
+  margin-top: 14px;\
+  color: #607d8b;\
+}}\
+</style>\
+</head>\
+<body>\
+<div class=\"wrap\">\
+<main class=\"card\">\
+<span class=\"badge\">{badge}</span>\
+<h1>{escaped_title}</h1>\
+<p>{escaped_body}</p>\
+<p class=\"follow-up\">{escaped_follow_up}</p>\
+</main>\
+</div>\
+</body>\
+</html>"
+    )
+}
+
+fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -214,5 +325,30 @@ mod tests {
         let bytes = [0xde, 0xad, 0xbe, 0xef];
         let hex = bytes_to_hex(&bytes);
         assert_eq!(hex, "deadbeef");
+    }
+
+    #[test]
+    fn callback_html_success_variant_is_styled() {
+        let html = render_callback_html(200, "Authentication complete. You can close this tab.");
+        assert!(html.contains("Authentication Complete"));
+        assert!(html.contains(">OK<"));
+        assert!(html.contains("#10b981"));
+        assert!(html.contains("Work Sans"));
+    }
+
+    #[test]
+    fn callback_html_error_variant_is_styled() {
+        let html = render_callback_html(400, "State mismatch. Please retry cadence login.");
+        assert!(html.contains("Authentication Failed"));
+        assert!(html.contains(">ERR<"));
+        assert!(html.contains("#ef4444"));
+        assert!(html.contains("run cadence login again"));
+    }
+
+    #[test]
+    fn callback_html_escapes_message_content() {
+        let html = render_callback_html(400, "<script>alert('xss')</script>");
+        assert!(html.contains("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"));
+        assert!(!html.contains("<script>alert('xss')</script>"));
     }
 }
