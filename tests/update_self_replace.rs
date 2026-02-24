@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
-/// Start a minimal single-request HTTP server.
+/// Start a minimal single-request HTTP server that returns a given status and body.
 fn spawn_one_shot_server(status: u16, body: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
     let addr = listener.local_addr().unwrap();
@@ -22,9 +22,33 @@ fn spawn_one_shot_server(status: u16, body: &str) -> String {
         let _ = stream.read(&mut buf);
 
         let response = format!(
-            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+
+    url
+}
+
+/// Start a minimal HTTP server that returns a 302 redirect to a release tag URL.
+fn spawn_redirect_server(tag: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+
+    let tag = tag.to_string();
+    let url_clone = url.clone();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+
+        let location = format!("{url_clone}/releases/tag/{tag}");
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
@@ -238,16 +262,9 @@ fn extract_zip_integration() {
 fn update_install_already_up_to_date() {
     use cadence_cli::update::{current_version, run_update_install_from_url};
 
-    // Serve a release with the same version as the current binary
+    // Serve a redirect with the same version as the current binary
     let tag = format!("v{}", current_version());
-    let json = format!(
-        r#"{{"tag_name":"{tag}","assets":[
-            {{"name":"cadence-cli-aarch64-apple-darwin.tar.gz","browser_download_url":"https://example.com/a.tar.gz"}},
-            {{"name":"checksums-sha256.txt","browser_download_url":"https://example.com/checksums.txt"}}
-        ]}}"#
-    );
-
-    let url = spawn_one_shot_server(200, &json);
+    let url = spawn_redirect_server(&tag);
 
     // Should succeed and indicate already up to date
     let result = run_update_install_from_url(&url, true);
@@ -273,57 +290,10 @@ fn update_install_network_error() {
 }
 
 #[test]
-fn update_install_missing_checksums_asset() {
-    use cadence_cli::update::run_update_install_from_url;
-
-    // Release with a newer version but no checksums file
-    let target = cadence_cli::update::build_target();
-    let artifact_name = cadence_cli::update::expected_artifact_name(target);
-
-    let json = format!(
-        r#"{{"tag_name":"v99.0.0","assets":[
-            {{"name":"{artifact_name}","browser_download_url":"https://example.com/artifact"}}
-        ]}}"#
-    );
-
-    let url = spawn_one_shot_server(200, &json);
-
-    let result = run_update_install_from_url(&url, true);
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("checksums-sha256.txt")
-    );
-}
-
-#[test]
-fn update_install_missing_target_asset() {
-    use cadence_cli::update::run_update_install_from_url;
-
-    // Release with a newer version but wrong platform artifact
-    let json = r#"{"tag_name":"v99.0.0","assets":[
-        {"name":"cadence-cli-riscv64-unknown-linux-gnu.tar.gz","browser_download_url":"https://example.com/wrong"},
-        {"name":"checksums-sha256.txt","browser_download_url":"https://example.com/checksums"}
-    ]}"#;
-
-    let url = spawn_one_shot_server(200, json);
-
-    let result = run_update_install_from_url(&url, true);
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("No release asset found"),
-        "should report missing asset: {err}"
-    );
-}
-
-#[test]
 fn update_check_flag_still_works() {
     use cadence_cli::update::run_update;
 
-    // --check mode should work (hits real API or fails gracefully)
+    // --check mode should work (hits real server or fails gracefully)
     // We just verify it doesn't panic or try to install anything
     let result = run_update(true, false);
     assert!(
@@ -406,4 +376,35 @@ fn download_to_file_connection_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let result = download_to_file("http://127.0.0.1:1/file.bin", tmp.path(), "file.bin");
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// build_release_from_tag integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_release_from_tag_includes_current_target() {
+    use cadence_cli::update::{build_release_from_tag, build_target, pick_artifact_for_target};
+
+    let release = build_release_from_tag("v1.0.0", "https://github.com/Org/Repo");
+    let target = build_target();
+    let result = pick_artifact_for_target(&release.assets, target);
+    assert!(
+        result.is_ok(),
+        "build_release_from_tag should include asset for current target '{target}': {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn build_release_from_tag_includes_checksums() {
+    use cadence_cli::update::{build_release_from_tag, pick_checksums_asset};
+
+    let release = build_release_from_tag("v1.0.0", "https://github.com/Org/Repo");
+    let result = pick_checksums_asset(&release.assets);
+    assert!(
+        result.is_ok(),
+        "build_release_from_tag should include checksums asset: {:?}",
+        result.err()
+    );
 }

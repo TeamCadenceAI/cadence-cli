@@ -62,6 +62,7 @@ impl std::fmt::Display for Confidence {
 /// `splitn(3, "---\n")` (splitting on at most 3 occurrences) to correctly
 /// separate the header from the payload, and verify integrity using the
 /// `payload_sha256` field.
+#[cfg(test)]
 pub fn format(
     agent: &AgentType,
     session_id: &str,
@@ -82,6 +83,7 @@ pub fn format(
 }
 
 /// Produce a complete note with an explicit confidence value.
+#[cfg(test)]
 pub fn format_with_confidence(
     agent: &AgentType,
     session_id: &str,
@@ -122,6 +124,104 @@ pub fn payload_sha256(content: &str) -> String {
     hasher.update(content.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
+}
+
+// ---------------------------------------------------------------------------
+// V2 pointer note format
+// ---------------------------------------------------------------------------
+
+/// Encoding applied to the payload blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PayloadEncoding {
+    /// Raw JSONL, no compression, no encryption.
+    Plain,
+    /// Zstd-compressed, not encrypted.
+    Zstd,
+    /// PGP-encrypted (binary), not compressed.
+    Pgp,
+    /// Zstd-compressed then PGP-encrypted (binary).
+    ZstdPgp,
+}
+
+impl std::fmt::Display for PayloadEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PayloadEncoding::Plain => write!(f, "plain"),
+            PayloadEncoding::Zstd => write!(f, "zstd"),
+            PayloadEncoding::Pgp => write!(f, "pgp"),
+            PayloadEncoding::ZstdPgp => write!(f, "zstd+pgp"),
+        }
+    }
+}
+
+/// Produce a v2 pointer note (no inline payload).
+///
+/// The note contains a YAML-style header referencing a git blob that holds
+/// the (optionally compressed, optionally encrypted) session log. Multiple
+/// commits from the same session share a single blob.
+///
+/// ```text
+/// ---
+/// cadence_version: 2
+/// agent: claude-code
+/// session_id: <uuid>
+/// repo: <path>
+/// commit: <full hash>
+/// confidence: exact_hash_match | time_window_match
+/// session_start: 2025-01-15T10:30:00Z
+/// payload_blob: <40-char SHA-1 of the git blob>
+/// payload_sha256: <hex SHA-256 of the uncompressed plaintext>
+/// payload_encoding: zstd+pgp | zstd | pgp | plain
+/// ---
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn format_v2(
+    agent: &AgentType,
+    session_id: &str,
+    repo: &str,
+    commit: &str,
+    confidence: Confidence,
+    session_start: Option<i64>,
+    payload_blob: &str,
+    payload_sha256_hex: &str,
+    payload_encoding: PayloadEncoding,
+) -> anyhow::Result<String> {
+    crate::git::validate_commit_hash(commit)?;
+
+    let mut note = String::new();
+    note.push_str("---\n");
+    note.push_str("cadence_version: 2\n");
+    note.push_str(&format!("agent: {}\n", agent));
+    note.push_str(&format!("session_id: {}\n", session_id));
+    note.push_str(&format!("repo: {}\n", repo));
+    note.push_str(&format!("commit: {}\n", commit));
+    note.push_str(&format!("confidence: {}\n", confidence));
+    if let Some(epoch) = session_start
+        && let Ok(dt) = OffsetDateTime::from_unix_timestamp(epoch)
+        && let Ok(formatted) = dt.format(&Rfc3339)
+    {
+        note.push_str(&format!("session_start: {}\n", formatted));
+    }
+    note.push_str(&format!("payload_blob: {}\n", payload_blob));
+    note.push_str(&format!("payload_sha256: {}\n", payload_sha256_hex));
+    note.push_str(&format!("payload_encoding: {}\n", payload_encoding));
+    note.push_str("---\n");
+
+    Ok(note)
+}
+
+/// Compress raw payload bytes with zstd (level 3).
+pub fn compress_payload(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    zstd::encode_all(std::io::Cursor::new(data), 3)
+        .map_err(|e| anyhow::anyhow!("zstd compression failed: {}", e))
+}
+
+/// Decompress zstd-compressed payload bytes.
+#[cfg(test)]
+pub fn decompress_payload(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    zstd::decode_all(std::io::Cursor::new(data))
+        .map_err(|e| anyhow::anyhow!("zstd decompression failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -557,5 +657,188 @@ mod tests {
         assert!(lines[6].starts_with("session_start: "));
         assert!(lines[7].starts_with("payload_sha256: "));
         assert_eq!(lines[8], "---");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_v2 — pointer note structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_v2_produces_correct_structure() {
+        let note = format_v2(
+            &AgentType::Claude,
+            "abc-123",
+            "/repo",
+            "655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e",
+            Confidence::ExactHashMatch,
+            Some(1_700_000_000),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            PayloadEncoding::ZstdPgp,
+        )
+        .unwrap();
+
+        assert!(note.starts_with("---\n"));
+        assert!(note.ends_with("---\n"));
+        assert!(note.contains("cadence_version: 2\n"));
+        assert!(note.contains("agent: claude-code\n"));
+        assert!(note.contains("session_id: abc-123\n"));
+        assert!(note.contains("repo: /repo\n"));
+        assert!(note.contains("commit: 655dd38a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e\n"));
+        assert!(note.contains("confidence: exact_hash_match\n"));
+        assert!(note.contains("session_start: 2023-11-14T22:13:20Z\n"));
+        assert!(note.contains("payload_blob: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        assert!(note.contains(
+            "payload_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+        ));
+        assert!(note.contains("payload_encoding: zstd+pgp\n"));
+    }
+
+    #[test]
+    fn test_format_v2_field_order() {
+        let note = format_v2(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            Confidence::ExactHashMatch,
+            Some(1_700_000_000),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            PayloadEncoding::Zstd,
+        )
+        .unwrap();
+
+        let lines: Vec<&str> = note.lines().collect();
+        assert_eq!(lines[0], "---");
+        assert!(lines[1].starts_with("cadence_version: "));
+        assert!(lines[2].starts_with("agent: "));
+        assert!(lines[3].starts_with("session_id: "));
+        assert!(lines[4].starts_with("repo: "));
+        assert!(lines[5].starts_with("commit: "));
+        assert!(lines[6].starts_with("confidence: "));
+        assert!(lines[7].starts_with("session_start: "));
+        assert!(lines[8].starts_with("payload_blob: "));
+        assert!(lines[9].starts_with("payload_sha256: "));
+        assert!(lines[10].starts_with("payload_encoding: "));
+        assert_eq!(lines[11], "---");
+    }
+
+    #[test]
+    fn test_format_v2_no_inline_payload() {
+        let note = format_v2(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            Confidence::ExactHashMatch,
+            None,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            PayloadEncoding::Plain,
+        )
+        .unwrap();
+
+        // Should end with closing --- and nothing after
+        assert!(note.ends_with("---\n"));
+        // Split: should have exactly empty prefix, header, empty suffix
+        let parts: Vec<&str> = note.splitn(3, "---\n").collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[2], ""); // no payload after closing ---
+    }
+
+    #[test]
+    fn test_format_v2_no_session_start() {
+        let note = format_v2(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "aabbccdd00112233",
+            Confidence::TimeWindowMatch,
+            None,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            PayloadEncoding::Zstd,
+        )
+        .unwrap();
+
+        assert!(!note.contains("session_start:"));
+        assert!(note.contains("confidence: time_window_match\n"));
+    }
+
+    #[test]
+    fn test_format_v2_all_encodings() {
+        for (enc, label) in [
+            (PayloadEncoding::Plain, "plain"),
+            (PayloadEncoding::Zstd, "zstd"),
+            (PayloadEncoding::Pgp, "pgp"),
+            (PayloadEncoding::ZstdPgp, "zstd+pgp"),
+        ] {
+            let note = format_v2(
+                &AgentType::Claude,
+                "sid",
+                "/repo",
+                "aabbccdd00112233",
+                Confidence::ExactHashMatch,
+                None,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                enc,
+            )
+            .unwrap();
+            assert!(
+                note.contains(&format!("payload_encoding: {}\n", label)),
+                "expected encoding label '{}' in note",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_v2_rejects_invalid_commit() {
+        let result = format_v2(
+            &AgentType::Claude,
+            "sid",
+            "/repo",
+            "not-a-hash",
+            Confidence::ExactHashMatch,
+            None,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            PayloadEncoding::Plain,
+        );
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // compress / decompress round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compress_decompress_roundtrip() {
+        let original =
+            b"hello world, this is a test payload with some repetition repetition repetition";
+        let compressed = compress_payload(original).unwrap();
+        let decompressed = decompress_payload(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_compress_reduces_size_on_repetitive_data() {
+        let data = "repetitive data\n".repeat(1000);
+        let compressed = compress_payload(data.as_bytes()).unwrap();
+        assert!(
+            compressed.len() < data.len(),
+            "compressed ({}) should be smaller than original ({})",
+            compressed.len(),
+            data.len()
+        );
+    }
+
+    #[test]
+    fn test_compress_empty() {
+        let compressed = compress_payload(b"").unwrap();
+        let decompressed = decompress_payload(&compressed).unwrap();
+        assert!(decompressed.is_empty());
     }
 }

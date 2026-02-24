@@ -76,6 +76,16 @@ pub fn detail(msg: &str) {
     detail_to_with_tty(&mut io::stderr(), msg, stderr_is_tty());
 }
 
+/// Format a detail message for display without writing it.
+/// Used when output needs to be routed through a progress bar via `pb.println()`.
+pub fn format_detail(msg: &str) -> String {
+    if stderr_is_tty() {
+        style(format!("  {msg}")).dim().to_string()
+    } else {
+        format!("  {msg}")
+    }
+}
+
 pub fn is_stderr_tty() -> bool {
     stderr_is_tty()
 }

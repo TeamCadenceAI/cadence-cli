@@ -63,13 +63,17 @@ main() {
     cp "${tmpdir}/cadence" "${INSTALL_DIR}/cadence"
     chmod +x "${INSTALL_DIR}/cadence"
 
+    # Show installed version for debugging
+    installed_version=$("${INSTALL_DIR}/cadence" --version 2>/dev/null || echo "unknown")
+    echo "Installed ${installed_version}"
+
     echo "Running initial setup..."
     "${INSTALL_DIR}/cadence" install || {
         echo "Warning: 'cadence install' failed. You can run it manually later." >&2
     }
 
     echo ""
-    echo "cadence installed successfully!"
+    echo "${installed_version} installed successfully!"
 
     # Check if install dir is on PATH
     case ":${PATH}:" in

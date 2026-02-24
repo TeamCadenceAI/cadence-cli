@@ -4,6 +4,7 @@ use pgp::KeyType;
 use pgp::composed::key::{SecretKeyParamsBuilder, SubkeyParamsBuilder};
 use pgp::composed::{Deserializable, Message, SignedPublicKey};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::ser::Serialize;
 use pgp::types::PublicKeyTrait;
 use std::path::{Path, PathBuf};
 
@@ -271,8 +272,15 @@ pub fn fingerprint_from_public_key(armored_public_key: &str) -> Result<String> {
     Ok(fingerprint_to_string(&public_key.fingerprint()))
 }
 
-/// Encrypt plaintext to multiple armored public keys using SEIPDv1.
-pub fn encrypt_to_public_keys(plaintext: &str, armored_public_keys: &[String]) -> Result<String> {
+/// Encrypt binary data to multiple armored public keys, returning raw bytes (not armored).
+///
+/// Same as [`encrypt_to_public_keys`] but operates on `&[u8]` input and returns
+/// `Vec<u8>` output (binary PGP packets). This avoids the ~33% overhead of
+/// ASCII armor for large payloads stored as git blobs.
+pub fn encrypt_to_public_keys_binary(
+    data: &[u8],
+    armored_public_keys: &[String],
+) -> Result<Vec<u8>> {
     if armored_public_keys.is_empty() {
         bail!("rpgp encrypt: at least one public key is required");
     }
@@ -298,7 +306,7 @@ pub fn encrypt_to_public_keys(plaintext: &str, armored_public_keys: &[String]) -
         enc_subkeys.push(enc_subkey);
     }
 
-    let literal = pgp::packet::LiteralData::from_bytes((&[]).into(), plaintext.as_bytes());
+    let literal = pgp::packet::LiteralData::from_bytes((&[]).into(), data);
     let message = Message::Literal(literal);
 
     let mut rng = rand08::thread_rng();
@@ -307,6 +315,6 @@ pub fn encrypt_to_public_keys(plaintext: &str, armored_public_keys: &[String]) -
         .context("rpgp encrypt failed: encryption error")?;
 
     encrypted
-        .to_armored_string(ArmorOptions::default())
-        .context("rpgp encrypt failed: armored serialization error")
+        .to_bytes()
+        .context("rpgp encrypt failed: binary serialization error")
 }

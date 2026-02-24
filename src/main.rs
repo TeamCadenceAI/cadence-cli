@@ -3,6 +3,7 @@ mod api_client;
 mod config;
 mod git;
 mod keychain;
+mod login;
 mod note;
 mod output;
 mod pending;
@@ -17,9 +18,19 @@ use console::Term;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::keychain::KeychainStore;
+
+const KEYCHAIN_SERVICE: &str = "cadence-cli";
+const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
+const LOGIN_TIMEOUT_SECS: u64 = 120;
+const API_TIMEOUT_SECS: u64 = 5;
+const CADENCE_DASHBOARD_URL: &str = "https://dash.teamcadence.ai/";
+static API_URL_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 /// Cadence CLI: attach AI coding agent session logs to Git commits via git notes.
 ///
@@ -31,13 +42,18 @@ struct Cli {
     /// Enable verbose logging (e.g., git commands and output).
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// API base URL override for this command invocation.
+    #[arg(long, global = true)]
+    api_url: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install Cadence CLI: set up git hooks and run initial hydration.
+    /// Install Cadence CLI: set up git hooks.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
@@ -51,15 +67,21 @@ enum Command {
     },
 
     /// Backfill AI session notes for recent commits.
-    Hydrate {
+    Backfill {
         /// How far back to scan, e.g. "7d" for 7 days.
         #[arg(long, default_value = "7d")]
         since: String,
 
-        /// Push notes to remote after hydration.
+        /// Push notes to remote after backfill.
         #[arg(long)]
         push: bool,
     },
+
+    /// Sign in via browser OAuth and store a CLI token locally.
+    Login,
+
+    /// Revoke and clear local CLI authentication token.
+    Logout,
 
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
@@ -73,6 +95,9 @@ enum Command {
 
     /// Show Cadence CLI status for the current repository.
     Status,
+
+    /// Diagnose hook and notes-rewrite configuration issues.
+    Doctor,
 
     /// Check for and install updates.
     Update {
@@ -95,6 +120,20 @@ enum Command {
     Keys {
         #[command(subcommand)]
         keys_command: Option<KeysCommands>,
+    },
+
+    /// Clear bloated notes and re-backfill in the optimized v2 format.
+    ///
+    /// Deletes the local and remote notes refs, then re-runs backfill
+    /// to regenerate notes with payload deduplication and compression.
+    Gc {
+        /// How far back to re-backfill, e.g. "30d" for 30 days.
+        #[arg(long, default_value = "30d")]
+        since: String,
+
+        /// Confirm destructive operation (required).
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -243,17 +282,41 @@ fn resolve_encryption_method() -> Result<EncryptionMethod> {
     }
 }
 
-/// Optionally encrypt note content before storage.
-fn maybe_encrypt_note(content: &str, method: &EncryptionMethod) -> Result<String> {
-    match method {
+/// Encode a session log payload: compress with zstd, optionally encrypt
+/// (binary, not armored), store as a git blob in a specific repository.
+///
+/// Returns `(blob_sha, payload_sha256, encoding)`.
+fn encode_and_store_payload_at(
+    repo: Option<&std::path::Path>,
+    session_log: &str,
+    method: &EncryptionMethod,
+) -> Result<(String, String, note::PayloadEncoding)> {
+    let payload_sha256 = note::payload_sha256(session_log);
+
+    // Step 1: Compress with zstd
+    let compressed =
+        note::compress_payload(session_log.as_bytes()).context("payload compression failed")?;
+
+    // Step 2: Optionally encrypt (binary, not armored)
+    let (encoded, encoding) = match method {
         EncryptionMethod::RpgpMulti { user_key, api_key } => {
-            pgp_keys::encrypt_to_public_keys(content, &[user_key.clone(), api_key.clone()])
+            let encrypted = pgp_keys::encrypt_to_public_keys_binary(
+                &compressed,
+                &[user_key.clone(), api_key.clone()],
+            )
+            .context("payload encryption failed")?;
+            (encrypted, note::PayloadEncoding::ZstdPgp)
         }
         EncryptionMethod::Unavailable(reason) => {
             anyhow::bail!("encryption unavailable: {}", reason);
         }
-        EncryptionMethod::None => Ok(content.to_string()),
-    }
+        EncryptionMethod::None => (compressed, note::PayloadEncoding::Zstd),
+    };
+
+    // Step 3: Store as a git blob
+    let blob_sha = git::store_blob_at(repo, &encoded).context("failed to store payload blob")?;
+
+    Ok((blob_sha, payload_sha256, encoding))
 }
 
 const API_PUBLIC_KEY_MAX_AGE_DAYS: i64 = 7;
@@ -263,6 +326,10 @@ fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn api_url_override() -> Option<&'static str> {
+    API_URL_OVERRIDE.get().map(String::as_str)
 }
 
 /// Resolve the cached API public key, refreshing if needed.
@@ -280,7 +347,7 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
     }
 
     let cfg = config::CliConfig::load()?;
-    let resolved = cfg.resolve_api_url(None);
+    let resolved = cfg.resolve_api_url(api_url_override());
     let client = api_client::ApiClient::new(&resolved.url);
     let keys_url = format!("{}/api/keys/public", resolved.url.trim_end_matches('/'));
     let api_key = client
@@ -309,16 +376,16 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-/// The install subcommand: set up global git hooks and run initial hydration.
+/// The install subcommand: set up global git hooks.
 ///
 /// Steps:
 /// 1. Set `git config --global core.hooksPath ~/.git-hooks`
-/// 2. Create `~/.git-hooks/` directory if missing
-/// 3. Write `~/.git-hooks/post-commit` shim script
-/// 4. Write `~/.git-hooks/pre-push` shim script
-/// 5. Make shims executable (chmod +x)
-/// 6. If `--org` provided, persist org filter to global git config
-/// 7. Run hydration for the last 7 days
+/// 2. Configure git-notes rewrite safety for rebase/amend
+/// 3. Create `~/.git-hooks/` directory if missing
+/// 4. Write `~/.git-hooks/post-commit` shim script
+/// 5. Write `~/.git-hooks/pre-push` shim script
+/// 6. Make shims executable (chmod +x)
+/// 7. If `--org` provided, persist org filter to global git config
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
@@ -369,6 +436,68 @@ fn pre_push_hook_content() -> String {
     )
 }
 
+fn config_bool_or_default(value: Option<&str>, default: bool) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("true" | "yes" | "on" | "1") => true,
+        Some("false" | "no" | "off" | "0") => false,
+        Some(_) => default,
+        None => default,
+    }
+}
+
+fn notes_rewrite_ref_present(refs: &[String], target: &str) -> bool {
+    refs.iter().any(|value| value.trim() == target)
+}
+
+fn resolve_hooks_path(repo_root: Option<&Path>, configured_path: &str) -> PathBuf {
+    let path = Path::new(configured_path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match repo_root {
+        Some(root) => root.join(path),
+        None => path.to_path_buf(),
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left_norm = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right_norm = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left_norm == right_norm
+}
+
+fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
+    let post_path = hooks_dir.join("post-commit");
+    let post_installed = match std::fs::read_to_string(&post_path) {
+        Ok(content) => is_cadence_hook(&content),
+        Err(_) => false,
+    };
+
+    let pre_path = hooks_dir.join("pre-push");
+    let pre_installed = match std::fs::read_to_string(&pre_path) {
+        Ok(content) => is_cadence_hook(&content),
+        Err(_) => false,
+    };
+
+    (post_installed, pre_installed)
+}
+
+fn ensure_notes_rewrite_config() -> Result<()> {
+    git::config_set_global("notes.rewrite.rebase", "true")
+        .context("failed to set notes.rewrite.rebase=true")?;
+    git::config_set_global("notes.rewrite.amend", "true")
+        .context("failed to set notes.rewrite.amend=true")?;
+
+    let refs = git::config_get_global_all("notes.rewriteRef")
+        .context("failed to inspect notes.rewriteRef")?;
+    if !notes_rewrite_ref_present(&refs, git::NOTES_REF) {
+        git::config_add_global("notes.rewriteRef", git::NOTES_REF)
+            .context("failed to add Cadence notes rewrite ref")?;
+    }
+
+    Ok(())
+}
+
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
@@ -394,6 +523,20 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         }
         Err(e) => {
             output::fail("Failed", &format!("to set core.hooksPath ({})", e));
+            had_errors = true;
+        }
+    }
+
+    // Step 1.5: Ensure notes survive commit rewrites (rebase/amend).
+    match ensure_notes_rewrite_config() {
+        Ok(()) => {
+            output::success(
+                "Updated",
+                &format!("notes rewrite configured for {}", git::NOTES_REF),
+            );
+        }
+        Err(e) => {
+            output::fail("Failed", &format!("to configure notes rewrite ({})", e));
             had_errors = true;
         }
     }
@@ -586,7 +729,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         }
     }
 
-    // Step 5.5: Optional encryption setup (before hydration)
+    // Step 5.5: Optional encryption setup
     if let Err(e) = run_install_encryption_setup() {
         output::fail("Install", &format!("stopped ({})", e));
         return Err(e);
@@ -594,18 +737,6 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
 
     // Step 5.6: Optional auto-update preference prompt
     run_install_auto_update_prompt();
-
-    // Step 6: Run hydration for the last 7 days
-    output::action("Hydrating", "recent sessions (last 30 days)");
-    let hydrate_start = std::time::Instant::now();
-    if let Err(e) = run_hydrate("30d", true) {
-        output::fail("Hydration", &format!("stopped ({})", e));
-        had_errors = true;
-    }
-    output::success(
-        "Hydration",
-        &format!("done in {} ms", hydrate_start.elapsed().as_millis()),
-    );
 
     if had_errors {
         output::fail("Install", "completed with issues");
@@ -616,8 +747,181 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         "Total time: {} ms",
         install_start.elapsed().as_millis()
     ));
+    output::note("Next step: run `cadence backfill --since 30d --push` during onboarding.");
+    output::detail("Then return to the Cadence onboarding page and refresh status.");
 
     Ok(())
+}
+
+fn run_login() -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+    let resolved = cfg.resolve_api_url(api_url_override());
+    output::detail(&format!("Using API URL: {}", resolved.url));
+    if resolved.is_non_https {
+        output::note(&format!(
+            "Using non-HTTPS API URL for login: {}",
+            resolved.url
+        ));
+    }
+
+    output::action("Login", "opening browser for authentication");
+    let exchanged =
+        login::login_via_browser(&resolved.url, Duration::from_secs(LOGIN_TIMEOUT_SECS))?;
+
+    cfg.api_url = Some(resolved.url.clone());
+    cfg.token = Some(exchanged.token.clone());
+    cfg.github_login = Some(exchanged.login.clone());
+    cfg.expires_at = Some(exchanged.expires_at.clone());
+    cfg.save()?;
+
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    if let Err(e) = keychain.set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token) {
+        output::note(&format!(
+            "Could not store token in OS keychain (using config fallback): {e}"
+        ));
+    }
+
+    output::success("Login", &format!("authenticated as {}", exchanged.login));
+    output::detail(&format!("Token expires at {}", exchanged.expires_at));
+    Ok(())
+}
+
+fn run_logout() -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+    let resolved = cfg.resolve_api_url(api_url_override());
+
+    if let Some(token) = resolve_cli_auth_token(&cfg) {
+        let client = api_client::ApiClient::new(&resolved.url);
+        match client.revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS)) {
+            Ok(()) => output::detail("Revoked token on server."),
+            Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+                output::note("Token was already invalid or expired.");
+            }
+            Err(err) => {
+                output::note(&format!("Could not revoke token on server ({err})"));
+            }
+        }
+    } else {
+        output::note("No local token found; clearing local auth state.");
+    }
+
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+        output::note(&format!("Could not clear OS keychain token: {e}"));
+    }
+
+    cfg.clear_token()?;
+    output::success("Logout", "authentication cleared");
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BackfillSyncStats {
+    notes_attached: i64,
+    notes_skipped: i64,
+    issues: Vec<String>,
+    repos_scanned: i32,
+}
+
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
+        Ok(_) | Err(_) => cfg.token.clone().filter(|t| !t.trim().is_empty()),
+    }
+}
+
+fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
+    let cfg = match config::CliConfig::load() {
+        Ok(cfg) => cfg,
+        Err(_) => return,
+    };
+
+    let token = match resolve_cli_auth_token(&cfg) {
+        Some(token) => token,
+        None => {
+            output::note("Run `cadence login` to sync results");
+            return;
+        }
+    };
+
+    let resolved = cfg.resolve_api_url(api_url_override());
+    let client = api_client::ApiClient::new(&resolved.url);
+    let finished_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    let request = api_client::BackfillCompleteRequest {
+        window_days,
+        notes_attached: stats.notes_attached,
+        notes_skipped: stats.notes_skipped,
+        issues: stats.issues,
+        repos_scanned: stats.repos_scanned,
+        finished_at,
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    match client.report_backfill_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS)) {
+        Ok(response) => {
+            if response.recorded {
+                output::detail(&format!(
+                    "Backfill results synced to Cadence onboarding at {}.",
+                    response.backfill_completed_at
+                ));
+            } else {
+                output::detail("Backfill sync already recorded.");
+            }
+            output::detail(&response.next_step);
+        }
+        Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+            output::note("Run `cadence login` to re-authenticate");
+        }
+        Err(api_client::AuthenticatedRequestError::Network(_)) => {
+            output::note("Notes are safely stored locally");
+        }
+        Err(api_client::AuthenticatedRequestError::NotFound) => {
+            output::note("API does not support this yet");
+        }
+        Err(api_client::AuthenticatedRequestError::Server(_)) => {
+            output::note("API returned an error");
+        }
+        Err(other) => {
+            output::detail(&format!("Backfill sync skipped: {other}"));
+        }
+    }
+}
+
+fn print_start_insights_link() {
+    let dashboard_url = config::CliConfig::load()
+        .ok()
+        .map(|cfg| dashboard_url_for_api(&cfg.resolve_api_url(api_url_override()).url))
+        .unwrap_or_else(|| CADENCE_DASHBOARD_URL.to_string());
+    output::note("Next step: Open Cadence and click Start Insights when ready.");
+    output::detail(&dashboard_url);
+}
+
+fn dashboard_url_for_api(api_base_url: &str) -> String {
+    let fallback = CADENCE_DASHBOARD_URL.to_string();
+    let Ok(url) = reqwest::Url::parse(api_base_url.trim_end_matches('/')) else {
+        return fallback;
+    };
+
+    let host = url.host_str().unwrap_or_default();
+    let is_local = host == "localhost" || host == "127.0.0.1";
+    if !is_local {
+        return fallback;
+    }
+
+    let api_port = url.port_or_known_default();
+    if api_port == Some(3001) {
+        let scheme = if url.scheme() == "https" {
+            "https"
+        } else {
+            "http"
+        };
+        return format!("{scheme}://{host}:5173/");
+    }
+
+    fallback
 }
 
 /// The post-commit hook handler. This is the critical hot path.
@@ -708,7 +1012,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
-        // Note already attached (e.g., by hydrate). Clean up stale pending record.
+        // Note already attached (e.g., by backfill). Clean up stale pending record.
         let _ = pending::remove(&head_hash);
         return Ok(());
     }
@@ -1000,6 +1304,16 @@ fn fallback_match_for_commit(
     })
 }
 
+/// Pre-computed payload blob info for deduplication across commits.
+///
+/// When a session produces multiple commits, the payload is stored once and
+/// the same `PayloadInfo` is reused for each pointer note.
+struct PayloadInfo {
+    blob_sha: String,
+    payload_sha256: String,
+    encoding: note::PayloadEncoding,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach_note_from_log(
     agent_type: &scanner::AgentType,
@@ -1011,17 +1325,66 @@ fn attach_note_from_log(
     method: &EncryptionMethod,
     session_start: Option<i64>,
 ) -> Result<()> {
-    let note_content = note::format_with_confidence(
+    attach_note_from_log_v2(
         agent_type,
         session_id,
         repo_str,
         commit,
         session_log,
         confidence,
+        method,
         session_start,
+        None, // no pre-stored payload — will store a new blob
+        None, // use CWD repo
+    )
+}
+
+/// V2 attach: stores payload as a separate blob, attaches a lightweight pointer note.
+///
+/// If `existing_payload` is provided, reuses the already-stored blob (dedup).
+/// If `repo` is provided, operates in that repo instead of CWD.
+#[allow(clippy::too_many_arguments)]
+fn attach_note_from_log_v2(
+    agent_type: &scanner::AgentType,
+    session_id: &str,
+    repo_str: &str,
+    commit: &str,
+    session_log: &str,
+    confidence: note::Confidence,
+    method: &EncryptionMethod,
+    session_start: Option<i64>,
+    existing_payload: Option<&PayloadInfo>,
+    repo: Option<&std::path::Path>,
+) -> Result<()> {
+    // Reuse existing payload blob or create a new one
+    let (blob_sha, payload_sha256, encoding) = match existing_payload {
+        Some(info) => (
+            info.blob_sha.clone(),
+            info.payload_sha256.clone(),
+            info.encoding,
+        ),
+        None => encode_and_store_payload_at(repo, session_log, method)?,
+    };
+
+    // Build the v2 pointer note
+    let note_content = note::format_v2(
+        agent_type,
+        session_id,
+        repo_str,
+        commit,
+        confidence,
+        session_start,
+        &blob_sha,
+        &payload_sha256,
+        encoding,
     )?;
-    let final_content = maybe_encrypt_note(&note_content, method)?;
-    git::add_note(commit, &final_content)?;
+
+    // Pointer note stays plaintext — only the payload blob is encrypted.
+    // This lets the API index metadata without needing decryption keys.
+    match repo {
+        Some(r) => git::add_note_at(r, commit, &note_content)?,
+        None => git::add_note(commit, &note_content)?,
+    }
     Ok(())
 }
 
@@ -1345,7 +1708,7 @@ fn parse_since_duration(since: &str) -> Result<i64> {
     }
 }
 
-/// The hydrate subcommand: backfill AI session notes for recent commits.
+/// The backfill subcommand: backfill AI session notes for recent commits.
 ///
 /// This scans ALL Claude and Codex log directories (not scoped to any
 /// single repo), finds commit hashes in session logs, resolves repos
@@ -1356,7 +1719,21 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - Prints verbose progress throughout
 /// - All errors are non-fatal (logged and continued)
 /// - Does NOT auto-push by default (use `--push` flag)
-fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
+fn run_backfill(since: &str, do_push: bool) -> Result<()> {
+    run_backfill_inner(since, do_push, None, true)
+}
+
+/// Inner implementation of backfill that accepts an optional repo filter.
+///
+/// When `repo_filter` is `Some`, only sessions whose resolved repo root
+/// matches the given path are processed. Used by `cadence gc` to scope
+/// re-backfill to the current repository.
+fn run_backfill_inner(
+    since: &str,
+    do_push: bool,
+    repo_filter: Option<&std::path::Path>,
+    show_next_step_link: bool,
+) -> Result<()> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
 
@@ -1365,7 +1742,7 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Resolve encryption method once for this hydration run
+    // Resolve encryption method once for this backfill run
     let encryption_method = match resolve_encryption_method() {
         Ok(method) => method,
         Err(e) => EncryptionMethod::Unavailable(format!("{e}")),
@@ -1413,6 +1790,10 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
     let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut fallback_attached = 0usize;
+    let sync_remote_before_attach = should_sync_remote_before_attach(do_push);
+    if !sync_remote_before_attach {
+        output::detail("Remote notes sync skipped (no --push)");
+    }
 
     // Step 3: Pre-process each file to resolve repo and group by repo display
     struct SessionInfo {
@@ -1459,6 +1840,13 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             Ok(r) => r,
             Err(_) => continue,
         };
+
+        // If a repo filter is set, skip sessions that don't match.
+        if let Some(filter) = repo_filter
+            && repo_root != filter
+        {
+            continue;
+        }
 
         let session_id = metadata
             .session_id
@@ -1515,23 +1903,48 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
             }
         }
 
-        let repo_remote = if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
-            let fetch_start = std::time::Instant::now();
-            match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
-                Ok(()) => {
-                    output::detail(&format!(
-                        "Fetched notes from {} in {} ms",
-                        remote,
-                        fetch_start.elapsed().as_millis()
-                    ));
+        let repo_remote = if sync_remote_before_attach {
+            if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
+                let fetch_start = std::time::Instant::now();
+                match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
+                    Ok(()) => {
+                        output::detail(&format!(
+                            "Fetched notes from {} in {} ms",
+                            remote,
+                            fetch_start.elapsed().as_millis()
+                        ));
+                    }
+                    Err(e) => {
+                        output::note(&format!("Could not fetch notes from {}: {}", remote, e));
+                    }
                 }
-                Err(e) => {
-                    output::note(&format!("Could not fetch notes from {}: {}", remote, e));
-                }
+                Some(remote)
+            } else {
+                None
             }
-            Some(remote)
         } else {
             None
+        };
+
+        let session_progress = if use_progress && sessions.len() > 1 {
+            let pb = ProgressBar::new(sessions.len() as u64);
+            pb.set_draw_target(ProgressDrawTarget::stderr());
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {pos}/{len} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_bar()),
+            );
+            pb.enable_steady_tick(std::time::Duration::from_millis(120));
+            Some(pb)
+        } else {
+            None
+        };
+
+        let print_detail = |msg: &str| {
+            if let Some(ref pb) = session_progress {
+                pb.println(output::format_detail(msg));
+            } else {
+                output::detail(msg);
+            }
         };
 
         let mut repo_total = 0usize;
@@ -1547,282 +1960,318 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
                 &session.session_id
             };
 
-            // Extract all commit hashes from the session log
-            let commit_hashes = scanner::extract_commit_hashes(&session.file);
+            // Use a labeled block so all exit paths reach the progress increment
+            'process_session: {
+                // Update progress bar with current session
+                if let Some(ref pb) = session_progress {
+                    pb.set_message(format!("{} — extracting commits", session_display));
+                }
 
-            if commit_hashes.is_empty() {
-                repo_without_commits += 1;
+                // Extract all commit hashes from the session log
+                let commit_hashes = scanner::extract_commit_hashes(&session.file);
+
+                if commit_hashes.is_empty() {
+                    repo_without_commits += 1;
+
+                    if !git::check_enabled_at(&session.repo_root) {
+                        break 'process_session;
+                    }
+
+                    let header = format!("{} |", session_display);
+
+                    if let Some(ref pb) = session_progress {
+                        pb.set_message(format!("{} — scanning timestamps", session_display));
+                    }
+
+                    let time_range =
+                        if let Some((start, end)) = scanner::session_time_range(&session.file) {
+                            Some((start, end))
+                        } else {
+                            // Fall back to file mtime ± 24 hours
+                            let mtime = match file_mtime_epoch(&session.file) {
+                                Some(t) => t,
+                                None => {
+                                    print_detail(&format!(
+                                        "{} no timestamps or file mtime; skipping",
+                                        header
+                                    ));
+                                    break 'process_session;
+                                }
+                            };
+                            Some((mtime - 86_400, mtime + 86_400))
+                        };
+
+                    let (start_ts, end_ts) = match time_range {
+                        Some(r) => r,
+                        None => {
+                            print_detail(&format!("{} no timestamps; skipping", header));
+                            break 'process_session;
+                        }
+                    };
+
+                    let commits =
+                        match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                print_detail(&format!(
+                                    "{} problem scanning commits: {}",
+                                    header, e
+                                ));
+                                errors += 1;
+                                break 'process_session;
+                            }
+                        };
+
+                    if commits.len() != 1 {
+                        let status = if commits.is_empty() {
+                            "no commits in time window"
+                        } else {
+                            "ambiguous commits in time window"
+                        };
+                        print_detail(&format!("{} {}", header, status));
+                        break 'process_session;
+                    }
+
+                    let hash = &commits[0];
+                    match git::note_exists_at(&session.repo_root, hash) {
+                        Ok(true) => {
+                            skipped += 1;
+                            print_detail(&format!(
+                                "{} commit {} already attached",
+                                header,
+                                &hash[..7]
+                            ));
+                            break 'process_session;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            print_detail(&format!(
+                                "{} problem checking note for {}: {}",
+                                header,
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            break 'process_session;
+                        }
+                    }
+
+                    if let Some(ref pb) = session_progress {
+                        pb.set_message(format!("{} — reading session log", session_display));
+                    }
+
+                    let session_log = match std::fs::read_to_string(&session.file) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            print_detail(&format!("{} could not read session log: {}", header, e));
+                            errors += 1;
+                            break 'process_session;
+                        }
+                    };
+
+                    let agent_type = session
+                        .metadata
+                        .agent_type
+                        .clone()
+                        .unwrap_or(scanner::AgentType::Claude);
+                    let repo_str = session.repo_root.to_string_lossy().to_string();
+                    let session_start =
+                        scanner::session_time_range(&session.file).map(|(start, _)| start);
+
+                    match attach_note_from_log_v2(
+                        &agent_type,
+                        &session.session_id,
+                        &repo_str,
+                        hash,
+                        &session_log,
+                        note::Confidence::TimeWindowMatch,
+                        &encryption_method,
+                        session_start,
+                        None,
+                        Some(&session.repo_root),
+                    ) {
+                        Ok(()) => {
+                            attached += 1;
+                            fallback_attached += 1;
+                            print_detail(&format!(
+                                "{} commit {} attached (time window match)",
+                                header,
+                                &hash[..7]
+                            ));
+                        }
+                        Err(e) => {
+                            print_detail(&format!(
+                                "{} could not attach note to {}: {}",
+                                header,
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                        }
+                    }
+
+                    break 'process_session;
+                }
+
+                repo_with_commits += 1;
 
                 if !git::check_enabled_at(&session.repo_root) {
-                    continue;
+                    break 'process_session;
                 }
+
+                // For each hash, attach note if missing.
+                // Buffer messages so we can combine a single status with the header.
+                let mut session_attached = 0usize;
+                let mut session_skipped = 0usize;
+                let mut messages: Vec<String> = Vec::new();
 
                 let header = format!("{} |", session_display);
 
-                let time_range =
-                    if let Some((start, end)) = scanner::session_time_range(&session.file) {
-                        Some((start, end))
-                    } else {
-                        // Fall back to file mtime ± 24 hours
-                        let mtime = match file_mtime_epoch(&session.file) {
-                            Some(t) => t,
-                            None => {
-                                output::detail(&format!(
-                                    "{} no timestamps or file mtime; skipping",
-                                    header
-                                ));
-                                continue;
+                if let Some(ref pb) = session_progress {
+                    pb.set_message(format!("{} — attaching notes", session_display));
+                }
+
+                // Pre-compute metadata shared across all commits in this session
+                let agent_type = session
+                    .metadata
+                    .agent_type
+                    .clone()
+                    .unwrap_or(scanner::AgentType::Claude);
+                let repo_str = session.repo_root.to_string_lossy().to_string();
+                let session_start =
+                    scanner::session_time_range(&session.file).map(|(start, _)| start);
+
+                // Lazily store the payload blob once for this session.
+                // We defer reading until we know at least one commit needs a note.
+                let mut payload_info: Option<PayloadInfo> = None;
+
+                for hash in &commit_hashes {
+                    // Verify the commit exists in the resolved repo
+                    match git::commit_exists_at(&session.repo_root, hash) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // Commit does not exist in this repo -- could be from a
+                            // different repo or could be rebased away. Skip silently.
+                            continue;
+                        }
+                        Err(e) => {
+                            messages.push(format!("problem checking commit {}: {}", &hash[..7], e));
+                            errors += 1;
+                            continue;
+                        }
+                    }
+
+                    // Check dedup: skip if note already exists
+                    match git::note_exists_at(&session.repo_root, hash) {
+                        Ok(true) => {
+                            session_skipped += 1;
+                            skipped += 1;
+                            continue;
+                        }
+                        Ok(false) => {} // Need to attach
+                        Err(e) => {
+                            messages.push(format!(
+                                "problem checking note for {}: {}",
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                            continue;
+                        }
+                    }
+
+                    // Lazily encode and store the payload blob on first need
+                    if payload_info.is_none() {
+                        let session_log = match std::fs::read_to_string(&session.file) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                messages.push(format!("could not read session log: {}", e));
+                                errors += 1;
+                                break;
                             }
                         };
-                        Some((mtime - 86_400, mtime + 86_400))
-                    };
-
-                let (start_ts, end_ts) = match time_range {
-                    Some(r) => r,
-                    None => {
-                        output::detail(&format!("{} no timestamps; skipping", header));
-                        continue;
+                        match encode_and_store_payload_at(
+                            Some(&session.repo_root),
+                            &session_log,
+                            &encryption_method,
+                        ) {
+                            Ok((blob_sha, sha256, encoding)) => {
+                                payload_info = Some(PayloadInfo {
+                                    blob_sha,
+                                    payload_sha256: sha256,
+                                    encoding,
+                                });
+                            }
+                            Err(e) => {
+                                messages.push(format!("could not store payload: {}", e));
+                                errors += 1;
+                                break;
+                            }
+                        }
                     }
-                };
 
-                let commits = match git::commits_in_time_range(&session.repo_root, start_ts, end_ts)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        output::detail(&format!("{} problem scanning commits: {}", header, e));
-                        errors += 1;
-                        continue;
-                    }
-                };
+                    let info = payload_info.as_ref().unwrap();
 
-                if commits.len() != 1 {
-                    let status = if commits.is_empty() {
-                        "no commits in time window"
-                    } else {
-                        "ambiguous commits in time window"
-                    };
-                    output::detail(&format!("{} {}", header, status));
-                    continue;
-                }
-
-                let hash = &commits[0];
-                match git::note_exists_at(&session.repo_root, hash) {
-                    Ok(true) => {
-                        skipped += 1;
-                        output::detail(&format!(
-                            "{} commit {} already attached",
-                            header,
-                            &hash[..7]
-                        ));
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} problem checking note for {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
-                        continue;
+                    // Attach v2 pointer note reusing the shared blob
+                    match attach_note_from_log_v2(
+                        &agent_type,
+                        &session.session_id,
+                        &repo_str,
+                        hash,
+                        "", // session_log not used when existing_payload is provided
+                        note::Confidence::ExactHashMatch,
+                        &encryption_method,
+                        session_start,
+                        Some(info),
+                        Some(&session.repo_root),
+                    ) {
+                        Ok(()) => {
+                            messages.push(format!("commit {} attached", &hash[..7]));
+                            session_attached += 1;
+                            attached += 1;
+                        }
+                        Err(e) => {
+                            messages.push(format!(
+                                "could not attach note to {}: {}",
+                                &hash[..7],
+                                e
+                            ));
+                            errors += 1;
+                        }
                     }
                 }
 
-                let session_log = match std::fs::read_to_string(&session.file) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        output::detail(&format!("{} could not read session log: {}", header, e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                let agent_type = session
-                    .metadata
-                    .agent_type
-                    .clone()
-                    .unwrap_or(scanner::AgentType::Claude);
-                let repo_str = session.repo_root.to_string_lossy().to_string();
-                let session_start =
-                    scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                let note_content = match note::format_with_confidence(
-                    &agent_type,
-                    &session.session_id,
-                    &repo_str,
-                    hash,
-                    &session_log,
-                    note::Confidence::TimeWindowMatch,
-                    session_start,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} could not format note for {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                match git::add_note_at(&session.repo_root, hash, &note_content) {
-                    Ok(()) => {
-                        attached += 1;
-                        fallback_attached += 1;
-                        output::detail(&format!(
-                            "{} commit {} attached (time window match)",
-                            header,
-                            &hash[..7]
-                        ));
-                    }
-                    Err(e) => {
-                        output::detail(&format!(
-                            "{} could not attach note to {}: {}",
-                            header,
-                            &hash[..7],
-                            e
-                        ));
-                        errors += 1;
-                    }
+                // Summarise skipped commits as a single message
+                if session_attached == 0 && session_skipped > 0 {
+                    messages.push(format!("{} already attached", session_skipped));
                 }
 
-                continue;
-            }
-
-            repo_with_commits += 1;
-
-            if !git::check_enabled_at(&session.repo_root) {
-                continue;
-            }
-
-            // For each hash, attach note if missing.
-            // Buffer messages so we can combine a single status with the header.
-            let mut session_attached = 0usize;
-            let mut session_skipped = 0usize;
-            let mut messages: Vec<String> = Vec::new();
-
-            let header = format!("{} |", session_display);
-
-            for hash in &commit_hashes {
-                // Verify the commit exists in the resolved repo
-                match git::commit_exists_at(&session.repo_root, hash) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Commit does not exist in this repo -- could be from a
-                        // different repo or could be rebased away. Skip silently.
-                        continue;
-                    }
-                    Err(e) => {
-                        messages.push(format!("problem checking commit {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                }
-
-                // Check dedup: skip if note already exists
-                match git::note_exists_at(&session.repo_root, hash) {
-                    Ok(true) => {
-                        session_skipped += 1;
-                        skipped += 1;
-                        continue;
-                    }
-                    Ok(false) => {} // Need to attach
-                    Err(e) => {
-                        messages.push(format!("problem checking note for {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                }
-
-                // Read the full session log
-                let session_log = match std::fs::read_to_string(&session.file) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        messages.push(format!("could not read session log: {}", e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Use agent type from parsed metadata (already inferred by
-                // parse_session_metadata via infer_agent_type). Fall back to
-                // Claude if metadata didn't determine it.
-                let agent_type = session
-                    .metadata
-                    .agent_type
-                    .clone()
-                    .unwrap_or(scanner::AgentType::Claude);
-
-                let repo_str = session.repo_root.to_string_lossy().to_string();
-                let session_start =
-                    scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                // Format the note
-                let note_content = match note::format(
-                    &agent_type,
-                    &session.session_id,
-                    &repo_str,
-                    hash,
-                    &session_log,
-                    session_start,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        messages.push(format!("could not format note for {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Optionally encrypt — in hydrate, encryption failure is non-fatal
-                let final_content = match maybe_encrypt_note(&note_content, &encryption_method) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        messages.push(format!("encryption failed for {}: {}", &hash[..7], e));
-                        errors += 1;
-                        continue;
-                    }
-                };
-
-                // Attach the note
-                match git::add_note_at(&session.repo_root, hash, &final_content) {
-                    Ok(()) => {
-                        messages.push(format!("commit {} attached", &hash[..7]));
-                        session_attached += 1;
-                        attached += 1;
-                    }
-                    Err(e) => {
-                        messages.push(format!("could not attach note to {}: {}", &hash[..7], e));
-                        errors += 1;
+                // Print: combine header + single message on one line, or multi-line
+                if messages.len() <= 1 {
+                    let status = messages
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("nothing to do");
+                    print_detail(&format!("{} {}", header, status));
+                } else {
+                    print_detail(&header);
+                    for msg in &messages {
+                        print_detail(&format!("  {}", msg));
                     }
                 }
             }
 
-            // Summarise skipped commits as a single message
-            if session_attached == 0 && session_skipped > 0 {
-                messages.push(format!("{} already attached", session_skipped));
-            }
-
-            // Print: combine header + single message on one line, or multi-line
-            if messages.len() <= 1 {
-                let status = messages
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("nothing to do");
-                output::detail(&format!("{} {}", header, status));
-            } else {
-                output::detail(&header);
-                for msg in &messages {
-                    output::detail(&format!("  {}", msg));
-                }
+            // Always increment progress after processing each session
+            if let Some(ref pb) = session_progress {
+                pb.inc(1);
             }
         }
 
-        // Per-repo summary
+        if let Some(ref pb) = session_progress {
+            pb.finish_and_clear();
+        }
+
+        // Per-repo summary (printed after progress bar is cleared)
         output::detail(&format!(
             "{} sessions, {} with commits, {} without",
             repo_total, repo_with_commits, repo_without_commits
@@ -1836,14 +2285,35 @@ fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
 
     // Final summary
     output::success(
-        "Hydrate",
+        "Backfill",
         &format!(
             "{} attached, {} fallback attached, {} skipped, {} issues",
             attached, fallback_attached, skipped, errors
         ),
     );
+    let issues = if errors > 0 {
+        vec![format!("{errors} issue(s) encountered during backfill")]
+    } else {
+        Vec::new()
+    };
+    report_backfill_completion(
+        since_days as i32,
+        BackfillSyncStats {
+            notes_attached: attached as i64,
+            notes_skipped: skipped as i64,
+            issues,
+            repos_scanned: sessions_by_repo.len() as i32,
+        },
+    );
+    if show_next_step_link {
+        print_start_insights_link();
+    }
 
     Ok(())
+}
+
+fn should_sync_remote_before_attach(do_push: bool) -> bool {
+    do_push
 }
 
 fn run_retry() -> Result<()> {
@@ -1884,7 +2354,9 @@ fn run_retry() -> Result<()> {
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Hooks path and whether the post-commit/pre-push shims are installed
+/// - Effective hooks path and whether the post-commit/pre-push shims are installed
+/// - Warning when a repo-local hooksPath overrides global Cadence hooks
+/// - Notes rewrite safety for rebase/amend
 /// - Number of pending retries for the current repo
 /// - Org filter config (if any)
 /// - Per-repo enabled/disabled status
@@ -1911,31 +2383,124 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     };
 
     // --- Hooks path and shim status ---
-    match git::config_get_global("core.hooksPath") {
-        Ok(Some(path)) => {
-            let post_path = std::path::Path::new(&path).join("post-commit");
-            let post_installed = match std::fs::read_to_string(&post_path) {
-                Ok(content) => is_cadence_hook(&content),
-                Err(_) => false,
-            };
-            let pre_path = std::path::Path::new(&path).join("pre-push");
-            let pre_installed = match std::fs::read_to_string(&pre_path) {
-                Ok(content) => is_cadence_hook(&content),
-                Err(_) => false,
-            };
-            let post_str = if post_installed { "yes" } else { "no" };
-            let pre_str = if pre_installed { "yes" } else { "no" };
+    let global_hooks_path = git::config_get_global("core.hooksPath").ok().flatten();
+    if let Some(ref root) = repo_root {
+        match git::config_get_at(root, "core.hooksPath").ok().flatten() {
+            Some(path) => {
+                let hooks_dir = resolve_hooks_path(Some(root), &path);
+                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+                let post_str = if post_installed { "yes" } else { "no" };
+                let pre_str = if pre_installed { "yes" } else { "no" };
+                output::detail_to_with_tty(
+                    w,
+                    &format!(
+                        "Hooks path: {} (post-commit: {}, pre-push: {})",
+                        path, post_str, pre_str
+                    ),
+                    false,
+                );
+
+                if !post_installed || !pre_installed {
+                    output::note_to_with_tty(
+                        w,
+                        "Cadence hooks are not fully installed in the active hooksPath.",
+                        false,
+                    );
+                }
+            }
+            None => {
+                output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
+            }
+        }
+
+        if let Ok(Some(local_hooks_path)) = git::config_get_local_at(root, "core.hooksPath")
+            && let Some(global_path) = &global_hooks_path
+        {
+            let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
+            let global_resolved = resolve_hooks_path(Some(root), global_path);
+            if !paths_equivalent(&local_resolved, &global_resolved) {
+                output::note_to_with_tty(
+                    w,
+                    &format!(
+                        "Repo-local core.hooksPath overrides global Cadence hooks: {}",
+                        local_hooks_path
+                    ),
+                    false,
+                );
+                output::detail_to_with_tty(
+                    w,
+                    "Run `git config --unset core.hooksPath` in this repo to use global hooks.",
+                    false,
+                );
+            }
+        }
+    } else if let Some(path) = global_hooks_path {
+        let hooks_dir = resolve_hooks_path(None, &path);
+        let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+        let post_str = if post_installed { "yes" } else { "no" };
+        let pre_str = if pre_installed { "yes" } else { "no" };
+        output::detail_to_with_tty(
+            w,
+            &format!(
+                "Hooks path: {} (post-commit: {}, pre-push: {})",
+                path, post_str, pre_str
+            ),
+            false,
+        );
+    } else {
+        output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
+    }
+
+    // --- Notes rewrite safety (rebase/amend) ---
+    let rewrite_refs = git::config_get_global_all("notes.rewriteRef").unwrap_or_default();
+    let rewrite_ref_enabled = notes_rewrite_ref_present(&rewrite_refs, git::NOTES_REF);
+    let rebase_value = git::config_get_global("notes.rewrite.rebase")
+        .ok()
+        .flatten();
+    let amend_value = git::config_get_global("notes.rewrite.amend").ok().flatten();
+    let rebase_enabled = config_bool_or_default(rebase_value.as_deref(), true);
+    let amend_enabled = config_bool_or_default(amend_value.as_deref(), true);
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Notes rewrite: {}={} rebase={} amend={}",
+            git::NOTES_REF,
+            if rewrite_ref_enabled { "yes" } else { "no" },
+            if rebase_enabled { "on" } else { "off" },
+            if amend_enabled { "on" } else { "off" }
+        ),
+        false,
+    );
+
+    if !rewrite_ref_enabled || !rebase_enabled || !amend_enabled {
+        output::note_to_with_tty(
+            w,
+            "Rebase/amend may orphan Cadence notes until rewrite settings are fixed.",
+            false,
+        );
+        if !rewrite_ref_enabled {
             output::detail_to_with_tty(
                 w,
                 &format!(
-                    "Hooks path: {} (post-commit: {}, pre-push: {})",
-                    path, post_str, pre_str
+                    "Run `git config --global --add notes.rewriteRef {}`",
+                    git::NOTES_REF
                 ),
                 false,
             );
         }
-        _ => {
-            output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
+        if !rebase_enabled {
+            output::detail_to_with_tty(
+                w,
+                "Run `git config --global notes.rewrite.rebase true`",
+                false,
+            );
+        }
+        if !amend_enabled {
+            output::detail_to_with_tty(
+                w,
+                "Run `git config --global notes.rewrite.amend true`",
+                false,
+            );
         }
     }
 
@@ -1973,6 +2538,236 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_doctor() -> Result<()> {
+    run_doctor_inner(&mut std::io::stderr())
+}
+
+fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
+    output::action_to_with_tty(w, "Doctor", "", false);
+
+    let mut issues = 0usize;
+
+    let repo_root = match git::repo_root() {
+        Ok(root) => {
+            output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
+            Some(root)
+        }
+        Err(_) => {
+            output::detail_to_with_tty(w, "Repo: (not in a git repository)", false);
+            None
+        }
+    };
+
+    let global_hooks_path = match git::config_get_global("core.hooksPath") {
+        Ok(path) => path,
+        Err(e) => {
+            output::fail_to_with_tty(
+                w,
+                "Failed",
+                &format!("could not read global core.hooksPath ({e})"),
+                false,
+            );
+            issues += 1;
+            None
+        }
+    };
+
+    match &global_hooks_path {
+        Some(path) => {
+            let hooks_dir = resolve_hooks_path(repo_root.as_deref(), path);
+            let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+            output::detail_to_with_tty(
+                w,
+                &format!(
+                    "Global hooks: {} (post-commit: {}, pre-push: {})",
+                    path,
+                    if post_installed { "yes" } else { "no" },
+                    if pre_installed { "yes" } else { "no" }
+                ),
+                false,
+            );
+            if !post_installed || !pre_installed {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    "Cadence global hooks are not fully installed",
+                    false,
+                );
+                output::detail_to_with_tty(w, "Run `cadence install` to repair hooks.", false);
+                issues += 1;
+            }
+        }
+        None => {
+            output::fail_to_with_tty(w, "Fail", "Global core.hooksPath is not configured", false);
+            output::detail_to_with_tty(w, "Run `cadence install` to configure hooks.", false);
+            issues += 1;
+        }
+    }
+
+    if let Some(ref root) = repo_root {
+        match git::config_get_at(root, "core.hooksPath") {
+            Ok(Some(active_path)) => {
+                let hooks_dir = resolve_hooks_path(Some(root), &active_path);
+                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir);
+                output::detail_to_with_tty(
+                    w,
+                    &format!(
+                        "Active hooks: {} (post-commit: {}, pre-push: {})",
+                        active_path,
+                        if post_installed { "yes" } else { "no" },
+                        if pre_installed { "yes" } else { "no" }
+                    ),
+                    false,
+                );
+                if !post_installed || !pre_installed {
+                    output::fail_to_with_tty(
+                        w,
+                        "Fail",
+                        "Active hooksPath does not contain Cadence hooks",
+                        false,
+                    );
+                    output::detail_to_with_tty(w, "Run `cadence install` or fix hooksPath.", false);
+                    issues += 1;
+                }
+            }
+            Ok(None) => {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    "No effective hooksPath found for this repository",
+                    false,
+                );
+                issues += 1;
+            }
+            Err(e) => {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    &format!("could not read repo hooksPath ({e})"),
+                    false,
+                );
+                issues += 1;
+            }
+        }
+
+        if let (Ok(Some(local_hooks_path)), Some(global_path)) = (
+            git::config_get_local_at(root, "core.hooksPath"),
+            global_hooks_path.as_ref(),
+        ) {
+            let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
+            let global_resolved = resolve_hooks_path(Some(root), global_path);
+            if !paths_equivalent(&local_resolved, &global_resolved) {
+                output::fail_to_with_tty(
+                    w,
+                    "Fail",
+                    &format!(
+                        "Repo-local core.hooksPath overrides global Cadence hooks: {}",
+                        local_hooks_path
+                    ),
+                    false,
+                );
+                output::detail_to_with_tty(
+                    w,
+                    "Run `git config --unset core.hooksPath` in this repo to use global hooks.",
+                    false,
+                );
+                issues += 1;
+            }
+        }
+    } else {
+        output::note_to_with_tty(
+            w,
+            "Skipped repo-local hook checks because current directory is not a git repository.",
+            false,
+        );
+    }
+
+    let rewrite_refs = match git::config_get_global_all("notes.rewriteRef") {
+        Ok(refs) => refs,
+        Err(e) => {
+            output::fail_to_with_tty(
+                w,
+                "Fail",
+                &format!("could not read notes.rewriteRef ({e})"),
+                false,
+            );
+            issues += 1;
+            Vec::new()
+        }
+    };
+    let rewrite_ref_enabled = notes_rewrite_ref_present(&rewrite_refs, git::NOTES_REF);
+    let rebase_enabled = config_bool_or_default(
+        git::config_get_global("notes.rewrite.rebase")
+            .ok()
+            .flatten()
+            .as_deref(),
+        true,
+    );
+    let amend_enabled = config_bool_or_default(
+        git::config_get_global("notes.rewrite.amend")
+            .ok()
+            .flatten()
+            .as_deref(),
+        true,
+    );
+
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Notes rewrite: {}={} rebase={} amend={}",
+            git::NOTES_REF,
+            if rewrite_ref_enabled { "yes" } else { "no" },
+            if rebase_enabled { "on" } else { "off" },
+            if amend_enabled { "on" } else { "off" }
+        ),
+        false,
+    );
+
+    if !rewrite_ref_enabled {
+        output::fail_to_with_tty(
+            w,
+            "Fail",
+            &format!("notes.rewriteRef missing {}", git::NOTES_REF),
+            false,
+        );
+        output::detail_to_with_tty(
+            w,
+            &format!(
+                "Run `git config --global --add notes.rewriteRef {}`",
+                git::NOTES_REF
+            ),
+            false,
+        );
+        issues += 1;
+    }
+    if !rebase_enabled {
+        output::fail_to_with_tty(w, "Fail", "notes.rewrite.rebase is disabled", false);
+        output::detail_to_with_tty(
+            w,
+            "Run `git config --global notes.rewrite.rebase true`",
+            false,
+        );
+        issues += 1;
+    }
+    if !amend_enabled {
+        output::fail_to_with_tty(w, "Fail", "notes.rewrite.amend is disabled", false);
+        output::detail_to_with_tty(
+            w,
+            "Run `git config --global notes.rewrite.amend true`",
+            false,
+        );
+        issues += 1;
+    }
+
+    if issues == 0 {
+        output::success_to_with_tty(w, "Doctor", "all checks passed", false);
+        Ok(())
+    } else {
+        output::fail_to_with_tty(w, "Doctor", &format!("{} issue(s) found", issues), false);
+        anyhow::bail!("doctor found {} issue(s)", issues);
+    }
 }
 
 /// The notes list subcommand: show recent commits with note markers.
@@ -2211,7 +3006,7 @@ fn run_keys_disable() -> Result<()> {
 }
 
 /// Optional encryption setup during install. Returns `Ok(())` if setup was
-/// skipped or completed, and `Err` if install should abort before hydration.
+/// skipped or completed, and `Err` if install should abort before backfill.
 fn run_install_encryption_setup() -> Result<()> {
     if !output::is_stderr_tty() || !Term::stdout().is_term() {
         return Ok(());
@@ -2261,7 +3056,7 @@ fn run_install_encryption_setup() -> Result<()> {
         output::fail_to_with_tty(
             &mut stdout,
             "Encryption",
-            "setup did not complete. Install will stop before hydration.",
+            "setup did not complete. Install will stop before backfill.",
             is_tty,
         );
         anyhow::bail!("encryption setup incomplete");
@@ -2551,12 +3346,73 @@ fn run_update(check: bool, yes: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// GC: clear bloated notes and re-backfill
+// ---------------------------------------------------------------------------
+
+fn run_gc(since: &str, confirm: bool) -> Result<()> {
+    // Validate the --since value early so we fail before any destructive work.
+    let since_secs = parse_since_duration(since)?;
+    let since_days = since_secs / 86_400;
+
+    let repo_root = git::repo_root()?;
+
+    if !confirm {
+        output::note("This will DELETE all local and remote AI session notes for this repo,");
+        output::note("then re-backfill them in the optimized v2 format.");
+        output::detail(&format!("Re-backfill window: last {} days", since_days));
+        output::detail("Local ref:  refs/notes/ai-sessions  → deleted");
+        output::detail("Remote ref: refs/notes/ai-sessions  → deleted");
+        output::detail("Then: cadence backfill --since <window> --push");
+        eprintln!();
+        output::fail("Aborted", "pass --confirm to proceed.");
+        anyhow::bail!("gc requires --confirm to proceed");
+    }
+
+    // Resolve push remote (e.g. "origin").
+    let remote = git::resolve_push_remote_at(&repo_root)?;
+
+    // Step 1: Delete remote notes ref.
+    if let Some(ref remote_name) = remote {
+        output::action(
+            "GC",
+            &format!("Deleting remote notes ref on '{}'", remote_name),
+        );
+        match git::delete_remote_ref_at(Some(&repo_root), remote_name, git::NOTES_REF) {
+            Ok(()) => output::detail("Remote notes ref deleted (or did not exist)."),
+            Err(e) => output::detail(&format!("Could not delete remote ref (continuing): {e}")),
+        }
+    } else {
+        output::detail("No push remote found; skipping remote ref deletion.");
+    }
+
+    // Step 2: Delete local notes ref.
+    output::action("GC", "Deleting local notes ref");
+    match git::delete_local_ref_at(Some(&repo_root), git::NOTES_REF) {
+        Ok(()) => output::detail("Local notes ref deleted (or did not exist)."),
+        Err(e) => output::detail(&format!("Could not delete local ref (continuing): {e}")),
+    }
+
+    // Step 3: Re-backfill in v2 format with push enabled (scoped to this repo).
+    output::action(
+        "GC",
+        &format!("Re-backfilling (last {} days) with push", since_days),
+    );
+    run_backfill_inner(since, true, Some(&repo_root), false)?;
+
+    output::success("GC", "Complete. Notes have been regenerated in v2 format.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 fn main() {
     let cli = Cli::parse();
     output::set_verbose(cli.verbose);
+    if let Some(url) = cli.api_url.clone() {
+        let _ = API_URL_OVERRIDE.set(url);
+    }
 
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
@@ -2571,7 +3427,9 @@ fn main() {
                 timestamp,
             } => run_hook_post_commit_retry(&commit, &repo, timestamp),
         },
-        Command::Hydrate { since, push } => run_hydrate(&since, push),
+        Command::Backfill { since, push } => run_backfill(&since, push),
+        Command::Login => run_login(),
+        Command::Logout => run_logout(),
         Command::Retry => run_retry(),
         Command::Notes { notes_command } => match notes_command {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
@@ -2582,6 +3440,7 @@ fn main() {
             ConfigCommand::Get { key } => run_config_get(&key),
             ConfigCommand::List => run_config_list(),
         },
+        Command::Doctor => run_doctor(),
         Command::Update { check, yes } => run_update(check, yes),
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Setup => run_keys_setup(),
@@ -2589,6 +3448,7 @@ fn main() {
             KeysCommands::Disable => run_keys_disable(),
             KeysCommands::Refresh => run_keys_refresh(),
         },
+        Command::Gc { since, confirm } => run_gc(&since, confirm),
     };
 
     // Passive background version check: run after successful command execution
@@ -2610,6 +3470,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn cli_parses_keys_setup() {
@@ -2627,10 +3488,40 @@ mod tests {
         let cli = Cli::parse_from(["cadence", "keys"]);
         match cli.command {
             Command::Keys { keys_command } => {
-                assert!(matches!(keys_command, None));
+                assert!(keys_command.is_none());
             }
             _ => panic!("expected Keys command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_login_command() {
+        let cli = Cli::parse_from(["cadence", "login"]);
+        assert!(matches!(cli.command, Command::Login));
+    }
+
+    #[test]
+    fn cli_parses_logout_command() {
+        let cli = Cli::parse_from(["cadence", "logout"]);
+        assert!(matches!(cli.command, Command::Logout));
+    }
+
+    #[test]
+    fn cli_parses_backfill_command() {
+        let cli = Cli::parse_from(["cadence", "backfill", "--since", "30d", "--push"]);
+        match cli.command {
+            Command::Backfill { since, push } => {
+                assert_eq!(since, "30d");
+                assert!(push);
+            }
+            _ => panic!("expected Backfill command"),
+        }
+    }
+
+    #[test]
+    fn backfill_remote_sync_depends_on_push_flag() {
+        assert!(should_sync_remote_before_attach(true));
+        assert!(!should_sync_remote_before_attach(false));
     }
 
     // -----------------------------------------------------------------------
@@ -2751,6 +3642,15 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_doctor() {
+        let cli = Cli::parse_from(["cadence", "doctor"]);
+        match cli.command {
+            Command::Doctor => {}
+            _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
     fn cli_parses_config_get() {
         let cli = Cli::parse_from(["cadence", "config", "get", "auto_update"]);
         match cli.command {
@@ -2786,63 +3686,41 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Install auto-update prompt tests (mock prompter)
-    // -----------------------------------------------------------------------
-
-    /// Mock prompter that returns a preconfigured answer.
-    struct MockPrompter {
-        response: Option<bool>,
-    }
-
-    impl Prompter for MockPrompter {
-        fn confirm(
-            &mut self,
-            _prompt: &str,
-            _writer: &mut dyn std::io::Write,
-        ) -> Result<Option<bool>> {
-            Ok(self.response)
-        }
+    #[test]
+    fn config_bool_or_default_parses_common_values() {
+        assert!(config_bool_or_default(Some("true"), false));
+        assert!(config_bool_or_default(Some("YES"), false));
+        assert!(!config_bool_or_default(Some("false"), true));
+        assert!(!config_bool_or_default(Some("0"), true));
+        assert!(config_bool_or_default(Some("unexpected"), true));
+        assert!(!config_bool_or_default(None, false));
     }
 
     #[test]
-    fn install_auto_update_prompt_skips_when_already_set() {
-        let cfg = config::CliConfig {
-            auto_update: Some(true),
-            ..Default::default()
-        };
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        cfg.save_to(&path).unwrap();
-
-        // The prompter should never be called — but even if the TTY check
-        // short-circuits first, the function should not modify config.
-        let mut prompter = MockPrompter {
-            response: Some(true),
-        };
-        run_install_auto_update_prompt_inner(&mut prompter, &cfg, &path);
-
-        // Config unchanged (auto_update was already Some(true))
-        let loaded = config::CliConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.auto_update, Some(true));
+    fn notes_rewrite_ref_present_checks_exact_ref() {
+        let refs = vec![
+            "refs/notes/commits".to_string(),
+            "refs/notes/ai-sessions".to_string(),
+        ];
+        assert!(notes_rewrite_ref_present(&refs, "refs/notes/ai-sessions"));
+        assert!(!notes_rewrite_ref_present(&refs, "refs/notes/other"));
     }
 
     #[test]
-    fn install_auto_update_prompt_skips_when_already_set_false() {
-        let cfg = config::CliConfig {
-            auto_update: Some(false),
-            ..Default::default()
-        };
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        cfg.save_to(&path).unwrap();
+    fn resolve_hooks_path_uses_repo_root_for_relative_paths() {
+        let repo = TempDir::new().expect("tempdir");
+        let resolved = resolve_hooks_path(Some(repo.path()), ".git/hooks");
+        assert_eq!(resolved, repo.path().join(".git/hooks"));
+    }
 
-        let mut prompter = MockPrompter {
-            response: Some(true),
-        };
-        run_install_auto_update_prompt_inner(&mut prompter, &cfg, &path);
+    #[test]
+    fn paths_equivalent_matches_relative_and_absolute_same_target() {
+        let repo = TempDir::new().expect("tempdir");
+        let hooks_dir = repo.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
 
-        let loaded = config::CliConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.auto_update, Some(false));
+        let absolute = hooks_dir.clone();
+        let relative = repo.path().join(".git/./hooks");
+        assert!(paths_equivalent(&absolute, &relative));
     }
 }

@@ -208,7 +208,7 @@ pub fn check_enabled() -> bool {
 /// Check whether Cadence CLI is enabled for a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`check_enabled`], for use
-/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+/// by commands that operate on repos other than the CWD (e.g., `backfill`).
 ///
 /// Reads `git -C <repo> config ai.cadence.enabled`. If the value is exactly
 /// `"false"`, returns `false`. Any other value (including unset) returns `true`.
@@ -255,7 +255,7 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 /// in a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`note_exists`], for use
-/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+/// by commands that operate on repos other than the CWD (e.g., `backfill`).
 pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     validate_commit_hash(commit)?;
     let output = run_git_output_at(
@@ -270,7 +270,7 @@ pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
 /// Attach an AI-session note to a commit in a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`add_note`], for use
-/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+/// by commands that operate on repos other than the CWD (e.g., `backfill`).
 ///
 /// **Precondition:** Callers must check [`note_exists_at`] first and skip if
 /// a note is already present.
@@ -298,6 +298,265 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
         bail!("git notes add failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+/// Store arbitrary bytes as a git blob in a specific repository and return its
+/// 40-char SHA-1 hash.
+///
+/// Uses `git hash-object -w --stdin` to write the blob to the object store.
+pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    if let Some(repo) = repo {
+        cmd.args(["-C", &repo.to_string_lossy()]);
+    }
+    cmd.args(["hash-object", "-w", "--stdin"]);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn git hash-object")?;
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(data)
+            .context("failed to write blob data to git hash-object stdin")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git hash-object")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git hash-object failed: {}", stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git hash-object output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("git hash-object returned invalid SHA: {}", sha);
+    }
+
+    Ok(sha)
+}
+
+/// Read a git blob by its SHA from a specific repository.
+///
+/// Uses `git cat-file blob <sha>`.
+pub fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
+    let output = run_git_output_at(repo, &["cat-file", "blob", sha], &[])
+        .context("failed to execute git cat-file blob")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git cat-file blob failed: {}", stderr.trim());
+    }
+
+    Ok(output.stdout)
+}
+
+// ---------------------------------------------------------------------------
+// Plumbing helpers for notes ref squashing (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// List all notes in the AI-session notes ref.
+///
+/// Returns `Vec<(note_blob_sha, commit_sha)>` — one entry per attached note.
+/// Returns an empty vec if the notes ref doesn't exist.
+pub(crate) fn list_notes_at(repo: Option<&Path>) -> Result<Vec<(String, String)>> {
+    let output = run_git_output_at(repo, &["notes", "--ref", NOTES_REF, "list"], &[])
+        .context("failed to execute git notes list")?;
+
+    if !output.status.success() {
+        // Empty notes ref returns exit 1 — not an error for us.
+        return Ok(Vec::new());
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("git notes list output was not valid UTF-8")?;
+
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(note_sha), Some(commit_sha)) = (parts.next(), parts.next()) {
+            entries.push((note_sha.to_string(), commit_sha.to_string()));
+        }
+    }
+    Ok(entries)
+}
+
+/// List top-level tree entries for a treeish (commit, tree, or ref).
+///
+/// Returns raw `git ls-tree` output lines, one per entry, in the format:
+/// `<mode> <type> <sha>\t<name>`
+pub(crate) fn ls_tree_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<String>> {
+    let output = run_git_output_at(repo, &["ls-tree", treeish], &[])
+        .context("failed to execute git ls-tree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git ls-tree failed: {}", stderr.trim());
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("git ls-tree output was not valid UTF-8")?;
+
+    Ok(stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect())
+}
+
+/// Create a tree object from `ls-tree`-formatted entry lines.
+///
+/// Each entry must be: `<mode> <type> <sha>\t<name>`
+/// Returns the 40-char SHA of the new tree.
+pub(crate) fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    if let Some(repo) = repo {
+        cmd.args(["-C", &repo.to_string_lossy()]);
+    }
+    cmd.arg("mktree");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn git mktree")?;
+    if let Some(ref mut stdin) = child.stdin {
+        let input = entries.join("\n");
+        stdin
+            .write_all(input.as_bytes())
+            .context("failed to write to git mktree stdin")?;
+        if !input.is_empty() {
+            stdin
+                .write_all(b"\n")
+                .context("failed to write trailing newline to mktree")?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git mktree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git mktree failed: {}", stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git mktree output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(sha)
+}
+
+/// Create a commit from a tree object, optionally with a parent.
+///
+/// If `parent` is `None`, creates an orphan commit (no parents).
+/// If `parent` is `Some(sha)`, creates a commit with that parent.
+/// Returns the 40-char SHA of the new commit.
+pub(crate) fn commit_tree_at(
+    repo: Option<&Path>,
+    tree: &str,
+    message: &str,
+    parent: Option<&str>,
+) -> Result<String> {
+    let mut args = vec!["commit-tree", tree, "-m", message];
+    if let Some(p) = parent {
+        args.push("-p");
+        args.push(p);
+    }
+    let output =
+        run_git_output_at(repo, &args, &[]).context("failed to execute git commit-tree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git commit-tree failed: {}", stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git commit-tree output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(sha)
+}
+
+/// Update a ref to point to a new commit.
+pub(crate) fn update_ref_at(repo: Option<&Path>, ref_name: &str, commit: &str) -> Result<()> {
+    let output = run_git_output_at(repo, &["update-ref", ref_name, commit], &[])
+        .context("failed to execute git update-ref")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git update-ref failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Delete a local ref (e.g. `refs/notes/ai-sessions`).
+///
+/// Wraps `git update-ref -d <ref>`. Returns Ok even if the ref didn't exist.
+pub(crate) fn delete_local_ref_at(repo: Option<&Path>, ref_name: &str) -> Result<()> {
+    let output = run_git_output_at(repo, &["update-ref", "-d", ref_name], &[])
+        .context("failed to execute git update-ref -d")?;
+
+    // Tolerate "not found" — the ref may not exist locally.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("does not exist") {
+            bail!("git update-ref -d failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+/// Delete a ref on a remote (e.g. `refs/notes/ai-sessions`).
+///
+/// Wraps `git push <remote> --delete <ref>`. Returns Ok even if the remote ref
+/// didn't exist.
+pub(crate) fn delete_remote_ref_at(
+    repo: Option<&Path>,
+    remote: &str,
+    ref_name: &str,
+) -> Result<()> {
+    // Use --no-verify to skip the pre-push hook, which would otherwise
+    // try to sync notes (fetch-merge-push) and change the ref we're deleting.
+    let output = run_git_output_at(
+        repo,
+        &["push", "--no-verify", remote, "--delete", ref_name],
+        &[],
+    )
+    .context("failed to execute git push --delete")?;
+
+    // Tolerate "not found" — the remote ref may not exist.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("remote ref does not exist") && !stderr.contains("unable to delete") {
+            bail!("git push --delete failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a revision expression to its SHA.
+pub(crate) fn rev_parse_at(repo: Option<&Path>, rev: &str) -> Result<String> {
+    let output = run_git_output_at(repo, &["rev-parse", rev], &[])
+        .context("failed to execute git rev-parse")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git rev-parse {:?} failed: {}", rev, stderr.trim());
+    }
+
+    let sha = String::from_utf8(output.stdout)
+        .context("git rev-parse output was not valid UTF-8")?
+        .trim()
+        .to_string();
+
+    Ok(sha)
 }
 
 /// Check whether a commit exists in a given repository.
@@ -490,10 +749,15 @@ fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
 }
 
 /// Push the AI-session notes ref to the provided remote.
+///
+/// Note: Production push paths now use inline force-with-lease pushes
+/// (see `push.rs`). This function is retained for test use.
+#[allow(dead_code)]
 pub fn push_notes(remote: &str) -> Result<()> {
     push_notes_at(None, remote)
 }
 
+#[allow(dead_code)]
 pub fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
     let output = run_git_output_at(
         repo,
@@ -532,6 +796,7 @@ pub fn has_upstream() -> Result<bool> {
 /// 5) otherwise return None
 ///
 /// Returns `Ok(None)` when HEAD is detached or the remote is "."/empty.
+#[cfg(test)]
 pub fn resolve_push_remote() -> Result<Option<String>> {
     let output = run_git_output_at(None, &["symbolic-ref", "--quiet", "--short", "HEAD"], &[])
         .context("failed to execute git symbolic-ref")?;
@@ -828,6 +1093,30 @@ pub fn config_get_at(repo: &Path, key: &str) -> Result<Option<String>> {
     Ok(Some(value.trim().to_string()))
 }
 
+/// Read a repo-local git config value (ignores global/system). Returns `Ok(None)` if unset.
+pub fn config_get_local_at(repo: &Path, key: &str) -> Result<Option<String>> {
+    let output = run_git_output_at(Some(repo), &["config", "--local", "--get", key], &[])
+        .context("failed to execute git config --local --get")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --local --get {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+        return Ok(None);
+    }
+
+    let value =
+        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
+    Ok(Some(value.trim().to_string()))
+}
+
 /// Read a git config value from global scope. Returns `Ok(None)` if the key is not set.
 ///
 /// Uses `--global` flag to read only the global config, not repo-local.
@@ -853,6 +1142,37 @@ pub fn config_get_global(key: &str) -> Result<Option<String>> {
     let value =
         String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
     Ok(Some(value.trim().to_string()))
+}
+
+/// Read all values for a global git config key (`--global --get-all`).
+///
+/// Returns an empty vector if the key is not set.
+pub fn config_get_global_all(key: &str) -> Result<Vec<String>> {
+    let output = run_git_output_at(None, &["config", "--global", "--get-all", key], &[])
+        .context("failed to execute git config --global --get-all")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "git config --global --get-all {:?} failed (exit {}): {}",
+                key,
+                code,
+                stderr.trim()
+            );
+        }
+        return Ok(Vec::new());
+    }
+
+    let value =
+        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
+    Ok(value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// Check org filter for a specific repository. If a global org is configured,
@@ -893,6 +1213,18 @@ pub fn config_set_global(key: &str, value: &str) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git config --global set failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Add a git config value in global scope (`--global --add`).
+pub fn config_add_global(key: &str, value: &str) -> Result<()> {
+    let output = run_git_output_at(None, &["config", "--global", "--add", key, value], &[])
+        .context("failed to execute git config --global --add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git config --global --add failed: {}", stderr.trim());
     }
     Ok(())
 }
@@ -1235,6 +1567,60 @@ mod tests {
 
         let value = git_output_in(path, &["config", "--get", "ai.cadence.org"]).unwrap();
         assert_eq!(value, "second-org");
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_get_global_all_returns_empty_when_unset() {
+        let dir = init_temp_repo();
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        let values = config_get_global_all("notes.rewriteRef").expect("config_get_global_all");
+        assert!(values.is_empty());
+
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_add_global_and_get_all_roundtrip() {
+        let dir = init_temp_repo();
+        let global_config = dir.path().join("fake-global-gitconfig");
+        std::fs::write(&global_config, "").unwrap();
+
+        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
+        }
+
+        config_add_global("notes.rewriteRef", "refs/notes/commits").expect("first add");
+        config_add_global("notes.rewriteRef", "refs/notes/ai-sessions").expect("second add");
+        let values = config_get_global_all("notes.rewriteRef").expect("config_get_global_all");
+        assert_eq!(
+            values,
+            vec![
+                "refs/notes/commits".to_string(),
+                "refs/notes/ai-sessions".to_string()
+            ]
+        );
+
+        unsafe {
+            match original_global {
+                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1783,5 +2169,179 @@ mod tests {
                 None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // store_blob / read_blob
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_store_and_read_blob_roundtrip() {
+        let dir = init_temp_repo();
+        let data = b"hello, this is a test blob";
+
+        let sha = store_blob_at(Some(dir.path()), data).expect("store_blob_at failed");
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn test_store_blob_binary_data() {
+        let dir = init_temp_repo();
+        // Binary data including null bytes
+        let data: Vec<u8> = (0..=255).collect();
+
+        let sha = store_blob_at(Some(dir.path()), &data).expect("store_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn test_store_blob_empty() {
+        let dir = init_temp_repo();
+        let sha = store_blob_at(Some(dir.path()), b"").expect("store_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        assert!(read_back.is_empty());
+    }
+
+    #[test]
+    fn test_store_blob_deterministic() {
+        let dir = init_temp_repo();
+        let data = b"same content";
+
+        let sha1 = store_blob_at(Some(dir.path()), data).expect("first store failed");
+        let sha2 = store_blob_at(Some(dir.path()), data).expect("second store failed");
+        assert_eq!(sha1, sha2, "same content should produce same SHA");
+    }
+
+    #[test]
+    fn test_read_blob_nonexistent() {
+        let dir = init_temp_repo();
+        let result = read_blob_at(Some(dir.path()), "0000000000000000000000000000000000000000");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 plumbing: list_notes_at, ls_tree_at, mktree_at, commit_tree_at,
+    //                    update_ref_at, rev_parse_at
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_notes_at_empty() {
+        let dir = init_temp_repo();
+        let notes = list_notes_at(Some(dir.path())).expect("list_notes_at failed");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn test_list_notes_at_with_notes() {
+        let dir = init_temp_repo();
+        let commit = run_git(dir.path(), &["rev-parse", "HEAD"]);
+
+        run_git(
+            dir.path(),
+            &[
+                "notes",
+                "--ref",
+                NOTES_REF,
+                "add",
+                "-m",
+                "test note",
+                &commit,
+            ],
+        );
+
+        let notes = list_notes_at(Some(dir.path())).expect("list_notes_at failed");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].1, commit);
+        // note blob SHA should be 40 hex chars
+        assert_eq!(notes[0].0.len(), 40);
+    }
+
+    #[test]
+    fn test_ls_tree_at() {
+        let dir = init_temp_repo();
+        let commit = run_git(dir.path(), &["rev-parse", "HEAD"]);
+
+        run_git(
+            dir.path(),
+            &["notes", "--ref", NOTES_REF, "add", "-m", "hi", &commit],
+        );
+
+        let tree_rev = format!("{}^{{tree}}", NOTES_REF);
+        let entries = ls_tree_at(Some(dir.path()), &tree_rev).expect("ls_tree_at failed");
+        assert!(!entries.is_empty());
+        // Each entry should have a tab-separated name
+        assert!(entries[0].contains('\t'));
+    }
+
+    #[test]
+    fn test_mktree_at_roundtrip() {
+        let dir = init_temp_repo();
+
+        // Store a blob and create a tree containing it.
+        let sha = store_blob_at(Some(dir.path()), b"content").expect("store_blob failed");
+        let entry = format!("100644 blob {}\tfile.txt", sha);
+        let tree_sha =
+            mktree_at(Some(dir.path()), std::slice::from_ref(&entry)).expect("mktree failed");
+
+        // Read it back.
+        let entries = ls_tree_at(Some(dir.path()), &tree_sha).expect("ls_tree failed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], entry);
+    }
+
+    #[test]
+    fn test_commit_tree_at_creates_orphan() {
+        let dir = init_temp_repo();
+
+        // Create a tree.
+        let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
+        let entry = format!("100644 blob {}\tfile.txt", sha);
+        let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
+
+        // Create orphan commit.
+        let commit = commit_tree_at(Some(dir.path()), &tree, "test commit", None)
+            .expect("commit_tree failed");
+        assert_eq!(commit.len(), 40);
+
+        // Verify no parents.
+        let parents = git_output_in(dir.path(), &["log", "--format=%P", &commit]).unwrap();
+        assert!(
+            parents.is_empty(),
+            "orphan commit should have no parents, got: {:?}",
+            parents
+        );
+    }
+
+    #[test]
+    fn test_update_ref_at() {
+        let dir = init_temp_repo();
+
+        // Create a tree and commit.
+        let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
+        let entry = format!("100644 blob {}\tfile.txt", sha);
+        let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
+        let commit =
+            commit_tree_at(Some(dir.path()), &tree, "test", None).expect("commit_tree failed");
+
+        // Update a ref.
+        update_ref_at(Some(dir.path()), "refs/test/foo", &commit).expect("update_ref_at failed");
+
+        // Verify.
+        let resolved =
+            rev_parse_at(Some(dir.path()), "refs/test/foo").expect("rev_parse_at failed");
+        assert_eq!(resolved, commit);
+    }
+
+    #[test]
+    fn test_rev_parse_at() {
+        let dir = init_temp_repo();
+        let head = run_git(dir.path(), &["rev-parse", "HEAD"]);
+        let resolved = rev_parse_at(Some(dir.path()), "HEAD").expect("rev_parse_at failed");
+        assert_eq!(resolved, head);
     }
 }
