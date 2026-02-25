@@ -66,6 +66,7 @@ pub struct BackfillCompleteRequest {
 pub struct BackfillCompleteResponse {
     pub recorded: bool,
     pub backfill_completed_at: String,
+    #[allow(dead_code)]
     pub next_step: String,
 }
 

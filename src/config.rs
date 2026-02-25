@@ -338,7 +338,6 @@ impl ConfigKey {
             ConfigKey::ApiUrl => "api_url",
         }
     }
-
 }
 
 impl std::str::FromStr for ConfigKey {

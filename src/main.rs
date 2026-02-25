@@ -29,7 +29,6 @@ const KEYCHAIN_SERVICE: &str = "cadence-cli";
 const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
-const CADENCE_DASHBOARD_URL: &str = "https://dash.teamcadence.ai/";
 static API_URL_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 /// Cadence CLI: attach AI coding agent session logs to Git commits via git notes.
@@ -501,6 +500,7 @@ fn ensure_notes_rewrite_config() -> Result<()> {
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
+    println!();
     output::action("Installing", "hooks");
     let install_start = std::time::Instant::now();
 
@@ -730,6 +730,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     }
 
     // Step 5.5: Optional encryption setup
+    println!();
     if let Err(e) = run_install_encryption_setup() {
         output::fail("Install", &format!("stopped ({})", e));
         return Err(e);
@@ -738,6 +739,7 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     // Step 5.6: Optional auto-update preference prompt
     run_install_auto_update_prompt();
 
+    println!();
     if had_errors {
         output::fail("Install", "completed with issues");
     } else {
@@ -747,8 +749,6 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         "Total time: {} ms",
         install_start.elapsed().as_millis()
     ));
-    output::note("Next step: run `cadence backfill --since 30d --push` during onboarding.");
-    output::detail("Then return to the Cadence onboarding page and refresh status.");
 
     Ok(())
 }
@@ -870,7 +870,6 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
             } else {
                 output::detail("Backfill sync already recorded.");
             }
-            output::detail(&response.next_step);
         }
         Err(api_client::AuthenticatedRequestError::Unauthorized) => {
             output::note("Run `cadence login` to re-authenticate");
@@ -888,40 +887,6 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
             output::detail(&format!("Backfill sync skipped: {other}"));
         }
     }
-}
-
-fn print_start_insights_link() {
-    let dashboard_url = config::CliConfig::load()
-        .ok()
-        .map(|cfg| dashboard_url_for_api(&cfg.resolve_api_url(api_url_override()).url))
-        .unwrap_or_else(|| CADENCE_DASHBOARD_URL.to_string());
-    output::note("Next step: Open Cadence and click Start Insights when ready.");
-    output::detail(&dashboard_url);
-}
-
-fn dashboard_url_for_api(api_base_url: &str) -> String {
-    let fallback = CADENCE_DASHBOARD_URL.to_string();
-    let Ok(url) = reqwest::Url::parse(api_base_url.trim_end_matches('/')) else {
-        return fallback;
-    };
-
-    let host = url.host_str().unwrap_or_default();
-    let is_local = host == "localhost" || host == "127.0.0.1";
-    if !is_local {
-        return fallback;
-    }
-
-    let api_port = url.port_or_known_default();
-    if api_port == Some(3001) {
-        let scheme = if url.scheme() == "https" {
-            "https"
-        } else {
-            "http"
-        };
-        return format!("{scheme}://{host}:5173/");
-    }
-
-    fallback
 }
 
 /// The post-commit hook handler. This is the critical hot path.
@@ -1720,7 +1685,7 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - All errors are non-fatal (logged and continued)
 /// - Does NOT auto-push by default (use `--push` flag)
 fn run_backfill(since: &str, do_push: bool) -> Result<()> {
-    run_backfill_inner(since, do_push, None, true)
+    run_backfill_inner(since, do_push, None)
 }
 
 /// Inner implementation of backfill that accepts an optional repo filter.
@@ -1732,7 +1697,6 @@ fn run_backfill_inner(
     since: &str,
     do_push: bool,
     repo_filter: Option<&std::path::Path>,
-    show_next_step_link: bool,
 ) -> Result<()> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
@@ -2305,10 +2269,6 @@ fn run_backfill_inner(
             repos_scanned: sessions_by_repo.len() as i32,
         },
     );
-    if show_next_step_link {
-        print_start_insights_link();
-    }
-
     Ok(())
 }
 
@@ -3107,6 +3067,8 @@ fn run_install_auto_update_prompt_inner(
     let mut stdout = std::io::stdout();
     let is_tty = Term::stdout().is_term();
 
+    println!();
+    output::action_to_with_tty(&mut stdout, "Auto-update", "setup", is_tty);
     output::detail_to_with_tty(
         &mut stdout,
         "Cadence can automatically install updates when available.",
@@ -3292,12 +3254,11 @@ fn run_keys_setup_inner(
     git::config_set_global(pgp_keys::USER_FINGERPRINT_KEY, &fingerprint)
         .context("failed to save user fingerprint to git config")?;
 
-    writeln!(writer)?;
-    output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
     writeln!(writer, "Local key fingerprint: {}", fingerprint)?;
     if let Ok(Some(api_fpr)) = pgp_keys::get_api_fingerprint() {
         writeln!(writer, "API key fingerprint: {}", api_fpr)?;
     }
+    output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
 
     Ok(())
 }
@@ -3397,7 +3358,7 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
         "GC",
         &format!("Re-backfilling (last {} days) with push", since_days),
     );
-    run_backfill_inner(since, true, Some(&repo_root), false)?;
+    run_backfill_inner(since, true, Some(&repo_root))?;
 
     output::success("GC", "Complete. Notes have been regenerated in v2 format.");
     Ok(())
