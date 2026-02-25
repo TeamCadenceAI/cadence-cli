@@ -10,3 +10,29 @@ payload_blob: 0c2627ea1dbe415091f869555ca323ee412ede35
 payload_sha256: 9fb226efac07616b38e39e6a19fbe4b2bee81b09463c8744691031e3ab3c92fb
 payload_encoding: zstd+pgp
 ---
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: b88ac9ce-7620-4b2d-8625-13706d2c467f
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 2e8af50e7db7c46d16c0812f163c96c0d2a68190
+confidence: time_window_match
+session_start: 2026-02-25T14:40:54Z
+payload_blob: a450a42982ce234e587bbc27d220988353fd4944
+payload_sha256: d7faa11bc82fdb72bad6567c0a5d7c112326e645b5e6548e828c7807851a3c1f
+payload_encoding: zstd+pgp
+---
+
+---
+cadence_version: 2
+agent: claude-code
+session_id: b88ac9ce-7620-4b2d-8625-13706d2c467f
+repo: /Users/daveslutzkin/dev/cadence-cli
+commit: 12f5485f7185a8d6e127b4d6a35e541c490be3b2
+confidence: time_window_match
+session_start: 2026-02-25T14:40:54Z
+payload_blob: 0da2ca6759d9d78d737b50f39ca73a59a516f3ef
+payload_sha256: c669a40c25d1e1ec03ef16504f1102b86111b2bbeca053e1a07b01ac17769ebb
+payload_encoding: zstd+pgp
+---
