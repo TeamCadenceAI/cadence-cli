@@ -34,7 +34,7 @@ cargo build --release
 ```sh
 cadence install
 ```
-During install, Cadence asks whether to watch all repositories (`y/N`).
+During install, Cadence asks whether to watch all repositories (`Y/n`).
 If you choose `N`, provide comma-separated absolute paths (repo root, or any file/dir inside each repo).
 
 2. Make commits as usual.

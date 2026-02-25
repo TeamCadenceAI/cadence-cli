@@ -3360,6 +3360,7 @@ fn run_install_watch_scope_prompt() {
     let mut stdout = std::io::stdout();
     let is_tty = Term::stdout().is_term();
     let theme = ColorfulTheme::default();
+    let mut prompter = DialoguerPrompter::new();
 
     output::detail_to_with_tty(
         &mut stdout,
@@ -3367,13 +3368,13 @@ fn run_install_watch_scope_prompt() {
         is_tty,
     );
 
-    let watch_all = match Confirm::with_theme(&theme)
-        .with_prompt("Do you want Cadence to watch all repositories?")
-        .default(false)
-        .interact()
-    {
-        Ok(value) => value,
-        Err(_) => return,
+    let watch_all = match prompter.confirm_with_default(
+        "Do you want Cadence to watch all repositories? (Recommended)",
+        true,
+        &mut stdout,
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return,
     };
 
     if watch_all {
@@ -3442,6 +3443,16 @@ fn run_install_watch_scope_prompt() {
 
 trait Prompter {
     fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>>;
+
+    fn confirm_with_default(
+        &mut self,
+        prompt: &str,
+        default: bool,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<Option<bool>> {
+        let _ = default;
+        self.confirm(prompt, writer)
+    }
 }
 
 struct DialoguerPrompter {
@@ -3460,6 +3471,25 @@ impl Prompter for DialoguerPrompter {
     fn confirm(&mut self, prompt: &str, _writer: &mut dyn std::io::Write) -> Result<Option<bool>> {
         let result = Confirm::with_theme(&self.theme)
             .with_prompt(prompt)
+            .interact();
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn confirm_with_default(
+        &mut self,
+        prompt: &str,
+        default: bool,
+        _writer: &mut dyn std::io::Write,
+    ) -> Result<Option<bool>> {
+        let result = Confirm::with_theme(&self.theme)
+            .with_prompt(prompt)
+            .default(default)
             .interact();
         match result {
             Ok(value) => Ok(Some(value)),
