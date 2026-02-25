@@ -212,15 +212,8 @@ fn render_callback_html(status_code: u16, body_text: &str) -> String {
     } else {
         "rgba(239, 68, 68, 0.14)"
     };
-    let follow_up = if is_success {
-        "You can close this tab and return to your terminal."
-    } else {
-        "Return to your terminal for details, then run cadence login again."
-    };
-
     let escaped_body = escape_html(body_text);
     let escaped_title = escape_html(title);
-    let escaped_follow_up = escape_html(follow_up);
     let brand_svg = CADENCE_LOCKUP_SVG.replacen("<svg ", "<svg class=\"brand-logo\" ", 1);
 
     format!(
@@ -251,7 +244,7 @@ body {{
   border: 1px solid #e8eaed;
   border-radius: 16px;
   box-shadow: 0 10px 36px rgba(15, 23, 42, 0.08);
-  padding: 26px 24px;
+  padding: 34px 30px;
 }}
 .brand {{
   margin-bottom: 14px;
@@ -288,10 +281,6 @@ p {{
   line-height: 1.55;
   color: #334155;
 }}
-.follow-up {{
-  margin-top: 14px;
-  color: #607d8b;
-}}
 @media (max-width: 480px) {{
   .brand-logo {{
     height: 56px;
@@ -309,7 +298,6 @@ p {{
 <span class="badge">{badge}</span>
 <h1>{escaped_title}</h1>
 <p>{escaped_body}</p>
-<p class="follow-up">{escaped_follow_up}</p>
 </main>
 </div>
 </body>
@@ -360,6 +348,7 @@ mod tests {
         assert!(html.contains("class=\"brand-logo\""));
         assert!(html.contains("viewBox=\"0 0 770 300\""));
         assert!(html.contains("fill=\"#1A1363\""));
+        assert!(!html.contains("You can close this tab and return to your terminal."));
     }
 
     #[test]
@@ -368,7 +357,7 @@ mod tests {
         assert!(html.contains("Authentication Failed"));
         assert!(html.contains(">ERR<"));
         assert!(html.contains("#ef4444"));
-        assert!(html.contains("run cadence login again"));
+        assert!(!html.contains("run cadence login again"));
     }
 
     #[test]
