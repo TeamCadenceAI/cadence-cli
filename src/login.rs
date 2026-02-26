@@ -200,13 +200,6 @@ fn render_callback_html(status_code: u16, body_text: &str) -> String {
     } else {
         "Authentication Failed"
     };
-    let badge = if is_success { "OK" } else { "ERR" };
-    let accent = if is_success { "#10b981" } else { "#ef4444" };
-    let accent_bg = if is_success {
-        "rgba(16, 185, 129, 0.14)"
-    } else {
-        "rgba(239, 68, 68, 0.14)"
-    };
     let escaped_body = escape_html(body_text);
     let escaped_title = escape_html(title);
     let brand_svg = CADENCE_LOCKUP_SVG.replacen("<svg ", "<svg class=\"brand-logo\" ", 1);
@@ -264,22 +257,6 @@ body {{
   width: auto;
   max-width: 320px;
 }}
-.badge {{
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: 30px;
-  margin: 0 auto 16px;
-  padding: 0 14px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  color: {accent};
-  background: {accent_bg};
-  border: 1px solid {accent_bg};
-  white-space: nowrap;
-}}
 h1 {{
   margin: 0 0 12px;
   font-size: 34px;
@@ -318,7 +295,6 @@ p {{
 <div class="brand" aria-label="Cadence">
 {brand_svg}
 </div>
-<span class="badge">{badge}</span>
 <h1>{escaped_title}</h1>
 <p>{escaped_body}</p>
 </main>
@@ -365,8 +341,7 @@ mod tests {
     fn callback_html_success_variant_is_styled() {
         let html = render_callback_html(200, "You can close this tab");
         assert!(html.contains("Authentication Complete"));
-        assert!(html.contains(">OK<"));
-        assert!(html.contains("#10b981"));
+        assert!(!html.contains(">OK<"));
         assert!(html.contains("Work Sans"));
         assert!(html.contains("class=\"brand-logo\""));
         assert!(html.contains("viewBox=\"0 0 770 300\""));
@@ -378,8 +353,7 @@ mod tests {
     fn callback_html_error_variant_is_styled() {
         let html = render_callback_html(400, "State mismatch. Please retry cadence login.");
         assert!(html.contains("Authentication Failed"));
-        assert!(html.contains(">ERR<"));
-        assert!(html.contains("#ef4444"));
+        assert!(!html.contains(">ERR<"));
         assert!(!html.contains("run cadence login again"));
     }
 
