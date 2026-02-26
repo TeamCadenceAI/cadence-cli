@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::api_client::{ApiClient, CliTokenExchangeResult};
 
-const CADENCE_LOCKUP_SVG: &str = include_str!("../assets/cadence-lockup.svg");
+const CADENCE_LOCKUP_INLINE_SVG: &str = include_str!("../assets/cadence-lockup-inline.svg");
 
 /// Complete browser-based CLI OAuth login flow.
 pub fn login_via_browser(api_base_url: &str, timeout: Duration) -> Result<CliTokenExchangeResult> {
@@ -202,7 +202,7 @@ fn render_callback_html(status_code: u16, body_text: &str) -> String {
     };
     let escaped_body = escape_html(body_text);
     let escaped_title = escape_html(title);
-    let brand_svg = CADENCE_LOCKUP_SVG.replacen("<svg ", "<svg class=\"brand-logo\" ", 1);
+    let brand_svg = CADENCE_LOCKUP_INLINE_SVG;
 
     format!(
         r#"<!doctype html>
@@ -216,11 +216,11 @@ fn render_callback_html(status_code: u16, body_text: &str) -> String {
 html, body {{ height: 100%; margin: 0; }}
 body {{
   font-family: 'Work Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  color: #0f172a;
+  color: #e2e8f0;
   background:
-    radial-gradient(1200px 640px at 8% -5%, rgba(88, 80, 236, 0.16) 0%, rgba(88, 80, 236, 0) 58%),
-    radial-gradient(720px 460px at 92% 110%, rgba(30, 64, 175, 0.12) 0%, rgba(30, 64, 175, 0) 62%),
-    linear-gradient(180deg, #f9fbff 0%, #f4f7fb 100%);
+    radial-gradient(1200px 640px at 8% -5%, rgba(99, 102, 241, 0.26) 0%, rgba(99, 102, 241, 0) 58%),
+    radial-gradient(720px 460px at 92% 110%, rgba(30, 64, 175, 0.2) 0%, rgba(30, 64, 175, 0) 62%),
+    linear-gradient(180deg, #070b14 0%, #0b1020 100%);
 }}
 .wrap {{
   min-height: 100%;
@@ -233,10 +233,10 @@ body {{
   overflow: hidden;
   width: min(640px, 100%);
   text-align: left;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, #ffffff 100%);
-  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.9) 0%, rgba(10, 15, 30, 0.92) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.28);
   border-radius: 24px;
-  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.13);
+  box-shadow: 0 30px 72px rgba(2, 6, 23, 0.55);
   padding: 58px 52px 56px;
 }}
 .card::before {{
@@ -253,9 +253,13 @@ body {{
 }}
 .brand-logo {{
   display: block;
-  height: 68px;
+  height: 66px;
   width: auto;
-  max-width: 305px;
+  max-width: 300px;
+  color: #ffffff;
+}}
+.brand-logo path {{
+  fill: #ffffff;
 }}
 .content {{
   max-width: 40ch;
@@ -266,13 +270,13 @@ h1 {{
   font-size: 30px;
   line-height: 1.14;
   letter-spacing: -0.015em;
-  color: #0f172a;
+  color: #f8fafc;
 }}
 p {{
   margin: 0;
   font-size: 18px;
   line-height: 1.5;
-  color: #475569;
+  color: #cbd5e1;
 }}
 @media (max-width: 600px) {{
   .wrap {{
@@ -283,8 +287,8 @@ p {{
     padding: 44px 24px 40px;
   }}
   .brand-logo {{
-    height: 56px;
-    max-width: 240px;
+    height: 54px;
+    max-width: 250px;
   }}
   .content {{
     padding-left: 8px;
@@ -356,7 +360,7 @@ mod tests {
         assert!(html.contains("Work Sans"));
         assert!(html.contains("class=\"brand-logo\""));
         assert!(html.contains("viewBox=\"0 0 770 300\""));
-        assert!(html.contains("fill=\"#1A1363\""));
+        assert!(html.contains("fill=\"currentColor\""));
         assert!(!html.contains("You can close this tab and return to your terminal."));
     }
 
