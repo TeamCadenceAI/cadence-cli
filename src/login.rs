@@ -167,12 +167,7 @@ fn handle_callback_request(stream: &mut TcpStream, expected_state: &str) -> Resu
         return Ok(None);
     }
 
-    write_http_response(
-        stream,
-        200,
-        "OK",
-        "Authentication complete. You can close this tab.",
-    )?;
+    write_http_response(stream, 200, "OK", "You can close this tab")?;
 
     Ok(Some(code))
 }
@@ -228,63 +223,91 @@ fn render_callback_html(status_code: u16, body_text: &str) -> String {
 html, body {{ height: 100%; margin: 0; }}
 body {{
   font-family: 'Work Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  color: #1a1a2e;
-  background: radial-gradient(circle at 15% 10%, rgba(79, 70, 229, 0.14) 0%, rgba(79, 70, 229, 0) 42%), #fafafa;
+  color: #0f172a;
+  background:
+    radial-gradient(1200px 640px at 8% -5%, rgba(88, 80, 236, 0.16) 0%, rgba(88, 80, 236, 0) 58%),
+    radial-gradient(720px 460px at 92% 110%, rgba(30, 64, 175, 0.12) 0%, rgba(30, 64, 175, 0) 62%),
+    linear-gradient(180deg, #f9fbff 0%, #f4f7fb 100%);
 }}
 .wrap {{
   min-height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
+  display: grid;
+  place-items: center;
+  padding: 28px;
 }}
 .card {{
-  width: min(560px, 100%);
-  background: #ffffff;
-  border: 1px solid #e8eaed;
-  border-radius: 16px;
-  box-shadow: 0 10px 36px rgba(15, 23, 42, 0.08);
-  padding: 34px 30px;
+  position: relative;
+  overflow: hidden;
+  width: min(620px, 100%);
+  text-align: center;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, #ffffff 100%);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 24px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.13);
+  padding: 54px 48px 46px;
+}}
+.card::before {{
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 7px;
+  background: linear-gradient(90deg, #1A1363 0%, #4f46e5 52%, #1e40af 100%);
 }}
 .brand {{
-  margin-bottom: 14px;
+  margin: 0 0 18px;
   display: flex;
   justify-content: center;
 }}
 .brand-logo {{
   display: block;
-  height: 64px;
+  height: 72px;
   width: auto;
-  max-width: 280px;
+  max-width: 320px;
 }}
 .badge {{
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 28px;
-  padding: 0 12px;
+  height: 30px;
+  margin: 0 auto 16px;
+  padding: 0 14px;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   color: {accent};
   background: {accent_bg};
+  border: 1px solid {accent_bg};
+  white-space: nowrap;
 }}
 h1 {{
-  margin: 14px 0 10px;
-  font-size: 28px;
-  line-height: 1.15;
-  color: #16213e;
+  margin: 0 0 12px;
+  font-size: 34px;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  color: #0f172a;
 }}
 p {{
-  margin: 0;
-  line-height: 1.55;
-  color: #334155;
+  margin: 0 auto;
+  max-width: 34ch;
+  font-size: 17px;
+  line-height: 1.6;
+  color: #475569;
 }}
-@media (max-width: 480px) {{
+@media (max-width: 600px) {{
+  .card {{
+    border-radius: 20px;
+    padding: 42px 28px 34px;
+  }}
   .brand-logo {{
-    height: 56px;
-    max-width: 240px;
+    height: 58px;
+    max-width: 252px;
+  }}
+  h1 {{
+    font-size: 28px;
+  }}
+  p {{
+    font-size: 16px;
   }}
 }}
 </style>
@@ -340,7 +363,7 @@ mod tests {
 
     #[test]
     fn callback_html_success_variant_is_styled() {
-        let html = render_callback_html(200, "Authentication complete. You can close this tab.");
+        let html = render_callback_html(200, "You can close this tab");
         assert!(html.contains("Authentication Complete"));
         assert!(html.contains(">OK<"));
         assert!(html.contains("#10b981"));

@@ -141,14 +141,6 @@ impl CliConfig {
         self.save()
     }
 
-    /// Clear token credentials and save to a specific path.
-    fn clear_token_to(&mut self, path: &Path) -> Result<()> {
-        self.token = None;
-        self.github_login = None;
-        self.expires_at = None;
-        self.save_to(path)
-    }
-
     /// Returns whether auto-update is enabled.
     ///
     /// Defaults to `false` when `auto_update` is absent from config.
@@ -260,19 +252,11 @@ pub fn parse_duration_string(s: &str) -> Result<Duration> {
         })
 }
 
-/// Reads the cached latest-available version from the config directory.
-///
-/// Returns `None` if the cache file is absent, empty, or unreadable.
-/// This is intentionally non-failing to keep `cadence status` resilient.
-pub fn read_cached_latest_version() -> Option<String> {
-    let dir = CliConfig::config_dir()?;
-    read_cached_latest_version_from_dir(&dir)
-}
-
 /// Reads the cached latest-available version from a specific directory.
 ///
 /// Trims whitespace and strips a leading `v`/`V` prefix if present.
 /// Returns `None` if the file is absent, empty, or not valid UTF-8.
+#[cfg(test)]
 pub fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
     let path = dir.join(LATEST_VERSION_CACHE_FILE);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -366,7 +350,6 @@ impl ConfigKey {
             ConfigKey::WatchedRepoPaths => "watched_repo_paths",
         }
     }
-
     /// A short description of this key for help text.
     pub fn description(&self) -> &'static str {
         match self {
@@ -566,6 +549,21 @@ fn non_empty_trimmed(value: Option<String>) -> Option<String> {
 /// Resolve the user's home directory from the `HOME` environment variable.
 fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl CliConfig {
+    /// Clear token credentials and save to a specific path.
+    fn clear_token_to(&mut self, path: &Path) -> Result<()> {
+        self.token = None;
+        self.github_login = None;
+        self.expires_at = None;
+        self.save_to(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
