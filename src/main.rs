@@ -980,6 +980,39 @@ fn select_session_for_commit(
     candidate_files: &[std::path::PathBuf],
     time_window: i64,
 ) -> Option<scanner::SelectedSession> {
+    if candidate_files.is_empty() {
+        return None;
+    }
+
+    let cheap_ranked = scanner::rank_sessions_for_commit(
+        commit,
+        repo_root,
+        commit_time,
+        time_window,
+        candidate_files,
+        &[],
+        "",
+    );
+
+    let cheap_selected = scanner::select_best_session(&cheap_ranked);
+    let cheap_margin = if cheap_ranked.len() >= 2 {
+        cheap_ranked[0].score - cheap_ranked[1].score
+    } else {
+        f64::INFINITY
+    };
+    if let Some(selected) = cheap_selected {
+        let top = &selected.candidate;
+        let strong_exact = selected.confidence == note::Confidence::ExactHashMatch
+            && top.score >= scanner::min_accept_score() + 1.0
+            && cheap_margin >= scanner::min_margin_score() + 0.4;
+        if strong_exact {
+            if output::is_verbose() {
+                output::detail("selected from cheap pass (strong exact match)");
+            }
+            return Some(selected);
+        }
+    }
+
     let commit_paths = git::commit_changed_paths_at(repo_root, commit).unwrap_or_default();
     let commit_patch =
         git::commit_patch_text_at(repo_root, commit, match_max_diff_bytes()).unwrap_or_default();

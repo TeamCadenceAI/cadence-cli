@@ -106,6 +106,7 @@ pub struct SelectedSession {
 const DEFAULT_MIN_ACCEPT_SCORE: f64 = 2.7;
 const DEFAULT_MIN_MARGIN: f64 = 0.55;
 const DEFAULT_MATCH_MAX_CANDIDATES: usize = 300;
+const DEFAULT_MATCH_EXPENSIVE_TOP_K: usize = 24;
 const DEFAULT_TIME_BUFFER_SECS: i64 = 300;
 
 const WEIGHT_FULL_HASH_EVENT: f64 = 2.8;
@@ -181,6 +182,15 @@ pub fn max_candidates() -> usize {
         .unwrap_or(DEFAULT_MATCH_MAX_CANDIDATES)
 }
 
+/// Read top-K count for expensive scoring signals from env (`CADENCE_MATCH_EXPENSIVE_TOP_K`).
+pub fn expensive_top_k() -> usize {
+    std::env::var("CADENCE_MATCH_EXPENSIVE_TOP_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MATCH_EXPENSIVE_TOP_K)
+}
+
 /// Rank candidate sessions for a commit using a deterministic multi-signal scorer.
 #[allow(clippy::too_many_arguments)]
 pub fn rank_sessions_for_commit(
@@ -206,8 +216,20 @@ pub fn rank_sessions_for_commit(
 
     let commit_paths: HashSet<String> = commit_changed_paths.iter().cloned().collect();
     let commit_tokens = tokenize_for_similarity(commit_patch_text, 1800);
+    let apply_expensive = !commit_paths.is_empty() && !commit_tokens.is_empty();
+    let expensive_k = expensive_top_k();
 
-    let mut ranked = Vec::new();
+    #[derive(Debug)]
+    struct CheapCandidate {
+        file_path: PathBuf,
+        metadata: SessionMetadata,
+        hash_signals: HashReferenceSignals,
+        time_distance_secs: Option<i64>,
+        time_distance_score: f64,
+        base_score: f64,
+    }
+
+    let mut cheap = Vec::new();
     for file_path in files {
         let metadata = parse_session_metadata(&file_path);
         let repo_match = metadata_repo_matches(&metadata, repo_root);
@@ -218,35 +240,70 @@ pub fn rank_sessions_for_commit(
         let hash_signals = extract_hash_reference_signals(&file_path, commit_hash, short_hash);
         let (time_distance_secs, time_distance_score) =
             time_distance_for_file(&file_path, commit_time, time_window);
-        let session_paths = extract_touched_paths(&file_path);
-        let path_overlap_score = jaccard_score(&commit_paths, &session_paths);
-        let artifacts = extract_edit_artifacts(&file_path);
-        let artifact_tokens = tokenize_for_similarity(&artifacts.join("\n"), 1800);
-        let diff_intent_score = overlap_score(&commit_tokens, &artifact_tokens);
 
-        let mut score = 0.0;
+        let mut base_score = 0.0;
         if hash_signals.full_hash_event_match {
-            score += WEIGHT_FULL_HASH_EVENT;
+            base_score += WEIGHT_FULL_HASH_EVENT;
         }
         if hash_signals.short_hash_event_match {
-            score += WEIGHT_SHORT_HASH_EVENT;
+            base_score += WEIGHT_SHORT_HASH_EVENT;
         }
-        score += hash_signals.commit_event_pattern_quality * WEIGHT_PATTERN_QUALITY;
-        score += time_distance_score * WEIGHT_TIME_DISTANCE;
-        score += path_overlap_score * WEIGHT_PATH_OVERLAP;
-        score += diff_intent_score * WEIGHT_DIFF_INTENT;
+        base_score += hash_signals.commit_event_pattern_quality * WEIGHT_PATTERN_QUALITY;
+        base_score += time_distance_score * WEIGHT_TIME_DISTANCE;
+
+        cheap.push(CheapCandidate {
+            file_path,
+            metadata,
+            hash_signals,
+            time_distance_secs,
+            time_distance_score,
+            base_score,
+        });
+    }
+
+    cheap.sort_by(|a, b| {
+        b.base_score
+            .partial_cmp(&a.base_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+
+    let mut expensive_cache: std::collections::HashMap<
+        PathBuf,
+        (HashSet<String>, HashSet<String>),
+    > = std::collections::HashMap::new();
+    let mut ranked = Vec::new();
+    for (idx, candidate) in cheap.into_iter().enumerate() {
+        let mut path_overlap_score = 0.0;
+        let mut diff_intent_score = 0.0;
+        if apply_expensive && idx < expensive_k {
+            let entry = expensive_cache
+                .entry(candidate.file_path.clone())
+                .or_insert_with(|| {
+                    let session_paths = extract_touched_paths(&candidate.file_path);
+                    let artifacts = extract_edit_artifacts(&candidate.file_path);
+                    let tokens = tokenize_for_similarity(&artifacts.join("\n"), 1800);
+                    (session_paths, tokens)
+                });
+            path_overlap_score = jaccard_score(&commit_paths, &entry.0);
+            diff_intent_score = overlap_score(&commit_tokens, &entry.1);
+        }
+
+        let score = candidate.base_score
+            + path_overlap_score * WEIGHT_PATH_OVERLAP
+            + diff_intent_score * WEIGHT_DIFF_INTENT;
 
         let mut reasons = Vec::new();
-        if hash_signals.full_hash_event_match {
+        if candidate.hash_signals.full_hash_event_match {
             reasons.push("full_hash_event_match".to_string());
         }
-        if hash_signals.short_hash_event_match {
+        if candidate.hash_signals.short_hash_event_match {
             reasons.push("short_hash_event_match".to_string());
         }
-        if hash_signals.commit_event_pattern_quality > 0.0 {
+        if candidate.hash_signals.commit_event_pattern_quality > 0.0 {
             reasons.push("commit_event_pattern".to_string());
         }
-        if time_distance_score > 0.0 {
+        if candidate.time_distance_score > 0.0 {
             reasons.push("time_distance".to_string());
         }
         if path_overlap_score > 0.0 {
@@ -256,30 +313,32 @@ pub fn rank_sessions_for_commit(
             reasons.push("diff_intent".to_string());
         }
 
-        let session_start = session_time_range(&file_path).map(|(start, _)| start);
+        let session_start = session_time_range(&candidate.file_path).map(|(start, _)| start);
         let signals = MatchSignals {
-            repo_match,
-            full_hash_event_match: hash_signals.full_hash_event_match,
-            short_hash_event_match: hash_signals.short_hash_event_match,
-            commit_event_pattern_quality: hash_signals.commit_event_pattern_quality,
-            time_distance_score,
-            time_distance_secs,
+            repo_match: true,
+            full_hash_event_match: candidate.hash_signals.full_hash_event_match,
+            short_hash_event_match: candidate.hash_signals.short_hash_event_match,
+            commit_event_pattern_quality: candidate.hash_signals.commit_event_pattern_quality,
+            time_distance_score: candidate.time_distance_score,
+            time_distance_secs: candidate.time_distance_secs,
             path_overlap_score,
             diff_intent_score,
         };
-        let session_id = metadata
+        let session_id = candidate
+            .metadata
             .session_id
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
         ranked.push(RankedSessionCandidate {
-            file_path: file_path.clone(),
-            agent_type: metadata
+            file_path: candidate.file_path.clone(),
+            agent_type: candidate
+                .metadata
                 .agent_type
                 .clone()
-                .unwrap_or_else(|| infer_agent_type(&file_path)),
+                .unwrap_or_else(|| infer_agent_type(&candidate.file_path)),
             session_id,
-            metadata,
+            metadata: candidate.metadata,
             session_start,
             score,
             reasons,
