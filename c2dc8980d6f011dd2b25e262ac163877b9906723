@@ -1,0 +1,12 @@
+---
+cadence_version: 2
+agent: codex
+session_id: 019c645d-ba93-7f33-93d2-420d93c77a66
+repo: /Users/keithlang/Documents/GitHub/cadence-cli
+commit: c2dc898
+confidence: exact_hash_match
+session_start: 2026-02-16T02:53:10Z
+payload_blob: 530cff8ceb9d9f7257eed83fcce88db1bda31b8a
+payload_sha256: f9b4d738eea978d98486ce68178213ba8edbf029137633581159b21d091ee32d
+payload_encoding: zstd+pgp
+---

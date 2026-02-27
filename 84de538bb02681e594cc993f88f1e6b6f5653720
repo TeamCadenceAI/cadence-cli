@@ -1,0 +1,12 @@
+---
+cadence_version: 2
+agent: codex
+session_id: 019c5423-dc00-73c0-bcca-8b852f1a7604
+repo: /Users/keithlang/Documents/GitHub/ai-session-commit-linker
+commit: 84de538
+confidence: exact_hash_match
+session_start: 2026-02-12T23:16:02Z
+payload_blob: b16003dbc05f0077180fba01e12b1bd448ac7792
+payload_sha256: 881c0cb3f393a738762bbfa1a88373c38d9868d8a09d59eb89fb539376c82ca2
+payload_encoding: zstd+pgp
+---
