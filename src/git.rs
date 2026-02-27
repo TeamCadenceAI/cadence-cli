@@ -309,6 +309,24 @@ pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
+/// Read the AI-session note content for a commit in a specific repository.
+pub(crate) fn read_note_at(repo: Option<&Path>, commit: &str) -> Result<String> {
+    validate_commit_hash(commit)?;
+    let output = run_git_output_at(
+        repo,
+        &["notes", "--ref", NOTES_REF, "show", "--", commit],
+        &[],
+    )
+    .context("failed to execute git notes show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git notes show failed: {}", stderr.trim());
+    }
+
+    String::from_utf8(output.stdout).context("git notes show output was not valid UTF-8")
+}
+
 /// Attach an AI-session note to a commit in a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`add_note`], for use
@@ -338,6 +356,32 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git notes add failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Force-replace (or create) an AI-session note on a commit in a specific repo.
+pub(crate) fn add_note_force_at(repo: Option<&Path>, commit: &str, content: &str) -> Result<()> {
+    validate_commit_hash(commit)?;
+
+    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
+    tmp.write_all(content.as_bytes())
+        .context("failed to write note to temp file")?;
+    tmp.flush().context("failed to flush note temp file")?;
+    let tmp_path = tmp.path().to_string_lossy().to_string();
+
+    let output = run_git_output_at(
+        repo,
+        &[
+            "notes", "--ref", NOTES_REF, "add", "-f", "-F", &tmp_path, "--", commit,
+        ],
+        &[],
+    )
+    .context("failed to execute git notes add -f")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git notes add -f failed: {}", stderr.trim());
     }
     Ok(())
 }
@@ -951,6 +995,11 @@ pub fn note_exists(commit: &str) -> Result<bool> {
     git_succeeds(&["notes", "--ref", NOTES_REF, "show", "--", commit])
 }
 
+/// Read the AI-session note content for the given commit.
+pub fn read_note(commit: &str) -> Result<String> {
+    read_note_at(None, commit)
+}
+
 /// Attach an AI-session note to the given commit.
 ///
 /// **Precondition:** Callers must check [`note_exists`] first and skip if a note
@@ -981,6 +1030,11 @@ pub fn add_note(commit: &str, content: &str) -> Result<()> {
         bail!("git notes add failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+/// Force-replace (or create) an AI-session note on the given commit.
+pub fn add_note_force(commit: &str, content: &str) -> Result<()> {
+    add_note_force_at(None, commit, content)
 }
 
 /// A single `git log` entry annotated with whether it has a note.
@@ -1762,6 +1816,20 @@ mod tests {
         let note_content =
             git_output_in(path, &["notes", "--ref", NOTES_REF, "show", &hash]).unwrap();
         assert_eq!(note_content, "test note content");
+    }
+
+    #[test]
+    fn test_add_note_force_replaces_existing_note_content() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+        let hash = run_git(path, &["rev-parse", "HEAD"]);
+
+        add_note_at(path, &hash, "first content").expect("add_note_at");
+        add_note_force_at(Some(path), &hash, "updated content").expect("add_note_force_at");
+
+        let note_content =
+            git_output_in(path, &["notes", "--ref", NOTES_REF, "show", &hash]).unwrap();
+        assert_eq!(note_content, "updated content");
     }
 
     // -----------------------------------------------------------------------

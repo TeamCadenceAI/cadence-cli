@@ -12,6 +12,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -141,12 +142,7 @@ fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to build HTTP client")?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create Tokio runtime for HTTP request")?;
-
-    runtime.block_on(async move {
+    block_on_http(async move {
         let response = client
             .get(url)
             .send()
@@ -310,12 +306,7 @@ fn build_http_client() -> Result<reqwest::Client> {
 /// Downloads a URL to a file in the given directory. Returns the file path.
 pub fn download_to_file(url: &str, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
     let client = build_http_client()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create Tokio runtime for HTTP request")?;
-
-    let bytes = runtime.block_on(async move {
+    let bytes = block_on_http(async move {
         let response =
             client.get(url).send().await.with_context(|| {
                 format!("Failed to connect to download server for '{filename}'")
@@ -337,6 +328,21 @@ pub fn download_to_file(url: &str, dest_dir: &Path, filename: &str) -> Result<Pa
         .with_context(|| format!("Failed to write '{filename}' to {}", dest_path.display()))?;
 
     Ok(dest_path)
+}
+
+fn block_on_http<F>(fut: F) -> F::Output
+where
+    F: Future,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create Tokio runtime")
+            .block_on(fut)
+    }
 }
 
 // ---------------------------------------------------------------------------

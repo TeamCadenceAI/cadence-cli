@@ -1000,6 +1000,33 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
+        match maybe_refresh_rewritten_note(&head_hash) {
+            Ok(true) => {
+                output::success(
+                    "[Cadence]",
+                    &format!(
+                        "Reattached session note to amended commit {}",
+                        &head_hash[..7]
+                    ),
+                );
+            }
+            Ok(false) => {
+                output::success(
+                    "[Cadence]",
+                    &format!(
+                        "Session note already attached to commit {}",
+                        &head_hash[..7]
+                    ),
+                );
+            }
+            Err(e) => {
+                output::note(&format!(
+                    "Could not refresh rewritten note for amended commit {} ({})",
+                    &head_hash[..7],
+                    e
+                ));
+            }
+        }
         // Note already attached (e.g., by backfill). Clean up stale pending record.
         let _ = pending::remove(&head_hash);
         return Ok(());
@@ -1129,6 +1156,152 @@ fn log_attached_session(
         message.push_str(" (scored match)");
     }
     output::success("[Cadence]", &message);
+}
+
+fn parse_note_header(note_content: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut in_header = false;
+
+    for line in note_content.lines() {
+        if line == "---" {
+            if !in_header {
+                in_header = true;
+                continue;
+            }
+            break;
+        }
+        if !in_header {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+
+    map
+}
+
+fn parse_agent_type(value: &str) -> Option<scanner::AgentType> {
+    match value {
+        "claude-code" => Some(scanner::AgentType::Claude),
+        "codex" => Some(scanner::AgentType::Codex),
+        "cursor" => Some(scanner::AgentType::Cursor),
+        "copilot" => Some(scanner::AgentType::Copilot),
+        "antigravity" => Some(scanner::AgentType::Antigravity),
+        _ => None,
+    }
+}
+
+fn parse_confidence(value: &str) -> Option<note::Confidence> {
+    match value {
+        "exact_hash_match" => Some(note::Confidence::ExactHashMatch),
+        "time_window_match" => Some(note::Confidence::TimeWindowMatch),
+        "scored_match" => Some(note::Confidence::ScoredMatch),
+        _ => None,
+    }
+}
+
+fn parse_payload_encoding(value: &str) -> Option<note::PayloadEncoding> {
+    match value {
+        "plain" => Some(note::PayloadEncoding::Plain),
+        "zstd" => Some(note::PayloadEncoding::Zstd),
+        "pgp" => Some(note::PayloadEncoding::Pgp),
+        "zstd+pgp" => Some(note::PayloadEncoding::ZstdPgp),
+        _ => None,
+    }
+}
+
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
+}
+
+fn maybe_refresh_rewritten_note(commit: &str) -> Result<bool> {
+    let note_content = match git::read_note(commit) {
+        Ok(content) => content,
+        Err(_) => return Ok(false),
+    };
+
+    let header = parse_note_header(&note_content);
+    if header.get("cadence_version").map(String::as_str) != Some("2") {
+        return Ok(false);
+    }
+
+    let existing_commit = match header.get("commit").map(String::as_str) {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    if existing_commit == commit {
+        return Ok(false);
+    }
+
+    let agent = match header.get("agent").and_then(|v| parse_agent_type(v)) {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+    let session_id = match header.get("session_id").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let repo = match header.get("repo").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let payload_blob = match header.get("payload_blob").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let payload_sha256 = match header.get("payload_sha256").map(String::as_str) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let payload_encoding = match header
+        .get("payload_encoding")
+        .and_then(|v| parse_payload_encoding(v))
+    {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+
+    let confidence = header
+        .get("confidence")
+        .and_then(|v| parse_confidence(v))
+        .unwrap_or(note::Confidence::ExactHashMatch);
+    let session_start = header
+        .get("session_start")
+        .and_then(|v| parse_rfc3339_unix(v));
+    let match_score = header
+        .get("match_score")
+        .and_then(|v| v.parse::<f64>().ok());
+    let match_reasons_storage = header
+        .get("match_reasons")
+        .map(|v| {
+            v.split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+    let match_reasons = match_reasons_storage.as_deref();
+
+    let refreshed = note::format_v2_with_match_details(
+        &agent,
+        session_id,
+        repo,
+        commit,
+        confidence,
+        session_start,
+        payload_blob,
+        payload_sha256,
+        payload_encoding,
+        match_score,
+        match_reasons,
+    )?;
+
+    git::add_note_force(commit, &refreshed)?;
+    Ok(true)
 }
 
 /// Maximum number of retry attempts before a pending record is abandoned.
@@ -3800,6 +3973,48 @@ mod tests {
     fn match_window_defaults_are_stable() {
         assert_eq!(POST_COMMIT_MATCH_WINDOW_SECS, 1_800);
         assert_eq!(DAILY_MATCH_WINDOW_SECS, 86_400);
+    }
+
+    #[test]
+    fn parse_note_header_extracts_v2_fields() {
+        let note = "---\n\
+cadence_version: 2\n\
+agent: codex\n\
+session_id: abc\n\
+repo: /tmp/repo\n\
+commit: 1111111111111111111111111111111111111111\n\
+payload_blob: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+payload_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+payload_encoding: zstd+pgp\n\
+---\n";
+        let header = parse_note_header(note);
+        assert_eq!(header.get("cadence_version").map(String::as_str), Some("2"));
+        assert_eq!(header.get("agent").map(String::as_str), Some("codex"));
+        assert_eq!(
+            header.get("commit").map(String::as_str),
+            Some("1111111111111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn parse_payload_encoding_supports_all_v2_values() {
+        assert_eq!(
+            parse_payload_encoding("plain"),
+            Some(note::PayloadEncoding::Plain)
+        );
+        assert_eq!(
+            parse_payload_encoding("zstd"),
+            Some(note::PayloadEncoding::Zstd)
+        );
+        assert_eq!(
+            parse_payload_encoding("pgp"),
+            Some(note::PayloadEncoding::Pgp)
+        );
+        assert_eq!(
+            parse_payload_encoding("zstd+pgp"),
+            Some(note::PayloadEncoding::ZstdPgp)
+        );
+        assert_eq!(parse_payload_encoding("unknown"), None);
     }
 
     #[test]
