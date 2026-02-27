@@ -103,8 +103,8 @@ pub struct SelectedSession {
     pub reason_codes: Vec<String>,
 }
 
-const DEFAULT_MIN_ACCEPT_SCORE: f64 = 2.7;
-const DEFAULT_MIN_MARGIN: f64 = 0.55;
+const DEFAULT_MIN_ACCEPT_SCORE: f64 = 1.0;
+const DEFAULT_MIN_MARGIN: f64 = 0.10;
 const DEFAULT_MATCH_MAX_CANDIDATES: usize = 300;
 const DEFAULT_MATCH_EXPENSIVE_TOP_K: usize = 24;
 const DEFAULT_TIME_BUFFER_SECS: i64 = 300;
@@ -364,14 +364,22 @@ pub fn rank_sessions_for_commit(
 /// Select the single best session candidate under high-precision thresholds.
 pub fn select_best_session(candidates: &[RankedSessionCandidate]) -> Option<SelectedSession> {
     let top = candidates.first()?;
-    if top.score < min_accept_score() {
-        return None;
-    }
+    let top_is_time_match = top.signals.time_distance_score > 0.0;
+
+    // Ambiguous top two candidates are always rejected, including time-based
+    // matches, to avoid non-deterministic auto-attachment.
     if let Some(second) = candidates.get(1)
         && (top.score - second.score) < min_margin_score()
     {
         return None;
     }
+
+    // Allow strong time-window-only matches to attach even when the global
+    // score floor is not met, as long as they are unambiguous.
+    if top.score < min_accept_score() && !top_is_time_match {
+        return None;
+    }
+
     let confidence = if top.signals.full_hash_event_match || top.signals.short_hash_event_match {
         crate::note::Confidence::ExactHashMatch
     } else if top.signals.time_distance_score > 0.0 {
@@ -2119,9 +2127,79 @@ also not json {{{{
             session_id: "b".to_string(),
             metadata: SessionMetadata::default(),
             session_start: None,
-            score: 2.8,
+            score: 2.95, // margin below default min_margin_score (0.10)
             reasons: vec!["y".to_string()],
             signals: MatchSignals::default(),
+        };
+
+        let selected = select_best_session(&[c1, c2]);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn test_select_best_session_accepts_unambiguous_time_match_below_threshold() {
+        let c1 = RankedSessionCandidate {
+            file_path: PathBuf::from("/tmp/a.jsonl"),
+            agent_type: AgentType::Claude,
+            session_id: "a".to_string(),
+            metadata: SessionMetadata::default(),
+            session_start: None,
+            score: 0.95, // below default min_accept_score (1.0)
+            reasons: vec!["time_distance".to_string()],
+            signals: MatchSignals {
+                time_distance_score: 1.0,
+                ..MatchSignals::default()
+            },
+        };
+        let c2 = RankedSessionCandidate {
+            file_path: PathBuf::from("/tmp/b.jsonl"),
+            agent_type: AgentType::Claude,
+            session_id: "b".to_string(),
+            metadata: SessionMetadata::default(),
+            session_start: None,
+            score: 0.7, // clear margin from c1
+            reasons: vec!["time_distance".to_string()],
+            signals: MatchSignals {
+                time_distance_score: 0.4,
+                ..MatchSignals::default()
+            },
+        };
+
+        let selected = select_best_session(&[c1, c2]).expect("expected selection");
+        assert_eq!(
+            selected.confidence,
+            crate::note::Confidence::TimeWindowMatch
+        );
+        assert_eq!(selected.candidate.session_id, "a");
+    }
+
+    #[test]
+    fn test_select_best_session_rejects_ambiguous_time_matches_below_threshold() {
+        let c1 = RankedSessionCandidate {
+            file_path: PathBuf::from("/tmp/a.jsonl"),
+            agent_type: AgentType::Claude,
+            session_id: "a".to_string(),
+            metadata: SessionMetadata::default(),
+            session_start: None,
+            score: 0.95,
+            reasons: vec!["time_distance".to_string()],
+            signals: MatchSignals {
+                time_distance_score: 1.0,
+                ..MatchSignals::default()
+            },
+        };
+        let c2 = RankedSessionCandidate {
+            file_path: PathBuf::from("/tmp/b.jsonl"),
+            agent_type: AgentType::Claude,
+            session_id: "b".to_string(),
+            metadata: SessionMetadata::default(),
+            session_start: None,
+            score: 0.89, // margin below default min_margin_score (0.10)
+            reasons: vec!["time_distance".to_string()],
+            signals: MatchSignals {
+                time_distance_score: 0.9,
+                ..MatchSignals::default()
+            },
         };
 
         let selected = select_best_session(&[c1, c2]);
