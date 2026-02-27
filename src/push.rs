@@ -15,7 +15,7 @@
 //! Push failures are always non-fatal: logged to stderr, never block the
 //! commit, never retry automatically in the hook.
 
-use crate::{git, output};
+use crate::{git, output, payload_pending};
 use anyhow::{Context, Result};
 use console::style;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -56,9 +56,19 @@ pub fn should_push_remote(remote: &str) -> bool {
 ///
 /// Shows a spinner while pushing (if stderr is a TTY) and reports the elapsed
 /// time on completion. On failure: logs a note to stderr.
+#[allow(dead_code)]
 pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
+    attempt_push_remote_at_with_options(repo, remote, true);
+}
+
+/// Backfill/helper variant: run push sync without spinner or summary logs.
+pub fn attempt_push_remote_at_quiet(repo: &Path, remote: &str) {
+    attempt_push_remote_at_with_options(repo, remote, false);
+}
+
+fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress: bool) {
     let push_start = std::time::Instant::now();
-    let use_spinner = output::is_stderr_tty();
+    let use_spinner = show_progress && output::is_stderr_tty();
 
     let spinner = if use_spinner {
         let pb = ProgressBar::new_spinner();
@@ -74,44 +84,42 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
         None
     };
 
-    // Fetch and merge remote notes before pushing to avoid overwriting
-    // notes pushed by other users.
     let result = (|| -> Result<()> {
-        // Capture the remote hash BEFORE fetch for force-with-lease.
-        let pre_fetch_remote_hash = remote_notes_hash_at(repo, remote).unwrap_or(None);
-
+        process_payload_retry_for(repo, remote);
+        let pre_fetch_remote_hash =
+            git::remote_ref_hash_at(Some(repo), remote, git::NOTES_REF).unwrap_or(None);
         fetch_merge_notes_for_remote_at(repo, remote)?;
+        maybe_migrate_legacy_payloads_at(repo)?;
+        if let Err(e) = sync_payload_ref_for_remote_at(repo, remote) {
+            output::note(&format!(
+                "Could not sync payload ref with {}: {}",
+                remote, e
+            ));
+        }
 
-        // After fetch-merge, check if the local notes ref exists. If the repo
-        // has no attached sessions (and the remote didn't have any either),
-        // there's nothing to push — skip to avoid a spurious error.
-        let has_local_notes = git::run_git_output_at(
-            Some(repo),
-            &["show-ref", "--verify", "--quiet", git::NOTES_REF],
-            &[],
-        )
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-        if !has_local_notes {
+        let post_merge_hash = git::local_ref_hash_at(Some(repo), git::NOTES_REF).unwrap_or(None);
+        if post_merge_hash.is_none() {
+            return Ok(());
+        }
+        if post_merge_hash == pre_fetch_remote_hash {
+            if output::is_verbose() {
+                output::detail("Notes push skipped (hash unchanged)");
+            }
             return Ok(());
         }
 
-        // Prepare the notes ref for push (ensures payload blobs are referenced).
-        prepare_notes_for_push(Some(repo))?;
-
-        // Force-push with lease for safety.
-        let lease = force_with_lease_arg(&pre_fetch_remote_hash);
-        let push_status = git::run_git_output_at(
-            Some(repo),
-            &["push", "--no-verify", &lease, remote, git::NOTES_REF],
-            &[("GIT_TERMINAL_PROMPT", "0")],
-        )
-        .context("failed to execute git push for notes")?;
-
-        if !push_status.status.success() {
-            let stderr = String::from_utf8_lossy(&push_status.stderr);
-            anyhow::bail!("git push notes failed: {}", stderr.trim());
+        let push_result =
+            git::push_ref_with_lease_at(Some(repo), remote, git::NOTES_REF, &pre_fetch_remote_hash);
+        if let Err(e) = push_result {
+            let msg = e.to_string();
+            if is_ref_push_race(&msg, git::NOTES_REF) {
+                let retry_hash =
+                    git::remote_ref_hash_at(Some(repo), remote, git::NOTES_REF).unwrap_or(None);
+                git::push_ref_with_lease_at(Some(repo), remote, git::NOTES_REF, &retry_hash)
+                    .context("failed to push notes ref on retry")?;
+            } else {
+                return Err(e);
+            }
         }
         Ok(())
     })();
@@ -122,14 +130,20 @@ pub fn attempt_push_remote_at(repo: &Path, remote: &str) {
 
     match result {
         Ok(()) => {
-            output::detail(&format!(
-                "Synced notes with {} in {} ms",
-                remote,
-                push_start.elapsed().as_millis()
-            ));
+            if show_progress {
+                output::detail(&format!(
+                    "Synced notes with {} in {} ms",
+                    remote,
+                    push_start.elapsed().as_millis()
+                ));
+            }
         }
         Err(e) => {
-            output::note(&format!("Could not sync notes with {}: {}", remote, e));
+            if show_progress {
+                output::note(&format!("Could not sync notes with {}: {}", remote, e));
+            } else if output::is_verbose() {
+                output::detail(&format!("Could not sync notes with {}: {}", remote, e));
+            }
         }
     }
 }
@@ -197,9 +211,13 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         anyhow::bail!("invalid remote name");
     }
 
+    let repo_root = git::repo_root()?;
+    process_payload_retry_for(&repo_root, remote);
     let phase = std::time::Instant::now();
-    let local_hash = local_notes_hash().context("failed to read local notes ref")?;
-    let remote_hash = remote_notes_hash(remote).context("failed to read remote notes ref")?;
+    let local_hash =
+        git::local_ref_hash_at(None, git::NOTES_REF).context("failed to read local notes ref")?;
+    let remote_hash = git::remote_ref_hash_at(None, remote, git::NOTES_REF)
+        .context("failed to read remote notes ref")?;
     if output::is_verbose() {
         output::detail(&format!(
             "Hashes local={:?} remote={:?} ({} ms)",
@@ -289,7 +307,8 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     }
 
     let post_hash_start = std::time::Instant::now();
-    let post_merge_hash = local_notes_hash().context("failed to read local notes ref")?;
+    let post_merge_hash =
+        git::local_ref_hash_at(None, git::NOTES_REF).context("failed to read local notes ref")?;
     if output::is_verbose() {
         output::detail(&format!(
             "Post-merge hash={:?} ({} ms)",
@@ -306,13 +325,11 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Prepare the notes ref for push (ensures payload blobs are referenced).
-    let prepare_start = std::time::Instant::now();
-    prepare_notes_for_push(None).context("failed to prepare notes ref")?;
-    if output::is_verbose() {
-        output::detail(&format!(
-            "Prepare in {} ms",
-            prepare_start.elapsed().as_millis()
+    maybe_migrate_legacy_payloads_at(&repo_root)?;
+    if let Err(e) = sync_payload_ref_for_remote_at(&repo_root, remote) {
+        output::note(&format!(
+            "Could not sync payload ref with {}: {}",
+            remote, e
         ));
     }
 
@@ -320,31 +337,16 @@ fn sync_notes_for_remote_inner(remote: &str) -> Result<()> {
     if output::is_verbose() {
         output::detail("Pushing notes (force-with-lease)");
     }
-    let lease = force_with_lease_arg(&remote_hash);
-    let push_status = git::run_git_output_at(
-        None,
-        &["push", "--no-verify", &lease, remote, git::NOTES_REF],
-        &[("GIT_TERMINAL_PROMPT", "0")],
-    )
-    .context("failed to execute git push for notes")?;
-    if output::is_verbose() {
-        output::detail(&format!("Push in {} ms", push_start.elapsed().as_millis()));
-    }
-
-    if !push_status.status.success() {
-        let stderr = String::from_utf8_lossy(&push_status.stderr);
-        let stderr_trim = stderr.trim();
-        let is_lock_conflict = stderr_trim.contains("cannot lock ref")
-            && stderr_trim.contains(git::NOTES_REF)
-            && stderr_trim.contains("expected");
-        let is_non_fast_forward = stderr_trim.contains("non-fast-forward");
-        let is_lease_rejected =
-            stderr_trim.contains("stale info") || stderr_trim.contains("failed to push");
-        if is_lock_conflict || is_non_fast_forward || is_lease_rejected {
+    if let Err(e) = git::push_ref_with_lease_at(None, remote, git::NOTES_REF, &remote_hash) {
+        let stderr_trim = e.to_string();
+        if is_ref_push_race(&stderr_trim, git::NOTES_REF) {
             output::note("Notes ref changed on remote; retrying sync once");
             return sync_notes_for_remote_retry(remote);
         }
         anyhow::bail!("git push notes failed: {}", stderr_trim);
+    }
+    if output::is_verbose() {
+        output::detail(&format!("Push in {} ms", push_start.elapsed().as_millis()));
     }
 
     Ok(())
@@ -356,7 +358,7 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
     }
 
     // Capture remote hash before fetch for force-with-lease.
-    let retry_remote_hash = remote_notes_hash(remote).unwrap_or(None);
+    let retry_remote_hash = git::remote_ref_hash_at(None, remote, git::NOTES_REF).unwrap_or(None);
 
     let temp_ref = format!("refs/notes/ai-sessions-remote/{}", remote);
     let fetch_spec = format!("+{}:{}", git::NOTES_REF, temp_ref);
@@ -408,77 +410,30 @@ fn sync_notes_for_remote_retry(remote: &str) -> Result<()> {
         let _ = git::run_git_output_at(None, &["update-ref", "-d", &temp_ref], &[]);
     }
 
-    // Prepare the notes ref for push (ensures payload blobs are referenced).
-    prepare_notes_for_push(None).context("failed to prepare notes ref on retry")?;
-
-    let lease = force_with_lease_arg(&retry_remote_hash);
-    let push_status = git::run_git_output_at(
-        None,
-        &["push", "--no-verify", &lease, remote, git::NOTES_REF],
-        &[("GIT_TERMINAL_PROMPT", "0")],
-    )
-    .context("failed to execute git push for notes")?;
-
-    if !push_status.status.success() {
-        let stderr = String::from_utf8_lossy(&push_status.stderr);
-        anyhow::bail!("git push notes failed: {}", stderr.trim());
+    let repo_root = git::repo_root()?;
+    maybe_migrate_legacy_payloads_at(&repo_root)?;
+    if let Err(e) = sync_payload_ref_for_remote_at(&repo_root, remote) {
+        output::note(&format!(
+            "Could not sync payload ref with {}: {}",
+            remote, e
+        ));
     }
+
+    git::push_ref_with_lease_at(None, remote, git::NOTES_REF, &retry_remote_hash)
+        .context("failed to execute git push for notes")?;
 
     Ok(())
 }
 
-fn local_notes_hash() -> Result<Option<String>> {
-    let output = git::run_git_output_at(
-        None,
-        &["show-ref", "--verify", "--hash", git::NOTES_REF],
-        &[],
-    )
-    .context("failed to execute git show-ref")?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-    let hash = stdout.trim();
-    if hash.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(hash.to_string()))
-    }
-}
-
-fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
-    let start = std::time::Instant::now();
-    let output = git::run_git_output_at(
-        None,
-        &[
-            "-c",
-            "protocol.version=2",
-            "ls-remote",
-            "--refs",
-            remote,
+#[cfg(test)]
+fn force_with_lease_arg(remote_hash: &Option<String>) -> String {
+    match remote_hash {
+        Some(hash) => format!("--force-with-lease={}:{}", git::NOTES_REF, hash),
+        None => format!(
+            "--force-with-lease={}:{}",
             git::NOTES_REF,
-        ],
-        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
-    )
-    .context("failed to execute git ls-remote")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git ls-remote failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-    if output::is_verbose() {
-        output::detail(&format!("ls-remote in {} ms", start.elapsed().as_millis()));
-    }
-    let line = stdout.lines().next().unwrap_or("");
-    let hash = line.split_whitespace().next().unwrap_or("");
-    if hash.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(hash.to_string()))
+            "0000000000000000000000000000000000000000"
+        ),
     }
 }
 
@@ -494,6 +449,7 @@ fn remote_notes_hash(remote: &str) -> Result<Option<String>> {
 /// as its parent (or creates an initial commit if no history exists).
 ///
 /// Returns the SHA of the new commit.
+#[cfg(test)]
 fn prepare_notes_for_push(repo: Option<&Path>) -> Result<String> {
     // 1. Get the current tree from the notes ref.
     let tree_rev = format!("{}^{{tree}}", git::NOTES_REF);
@@ -583,52 +539,293 @@ fn prepare_notes_for_push(repo: Option<&Path>) -> Result<String> {
     Ok(new_commit)
 }
 
-/// Get the remote notes ref hash for a specific repo via `ls-remote`.
-///
-/// Returns `None` if the remote doesn't have the notes ref.
-fn remote_notes_hash_at(repo: &Path, remote: &str) -> Result<Option<String>> {
-    let output = git::run_git_output_at(
-        Some(repo),
-        &[
-            "-c",
-            "protocol.version=2",
-            "ls-remote",
-            "--refs",
-            remote,
-            git::NOTES_REF,
-        ],
-        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
-    )
-    .context("failed to execute git ls-remote")?;
+fn is_ref_push_race(stderr_trim: &str, ref_name: &str) -> bool {
+    let is_lock_conflict = stderr_trim.contains("cannot lock ref")
+        && stderr_trim.contains(ref_name)
+        && stderr_trim.contains("expected");
+    let is_non_fast_forward = stderr_trim.contains("non-fast-forward");
+    let is_lease_rejected =
+        stderr_trim.contains("stale info") || stderr_trim.contains("failed to push");
+    is_lock_conflict || is_non_fast_forward || is_lease_rejected
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git ls-remote failed: {}", stderr.trim());
+fn parse_ls_tree_line(line: &str) -> Option<(String, String, String, String)> {
+    let (meta, path) = line.split_once('\t')?;
+    let mut parts = meta.split_whitespace();
+    Some((
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+        path.to_string(),
+    ))
+}
+
+fn payload_map_from_treeish(
+    repo: &Path,
+    treeish: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for root_line in git::list_tree_entries_at(Some(repo), treeish)? {
+        let Some((_mode, kind, sha, name)) = parse_ls_tree_line(&root_line) else {
+            continue;
+        };
+        if kind == "blob" {
+            out.insert(name, sha);
+            continue;
+        }
+        if kind != "tree" {
+            continue;
+        }
+        for child_line in git::list_tree_entries_at(Some(repo), &sha)? {
+            if let Some((_cmode, ckind, csha, child_name)) = parse_ls_tree_line(&child_line)
+                && ckind == "blob"
+            {
+                out.insert(format!("{}/{}", name, child_name), csha);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn payload_map_from_ref(
+    repo: &Path,
+    ref_name: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    if !git::ref_exists_at(Some(repo), ref_name)? {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let tree_rev = format!("{}^{{tree}}", ref_name);
+    payload_map_from_treeish(repo, &tree_rev)
+}
+
+fn build_payload_tree_from_map(
+    repo: &Path,
+    payload_map: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    let mut fanout: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut root_files: Vec<String> = Vec::new();
+
+    for (path, sha) in payload_map {
+        if let Some((dir, file)) = path.split_once('/') {
+            fanout
+                .entry(dir.to_string())
+                .or_default()
+                .push(format!("100644 blob {}\t{}", sha, file));
+        } else {
+            root_files.push(format!("100644 blob {}\t{}", sha, path));
+        }
     }
 
-    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-    let line = stdout.lines().next().unwrap_or("");
-    let hash = line.split_whitespace().next().unwrap_or("");
-    if hash.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(hash.to_string()))
+    let mut root_entries: Vec<String> = root_files;
+    for (dir, mut entries) in fanout {
+        entries.sort();
+        let subtree = git::mktree_at(Some(repo), &entries)?;
+        root_entries.push(format!("040000 tree {}\t{}", subtree, dir));
+    }
+    root_entries.sort();
+    git::mktree_at(Some(repo), &root_entries)
+}
+
+fn collect_legacy_payload_blobs(repo: &Path) -> Result<HashSet<String>> {
+    let mut blobs: HashSet<String> = HashSet::new();
+
+    // First, try the legacy _payload subtree on notes ref.
+    let tree_rev = format!("{}^{{tree}}", git::NOTES_REF);
+    if let Ok(top_entries) = git::list_tree_entries_at(Some(repo), &tree_rev) {
+        for entry in top_entries {
+            let Some((_mode, kind, sha, name)) = parse_ls_tree_line(&entry) else {
+                continue;
+            };
+            if kind == "tree" && name == "_payload" {
+                if let Ok(children) = git::list_tree_entries_at(Some(repo), &sha) {
+                    for child in children {
+                        if let Some((_cmode, ckind, csha, _cname)) = parse_ls_tree_line(&child)
+                            && ckind == "blob"
+                        {
+                            blobs.insert(csha);
+                        }
+                    }
+                }
+                return Ok(blobs);
+            }
+        }
+    }
+
+    // Fallback: one-time scan of pointer notes for payload_blob headers.
+    for (note_sha, _commit) in git::list_notes_at(Some(repo))? {
+        if let Ok(blob_data) = git::read_blob_at(Some(repo), &note_sha) {
+            let content = String::from_utf8_lossy(&blob_data);
+            for line in content.lines() {
+                if let Some(blob_sha) = line.strip_prefix("payload_blob: ") {
+                    let candidate = blob_sha.trim();
+                    if candidate.len() == 40 && candidate.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        blobs.insert(candidate.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(blobs)
+}
+
+fn maybe_migrate_legacy_payloads_at(repo: &Path) -> Result<()> {
+    let existing = payload_map_from_ref(repo, git::PAYLOAD_REF)?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    let legacy_blobs = collect_legacy_payload_blobs(repo)?;
+    if legacy_blobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut merged: std::collections::BTreeMap<String, String> = existing;
+    for blob_sha in legacy_blobs {
+        merged.insert(git::payload_path_for_sha(&blob_sha)?, blob_sha);
+    }
+
+    let new_tree = build_payload_tree_from_map(repo, &merged)?;
+    let current_tip = git::rev_parse_at(Some(repo), git::PAYLOAD_REF).ok();
+    let current_tree = current_tip.as_deref().and_then(|_| {
+        git::rev_parse_at(Some(repo), &format!("{}^{{tree}}", git::PAYLOAD_REF)).ok()
+    });
+    if current_tree.as_deref() == Some(new_tree.as_str()) {
+        return Ok(());
+    }
+    let commit = git::commit_tree_at(
+        Some(repo),
+        &new_tree,
+        "cadence payloads migrate",
+        current_tip.as_deref(),
+    )?;
+    git::update_ref_at(Some(repo), git::PAYLOAD_REF, &commit)?;
+    Ok(())
+}
+
+fn sync_payload_ref_for_remote_inner(repo: &Path, remote: &str, allow_retry: bool) -> Result<()> {
+    let pre_remote_hash =
+        git::remote_ref_hash_at(Some(repo), remote, git::PAYLOAD_REF).unwrap_or(None);
+    let local_hash = git::local_ref_hash_at(Some(repo), git::PAYLOAD_REF).unwrap_or(None);
+    if local_hash == pre_remote_hash {
+        return Ok(());
+    }
+
+    if pre_remote_hash.is_none() {
+        if local_hash.is_none() {
+            return Ok(());
+        }
+        let push_res =
+            git::push_ref_with_lease_at(Some(repo), remote, git::PAYLOAD_REF, &pre_remote_hash);
+        if let Err(e) = push_res {
+            let msg = e.to_string();
+            if allow_retry && is_ref_push_race(&msg, git::PAYLOAD_REF) {
+                return sync_payload_ref_for_remote_inner(repo, remote, false);
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    if local_hash.is_none() {
+        let temp_ref = format!("refs/notes/ai-payloads-remote/{}", remote);
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        let fetch_result =
+            git::fetch_ref_to_temp_at(Some(repo), remote, git::PAYLOAD_REF, &temp_ref)?;
+        if fetch_result.fetched {
+            let remote_tip = git::rev_parse_at(Some(repo), &temp_ref)?;
+            git::update_ref_at(Some(repo), git::PAYLOAD_REF, &remote_tip)?;
+            let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        }
+        return Ok(());
+    }
+
+    let temp_ref = format!("refs/notes/ai-payloads-remote/{}", remote);
+    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+    let fetch_result = git::fetch_ref_to_temp_at(Some(repo), remote, git::PAYLOAD_REF, &temp_ref)?;
+    if !fetch_result.fetched {
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        let push_res =
+            git::push_ref_with_lease_at(Some(repo), remote, git::PAYLOAD_REF, &pre_remote_hash);
+        if let Err(e) = push_res {
+            let msg = e.to_string();
+            if allow_retry && is_ref_push_race(&msg, git::PAYLOAD_REF) {
+                return sync_payload_ref_for_remote_inner(repo, remote, false);
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    let fetched_hash = git::rev_parse_at(Some(repo), &temp_ref).ok();
+    if fetched_hash == local_hash {
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        return Ok(());
+    }
+
+    let mut merged = payload_map_from_ref(repo, git::PAYLOAD_REF)?;
+    for (path, sha) in payload_map_from_treeish(repo, &temp_ref)? {
+        merged.insert(path, sha);
+    }
+
+    if merged.is_empty() {
+        let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+        return Ok(());
+    }
+
+    let new_tree = build_payload_tree_from_map(repo, &merged)?;
+    let current_tip = git::rev_parse_at(Some(repo), git::PAYLOAD_REF).ok();
+    let current_tree = current_tip.as_deref().and_then(|_| {
+        git::rev_parse_at(Some(repo), &format!("{}^{{tree}}", git::PAYLOAD_REF)).ok()
+    });
+    if current_tree.as_deref() != Some(new_tree.as_str()) {
+        let commit = git::commit_tree_at(
+            Some(repo),
+            &new_tree,
+            "cadence payloads",
+            current_tip.as_deref(),
+        )?;
+        git::update_ref_at(Some(repo), git::PAYLOAD_REF, &commit)?;
+    }
+
+    let push_res =
+        git::push_ref_with_lease_at(Some(repo), remote, git::PAYLOAD_REF, &pre_remote_hash);
+    let _ = git::run_git_output_at(Some(repo), &["update-ref", "-d", &temp_ref], &[]);
+    if let Err(e) = push_res {
+        let msg = e.to_string();
+        if allow_retry && is_ref_push_race(&msg, git::PAYLOAD_REF) {
+            return sync_payload_ref_for_remote_inner(repo, remote, false);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn sync_payload_ref_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
+    let repo_str = repo.to_string_lossy().to_string();
+    match sync_payload_ref_for_remote_inner(repo, remote, true) {
+        Ok(()) => {
+            let _ = payload_pending::clear(&repo_str, remote);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = payload_pending::record_failure(&repo_str, remote, &e.to_string());
+            Err(e)
+        }
     }
 }
 
-/// Build the `--force-with-lease` argument for a push.
-///
-/// If `remote_hash` is `Some`, uses it as the expected value.
-/// If `None` (remote ref doesn't exist), uses the zero OID (only push if
-/// the ref still doesn't exist on the remote).
-fn force_with_lease_arg(remote_hash: &Option<String>) -> String {
-    match remote_hash {
-        Some(hash) => format!("--force-with-lease={}:{}", git::NOTES_REF, hash),
-        None => format!(
-            "--force-with-lease={}:{}",
-            git::NOTES_REF,
-            "0000000000000000000000000000000000000000"
-        ),
+fn process_payload_retry_for(repo: &Path, remote: &str) {
+    let repo_str = repo.to_string_lossy().to_string();
+    let record = payload_pending::load(&repo_str, remote).ok().flatten();
+    if let Some(record) = record {
+        if !payload_pending::is_retry_due(&record) {
+            return;
+        }
+        if let Err(e) = sync_payload_ref_for_remote_at(repo, remote) {
+            output::note(&format!("Payload retry failed for {}: {}", remote, e));
+        }
     }
 }
 
@@ -1704,6 +1901,14 @@ mod tests {
                 &format!("+{}:{}", crate::git::NOTES_REF, crate::git::NOTES_REF),
             ],
         );
+        run_git(
+            other.path(),
+            &[
+                "fetch",
+                "origin",
+                &format!("+{}:{}", crate::git::PAYLOAD_REF, crate::git::PAYLOAD_REF),
+            ],
+        );
 
         // Verify the note is readable.
         let note = run_git(
@@ -1799,6 +2004,91 @@ mod tests {
 
         assert_eq!(note1, "note-from-other-user");
         assert_eq!(note2, "note-from-local-user");
+    }
+
+    #[test]
+    #[serial]
+    fn test_lazy_migration_seeds_payload_ref_and_pushes_it() {
+        let (local, _bare) = init_repo_with_remote();
+        let commit = head_hash(local.path());
+
+        let blob_sha = crate::git::store_blob_at(Some(local.path()), b"legacy payload")
+            .expect("store_blob failed");
+        let note_content = format!(
+            "---\ncadence_version: 2\npayload_blob: {}\npayload_encoding: zstd\n---\n",
+            blob_sha
+        );
+        run_git(
+            local.path(),
+            &[
+                "notes",
+                "--ref",
+                crate::git::NOTES_REF,
+                "add",
+                "-m",
+                &note_content,
+                &commit,
+            ],
+        );
+
+        // Precondition: payload ref does not exist yet.
+        let has_payload_ref =
+            crate::git::ref_exists_at(Some(local.path()), crate::git::PAYLOAD_REF)
+                .expect("ref_exists");
+        assert!(!has_payload_ref);
+
+        attempt_push_remote_at(local.path(), "origin");
+
+        let has_payload_ref =
+            crate::git::ref_exists_at(Some(local.path()), crate::git::PAYLOAD_REF)
+                .expect("ref_exists");
+        assert!(
+            has_payload_ref,
+            "payload ref should be created by migration"
+        );
+
+        let remote_payload = run_git(
+            local.path(),
+            &["ls-remote", "--refs", "origin", crate::git::PAYLOAD_REF],
+        );
+        assert!(
+            !remote_payload.is_empty(),
+            "payload ref should be pushed to remote"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_payload_sync_failure_records_retry() {
+        let dir = init_temp_repo();
+        let blob_sha =
+            crate::git::store_blob_at(Some(dir.path()), b"payload").expect("store_blob failed");
+        crate::git::ensure_payload_blob_referenced_at(dir.path(), &blob_sha)
+            .expect("ensure payload ref");
+
+        let home = TempDir::new().expect("home dir");
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let repo_str = dir.path().to_string_lossy().to_string();
+        let result = sync_payload_ref_for_remote_at(dir.path(), "origin");
+        assert!(
+            result.is_err(),
+            "sync should fail without configured remote"
+        );
+
+        let record = crate::payload_pending::load(&repo_str, "origin")
+            .expect("load pending")
+            .expect("pending record should exist");
+        assert_eq!(record.remote, "origin");
+        assert!(record.attempts >= 1);
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]

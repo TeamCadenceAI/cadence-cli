@@ -13,6 +13,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::{collections::HashSet, fs};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -44,6 +45,7 @@ impl std::fmt::Display for AgentType {
 
 /// A successful match: a candidate file contains a commit hash.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SessionMatch {
     /// Path to the session log file that contained the commit hash.
     pub file_path: PathBuf,
@@ -65,6 +67,55 @@ pub struct SessionMetadata {
     pub agent_type: Option<AgentType>,
 }
 
+/// Scoring signals used to rank candidate session logs for a commit.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct MatchSignals {
+    pub repo_match: bool,
+    pub full_hash_event_match: bool,
+    pub short_hash_event_match: bool,
+    pub commit_event_pattern_quality: f64,
+    pub time_distance_score: f64,
+    pub time_distance_secs: Option<i64>,
+    pub path_overlap_score: f64,
+    pub diff_intent_score: f64,
+}
+
+/// A ranked candidate session for a commit.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RankedSessionCandidate {
+    pub file_path: PathBuf,
+    pub agent_type: AgentType,
+    pub session_id: String,
+    pub metadata: SessionMetadata,
+    pub session_start: Option<i64>,
+    pub score: f64,
+    pub reasons: Vec<String>,
+    pub signals: MatchSignals,
+}
+
+/// The selected best match for a commit.
+#[derive(Debug, Clone)]
+pub struct SelectedSession {
+    pub candidate: RankedSessionCandidate,
+    pub confidence: crate::note::Confidence,
+    pub reason_codes: Vec<String>,
+}
+
+const DEFAULT_MIN_ACCEPT_SCORE: f64 = 2.7;
+const DEFAULT_MIN_MARGIN: f64 = 0.55;
+const DEFAULT_MATCH_MAX_CANDIDATES: usize = 300;
+const DEFAULT_MATCH_EXPENSIVE_TOP_K: usize = 24;
+const DEFAULT_TIME_BUFFER_SECS: i64 = 300;
+
+const WEIGHT_FULL_HASH_EVENT: f64 = 2.8;
+const WEIGHT_SHORT_HASH_EVENT: f64 = 1.1;
+const WEIGHT_PATTERN_QUALITY: f64 = 1.2;
+const WEIGHT_TIME_DISTANCE: f64 = 1.8;
+const WEIGHT_PATH_OVERLAP: f64 = 1.2;
+const WEIGHT_DIFF_INTENT: f64 = 1.0;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -83,46 +134,251 @@ pub struct SessionMetadata {
 /// - If the path contains `.claude` -> Claude
 /// - If the path contains `.codex` -> Codex
 /// - Otherwise defaults to Claude (conservative fallback)
+#[allow(dead_code)]
 pub fn find_session_for_commit(
     commit_hash: &str,
     candidate_files: &[PathBuf],
 ) -> Option<SessionMatch> {
-    // Reject invalid commit hashes: must be 7-40 hex characters.
-    // An empty or short string would cause `line.contains("")` to return true
-    // for every line, producing universal false positives. Non-hex strings
-    // can never be valid commit hashes.
-    if crate::git::validate_commit_hash(commit_hash).is_err() {
-        return None;
-    }
-
-    let short_hash = &commit_hash[..7];
-
+    let short_hash = commit_hash.get(0..7)?;
     for file_path in candidate_files {
-        let file = match File::open(file_path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
-            // Check for full hash first (more specific), then short hash
-            if line.contains(commit_hash) || line.contains(short_hash) {
-                let agent_type = infer_agent_type(file_path);
-                return Some(SessionMatch {
-                    file_path: file_path.clone(),
-                    agent_type,
-                });
-            }
+        let signals = extract_hash_reference_signals(file_path, commit_hash, short_hash);
+        if signals.full_hash_event_match
+            || signals.short_hash_event_match
+            || signals.commit_event_pattern_quality > 0.0
+        {
+            return Some(SessionMatch {
+                file_path: file_path.clone(),
+                agent_type: infer_agent_type(file_path),
+            });
         }
     }
-
     None
+}
+
+/// Read matcher threshold from env (`CADENCE_MATCH_MIN_SCORE`).
+pub fn min_accept_score() -> f64 {
+    std::env::var("CADENCE_MATCH_MIN_SCORE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(DEFAULT_MIN_ACCEPT_SCORE)
+}
+
+/// Read matcher ambiguity margin from env (`CADENCE_MATCH_MIN_MARGIN`).
+pub fn min_margin_score() -> f64 {
+    std::env::var("CADENCE_MATCH_MIN_MARGIN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(DEFAULT_MIN_MARGIN)
+}
+
+/// Read max candidate file count from env (`CADENCE_MATCH_MAX_CANDIDATES`).
+pub fn max_candidates() -> usize {
+    std::env::var("CADENCE_MATCH_MAX_CANDIDATES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MATCH_MAX_CANDIDATES)
+}
+
+/// Read top-K count for expensive scoring signals from env (`CADENCE_MATCH_EXPENSIVE_TOP_K`).
+pub fn expensive_top_k() -> usize {
+    std::env::var("CADENCE_MATCH_EXPENSIVE_TOP_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MATCH_EXPENSIVE_TOP_K)
+}
+
+/// Rank candidate sessions for a commit using a deterministic multi-signal scorer.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_sessions_for_commit(
+    commit_hash: &str,
+    repo_root: &Path,
+    commit_time: i64,
+    time_window: i64,
+    candidate_files: &[PathBuf],
+    commit_changed_paths: &[String],
+    commit_patch_text: &str,
+) -> Vec<RankedSessionCandidate> {
+    if crate::git::validate_commit_hash(commit_hash).is_err() {
+        return Vec::new();
+    }
+    let short_hash = &commit_hash[..7];
+
+    let mut files = candidate_files.to_vec();
+    files.sort_by_key(|path| {
+        let mtime = file_mtime_epoch(path).unwrap_or(i64::MAX / 2);
+        (mtime - commit_time).abs()
+    });
+    files.truncate(max_candidates());
+
+    let commit_paths: HashSet<String> = commit_changed_paths.iter().cloned().collect();
+    let commit_tokens = tokenize_for_similarity(commit_patch_text, 1800);
+    let apply_expensive = !commit_paths.is_empty() && !commit_tokens.is_empty();
+    let expensive_k = expensive_top_k();
+
+    #[derive(Debug)]
+    struct CheapCandidate {
+        file_path: PathBuf,
+        metadata: SessionMetadata,
+        hash_signals: HashReferenceSignals,
+        time_distance_secs: Option<i64>,
+        time_distance_score: f64,
+        base_score: f64,
+    }
+
+    let mut cheap = Vec::new();
+    for file_path in files {
+        let metadata = parse_session_metadata(&file_path);
+        let repo_match = metadata_repo_matches(&metadata, repo_root);
+        if !repo_match {
+            continue;
+        }
+
+        let hash_signals = extract_hash_reference_signals(&file_path, commit_hash, short_hash);
+        let (time_distance_secs, time_distance_score) =
+            time_distance_for_file(&file_path, commit_time, time_window);
+
+        let mut base_score = 0.0;
+        if hash_signals.full_hash_event_match {
+            base_score += WEIGHT_FULL_HASH_EVENT;
+        }
+        if hash_signals.short_hash_event_match {
+            base_score += WEIGHT_SHORT_HASH_EVENT;
+        }
+        base_score += hash_signals.commit_event_pattern_quality * WEIGHT_PATTERN_QUALITY;
+        base_score += time_distance_score * WEIGHT_TIME_DISTANCE;
+
+        cheap.push(CheapCandidate {
+            file_path,
+            metadata,
+            hash_signals,
+            time_distance_secs,
+            time_distance_score,
+            base_score,
+        });
+    }
+
+    cheap.sort_by(|a, b| {
+        b.base_score
+            .partial_cmp(&a.base_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+
+    let mut expensive_cache: std::collections::HashMap<
+        PathBuf,
+        (HashSet<String>, HashSet<String>),
+    > = std::collections::HashMap::new();
+    let mut ranked = Vec::new();
+    for (idx, candidate) in cheap.into_iter().enumerate() {
+        let mut path_overlap_score = 0.0;
+        let mut diff_intent_score = 0.0;
+        if apply_expensive && idx < expensive_k {
+            let entry = expensive_cache
+                .entry(candidate.file_path.clone())
+                .or_insert_with(|| {
+                    let session_paths = extract_touched_paths(&candidate.file_path);
+                    let artifacts = extract_edit_artifacts(&candidate.file_path);
+                    let tokens = tokenize_for_similarity(&artifacts.join("\n"), 1800);
+                    (session_paths, tokens)
+                });
+            path_overlap_score = jaccard_score(&commit_paths, &entry.0);
+            diff_intent_score = overlap_score(&commit_tokens, &entry.1);
+        }
+
+        let score = candidate.base_score
+            + path_overlap_score * WEIGHT_PATH_OVERLAP
+            + diff_intent_score * WEIGHT_DIFF_INTENT;
+
+        let mut reasons = Vec::new();
+        if candidate.hash_signals.full_hash_event_match {
+            reasons.push("full_hash_event_match".to_string());
+        }
+        if candidate.hash_signals.short_hash_event_match {
+            reasons.push("short_hash_event_match".to_string());
+        }
+        if candidate.hash_signals.commit_event_pattern_quality > 0.0 {
+            reasons.push("commit_event_pattern".to_string());
+        }
+        if candidate.time_distance_score > 0.0 {
+            reasons.push("time_distance".to_string());
+        }
+        if path_overlap_score > 0.0 {
+            reasons.push("path_overlap".to_string());
+        }
+        if diff_intent_score > 0.0 {
+            reasons.push("diff_intent".to_string());
+        }
+
+        let session_start = session_time_range(&candidate.file_path).map(|(start, _)| start);
+        let signals = MatchSignals {
+            repo_match: true,
+            full_hash_event_match: candidate.hash_signals.full_hash_event_match,
+            short_hash_event_match: candidate.hash_signals.short_hash_event_match,
+            commit_event_pattern_quality: candidate.hash_signals.commit_event_pattern_quality,
+            time_distance_score: candidate.time_distance_score,
+            time_distance_secs: candidate.time_distance_secs,
+            path_overlap_score,
+            diff_intent_score,
+        };
+        let session_id = candidate
+            .metadata
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        ranked.push(RankedSessionCandidate {
+            file_path: candidate.file_path.clone(),
+            agent_type: candidate
+                .metadata
+                .agent_type
+                .clone()
+                .unwrap_or_else(|| infer_agent_type(&candidate.file_path)),
+            session_id,
+            metadata: candidate.metadata,
+            session_start,
+            score,
+            reasons,
+            signals,
+        });
+    }
+
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
+
+    ranked
+}
+
+/// Select the single best session candidate under high-precision thresholds.
+pub fn select_best_session(candidates: &[RankedSessionCandidate]) -> Option<SelectedSession> {
+    let top = candidates.first()?;
+    if top.score < min_accept_score() {
+        return None;
+    }
+    if let Some(second) = candidates.get(1)
+        && (top.score - second.score) < min_margin_score()
+    {
+        return None;
+    }
+    let confidence = if top.signals.full_hash_event_match || top.signals.short_hash_event_match {
+        crate::note::Confidence::ExactHashMatch
+    } else if top.signals.time_distance_score > 0.0 {
+        crate::note::Confidence::TimeWindowMatch
+    } else {
+        crate::note::Confidence::ScoredMatch
+    };
+    Some(SelectedSession {
+        candidate: top.clone(),
+        confidence,
+        reason_codes: top.reasons.clone(),
+    })
 }
 
 /// Parse minimal metadata from a session log file.
@@ -289,36 +545,16 @@ pub fn session_time_range(file: &Path) -> Option<(i64, i64)> {
 ///
 /// Returns `false` if any check fails or if the cwd is not available
 /// in the metadata.
+#[allow(dead_code)]
 pub fn verify_match(metadata: &SessionMetadata, repo_root: &Path, commit: &str) -> bool {
     // Validate commit hash before passing to git commands.
     if crate::git::validate_commit_hash(commit).is_err() {
         return false;
     }
 
-    let cwd = match &metadata.cwd {
-        Some(c) => c,
-        None => return false,
-    };
-
-    let cwd_path = Path::new(cwd);
-
     // Check 1: cwd resolves to the same git repo root
-    match crate::git::repo_root_at(cwd_path) {
-        Ok(cwd_repo_root) => {
-            // Canonicalize both paths for comparison to handle symlinks
-            let canonical_repo = match repo_root.canonicalize() {
-                Ok(p) => p,
-                Err(_) => repo_root.to_path_buf(),
-            };
-            let canonical_cwd_repo = match cwd_repo_root.canonicalize() {
-                Ok(p) => p,
-                Err(_) => cwd_repo_root,
-            };
-            if canonical_repo != canonical_cwd_repo {
-                return false;
-            }
-        }
-        Err(_) => return false,
+    if !metadata_repo_matches(metadata, repo_root) {
+        return false;
     }
 
     // Check 2: commit exists in the repo
@@ -430,6 +666,283 @@ fn extract_hashes_from_line(
         }
 
         i += 1; // skip ']'
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HashReferenceSignals {
+    full_hash_event_match: bool,
+    short_hash_event_match: bool,
+    commit_event_pattern_quality: f64,
+}
+
+fn extract_hash_reference_signals(
+    file: &Path,
+    full_hash: &str,
+    short_hash: &str,
+) -> HashReferenceSignals {
+    let mut signals = HashReferenceSignals::default();
+    let file_handle = match File::open(file) {
+        Ok(f) => f,
+        Err(_) => return signals,
+    };
+    let reader = BufReader::new(file_handle);
+    let mut extracted = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.contains(full_hash) {
+            signals.full_hash_event_match = true;
+        }
+        if line.contains(short_hash) {
+            signals.short_hash_event_match = true;
+        }
+        extracted.clear();
+        extract_hashes_from_line(&line, &mut extracted, &mut seen);
+        for hash in &extracted {
+            if hash == full_hash {
+                signals.full_hash_event_match = true;
+                signals.commit_event_pattern_quality = 1.0;
+            } else if hash == short_hash || full_hash.starts_with(hash) {
+                signals.short_hash_event_match = true;
+                signals.commit_event_pattern_quality =
+                    signals.commit_event_pattern_quality.max(0.8);
+            }
+        }
+    }
+
+    if signals.commit_event_pattern_quality == 0.0 {
+        if signals.full_hash_event_match {
+            signals.commit_event_pattern_quality = 0.4;
+        } else if signals.short_hash_event_match {
+            signals.commit_event_pattern_quality = 0.2;
+        }
+    }
+
+    signals
+}
+
+fn file_mtime_epoch(path: &Path) -> Option<i64> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let mtime_epoch = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(mtime_epoch)
+}
+
+fn time_distance_for_file(file: &Path, commit_time: i64, time_window: i64) -> (Option<i64>, f64) {
+    let distance = if let Some((start_ts, end_ts)) = session_time_range(file) {
+        let start = start_ts - DEFAULT_TIME_BUFFER_SECS;
+        let end = end_ts + DEFAULT_TIME_BUFFER_SECS;
+        if commit_time >= start && commit_time <= end {
+            0
+        } else {
+            let d1 = (commit_time - start_ts).abs();
+            let d2 = (commit_time - end_ts).abs();
+            d1.min(d2)
+        }
+    } else {
+        match file_mtime_epoch(file) {
+            Some(mtime) => (commit_time - mtime).abs(),
+            None => return (None, 0.0),
+        }
+    };
+
+    if time_window <= 0 {
+        return (Some(distance), 0.0);
+    }
+    if distance > time_window {
+        return (Some(distance), 0.0);
+    }
+    let score = 1.0 - (distance as f64 / time_window as f64);
+    (Some(distance), score.max(0.0))
+}
+
+fn metadata_repo_matches(metadata: &SessionMetadata, repo_root: &Path) -> bool {
+    let cwd = match &metadata.cwd {
+        Some(c) => c,
+        None => return false,
+    };
+    let cwd_path = Path::new(cwd);
+    match crate::git::repo_root_at(cwd_path) {
+        Ok(cwd_repo_root) => {
+            let canonical_repo = repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf());
+            let canonical_cwd_repo = cwd_repo_root.canonicalize().unwrap_or(cwd_repo_root);
+            canonical_repo == canonical_cwd_repo
+        }
+        Err(_) => false,
+    }
+}
+
+/// Extract likely touched file paths from a session log.
+pub fn extract_touched_paths(file: &Path) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    let file_handle = match File::open(file) {
+        Ok(f) => f,
+        Err(_) => return paths,
+    };
+    let reader = BufReader::new(file_handle);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        extract_paths_from_text(&line, &mut paths);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            let mut strings = Vec::new();
+            collect_strings(&value, &mut strings);
+            for s in strings {
+                extract_paths_from_text(&s, &mut paths);
+            }
+        }
+        if paths.len() >= 500 {
+            break;
+        }
+    }
+    paths
+}
+
+/// Extract textual edit artifacts from a session log.
+pub fn extract_edit_artifacts(file: &Path) -> Vec<String> {
+    let file_handle = match File::open(file) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file_handle);
+    let mut artifacts = Vec::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if looks_like_edit_artifact(&line) {
+            artifacts.push(line.clone());
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            let mut strings = Vec::new();
+            collect_strings(&value, &mut strings);
+            for s in strings {
+                if looks_like_edit_artifact(&s) {
+                    artifacts.push(s);
+                }
+            }
+        }
+        if artifacts.len() >= 600 {
+            break;
+        }
+    }
+    artifacts
+}
+
+fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_edit_artifact(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let keywords = [
+        "diff --git",
+        "@@",
+        "apply_patch",
+        "*** begin patch",
+        "git commit",
+        "git add",
+        "git cherry-pick",
+        "write_file",
+        "replace",
+        "edited",
+    ];
+    keywords.iter().any(|kw| lower.contains(kw))
+}
+
+fn extract_paths_from_text(text: &str, out: &mut HashSet<String>) {
+    for token in text.split(|c: char| {
+        c.is_whitespace()
+            || [
+                '"', '\'', ',', ';', ':', '(', ')', '[', ']', '{', '}', '<', '>',
+            ]
+            .contains(&c)
+    }) {
+        let trimmed = token.trim_matches(|c: char| c == '.' || c == '`');
+        if trimmed.len() < 3 {
+            continue;
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            continue;
+        }
+        let normalized = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        if !(normalized.contains('/') || normalized.contains('\\')) {
+            continue;
+        }
+        if !normalized.contains('.') {
+            continue;
+        }
+        out.insert(
+            normalized
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string(),
+        );
+    }
+}
+
+fn tokenize_for_similarity(text: &str, max_tokens: usize) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for token in
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '/' || c == '.'))
+    {
+        let t = token.trim().to_ascii_lowercase();
+        if t.len() < 3 {
+            continue;
+        }
+        if tokens.insert(t) && tokens.len() >= max_tokens {
+            break;
+        }
+    }
+    tokens
+}
+
+fn overlap_score(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let overlap = a.intersection(b).count() as f64;
+    let min_len = a.len().min(b.len()) as f64;
+    if min_len == 0.0 {
+        0.0
+    } else {
+        (overlap / min_len).min(1.0)
+    }
+}
+
+fn jaccard_score(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        (intersection / union).min(1.0)
     }
 }
 
@@ -1527,6 +2040,103 @@ also not json {{{{
         // but NOT from the bare "Commit 655dd38" mention
         assert_eq!(hashes.len(), 1);
         assert_eq!(hashes[0], "655dd38");
+    }
+
+    // -----------------------------------------------------------------------
+    // ranked matching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ranked_matching_prefers_repo_match_with_commit_event() {
+        let (repo, commit_hash) = init_temp_repo();
+        let repo_root = repo.path().to_path_buf();
+        let commit_time: i64 = run_git(repo.path(), &["show", "-s", "--format=%ct", "HEAD"])
+            .parse()
+            .unwrap();
+        let changed = crate::git::commit_changed_paths_at(repo.path(), &commit_hash).unwrap();
+        let patch = crate::git::commit_patch_text_at(repo.path(), &commit_hash, 32_000).unwrap();
+
+        let logs = TempDir::new().unwrap();
+        let wrong = write_temp_file(
+            logs.path(),
+            "wrong.jsonl",
+            &format!(
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "wrong",
+                    "cwd": "/tmp/other",
+                    "content": format!("[main {}] x", &commit_hash[..7])
+                })
+            ),
+        );
+        let good_header = serde_json::json!({
+            "session_id": "good",
+            "cwd": repo.path().to_string_lossy().to_string()
+        });
+        let good_event = serde_json::json!({
+            "content": format!("[main {}] commit", &commit_hash[..7])
+        });
+        let good = write_temp_file(
+            logs.path(),
+            "good.jsonl",
+            &format!("{good_header}\n{good_event}\n"),
+        );
+
+        let ranked = rank_sessions_for_commit(
+            &commit_hash,
+            &repo_root,
+            commit_time,
+            600,
+            &[wrong, good.clone()],
+            &changed,
+            &patch,
+        );
+        assert!(!ranked.is_empty());
+        assert_eq!(ranked[0].file_path, good);
+        assert!(ranked[0].signals.repo_match);
+    }
+
+    #[test]
+    fn test_select_best_session_rejects_ambiguous_top_two() {
+        let c1 = RankedSessionCandidate {
+            file_path: PathBuf::from("/tmp/a.jsonl"),
+            agent_type: AgentType::Claude,
+            session_id: "a".to_string(),
+            metadata: SessionMetadata::default(),
+            session_start: None,
+            score: 3.0,
+            reasons: vec!["x".to_string()],
+            signals: MatchSignals::default(),
+        };
+        let c2 = RankedSessionCandidate {
+            file_path: PathBuf::from("/tmp/b.jsonl"),
+            agent_type: AgentType::Claude,
+            session_id: "b".to_string(),
+            metadata: SessionMetadata::default(),
+            session_start: None,
+            score: 2.8,
+            reasons: vec!["y".to_string()],
+            signals: MatchSignals::default(),
+        };
+
+        let selected = select_best_session(&[c1, c2]);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn test_path_overlap_signal_increases_score() {
+        let paths_a: std::collections::HashSet<String> =
+            ["src/main.rs".to_string(), "README.md".to_string()]
+                .into_iter()
+                .collect();
+        let paths_b: std::collections::HashSet<String> =
+            ["README.md".to_string()].into_iter().collect();
+        let paths_c: std::collections::HashSet<String> =
+            ["docs/guide.md".to_string()].into_iter().collect();
+
+        let overlap = jaccard_score(&paths_a, &paths_b);
+        let no_overlap = jaccard_score(&paths_a, &paths_c);
+        assert!(overlap > no_overlap);
     }
 
     // -----------------------------------------------------------------------

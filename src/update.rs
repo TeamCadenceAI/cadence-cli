@@ -135,40 +135,49 @@ pub fn check_latest_version_from_url(url: &str) -> Result<LatestRelease> {
 /// from the redirect `Location` header without actually following it. This
 /// is efficient (single request) and avoids the GitHub API entirely.
 fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Failed to build HTTP client")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create Tokio runtime for HTTP request")?;
 
-    let response = client
-        .get(url)
-        .send()
-        .context("Failed to connect to release server")?;
+    runtime.block_on(async move {
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to connect to release server")?;
 
-    let status = response.status();
-    if !status.is_redirection() {
-        bail!("Release server returned HTTP {status} — expected a redirect to the latest release");
-    }
+        let status = response.status();
+        if !status.is_redirection() {
+            bail!(
+                "Release server returned HTTP {status} — expected a redirect to the latest release"
+            );
+        }
 
-    let location = response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?
-        .to_str()
-        .context("Location header is not valid UTF-8")?;
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?
+            .to_str()
+            .context("Location header is not valid UTF-8")?;
 
-    // Extract tag from URL like: https://github.com/REPO/releases/tag/v0.4.1
-    let tag = location
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Could not extract version tag from redirect URL: {location}")
-        })?;
+        // Extract tag from URL like: https://github.com/REPO/releases/tag/v0.4.1
+        let tag = location
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Could not extract version tag from redirect URL: {location}")
+            })?;
 
-    Ok(tag.to_string())
+        Ok(tag.to_string())
+    })
 }
 
 /// Constructs a `LatestRelease` from a discovered tag and repo base URL.
@@ -290,8 +299,8 @@ pub fn pick_checksums_asset(assets: &[ReleaseAsset]) -> Result<ReleaseAsset> {
 // ---------------------------------------------------------------------------
 
 /// Builds a reqwest blocking client with standard headers and timeout.
-fn build_http_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(120))
         .build()
@@ -301,22 +310,29 @@ fn build_http_client() -> Result<reqwest::blocking::Client> {
 /// Downloads a URL to a file in the given directory. Returns the file path.
 pub fn download_to_file(url: &str, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
     let client = build_http_client()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create Tokio runtime for HTTP request")?;
 
-    let response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("Failed to connect to download server for '{filename}'"))?;
+    let bytes = runtime.block_on(async move {
+        let response =
+            client.get(url).send().await.with_context(|| {
+                format!("Failed to connect to download server for '{filename}'")
+            })?;
 
-    let status = response.status();
-    if !status.is_success() {
-        bail!("Download of '{filename}' failed: HTTP {status} from {url}");
-    }
+        let status = response.status();
+        if !status.is_success() {
+            bail!("Download of '{filename}' failed: HTTP {status} from {url}");
+        }
+
+        response
+            .bytes()
+            .await
+            .with_context(|| format!("Failed to read response body for '{filename}'"))
+    })?;
 
     let dest_path = dest_dir.join(filename);
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("Failed to read response body for '{filename}'"))?;
-
     std::fs::write(&dest_path, &bytes)
         .with_context(|| format!("Failed to write '{filename}' to {}", dest_path.display()))?;
 

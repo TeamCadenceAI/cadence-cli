@@ -6,6 +6,7 @@ mod keychain;
 mod login;
 mod note;
 mod output;
+mod payload_pending;
 mod pending;
 mod pgp_keys;
 mod push;
@@ -16,12 +17,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use console::Term;
 use dialoguer::{Confirm, theme::ColorfulTheme};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::runtime::Handle;
 
 use crate::keychain::KeychainStore;
 
@@ -228,6 +230,7 @@ impl From<anyhow::Error> for HookError {
 // ---------------------------------------------------------------------------
 
 /// How note content should be encrypted before storage.
+#[derive(Clone)]
 enum EncryptionMethod {
     /// Pure-Rust rpgp encryption using user + API public keys.
     RpgpMulti { user_key: String, api_key: String },
@@ -331,6 +334,21 @@ fn api_url_override() -> Option<&'static str> {
     API_URL_OVERRIDE.get().map(String::as_str)
 }
 
+fn block_on_io<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if let Ok(handle) = Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create Tokio runtime")
+            .block_on(fut)
+    }
+}
+
 /// Resolve the cached API public key, refreshing if needed.
 fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
     let cached_key = pgp_keys::load_cached_api_public_key().unwrap_or(None);
@@ -349,8 +367,7 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
     let resolved = cfg.resolve_api_url(api_url_override());
     let client = api_client::ApiClient::new(&resolved.url);
     let keys_url = format!("{}/api/keys/public", resolved.url.trim_end_matches('/'));
-    let api_key = client
-        .get_api_public_key()
+    let api_key = block_on_io(client.get_api_public_key())
         .with_context(|| format!("failed to fetch API public key from {keys_url}"))?;
 
     let meta = pgp_keys::ApiPublicKeyMetadata {
@@ -765,8 +782,10 @@ fn run_login() -> Result<()> {
     }
 
     output::action("Login", "opening browser for authentication");
-    let exchanged =
-        login::login_via_browser(&resolved.url, Duration::from_secs(LOGIN_TIMEOUT_SECS))?;
+    let exchanged = block_on_io(login::login_via_browser(
+        &resolved.url,
+        Duration::from_secs(LOGIN_TIMEOUT_SECS),
+    ))?;
 
     cfg.api_url = Some(resolved.url.clone());
     cfg.token = Some(exchanged.token.clone());
@@ -792,7 +811,7 @@ fn run_logout() -> Result<()> {
 
     if let Some(token) = resolve_cli_auth_token(&cfg) {
         let client = api_client::ApiClient::new(&resolved.url);
-        match client.revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS)) {
+        match block_on_io(client.revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))) {
             Ok(()) => output::detail("Revoked token on server."),
             Err(api_client::AuthenticatedRequestError::Unauthorized) => {
                 output::note("Token was already invalid or expired.");
@@ -860,7 +879,11 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    match client.report_backfill_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS)) {
+    match block_on_io(client.report_backfill_complete(
+        &token,
+        &request,
+        Duration::from_secs(API_TIMEOUT_SECS),
+    )) {
         Ok(response) => {
             if response.recorded {
                 output::detail(&format!(
@@ -985,110 +1008,61 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 3: Collect candidate files across all agents
     let candidate_files = agents::all_candidate_files(&repo_root, head_timestamp, 600);
 
-    // Step 5: Run scanner to find session match
-    let session_match = scanner::find_session_for_commit(&head_hash, &candidate_files);
+    let selected = select_session_for_commit(
+        &head_hash,
+        &repo_root,
+        head_timestamp,
+        &candidate_files,
+        600,
+    );
 
     let mut attached = false;
-    if let Some(ref matched) = session_match {
-        // Step 6a: Parse metadata and verify match
-        let metadata = scanner::parse_session_metadata(&matched.file_path);
-
-        if scanner::verify_match(&metadata, &repo_root, &head_hash) {
-            // Read the full session log. If the read fails (permissions,
-            // file deleted between match and read, etc.), fall through to
-            // the pending path so it can be retried later.
-            //
-            // Note: `read_to_string` loads the entire file into memory.
-            // This is acceptable because session logs are typically small
-            // (tens of KB to a few MB).
-            let session_log = match std::fs::read_to_string(&matched.file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    output::note(&format!("Could not read session log ({})", e));
-                    if let Err(e) =
-                        pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
-                    {
-                        output::note(&format!("Could not write pending record ({})", e));
-                    }
-                    spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
-                    // Skip note attachment; retry will pick this up later
-                    return Ok(());
+    if let Some(selected) = selected {
+        let scanner::SelectedSession {
+            candidate,
+            confidence,
+            reason_codes,
+        } = selected;
+        let session_log = match std::fs::read_to_string(&candidate.file_path) {
+            Ok(content) => content,
+            Err(e) => {
+                output::note(&format!("Could not read session log ({})", e));
+                if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
+                    output::note(&format!("Could not write pending record ({})", e));
                 }
-            };
+                spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
+                return Ok(());
+            }
+        };
 
-            let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
-            let session_start =
-                scanner::session_time_range(&matched.file_path).map(|(start, _)| start);
+        attach_note_from_log(
+            &candidate.agent_type,
+            &candidate.session_id,
+            &repo_root_str,
+            &head_hash,
+            &session_log,
+            confidence,
+            &encryption_method,
+            candidate.session_start,
+            Some(candidate.score),
+            Some(&reason_codes),
+        )
+        .map_err(|e| {
+            if encryption_method.is_configured() {
+                HookError::EncryptionFailed(format!("{:#}", e))
+            } else {
+                HookError::Soft(e)
+            }
+        })?;
 
-            // Attach the note (encryption failure blocks the commit when configured)
-            attach_note_from_log(
-                &matched.agent_type,
-                session_id,
-                &repo_root_str,
-                &head_hash,
-                &session_log,
-                note::Confidence::ExactHashMatch,
-                &encryption_method,
-                session_start,
-            )
-            .map_err(|e| {
-                if encryption_method.is_configured() {
-                    HookError::EncryptionFailed(format!("{:#}", e))
-                } else {
-                    HookError::Soft(e)
-                }
-            })?;
+        log_attached_session(
+            &candidate.agent_type,
+            &candidate.session_id,
+            &head_hash,
+            confidence,
+        );
 
-            log_attached_session(&matched.agent_type, session_id, &head_hash, false);
-
-            attached = true;
-        }
-    }
-
-    if !attached {
-        // Step 6b: No exact match found — attempt time-based fallback
-        if let Some(fallback) =
-            fallback_match_for_commit(head_timestamp, &repo_root, &candidate_files, 600)
-        {
-            let session_log = match std::fs::read_to_string(&fallback.file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    output::note(&format!("Could not read session log ({})", e));
-                    if let Err(e) =
-                        pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
-                    {
-                        output::note(&format!("Could not write pending record ({})", e));
-                    }
-                    spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
-                    return Ok(());
-                }
-            };
-
-            let session_start =
-                scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
-
-            attach_note_from_log(
-                &fallback.agent_type,
-                &fallback.session_id,
-                &repo_root_str,
-                &head_hash,
-                &session_log,
-                note::Confidence::TimeWindowMatch,
-                &encryption_method,
-                session_start,
-            )
-            .map_err(|e| {
-                if encryption_method.is_configured() {
-                    HookError::EncryptionFailed(format!("{:#}", e))
-                } else {
-                    HookError::Soft(e)
-                }
-            })?;
-
-            log_attached_session(&fallback.agent_type, &fallback.session_id, &head_hash, true);
-
-            attached = true;
-        }
+        attached = true;
     }
 
     if !attached {
@@ -1139,7 +1113,7 @@ fn log_attached_session(
     agent: &scanner::AgentType,
     session_id: &str,
     commit_hash: &str,
-    is_fallback: bool,
+    confidence: note::Confidence,
 ) {
     let mut message = format!(
         "Attached {} session {} to commit {}",
@@ -1147,8 +1121,11 @@ fn log_attached_session(
         session_id,
         &commit_hash[..7]
     );
-    if is_fallback {
+    if confidence == note::Confidence::TimeWindowMatch {
         message.push_str(" (time window match)");
+    }
+    if confidence == note::Confidence::ScoredMatch {
+        message.push_str(" (scored match)");
     }
     output::success("[Cadence]", &message);
 }
@@ -1165,18 +1142,6 @@ const MAX_RETRY_ATTEMPTS: u32 = 20;
 /// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
 const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
 
-/// If two fallback candidates are within this many seconds, treat as ambiguous.
-const FALLBACK_AMBIGUITY_MARGIN_SECS: i64 = 120;
-
-/// Expand session time ranges by this many seconds when matching commits.
-const FALLBACK_RANGE_BUFFER_SECS: i64 = 300;
-
-struct FallbackMatch {
-    file_path: std::path::PathBuf,
-    agent_type: scanner::AgentType,
-    session_id: String,
-}
-
 fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
@@ -1184,89 +1149,109 @@ fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     Some(mtime_epoch)
 }
 
-fn metadata_repo_matches(metadata: &scanner::SessionMetadata, repo_root: &std::path::Path) -> bool {
-    let cwd = match &metadata.cwd {
-        Some(c) => c,
-        None => return false,
-    };
-    let cwd_path = std::path::Path::new(cwd);
-    match git::repo_root_at(cwd_path) {
-        Ok(cwd_repo_root) => {
-            let canonical_repo = repo_root
-                .canonicalize()
-                .unwrap_or_else(|_| repo_root.to_path_buf());
-            let canonical_cwd_repo = cwd_repo_root.canonicalize().unwrap_or(cwd_repo_root);
-            canonical_repo == canonical_cwd_repo
-        }
-        Err(_) => false,
+fn commit_timestamp_at(repo: &std::path::Path, commit: &str) -> Option<i64> {
+    let output = git::run_git_output_at(
+        Some(repo),
+        &["show", "-s", "--format=%ct", "--", commit],
+        &[],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.trim().parse::<i64>().ok()
 }
 
-fn fallback_match_for_commit(
-    commit_time: i64,
+fn match_max_diff_bytes() -> usize {
+    const DEFAULT_MAX_DIFF_BYTES: usize = 131_072;
+    std::env::var("CADENCE_MATCH_MAX_DIFF_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_DIFF_BYTES)
+}
+
+fn select_session_for_commit(
+    commit: &str,
     repo_root: &std::path::Path,
+    commit_time: i64,
     candidate_files: &[std::path::PathBuf],
     time_window: i64,
-) -> Option<FallbackMatch> {
-    let mut candidates: Vec<(i64, std::path::PathBuf, scanner::SessionMetadata)> = Vec::new();
-
-    for file_path in candidate_files {
-        let metadata = scanner::parse_session_metadata(file_path);
-        if !metadata_repo_matches(&metadata, repo_root) {
-            continue;
-        }
-
-        let distance = if let Some((start_ts, end_ts)) = scanner::session_time_range(file_path) {
-            let start = start_ts - FALLBACK_RANGE_BUFFER_SECS;
-            let end = end_ts + FALLBACK_RANGE_BUFFER_SECS;
-            if commit_time >= start && commit_time <= end {
-                0
-            } else {
-                let d1 = (commit_time - start_ts).abs();
-                let d2 = (commit_time - end_ts).abs();
-                d1.min(d2)
-            }
-        } else {
-            let mtime = match file_mtime_epoch(file_path) {
-                Some(t) => t,
-                None => continue,
-            };
-            (commit_time - mtime).abs()
-        };
-
-        if distance <= time_window {
-            candidates.push((distance, file_path.clone(), metadata));
-        }
-    }
-
-    if candidates.is_empty() {
+) -> Option<scanner::SelectedSession> {
+    if candidate_files.is_empty() {
         return None;
     }
 
-    candidates.sort_by_key(|(distance, _, _)| *distance);
-    if candidates.len() >= 2 {
-        let diff = (candidates[1].0 - candidates[0].0).abs();
-        if diff <= FALLBACK_AMBIGUITY_MARGIN_SECS {
-            return None;
+    let cheap_ranked = scanner::rank_sessions_for_commit(
+        commit,
+        repo_root,
+        commit_time,
+        time_window,
+        candidate_files,
+        &[],
+        "",
+    );
+
+    let cheap_selected = scanner::select_best_session(&cheap_ranked);
+    let cheap_margin = if cheap_ranked.len() >= 2 {
+        cheap_ranked[0].score - cheap_ranked[1].score
+    } else {
+        f64::INFINITY
+    };
+    if let Some(selected) = cheap_selected {
+        let top = &selected.candidate;
+        let strong_exact = selected.confidence == note::Confidence::ExactHashMatch
+            && top.score >= scanner::min_accept_score() + 1.0
+            && cheap_margin >= scanner::min_margin_score() + 0.4;
+        if strong_exact {
+            if output::is_verbose() {
+                output::detail("selected from cheap pass (strong exact match)");
+            }
+            return Some(selected);
         }
     }
 
-    let (_, file_path, metadata) = candidates.remove(0);
-    let agent_type = metadata
-        .agent_type
-        .clone()
-        .unwrap_or(scanner::AgentType::Claude);
-    let session_id = metadata
-        .session_id
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string();
+    let commit_paths = git::commit_changed_paths_at(repo_root, commit).unwrap_or_default();
+    let commit_patch =
+        git::commit_patch_text_at(repo_root, commit, match_max_diff_bytes()).unwrap_or_default();
+    let ranked = scanner::rank_sessions_for_commit(
+        commit,
+        repo_root,
+        commit_time,
+        time_window,
+        candidate_files,
+        &commit_paths,
+        &commit_patch,
+    );
 
-    Some(FallbackMatch {
-        file_path,
-        agent_type,
-        session_id,
-    })
+    if output::is_verbose() {
+        for (idx, candidate) in ranked.iter().take(3).enumerate() {
+            output::detail(&format!(
+                "match candidate #{} score={:.3} session={} file={} reasons={}",
+                idx + 1,
+                candidate.score,
+                candidate.session_id,
+                candidate.file_path.display(),
+                candidate.reasons.join(",")
+            ));
+        }
+    }
+
+    let selected = scanner::select_best_session(&ranked);
+    if selected.is_none() && output::is_verbose() {
+        if let Some(top) = ranked.first() {
+            output::detail(&format!(
+                "no candidate selected: top score {:.3} below threshold {:.3} or ambiguous margin {:.3}",
+                top.score,
+                scanner::min_accept_score(),
+                scanner::min_margin_score()
+            ));
+        } else {
+            output::detail("no candidate selected: no repo-matching session candidates");
+        }
+    }
+    selected
 }
 
 /// Pre-computed payload blob info for deduplication across commits.
@@ -1289,6 +1274,8 @@ fn attach_note_from_log(
     confidence: note::Confidence,
     method: &EncryptionMethod,
     session_start: Option<i64>,
+    match_score: Option<f64>,
+    match_reasons: Option<&[String]>,
 ) -> Result<()> {
     attach_note_from_log_v2(
         agent_type,
@@ -1299,6 +1286,9 @@ fn attach_note_from_log(
         confidence,
         method,
         session_start,
+        match_score,
+        match_reasons,
+        true,
         None, // no pre-stored payload — will store a new blob
         None, // use CWD repo
     )
@@ -1318,6 +1308,9 @@ fn attach_note_from_log_v2(
     confidence: note::Confidence,
     method: &EncryptionMethod,
     session_start: Option<i64>,
+    match_score: Option<f64>,
+    match_reasons: Option<&[String]>,
+    anchor_payload_ref: bool,
     existing_payload: Option<&PayloadInfo>,
     repo: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -1332,7 +1325,7 @@ fn attach_note_from_log_v2(
     };
 
     // Build the v2 pointer note
-    let note_content = note::format_v2(
+    let note_content = note::format_v2_with_match_details(
         agent_type,
         session_id,
         repo_str,
@@ -1342,10 +1335,31 @@ fn attach_note_from_log_v2(
         &blob_sha,
         &payload_sha256,
         encoding,
+        match_score,
+        match_reasons,
     )?;
 
     // Pointer note stays plaintext — only the payload blob is encrypted.
     // This lets the API index metadata without needing decryption keys.
+    if anchor_payload_ref {
+        let payload_repo = match repo {
+            Some(r) => Some(r.to_path_buf()),
+            None => git::repo_root().ok(),
+        };
+        if let Some(r) = payload_repo.as_deref()
+            && let Err(e) = git::ensure_payload_blob_referenced_at(r, &blob_sha)
+        {
+            let short = if blob_sha.len() >= 8 {
+                &blob_sha[..8]
+            } else {
+                &blob_sha
+            };
+            output::note(&format!(
+                "Could not update payload ref for blob {}: {}",
+                short, e
+            ));
+        }
+    }
     match repo {
         Some(r) => git::add_note_at(r, commit, &note_content)?,
         None => git::add_note(commit, &note_content)?,
@@ -1467,112 +1481,38 @@ fn try_resolve_single_commit(
     // Collect candidate files across all agents
     let candidate_files = agents::all_candidate_files(repo_root, commit_time, time_window);
 
-    let session_match = scanner::find_session_for_commit(commit, &candidate_files);
-
-    let matched = match session_match {
-        Some(m) => m,
-        None => {
-            if let Some(fallback) =
-                fallback_match_for_commit(commit_time, repo_root, &candidate_files, time_window)
-            {
-                let session_log = match std::fs::read_to_string(&fallback.file_path) {
-                    Ok(content) => content,
-                    Err(_) => return ResolveResult::TransientError,
-                };
-
-                let session_start =
-                    scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
-
-                if attach_note_from_log(
-                    &fallback.agent_type,
-                    &fallback.session_id,
-                    repo_str,
-                    commit,
-                    &session_log,
-                    note::Confidence::TimeWindowMatch,
-                    method,
-                    session_start,
-                )
-                .is_ok()
-                {
-                    output::success(
-                        "Retry",
-                        &format!(
-                            "attached session {} to commit {} (time window match)",
-                            fallback.session_id,
-                            &commit[..std::cmp::min(7, commit.len())]
-                        ),
-                    );
-
-                    return ResolveResult::Attached;
-                }
-                return ResolveResult::TransientError;
-            }
-
-            return ResolveResult::NotFound;
-        }
+    let selected = match select_session_for_commit(
+        commit,
+        repo_root,
+        commit_time,
+        &candidate_files,
+        time_window,
+    ) {
+        Some(s) => s,
+        None => return ResolveResult::NotFound,
     };
+    let scanner::SelectedSession {
+        candidate,
+        confidence,
+        reason_codes,
+    } = selected;
 
-    let metadata = scanner::parse_session_metadata(&matched.file_path);
-
-    if !scanner::verify_match(&metadata, repo_root, commit) {
-        if let Some(fallback) =
-            fallback_match_for_commit(commit_time, repo_root, &candidate_files, time_window)
-        {
-            let session_log = match std::fs::read_to_string(&fallback.file_path) {
-                Ok(content) => content,
-                Err(_) => return ResolveResult::TransientError,
-            };
-
-            let session_start =
-                scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
-
-            if attach_note_from_log(
-                &fallback.agent_type,
-                &fallback.session_id,
-                repo_str,
-                commit,
-                &session_log,
-                note::Confidence::TimeWindowMatch,
-                method,
-                session_start,
-            )
-            .is_ok()
-            {
-                output::success(
-                    "Retry",
-                    &format!(
-                        "attached session {} to commit {} (time window match)",
-                        fallback.session_id,
-                        &commit[..std::cmp::min(7, commit.len())]
-                    ),
-                );
-
-                return ResolveResult::Attached;
-            }
-            return ResolveResult::TransientError;
-        }
-
-        return ResolveResult::NotFound;
-    }
-
-    let session_log = match std::fs::read_to_string(&matched.file_path) {
+    let session_log = match std::fs::read_to_string(&candidate.file_path) {
         Ok(content) => content,
         Err(_) => return ResolveResult::TransientError,
     };
 
-    let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
-    let session_start = scanner::session_time_range(&matched.file_path).map(|(start, _)| start);
-
     if attach_note_from_log(
-        &matched.agent_type,
-        session_id,
+        &candidate.agent_type,
+        &candidate.session_id,
         repo_str,
         commit,
         &session_log,
-        note::Confidence::ExactHashMatch,
+        confidence,
         method,
-        session_start,
+        candidate.session_start,
+        Some(candidate.score),
+        Some(&reason_codes),
     )
     .is_ok()
     {
@@ -1580,7 +1520,7 @@ fn try_resolve_single_commit(
             "Retry",
             &format!(
                 "attached session {} to commit {}",
-                session_id,
+                candidate.session_id,
                 &commit[..std::cmp::min(7, commit.len())]
             ),
         );
@@ -1684,8 +1624,8 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - Prints verbose progress throughout
 /// - All errors are non-fatal (logged and continued)
 /// - Does NOT auto-push by default (use `--push` flag)
-fn run_backfill(since: &str, do_push: bool) -> Result<()> {
-    run_backfill_inner(since, do_push, None)
+async fn run_backfill(since: &str, do_push: bool) -> Result<()> {
+    run_backfill_inner(since, do_push, None).await
 }
 
 /// Inner implementation of backfill that accepts an optional repo filter.
@@ -1693,7 +1633,434 @@ fn run_backfill(since: &str, do_push: bool) -> Result<()> {
 /// When `repo_filter` is `Some`, only sessions whose resolved repo root
 /// matches the given path are processed. Used by `cadence gc` to scope
 /// re-backfill to the current repository.
-fn run_backfill_inner(
+#[derive(Clone)]
+struct SessionInfo {
+    file: std::path::PathBuf,
+    session_id: String,
+    repo_root: std::path::PathBuf,
+    metadata: scanner::SessionMetadata,
+    commit_hashes: Vec<String>,
+}
+
+#[derive(Default)]
+struct RepoBackfillStats {
+    attached: usize,
+    skipped: usize,
+    errors: usize,
+    fallback_attached: usize,
+    commits_found: usize,
+}
+
+fn repo_label_from_display(display: &str) -> String {
+    let trimmed = display.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+
+    // HTTPS / HTTP remotes: https://github.com/org/repo(.git)
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let mut segments = url
+            .path_segments()
+            .map(|s| s.filter(|p| !p.is_empty()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if segments.len() >= 2 {
+            let org = segments.remove(segments.len() - 2);
+            let mut repo = segments.remove(segments.len() - 1).to_string();
+            if let Some(stripped) = repo.strip_suffix(".git") {
+                repo = stripped.to_string();
+            }
+            return format!("{org}/{repo}");
+        }
+    }
+
+    // SSH remote: git@github.com:org/repo.git
+    if let Some((_, path)) = trimmed.split_once(':') {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 2 {
+            let org = parts[parts.len() - 2];
+            let mut repo = parts[parts.len() - 1].to_string();
+            if let Some(stripped) = repo.strip_suffix(".git") {
+                repo = stripped.to_string();
+            }
+            return format!("{org}/{repo}");
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn backfill_repo_concurrency() -> usize {
+    let adaptive = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2))
+        .unwrap_or(4)
+        .clamp(1, 32);
+    std::env::var("CADENCE_BACKFILL_REPO_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(adaptive)
+}
+
+fn process_repo_backfill(
+    repo_display: String,
+    sessions: Vec<SessionInfo>,
+    do_push: bool,
+    sync_remote_before_attach: bool,
+    encryption_method: EncryptionMethod,
+    repo_progress: Option<ProgressBar>,
+) -> RepoBackfillStats {
+    let mut stats = RepoBackfillStats::default();
+    let planned_units: u64 = sessions
+        .iter()
+        .map(|s| {
+            if s.commit_hashes.is_empty() {
+                1_u64
+            } else {
+                s.commit_hashes.len() as u64
+            }
+        })
+        .sum::<u64>()
+        .max(1);
+    if let Some(pb) = &repo_progress {
+        pb.set_length(planned_units);
+        pb.set_message("starting");
+    }
+
+    let repo_root = match sessions.first() {
+        Some(session) => session.repo_root.clone(),
+        None => {
+            if let Some(pb) = &repo_progress {
+                pb.finish_with_message("no sessions");
+            }
+            return stats;
+        }
+    };
+
+    match git::repo_matches_org_filter(&repo_root) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(pb) = &repo_progress {
+                pb.finish_with_message("skipped (org filter)");
+            }
+            return stats;
+        }
+        Err(e) => {
+            output::detail(&format!("{}: org filter check failed: {}", repo_display, e));
+            stats.errors += 1;
+            if let Some(pb) = &repo_progress {
+                pb.finish_with_message("error (org filter)");
+            }
+            return stats;
+        }
+    }
+
+    let repo_enabled = git::check_enabled_at(&repo_root);
+    if !repo_enabled {
+        if let Some(pb) = &repo_progress {
+            pb.finish_with_message("skipped (disabled)");
+        }
+        return stats;
+    }
+
+    let repo_remote = if sync_remote_before_attach {
+        if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
+            let _ = push::fetch_merge_notes_for_remote_at(&repo_root, &remote);
+            Some(remote)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut noted_commits: std::collections::HashSet<String> = git::list_notes_at(Some(&repo_root))
+        .map(|rows| rows.into_iter().map(|(_, commit)| commit).collect())
+        .unwrap_or_default();
+
+    for session in sessions {
+        let commit_hashes = session.commit_hashes.clone();
+        stats.commits_found += commit_hashes.len();
+
+        if commit_hashes.is_empty() {
+            let time_range = if let Some((start, end)) = scanner::session_time_range(&session.file)
+            {
+                Some((start, end))
+            } else {
+                file_mtime_epoch(&session.file).map(|mtime| (mtime - 86_400, mtime + 86_400))
+            };
+
+            let (start_ts, end_ts) = match time_range {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let commits = match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
+                Ok(c) => c,
+                Err(_) => {
+                    stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, errors={}",
+                            stats.commits_found, stats.errors
+                        ));
+                    }
+                    continue;
+                }
+            };
+            stats.commits_found += commits.len();
+            if commits.is_empty() {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
+                continue;
+            }
+
+            let mut scored: Vec<(String, scanner::SelectedSession)> = Vec::new();
+            for hash in &commits {
+                let commit_time = match commit_timestamp_at(&session.repo_root, hash) {
+                    Some(ts) => ts,
+                    None => continue,
+                };
+                if let Some(selected) = select_session_for_commit(
+                    hash,
+                    &session.repo_root,
+                    commit_time,
+                    std::slice::from_ref(&session.file),
+                    86_400,
+                ) {
+                    scored.push((hash.clone(), selected));
+                }
+            }
+            scored.sort_by(|a, b| {
+                b.1.candidate
+                    .score
+                    .partial_cmp(&a.1.candidate.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if scored.is_empty() {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
+                continue;
+            }
+            if scored.len() > 1
+                && (scored[0].1.candidate.score - scored[1].1.candidate.score)
+                    < scanner::min_margin_score()
+            {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
+                continue;
+            }
+
+            let (hash, selected) = scored.remove(0);
+            if noted_commits.contains(&hash) {
+                stats.skipped += 1;
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
+                continue;
+            }
+
+            let session_log = match std::fs::read_to_string(&session.file) {
+                Ok(content) => content,
+                Err(_) => {
+                    stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, errors={}",
+                            stats.commits_found, stats.errors
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let agent_type = session
+                .metadata
+                .agent_type
+                .clone()
+                .unwrap_or(scanner::AgentType::Claude);
+            let repo_str = session.repo_root.to_string_lossy().to_string();
+            let session_start = scanner::session_time_range(&session.file).map(|(start, _)| start);
+
+            match attach_note_from_log_v2(
+                &agent_type,
+                &session.session_id,
+                &repo_str,
+                &hash,
+                &session_log,
+                selected.confidence,
+                &encryption_method,
+                session_start,
+                Some(selected.candidate.score),
+                Some(&selected.reason_codes),
+                true,
+                None,
+                Some(&session.repo_root),
+            ) {
+                Ok(()) => {
+                    noted_commits.insert(hash);
+                    stats.attached += 1;
+                    if selected.confidence == note::Confidence::TimeWindowMatch {
+                        stats.fallback_attached += 1;
+                    }
+                }
+                Err(_) => stats.errors += 1,
+            }
+            if let Some(pb) = &repo_progress {
+                pb.inc(1);
+                pb.set_message(format!(
+                    "commits={}, attached={}, skipped={}",
+                    stats.commits_found, stats.attached, stats.skipped
+                ));
+            }
+            continue;
+        }
+
+        let agent_type = session
+            .metadata
+            .agent_type
+            .clone()
+            .unwrap_or(scanner::AgentType::Claude);
+        let repo_str = session.repo_root.to_string_lossy().to_string();
+        let session_start = scanner::session_time_range(&session.file).map(|(start, _)| start);
+        let mut payload_info: Option<PayloadInfo> = None;
+        let mut payload_anchored = false;
+
+        for hash in &commit_hashes {
+            match git::commit_exists_at(&session.repo_root, hash) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                    }
+                    continue;
+                }
+            }
+            if noted_commits.contains(hash) {
+                stats.skipped += 1;
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
+                }
+                continue;
+            }
+
+            if payload_info.is_none() {
+                let session_log = match std::fs::read_to_string(&session.file) {
+                    Ok(content) => content,
+                    Err(_) => {
+                        stats.errors += 1;
+                        break;
+                    }
+                };
+                match encode_and_store_payload_at(
+                    Some(&session.repo_root),
+                    &session_log,
+                    &encryption_method,
+                ) {
+                    Ok((blob_sha, sha256, encoding)) => {
+                        payload_info = Some(PayloadInfo {
+                            blob_sha,
+                            payload_sha256: sha256,
+                            encoding,
+                        });
+                        if let Some(info) = payload_info.as_ref()
+                            && let Err(e) = git::ensure_payload_blob_referenced_at(
+                                &session.repo_root,
+                                &info.blob_sha,
+                            )
+                        {
+                            output::detail(&format!("could not anchor payload ref: {}", e));
+                        } else {
+                            payload_anchored = true;
+                        }
+                    }
+                    Err(_) => {
+                        stats.errors += 1;
+                        if let Some(pb) = &repo_progress {
+                            pb.inc(1);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let info = payload_info.as_ref().expect("payload info must be present");
+            match attach_note_from_log_v2(
+                &agent_type,
+                &session.session_id,
+                &repo_str,
+                hash,
+                "",
+                note::Confidence::ExactHashMatch,
+                &encryption_method,
+                session_start,
+                None,
+                None,
+                !payload_anchored,
+                Some(info),
+                Some(&session.repo_root),
+            ) {
+                Ok(()) => {
+                    noted_commits.insert(hash.clone());
+                    stats.attached += 1;
+                }
+                Err(_) => stats.errors += 1,
+            }
+            if let Some(pb) = &repo_progress {
+                pb.inc(1);
+                pb.set_message(format!(
+                    "commits={}, attached={}, skipped={}",
+                    stats.commits_found, stats.attached, stats.skipped
+                ));
+            }
+        }
+    }
+
+    if do_push && let Some(ref remote) = repo_remote {
+        push::attempt_push_remote_at_quiet(&repo_root, remote);
+    }
+
+    if let Some(pb) = &repo_progress {
+        pb.finish_with_message(format!(
+            "done: commits={}, attached={}, skipped={}, issues={}",
+            stats.commits_found, stats.attached, stats.skipped, stats.errors
+        ));
+    }
+
+    stats
+}
+
+async fn run_backfill_inner(
     since: &str,
     do_push: bool,
     repo_filter: Option<&std::path::Path>,
@@ -1728,7 +2095,9 @@ fn run_backfill_inner(
     };
 
     // Step 2: Find all session files modified within the --since window
-    let files = agents::all_recent_files(now, since_secs);
+    let files = tokio::task::spawn_blocking(move || agents::all_recent_files(now, since_secs))
+        .await
+        .context("failed to scan recent files")?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -1759,16 +2128,12 @@ fn run_backfill_inner(
         output::detail("Remote notes sync skipped (no --push)");
     }
 
-    // Step 3: Pre-process each file to resolve repo and group by repo display
-    struct SessionInfo {
-        file: std::path::PathBuf,
-        session_id: String,
-        repo_root: std::path::PathBuf,
-        metadata: scanner::SessionMetadata,
-    }
-
     let mut sessions_by_repo: std::collections::BTreeMap<String, Vec<SessionInfo>> =
         std::collections::BTreeMap::new();
+    let mut repo_root_cache: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    let mut repo_display_cache: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
 
     let progress = if use_progress {
         let pb = ProgressBar::new(files.len() as u64);
@@ -1797,12 +2162,16 @@ fn run_backfill_inner(
             None => continue,
         };
 
-        let cwd_path = std::path::Path::new(&cwd);
-
-        // Skip sessions whose cwd isn't a git repo (silently)
-        let repo_root = match git::repo_root_at(cwd_path) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let repo_root = if let Some(cached) = repo_root_cache.get(&cwd) {
+            cached.clone()
+        } else {
+            let cwd_path = std::path::Path::new(&cwd);
+            let resolved = match git::repo_root_at(cwd_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            repo_root_cache.insert(cwd.clone(), resolved.clone());
+            resolved
         };
 
         // If a repo filter is set, skip sessions that don't match.
@@ -1819,12 +2188,18 @@ fn run_backfill_inner(
             .to_string();
 
         // Determine repo display: prefer remote URL, fall back to directory name
-        let repo_display = match git::first_remote_url_at(&repo_root) {
-            Ok(Some(url)) => url,
-            _ => repo_root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+        let repo_display = if let Some(cached) = repo_display_cache.get(&repo_root) {
+            cached.clone()
+        } else {
+            let resolved = match git::first_remote_url_at(&repo_root) {
+                Ok(Some(url)) => url,
+                _ => repo_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            };
+            repo_display_cache.insert(repo_root.clone(), resolved.clone());
+            resolved
         };
 
         sessions_by_repo
@@ -1835,6 +2210,7 @@ fn run_backfill_inner(
                 session_id,
                 repo_root,
                 metadata,
+                commit_hashes: scanner::extract_commit_hashes(file),
             });
 
         if let Some(ref pb) = progress {
@@ -1846,404 +2222,83 @@ fn run_backfill_inner(
         pb.finish_and_clear();
     }
 
-    // Step 4: Process sessions grouped by repo
-    for (repo_display, sessions) in &sessions_by_repo {
-        output::action("Repository", repo_display);
+    // Step 4: Process sessions grouped by repo (bounded parallelism)
+    let total_repos = sessions_by_repo.len();
+    let concurrency = backfill_repo_concurrency();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = tokio::task::JoinSet::new();
+    let multi = use_progress.then(MultiProgress::new);
+    if let Some(mp) = &multi {
+        mp.set_draw_target(ProgressDrawTarget::stderr());
+        mp.set_move_cursor(true);
+    }
 
-        let repo_root = match sessions.first() {
-            Some(session) => session.repo_root.clone(),
-            None => continue,
-        };
-
-        match git::repo_matches_org_filter(&repo_root) {
-            Ok(true) => {}
-            Ok(false) => {
-                output::detail("Org filter does not match; skipping");
-                continue;
-            }
-            Err(e) => {
-                output::detail(&format!("Org filter check failed: {}", e));
-                continue;
-            }
-        }
-
-        let repo_remote = if sync_remote_before_attach {
-            if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
-                let fetch_start = std::time::Instant::now();
-                match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
-                    Ok(()) => {
-                        output::detail(&format!(
-                            "Fetched notes from {} in {} ms",
-                            remote,
-                            fetch_start.elapsed().as_millis()
-                        ));
+    for (repo_display, sessions) in sessions_by_repo {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let method = encryption_method.clone();
+        let per_repo_bar = if let Some(mp) = &multi {
+            let total_units: u64 = sessions
+                .iter()
+                .map(|s| {
+                    if s.commit_hashes.is_empty() {
+                        1_u64
+                    } else {
+                        s.commit_hashes.len() as u64
                     }
-                    Err(e) => {
-                        output::note(&format!("Could not fetch notes from {}: {}", remote, e));
-                    }
-                }
-                Some(remote)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let session_progress = if use_progress && sessions.len() > 1 {
-            let pb = ProgressBar::new(sessions.len() as u64);
-            pb.set_draw_target(ProgressDrawTarget::stderr());
+                })
+                .sum::<u64>()
+                .max(1);
+            let pb = mp.add(ProgressBar::new(total_units));
             pb.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} {pos}/{len} {msg}")
-                    .unwrap_or_else(|_| ProgressStyle::default_bar()),
+                ProgressStyle::with_template(
+                    "  {prefix:36.cyan.bold} {bar:20.green/black} {pos:>3}/{len:<3} {msg:.yellow}",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
             );
-            pb.enable_steady_tick(std::time::Duration::from_millis(120));
+            let repo_label = repo_label_from_display(&repo_display);
+            let short_name = if repo_label.len() > 36 {
+                format!("{}…", &repo_label[..35])
+            } else {
+                repo_label
+            };
+            pb.set_prefix(short_name);
+            pb.set_message("queued");
             Some(pb)
         } else {
             None
         };
+        join_set.spawn(async move {
+            let _permit = permit;
+            tokio::task::spawn_blocking(move || {
+                process_repo_backfill(
+                    repo_display,
+                    sessions,
+                    do_push,
+                    sync_remote_before_attach,
+                    method,
+                    per_repo_bar,
+                )
+            })
+            .await
+        });
+    }
 
-        let print_detail = |msg: &str| {
-            if let Some(ref pb) = session_progress {
-                pb.println(output::format_detail(msg));
-            } else {
-                output::detail(msg);
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(repo_stats)) => {
+                attached += repo_stats.attached;
+                skipped += repo_stats.skipped;
+                errors += repo_stats.errors;
+                fallback_attached += repo_stats.fallback_attached;
             }
-        };
-
-        let mut repo_total = 0usize;
-        let mut repo_with_commits = 0usize;
-        let mut repo_without_commits = 0usize;
-
-        for session in sessions {
-            repo_total += 1;
-
-            let session_display = if session.session_id.len() > 8 {
-                &session.session_id[..8]
-            } else {
-                &session.session_id
-            };
-
-            // Use a labeled block so all exit paths reach the progress increment
-            'process_session: {
-                // Update progress bar with current session
-                if let Some(ref pb) = session_progress {
-                    pb.set_message(format!("{} — extracting commits", session_display));
-                }
-
-                // Extract all commit hashes from the session log
-                let commit_hashes = scanner::extract_commit_hashes(&session.file);
-
-                if commit_hashes.is_empty() {
-                    repo_without_commits += 1;
-
-                    if !git::check_enabled_at(&session.repo_root) {
-                        break 'process_session;
-                    }
-
-                    let header = format!("{} |", session_display);
-
-                    if let Some(ref pb) = session_progress {
-                        pb.set_message(format!("{} — scanning timestamps", session_display));
-                    }
-
-                    let time_range =
-                        if let Some((start, end)) = scanner::session_time_range(&session.file) {
-                            Some((start, end))
-                        } else {
-                            // Fall back to file mtime ± 24 hours
-                            let mtime = match file_mtime_epoch(&session.file) {
-                                Some(t) => t,
-                                None => {
-                                    print_detail(&format!(
-                                        "{} no timestamps or file mtime; skipping",
-                                        header
-                                    ));
-                                    break 'process_session;
-                                }
-                            };
-                            Some((mtime - 86_400, mtime + 86_400))
-                        };
-
-                    let (start_ts, end_ts) = match time_range {
-                        Some(r) => r,
-                        None => {
-                            print_detail(&format!("{} no timestamps; skipping", header));
-                            break 'process_session;
-                        }
-                    };
-
-                    let commits =
-                        match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                print_detail(&format!(
-                                    "{} problem scanning commits: {}",
-                                    header, e
-                                ));
-                                errors += 1;
-                                break 'process_session;
-                            }
-                        };
-
-                    if commits.len() != 1 {
-                        let status = if commits.is_empty() {
-                            "no commits in time window"
-                        } else {
-                            "ambiguous commits in time window"
-                        };
-                        print_detail(&format!("{} {}", header, status));
-                        break 'process_session;
-                    }
-
-                    let hash = &commits[0];
-                    match git::note_exists_at(&session.repo_root, hash) {
-                        Ok(true) => {
-                            skipped += 1;
-                            print_detail(&format!(
-                                "{} commit {} already attached",
-                                header,
-                                &hash[..7]
-                            ));
-                            break 'process_session;
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            print_detail(&format!(
-                                "{} problem checking note for {}: {}",
-                                header,
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                            break 'process_session;
-                        }
-                    }
-
-                    if let Some(ref pb) = session_progress {
-                        pb.set_message(format!("{} — reading session log", session_display));
-                    }
-
-                    let session_log = match std::fs::read_to_string(&session.file) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            print_detail(&format!("{} could not read session log: {}", header, e));
-                            errors += 1;
-                            break 'process_session;
-                        }
-                    };
-
-                    let agent_type = session
-                        .metadata
-                        .agent_type
-                        .clone()
-                        .unwrap_or(scanner::AgentType::Claude);
-                    let repo_str = session.repo_root.to_string_lossy().to_string();
-                    let session_start =
-                        scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                    match attach_note_from_log_v2(
-                        &agent_type,
-                        &session.session_id,
-                        &repo_str,
-                        hash,
-                        &session_log,
-                        note::Confidence::TimeWindowMatch,
-                        &encryption_method,
-                        session_start,
-                        None,
-                        Some(&session.repo_root),
-                    ) {
-                        Ok(()) => {
-                            attached += 1;
-                            fallback_attached += 1;
-                            print_detail(&format!(
-                                "{} commit {} attached (time window match)",
-                                header,
-                                &hash[..7]
-                            ));
-                        }
-                        Err(e) => {
-                            print_detail(&format!(
-                                "{} could not attach note to {}: {}",
-                                header,
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                        }
-                    }
-
-                    break 'process_session;
-                }
-
-                repo_with_commits += 1;
-
-                if !git::check_enabled_at(&session.repo_root) {
-                    break 'process_session;
-                }
-
-                // For each hash, attach note if missing.
-                // Buffer messages so we can combine a single status with the header.
-                let mut session_attached = 0usize;
-                let mut session_skipped = 0usize;
-                let mut messages: Vec<String> = Vec::new();
-
-                let header = format!("{} |", session_display);
-
-                if let Some(ref pb) = session_progress {
-                    pb.set_message(format!("{} — attaching notes", session_display));
-                }
-
-                // Pre-compute metadata shared across all commits in this session
-                let agent_type = session
-                    .metadata
-                    .agent_type
-                    .clone()
-                    .unwrap_or(scanner::AgentType::Claude);
-                let repo_str = session.repo_root.to_string_lossy().to_string();
-                let session_start =
-                    scanner::session_time_range(&session.file).map(|(start, _)| start);
-
-                // Lazily store the payload blob once for this session.
-                // We defer reading until we know at least one commit needs a note.
-                let mut payload_info: Option<PayloadInfo> = None;
-
-                for hash in &commit_hashes {
-                    // Verify the commit exists in the resolved repo
-                    match git::commit_exists_at(&session.repo_root, hash) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            // Commit does not exist in this repo -- could be from a
-                            // different repo or could be rebased away. Skip silently.
-                            continue;
-                        }
-                        Err(e) => {
-                            messages.push(format!("problem checking commit {}: {}", &hash[..7], e));
-                            errors += 1;
-                            continue;
-                        }
-                    }
-
-                    // Check dedup: skip if note already exists
-                    match git::note_exists_at(&session.repo_root, hash) {
-                        Ok(true) => {
-                            session_skipped += 1;
-                            skipped += 1;
-                            continue;
-                        }
-                        Ok(false) => {} // Need to attach
-                        Err(e) => {
-                            messages.push(format!(
-                                "problem checking note for {}: {}",
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                            continue;
-                        }
-                    }
-
-                    // Lazily encode and store the payload blob on first need
-                    if payload_info.is_none() {
-                        let session_log = match std::fs::read_to_string(&session.file) {
-                            Ok(content) => content,
-                            Err(e) => {
-                                messages.push(format!("could not read session log: {}", e));
-                                errors += 1;
-                                break;
-                            }
-                        };
-                        match encode_and_store_payload_at(
-                            Some(&session.repo_root),
-                            &session_log,
-                            &encryption_method,
-                        ) {
-                            Ok((blob_sha, sha256, encoding)) => {
-                                payload_info = Some(PayloadInfo {
-                                    blob_sha,
-                                    payload_sha256: sha256,
-                                    encoding,
-                                });
-                            }
-                            Err(e) => {
-                                messages.push(format!("could not store payload: {}", e));
-                                errors += 1;
-                                break;
-                            }
-                        }
-                    }
-
-                    let info = payload_info.as_ref().unwrap();
-
-                    // Attach v2 pointer note reusing the shared blob
-                    match attach_note_from_log_v2(
-                        &agent_type,
-                        &session.session_id,
-                        &repo_str,
-                        hash,
-                        "", // session_log not used when existing_payload is provided
-                        note::Confidence::ExactHashMatch,
-                        &encryption_method,
-                        session_start,
-                        Some(info),
-                        Some(&session.repo_root),
-                    ) {
-                        Ok(()) => {
-                            messages.push(format!("commit {} attached", &hash[..7]));
-                            session_attached += 1;
-                            attached += 1;
-                        }
-                        Err(e) => {
-                            messages.push(format!(
-                                "could not attach note to {}: {}",
-                                &hash[..7],
-                                e
-                            ));
-                            errors += 1;
-                        }
-                    }
-                }
-
-                // Summarise skipped commits as a single message
-                if session_attached == 0 && session_skipped > 0 {
-                    messages.push(format!("{} already attached", session_skipped));
-                }
-
-                // Print: combine header + single message on one line, or multi-line
-                if messages.len() <= 1 {
-                    let status = messages
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("nothing to do");
-                    print_detail(&format!("{} {}", header, status));
-                } else {
-                    print_detail(&header);
-                    for msg in &messages {
-                        print_detail(&format!("  {}", msg));
-                    }
-                }
+            Ok(Err(e)) => {
+                errors += 1;
+                output::detail(&format!("repo worker failed: {}", e));
             }
-
-            // Always increment progress after processing each session
-            if let Some(ref pb) = session_progress {
-                pb.inc(1);
+            Err(e) => {
+                errors += 1;
+                output::detail(&format!("repo task join failed: {}", e));
             }
-        }
-
-        if let Some(ref pb) = session_progress {
-            pb.finish_and_clear();
-        }
-
-        // Per-repo summary (printed after progress bar is cleared)
-        output::detail(&format!(
-            "{} sessions, {} with commits, {} without",
-            repo_total, repo_with_commits, repo_without_commits
-        ));
-
-        // Push notes for this repo if requested
-        if do_push && let Some(ref remote) = repo_remote {
-            push::attempt_push_remote_at(&repo_root, remote);
         }
     }
 
@@ -2266,7 +2321,7 @@ fn run_backfill_inner(
             notes_attached: attached as i64,
             notes_skipped: skipped as i64,
             issues,
-            repos_scanned: sessions_by_repo.len() as i32,
+            repos_scanned: total_repos as i32,
         },
     );
     Ok(())
@@ -3310,7 +3365,7 @@ fn run_update(check: bool, yes: bool) -> Result<()> {
 // GC: clear bloated notes and re-backfill
 // ---------------------------------------------------------------------------
 
-fn run_gc(since: &str, confirm: bool) -> Result<()> {
+async fn run_gc(since: &str, confirm: bool) -> Result<()> {
     // Validate the --since value early so we fail before any destructive work.
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
@@ -3358,7 +3413,7 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
         "GC",
         &format!("Re-backfilling (last {} days) with push", since_days),
     );
-    run_backfill_inner(since, true, Some(&repo_root))?;
+    run_backfill_inner(since, true, Some(&repo_root)).await?;
 
     output::success("GC", "Complete. Notes have been regenerated in v2 format.");
     Ok(())
@@ -3368,7 +3423,8 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let cli = Cli::parse();
     output::set_verbose(cli.verbose);
     if let Some(url) = cli.api_url.clone() {
@@ -3388,7 +3444,7 @@ fn main() {
                 timestamp,
             } => run_hook_post_commit_retry(&commit, &repo, timestamp),
         },
-        Command::Backfill { since, push } => run_backfill(&since, push),
+        Command::Backfill { since, push } => run_backfill(&since, push).await,
         Command::Login => run_login(),
         Command::Logout => run_logout(),
         Command::Retry => run_retry(),
@@ -3409,7 +3465,7 @@ fn main() {
             KeysCommands::Disable => run_keys_disable(),
             KeysCommands::Refresh => run_keys_refresh(),
         },
-        Command::Gc { since, confirm } => run_gc(&since, confirm),
+        Command::Gc { since, confirm } => run_gc(&since, confirm).await,
     };
 
     // Passive background version check: run after successful command execution
