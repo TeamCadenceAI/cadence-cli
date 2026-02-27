@@ -1141,12 +1141,40 @@ const MAX_RETRY_ATTEMPTS: u32 = 20;
 /// Backoff schedule for background retry (in seconds).
 /// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
 const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
+const BACKFILL_RELAXED_LOOKUP_WINDOW_SECS: i64 = 86_400;
 
 fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
     let mtime_epoch = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
     Some(mtime_epoch)
+}
+
+fn commit_lookup_windows_for_session(file: &std::path::Path) -> Vec<(i64, i64)> {
+    if let Some((start, end)) = scanner::session_time_range(file) {
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let tight = scanner::default_time_buffer_secs();
+        return vec![
+            (start.saturating_sub(tight), end.saturating_add(tight)),
+            (
+                start.saturating_sub(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
+                end.saturating_add(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
+            ),
+        ];
+    }
+
+    file_mtime_epoch(file)
+        .map(|mtime| {
+            vec![(
+                mtime.saturating_sub(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
+                mtime.saturating_add(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
+            )]
+        })
+        .unwrap_or_default()
 }
 
 fn commit_timestamp_at(repo: &std::path::Path, commit: &str) -> Option<i64> {
@@ -1782,32 +1810,45 @@ fn process_repo_backfill(
         stats.commits_found += commit_hashes.len();
 
         if commit_hashes.is_empty() {
-            let time_range = if let Some((start, end)) = scanner::session_time_range(&session.file)
-            {
-                Some((start, end))
-            } else {
-                file_mtime_epoch(&session.file).map(|mtime| (mtime - 86_400, mtime + 86_400))
-            };
-
-            let (start_ts, end_ts) = match time_range {
-                Some(r) => r,
-                None => continue,
-            };
-
-            let commits = match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
-                Ok(c) => c,
-                Err(_) => {
-                    stats.errors += 1;
-                    if let Some(pb) = &repo_progress {
-                        pb.inc(1);
-                        pb.set_message(format!(
-                            "commits={}, errors={}",
-                            stats.commits_found, stats.errors
-                        ));
-                    }
-                    continue;
+            let windows = commit_lookup_windows_for_session(&session.file);
+            if windows.is_empty() {
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, attached={}, skipped={}",
+                        stats.commits_found, stats.attached, stats.skipped
+                    ));
                 }
-            };
+                continue;
+            }
+
+            let mut commits = Vec::new();
+            let mut lookup_failed = false;
+            for (start_ts, end_ts) in windows {
+                match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
+                    Ok(found) => {
+                        if !found.is_empty() {
+                            commits = found;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        lookup_failed = true;
+                        break;
+                    }
+                }
+            }
+            if lookup_failed {
+                stats.errors += 1;
+                if let Some(pb) = &repo_progress {
+                    pb.inc(1);
+                    pb.set_message(format!(
+                        "commits={}, errors={}",
+                        stats.commits_found, stats.errors
+                    ));
+                }
+                continue;
+            }
             stats.commits_found += commits.len();
             if commits.is_empty() {
                 if let Some(pb) = &repo_progress {
@@ -3739,5 +3780,70 @@ mod tests {
         let absolute = hooks_dir.clone();
         let relative = repo.path().join(".git/./hooks");
         assert!(paths_equivalent(&absolute, &relative));
+    }
+
+    #[test]
+    fn commit_lookup_windows_use_timestamp_primary_and_relaxed_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(
+            &file,
+            r#"{"timestamp":"2026-02-10T01:00:00Z"}
+{"timestamp":"2026-02-10T01:10:00Z"}"#,
+        )
+        .expect("write session");
+
+        let windows = commit_lookup_windows_for_session(&file);
+        assert_eq!(windows.len(), 2);
+
+        let start = time::OffsetDateTime::parse(
+            "2026-02-10T01:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse start")
+        .unix_timestamp();
+        let end = time::OffsetDateTime::parse(
+            "2026-02-10T01:10:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse end")
+        .unix_timestamp();
+
+        assert_eq!(
+            windows[0],
+            (
+                start - scanner::default_time_buffer_secs(),
+                end + scanner::default_time_buffer_secs()
+            )
+        );
+        assert_eq!(
+            windows[1],
+            (
+                start - BACKFILL_RELAXED_LOOKUP_WINDOW_SECS,
+                end + BACKFILL_RELAXED_LOOKUP_WINDOW_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn commit_lookup_windows_fall_back_to_mtime_when_no_timestamps() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(
+            &file,
+            r#"{"type":"message","payload":{"text":"no timestamp"}}"#,
+        )
+        .expect("write session");
+
+        let windows = commit_lookup_windows_for_session(&file);
+        assert_eq!(windows.len(), 1);
+        let mtime = file_mtime_epoch(&file).expect("mtime");
+        assert_eq!(
+            windows[0],
+            (
+                mtime - BACKFILL_RELAXED_LOOKUP_WINDOW_SECS,
+                mtime + BACKFILL_RELAXED_LOOKUP_WINDOW_SECS
+            )
+        );
     }
 }

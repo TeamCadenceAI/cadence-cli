@@ -173,6 +173,11 @@ pub fn min_margin_score() -> f64 {
         .unwrap_or(DEFAULT_MIN_MARGIN)
 }
 
+/// Default timestamp buffer used when matching session activity to commits.
+pub fn default_time_buffer_secs() -> i64 {
+    DEFAULT_TIME_BUFFER_SECS
+}
+
 /// Read max candidate file count from env (`CADENCE_MATCH_MAX_CANDIDATES`).
 pub fn max_candidates() -> usize {
     std::env::var("CADENCE_MATCH_MAX_CANDIDATES")
