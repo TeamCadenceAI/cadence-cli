@@ -13,10 +13,10 @@ mod push;
 mod scanner;
 mod update;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use console::Term;
-use dialoguer::{Confirm, theme::ColorfulTheme};
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -498,6 +498,123 @@ fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
     (post_installed, pre_installed)
 }
 
+#[derive(Debug, Clone)]
+struct RepoWatchScope {
+    watch_all: bool,
+    watched_repo_roots: std::collections::HashSet<PathBuf>,
+}
+
+impl RepoWatchScope {
+    fn all() -> Self {
+        Self {
+            watch_all: true,
+            watched_repo_roots: std::collections::HashSet::new(),
+        }
+    }
+
+    fn from_config(cfg: &config::CliConfig) -> Self {
+        if cfg.watch_all_repos.unwrap_or(true) {
+            return Self::all();
+        }
+
+        let watched_repo_roots = cfg
+            .watched_repo_paths
+            .as_ref()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| {
+                        let repo_path = PathBuf::from(path);
+                        repo_path.canonicalize().unwrap_or(repo_path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            watch_all: false,
+            watched_repo_roots,
+        }
+    }
+
+    fn allows(&self, repo_root: &Path) -> bool {
+        if self.watch_all {
+            return true;
+        }
+        let normalized_repo = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        self.watched_repo_roots.contains(&normalized_repo)
+    }
+
+    fn watched_count(&self) -> usize {
+        self.watched_repo_roots.len()
+    }
+}
+
+fn load_repo_watch_scope() -> RepoWatchScope {
+    match config::CliConfig::load() {
+        Ok(cfg) => RepoWatchScope::from_config(&cfg),
+        Err(_) => RepoWatchScope::all(),
+    }
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = agents::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = agents::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn parse_install_repo_scope_paths(input: &str) -> Result<Vec<String>> {
+    let mut normalized_paths = std::collections::BTreeSet::new();
+
+    for token in input.split([',', '\n']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        let expanded = expand_user_path(token);
+        if !expanded.is_absolute() {
+            bail!("path '{}' must be absolute", token);
+        }
+
+        let repo_root = if expanded.exists() {
+            let probe_path = if expanded.is_file() {
+                expanded
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("path '{}' has no parent", expanded.display()))?
+            } else {
+                expanded.as_path()
+            };
+            git::repo_root_at(probe_path).with_context(|| {
+                format!(
+                    "path '{}' is not inside a git repository",
+                    expanded.display()
+                )
+            })?
+        } else {
+            expanded
+        };
+
+        let canonical_repo = repo_root.canonicalize().unwrap_or(repo_root);
+        normalized_paths.insert(canonical_repo.to_string_lossy().to_string());
+    }
+
+    if normalized_paths.is_empty() {
+        bail!("no repository paths provided");
+    }
+
+    Ok(normalized_paths.into_iter().collect())
+}
+
 fn ensure_notes_rewrite_config() -> Result<()> {
     git::config_set_global("notes.rewrite.rebase", "true")
         .context("failed to set notes.rewrite.rebase=true")?;
@@ -756,6 +873,9 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     // Step 5.6: Optional auto-update preference prompt
     run_install_auto_update_prompt();
 
+    // Step 5.7: Optional repository watch-scope prompt
+    run_install_watch_scope_prompt();
+
     println!();
     if had_errors {
         output::fail("Install", "completed with issues");
@@ -979,8 +1099,14 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
         return Ok(());
     }
 
-    // Step 1: Get repo root, HEAD hash, HEAD timestamp
+    // Step 1: Get repo root and check FTUE watch scope
     let repo_root = git::repo_root()?;
+    let watch_scope = load_repo_watch_scope();
+    if !watch_scope.allows(&repo_root) {
+        return Ok(());
+    }
+
+    // Step 1.1: Resolve HEAD metadata
     let head_hash = git::head_hash()?;
     let head_timestamp = git::head_timestamp()?;
     let repo_root_str = repo_root.to_string_lossy().to_string();
@@ -1110,6 +1236,15 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 /// Inner implementation of the pre-push hook.
 fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     if !git::check_enabled() {
+        return Ok(());
+    }
+
+    let repo_root = match git::repo_root() {
+        Ok(root) => root,
+        Err(_) => return Ok(()),
+    };
+    let watch_scope = load_repo_watch_scope();
+    if !watch_scope.allows(&repo_root) {
         return Ok(());
     }
 
@@ -1670,6 +1805,11 @@ fn spawn_background_retry(commit: &str, repo: &str, timestamp: i64) {
 /// The pending system handles long-term retry if this process fails.
 fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Result<()> {
     let repo_root = std::path::Path::new(repo);
+    let watch_scope = load_repo_watch_scope();
+    if !watch_scope.allows(repo_root) {
+        let _ = pending::remove(commit);
+        return Ok(());
+    }
 
     // Resolve encryption method once for this retry process
     let encryption_method = match resolve_encryption_method() {
@@ -2295,6 +2435,7 @@ async fn run_backfill_inner(
 ) -> Result<()> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
+    let watch_scope = load_repo_watch_scope();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2406,6 +2547,12 @@ async fn run_backfill_inner(
         if let Some(filter) = repo_filter
             && repo_root != filter
         {
+            continue;
+        }
+
+        // For unscoped backfills, only process selected repos when watch scope
+        // is explicitly limited.
+        if repo_filter.is_none() && !watch_scope.allows(&repo_root) {
             continue;
         }
 
@@ -2561,6 +2708,11 @@ fn should_sync_remote_before_attach(do_push: bool) -> bool {
 
 fn run_retry() -> Result<()> {
     let repo_root = git::repo_root()?;
+    let watch_scope = load_repo_watch_scope();
+    if !watch_scope.allows(&repo_root) {
+        output::detail("Current repo is outside watch scope; skipping retry.");
+        return Ok(());
+    }
     let repo_str = repo_root.to_string_lossy().to_string();
 
     let pending_count = pending::list_for_repo(&repo_str)
@@ -2597,6 +2749,7 @@ fn run_retry() -> Result<()> {
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
+/// - Watch scope (all repos or selected path count)
 /// - Effective hooks path and whether the post-commit/pre-push shims are installed
 /// - Warning when a repo-local hooksPath overrides global Cadence hooks
 /// - Notes rewrite safety for rebase/amend
@@ -2624,6 +2777,35 @@ fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
             None
         }
     };
+
+    // --- Watch scope ---
+    let watch_scope = load_repo_watch_scope();
+    if watch_scope.watch_all {
+        output::detail_to_with_tty(w, "Watch scope: all repositories", false);
+    } else {
+        output::detail_to_with_tty(
+            w,
+            &format!(
+                "Watch scope: selected repositories ({})",
+                watch_scope.watched_count()
+            ),
+            false,
+        );
+        if let Some(ref root) = repo_root {
+            output::detail_to_with_tty(
+                w,
+                &format!(
+                    "Current repo selected: {}",
+                    if watch_scope.allows(root) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                ),
+                false,
+            );
+        }
+    }
 
     // --- Hooks path and shim status ---
     let global_hooks_path = git::config_get_global("core.hooksPath").ok().flatten();
@@ -3394,11 +3576,128 @@ fn run_install_auto_update_prompt_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Install: repository watch-scope prompt
+// ---------------------------------------------------------------------------
+
+/// Prompt for repository watch scope during first-time install.
+///
+/// This is non-critical and never aborts install.
+/// Skipped if not interactive or watch scope is already configured.
+fn run_install_watch_scope_prompt() {
+    if !output::is_stderr_tty() || !Term::stdout().is_term() {
+        return;
+    }
+
+    let mut cfg = match config::CliConfig::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let config_path = match config::CliConfig::config_path() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Prompt only for FTUE when no watch-scope selection has been saved.
+    if cfg.watch_all_repos.is_some() || cfg.watched_repo_paths.is_some() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+    let is_tty = Term::stdout().is_term();
+    let theme = ColorfulTheme::default();
+    let mut prompter = DialoguerPrompter::new();
+
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Cadence can monitor all repositories or only selected paths.",
+        is_tty,
+    );
+
+    let watch_all = match prompter.confirm_with_default(
+        "Do you want Cadence to watch all repositories? (Recommended)",
+        true,
+        &mut stdout,
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return,
+    };
+
+    if watch_all {
+        cfg.watch_all_repos = Some(true);
+        cfg.watched_repo_paths = None;
+        if let Err(e) = cfg.save_to(&config_path) {
+            output::note_to_with_tty(
+                &mut stdout,
+                &format!("Could not save watch scope preference: {e}"),
+                is_tty,
+            );
+        } else {
+            output::success_to_with_tty(&mut stdout, "Watch scope", "all repositories.", is_tty);
+        }
+        return;
+    }
+
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Enter absolute paths (comma-separated). Paths can be repo roots, directories, or files inside each repo.",
+        is_tty,
+    );
+
+    let raw_paths = match Input::<String>::with_theme(&theme)
+        .with_prompt("Repository paths to watch")
+        .allow_empty(false)
+        .interact_text()
+    {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    let parsed_paths = match parse_install_repo_scope_paths(&raw_paths) {
+        Ok(paths) => paths,
+        Err(e) => {
+            output::note_to_with_tty(&mut stdout, &format!("Watch scope not saved: {e}"), is_tty);
+            return;
+        }
+    };
+
+    cfg.watch_all_repos = Some(false);
+    cfg.watched_repo_paths = Some(parsed_paths.clone());
+    if let Err(e) = cfg.save_to(&config_path) {
+        output::note_to_with_tty(
+            &mut stdout,
+            &format!("Could not save watch scope preference: {e}"),
+            is_tty,
+        );
+        return;
+    }
+
+    output::success_to_with_tty(
+        &mut stdout,
+        "Watch scope",
+        &format!("selected {} repo path(s).", parsed_paths.len()),
+        is_tty,
+    );
+    for path in parsed_paths {
+        output::detail_to_with_tty(&mut stdout, &path, is_tty);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Keys setup: prompter abstraction
 // ---------------------------------------------------------------------------
 
 trait Prompter {
     fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>>;
+
+    fn confirm_with_default(
+        &mut self,
+        prompt: &str,
+        default: bool,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<Option<bool>> {
+        let _ = default;
+        self.confirm(prompt, writer)
+    }
 }
 
 struct DialoguerPrompter {
@@ -3417,6 +3716,25 @@ impl Prompter for DialoguerPrompter {
     fn confirm(&mut self, prompt: &str, _writer: &mut dyn std::io::Write) -> Result<Option<bool>> {
         let result = Confirm::with_theme(&self.theme)
             .with_prompt(prompt)
+            .interact();
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn confirm_with_default(
+        &mut self,
+        prompt: &str,
+        default: bool,
+        _writer: &mut dyn std::io::Write,
+    ) -> Result<Option<bool>> {
+        let result = Confirm::with_theme(&self.theme)
+            .with_prompt(prompt)
+            .default(default)
             .interact();
         match result {
             Ok(value) => Ok(Some(value)),
@@ -3970,6 +4288,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_install_repo_scope_paths_requires_absolute() {
+        let result = parse_install_repo_scope_paths("relative/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn parse_install_repo_scope_paths_accepts_multiple_tokens() {
+        let prefix = if cfg!(windows) { "C:\\tmp" } else { "/tmp" };
+        let (a, b) = (format!("{prefix}/repo-a"), format!("{prefix}/repo-b"));
+        let input = format!("{a},{b}");
+        let paths = parse_install_repo_scope_paths(&input).unwrap();
+        assert_eq!(paths, vec![a, b]);
+    }
+
+    #[test]
     fn match_window_defaults_are_stable() {
         assert_eq!(POST_COMMIT_MATCH_WINDOW_SECS, 1_800);
         assert_eq!(DAILY_MATCH_WINDOW_SECS, 86_400);
@@ -3994,6 +4328,56 @@ payload_encoding: zstd+pgp\n\
             header.get("commit").map(String::as_str),
             Some("1111111111111111111111111111111111111111")
         );
+    }
+
+    #[test]
+    fn parse_install_repo_scope_paths_resolves_file_to_repo_root() {
+        let repo = TempDir::new().expect("tempdir");
+        let repo_path = repo.path();
+
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        let file_path = repo_path.join("README.md");
+        std::fs::write(&file_path, "hello").expect("write file");
+
+        let parsed = parse_install_repo_scope_paths(file_path.to_string_lossy().as_ref())
+            .expect("parse repo path");
+        assert_eq!(parsed.len(), 1);
+
+        let expected = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(parsed[0], expected);
+    }
+
+    #[test]
+    fn repo_watch_scope_defaults_to_all_repos() {
+        let cfg = config::CliConfig::default();
+        let scope = RepoWatchScope::from_config(&cfg);
+        assert!(scope.watch_all);
+    }
+
+    #[test]
+    fn repo_watch_scope_enforces_selected_paths() {
+        let repo = TempDir::new().expect("tempdir");
+        let other = TempDir::new().expect("tempdir");
+
+        let cfg = config::CliConfig {
+            watch_all_repos: Some(false),
+            watched_repo_paths: Some(vec![repo.path().to_string_lossy().to_string()]),
+            ..Default::default()
+        };
+        let scope = RepoWatchScope::from_config(&cfg);
+        assert!(!scope.watch_all);
+        assert!(scope.allows(repo.path()));
+        assert!(!scope.allows(other.path()));
     }
 
     #[test]

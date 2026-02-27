@@ -59,6 +59,12 @@ pub struct CliConfig {
     pub auto_update: Option<bool>,
     /// How often the passive background version check runs (e.g., "8h", "24h", "1d").
     pub update_check_interval: Option<String>,
+    /// Whether Cadence should monitor all repositories.
+    ///
+    /// Defaults to `true` when unset for backward compatibility.
+    pub watch_all_repos: Option<bool>,
+    /// Absolute repository root paths to monitor when `watch_all_repos` is `false`.
+    pub watched_repo_paths: Option<Vec<String>>,
 }
 
 impl CliConfig {
@@ -311,6 +317,8 @@ pub enum ConfigKey {
     AutoUpdate,
     UpdateCheckInterval,
     ApiUrl,
+    WatchAllRepos,
+    WatchedRepoPaths,
 }
 
 /// All user-settable configuration keys, in display order.
@@ -318,6 +326,8 @@ pub const ALL_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::AutoUpdate,
     ConfigKey::UpdateCheckInterval,
     ConfigKey::ApiUrl,
+    ConfigKey::WatchAllRepos,
+    ConfigKey::WatchedRepoPaths,
 ];
 
 /// Keys that are managed by the auth flow and cannot be set via `cadence config`.
@@ -336,6 +346,22 @@ impl ConfigKey {
             ConfigKey::AutoUpdate => "auto_update",
             ConfigKey::UpdateCheckInterval => "update_check_interval",
             ConfigKey::ApiUrl => "api_url",
+            ConfigKey::WatchAllRepos => "watch_all_repos",
+            ConfigKey::WatchedRepoPaths => "watched_repo_paths",
+        }
+    }
+    /// A short description of this key for help text.
+    pub fn description(&self) -> &'static str {
+        match self {
+            ConfigKey::AutoUpdate => {
+                "Skip confirmation prompt during `cadence update` (true/false)"
+            }
+            ConfigKey::UpdateCheckInterval => "Passive version-check interval (e.g. 8h, 24h, 1d)",
+            ConfigKey::ApiUrl => "API base URL for the Cadence service",
+            ConfigKey::WatchAllRepos => "Monitor every repository via global hooks (true/false)",
+            ConfigKey::WatchedRepoPaths => {
+                "Absolute repo paths watched when watch_all_repos=false (comma/newline separated)"
+            }
         }
     }
 }
@@ -366,6 +392,8 @@ impl std::str::FromStr for ConfigKey {
             "auto_update" => Ok(ConfigKey::AutoUpdate),
             "update_check_interval" => Ok(ConfigKey::UpdateCheckInterval),
             "api_url" => Ok(ConfigKey::ApiUrl),
+            "watch_all_repos" => Ok(ConfigKey::WatchAllRepos),
+            "watched_repo_paths" => Ok(ConfigKey::WatchedRepoPaths),
             _ => bail!(
                 "unknown config key '{}'. Valid keys: {}",
                 s,
@@ -399,6 +427,29 @@ pub fn parse_bool_value(s: &str) -> Result<bool> {
     }
 }
 
+/// Parse a comma/newline-separated list of absolute repo paths.
+///
+/// Empty tokens are ignored. Returns a de-duplicated list with `~` expanded
+/// when `$HOME` is available. Existing paths are canonicalized.
+pub fn parse_repo_path_list(value: &str) -> Result<Vec<String>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for token in value.split([',', '\n']) {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let expanded = expand_home_prefix(trimmed);
+        if !expanded.is_absolute() {
+            bail!("path '{}' must be absolute", trimmed);
+        }
+
+        let normalized = expanded.canonicalize().unwrap_or(expanded);
+        paths.insert(normalized.to_string_lossy().to_string());
+    }
+    Ok(paths.into_iter().collect())
+}
+
 impl CliConfig {
     /// Get the value of a user-settable config key as a display string.
     ///
@@ -416,6 +467,14 @@ impl CliConfig {
             ConfigKey::ApiUrl => match &self.api_url {
                 Some(v) => v.clone(),
                 None => "(not set)".to_string(),
+            },
+            ConfigKey::WatchAllRepos => match self.watch_all_repos {
+                Some(v) => v.to_string(),
+                None => "(not set)".to_string(),
+            },
+            ConfigKey::WatchedRepoPaths => match &self.watched_repo_paths {
+                Some(paths) if !paths.is_empty() => paths.join(","),
+                _ => "(not set)".to_string(),
             },
         }
     }
@@ -445,9 +504,34 @@ impl CliConfig {
                     self.api_url = Some(trimmed);
                 }
             }
+            ConfigKey::WatchAllRepos => {
+                let b = parse_bool_value(value)?;
+                self.watch_all_repos = Some(b);
+            }
+            ConfigKey::WatchedRepoPaths => {
+                let paths = parse_repo_path_list(value)?;
+                if paths.is_empty() {
+                    self.watched_repo_paths = None;
+                } else {
+                    self.watched_repo_paths = Some(paths);
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn expand_home_prefix(value: &str) -> PathBuf {
+    if value == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(value)
 }
 
 /// Return the trimmed value if non-empty after trimming, otherwise `None`.
@@ -540,6 +624,8 @@ mod tests {
         assert_eq!(cfg.token, None);
         assert_eq!(cfg.github_login, None);
         assert_eq!(cfg.expires_at, None);
+        assert_eq!(cfg.watch_all_repos, None);
+        assert_eq!(cfg.watched_repo_paths, None);
     }
 
     // -----------------------------------------------------------------------
@@ -1376,6 +1462,14 @@ mod tests {
             ConfigKey::UpdateCheckInterval
         );
         assert_eq!("api_url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
+        assert_eq!(
+            "watch_all_repos".parse::<ConfigKey>().unwrap(),
+            ConfigKey::WatchAllRepos
+        );
+        assert_eq!(
+            "watched_repo_paths".parse::<ConfigKey>().unwrap(),
+            ConfigKey::WatchedRepoPaths
+        );
     }
 
     #[test]
@@ -1389,6 +1483,14 @@ mod tests {
             ConfigKey::UpdateCheckInterval
         );
         assert_eq!("api-url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
+        assert_eq!(
+            "watch-all-repos".parse::<ConfigKey>().unwrap(),
+            ConfigKey::WatchAllRepos
+        );
+        assert_eq!(
+            "watched-repo-paths".parse::<ConfigKey>().unwrap(),
+            ConfigKey::WatchedRepoPaths
+        );
     }
 
     #[test]
@@ -1488,6 +1590,53 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // parse_repo_path_list
+    // -----------------------------------------------------------------------
+
+    /// Returns an absolute path prefix suitable for the current platform.
+    /// On Unix: "/tmp"  On Windows: "C:\\tmp"
+    fn abs_prefix() -> &'static str {
+        if cfg!(windows) { "C:\\tmp" } else { "/tmp" }
+    }
+
+    #[test]
+    fn test_parse_repo_path_list_comma_separated() {
+        let (a, b) = (
+            &format!("{}/a", abs_prefix()),
+            &format!("{}/b", abs_prefix()),
+        );
+        let input = format!("{a},{b}");
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![a.to_string(), b.to_string()]);
+    }
+
+    #[test]
+    fn test_parse_repo_path_list_newline_separated() {
+        let (a, b) = (
+            &format!("{}/a", abs_prefix()),
+            &format!("{}/b", abs_prefix()),
+        );
+        let input = format!("{a}\n{b}");
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![a.to_string(), b.to_string()]);
+    }
+
+    #[test]
+    fn test_parse_repo_path_list_deduplicates() {
+        let a = format!("{}/a", abs_prefix());
+        let input = format!("{a}, {a}");
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![a.to_string()]);
+    }
+
+    #[test]
+    fn test_parse_repo_path_list_requires_absolute() {
+        let result = parse_repo_path_list("relative/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be absolute"));
+    }
+
+    // -----------------------------------------------------------------------
     // set_key / get_key roundtrips
     // -----------------------------------------------------------------------
 
@@ -1529,6 +1678,46 @@ mod tests {
     }
 
     #[test]
+    fn test_set_get_watch_all_repos() {
+        let mut cfg = CliConfig::default();
+        cfg.set_key(ConfigKey::WatchAllRepos, "false").unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::WatchAllRepos), "false");
+        assert_eq!(cfg.watch_all_repos, Some(false));
+
+        cfg.set_key(ConfigKey::WatchAllRepos, "true").unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::WatchAllRepos), "true");
+        assert_eq!(cfg.watch_all_repos, Some(true));
+    }
+
+    #[test]
+    fn test_set_get_watched_repo_paths() {
+        let (a, b) = (
+            &format!("{}/a", abs_prefix()),
+            &format!("{}/b", abs_prefix()),
+        );
+        let input = format!("{a},{b}");
+        let mut cfg = CliConfig::default();
+        cfg.set_key(ConfigKey::WatchedRepoPaths, &input).unwrap();
+        assert_eq!(
+            cfg.watched_repo_paths,
+            Some(vec![a.to_string(), b.to_string()])
+        );
+        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), format!("{a},{b}"));
+    }
+
+    #[test]
+    fn test_set_watched_repo_paths_empty_clears() {
+        let a = format!("{}/a", abs_prefix());
+        let mut cfg = CliConfig {
+            watched_repo_paths: Some(vec![a]),
+            ..Default::default()
+        };
+        cfg.set_key(ConfigKey::WatchedRepoPaths, "").unwrap();
+        assert_eq!(cfg.watched_repo_paths, None);
+        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), "(not set)");
+    }
+
+    #[test]
     fn test_set_api_url_empty_clears() {
         let mut cfg = CliConfig {
             api_url: Some("https://example.com".to_string()),
@@ -1545,6 +1734,8 @@ mod tests {
         assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "(not set)");
         assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "(not set)");
         assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "(not set)");
+        assert_eq!(cfg.get_key(ConfigKey::WatchAllRepos), "(not set)");
+        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), "(not set)");
     }
 
     #[test]
@@ -1559,10 +1750,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
+        let (r1, r2) = (
+            &format!("{}/r1", abs_prefix()),
+            &format!("{}/r2", abs_prefix()),
+        );
+        let repo_input = format!("{r1},{r2}");
+
         let mut cfg = CliConfig::default();
         cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
         cfg.set_key(ConfigKey::UpdateCheckInterval, "12h").unwrap();
         cfg.set_key(ConfigKey::ApiUrl, "https://test.example.com")
+            .unwrap();
+        cfg.set_key(ConfigKey::WatchAllRepos, "false").unwrap();
+        cfg.set_key(ConfigKey::WatchedRepoPaths, &repo_input)
             .unwrap();
         cfg.save_to(&path).unwrap();
 
@@ -1570,6 +1770,11 @@ mod tests {
         assert_eq!(loaded.auto_update, Some(true));
         assert_eq!(loaded.update_check_interval, Some("12h".to_string()));
         assert_eq!(loaded.api_url, Some("https://test.example.com".to_string()));
+        assert_eq!(loaded.watch_all_repos, Some(false));
+        assert_eq!(
+            loaded.watched_repo_paths,
+            Some(vec![r1.to_string(), r2.to_string()])
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1584,10 +1789,15 @@ mod tests {
             "update_check_interval"
         );
         assert_eq!(ConfigKey::ApiUrl.to_string(), "api_url");
+        assert_eq!(ConfigKey::WatchAllRepos.to_string(), "watch_all_repos");
+        assert_eq!(
+            ConfigKey::WatchedRepoPaths.to_string(),
+            "watched_repo_paths"
+        );
     }
 
     #[test]
     fn test_all_config_keys_count() {
-        assert_eq!(ALL_CONFIG_KEYS.len(), 3);
+        assert_eq!(ALL_CONFIG_KEYS.len(), 5);
     }
 }

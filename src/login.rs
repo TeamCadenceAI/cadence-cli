@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use crate::api_client::{ApiClient, CliTokenExchangeResult};
 
+const CADENCE_LOCKUP_INLINE_SVG: &str = include_str!("../assets/cadence-lockup-inline.svg");
+
 /// Complete browser-based CLI OAuth login flow.
 pub async fn login_via_browser(
     api_base_url: &str,
@@ -169,12 +171,7 @@ fn handle_callback_request(stream: &mut TcpStream, expected_state: &str) -> Resu
         return Ok(None);
     }
 
-    write_http_response(
-        stream,
-        200,
-        "OK",
-        "Authentication complete. You can close this tab.",
-    )?;
+    write_http_response(stream, 200, "OK", "You can close this tab")?;
 
     Ok(Some(code))
 }
@@ -207,94 +204,122 @@ fn render_callback_html(status_code: u16, body_text: &str) -> String {
     } else {
         "Authentication Failed"
     };
-    let badge = if is_success { "OK" } else { "ERR" };
-    let accent = if is_success { "#10b981" } else { "#ef4444" };
-    let accent_bg = if is_success {
-        "rgba(16, 185, 129, 0.14)"
-    } else {
-        "rgba(239, 68, 68, 0.14)"
-    };
-    let follow_up = if is_success {
-        "You can close this tab and return to your terminal."
-    } else {
-        "Return to your terminal for details, then run cadence login again."
-    };
-
     let escaped_body = escape_html(body_text);
     let escaped_title = escape_html(title);
-    let escaped_follow_up = escape_html(follow_up);
+    let brand_svg = CADENCE_LOCKUP_INLINE_SVG;
 
     format!(
-        "<!doctype html>\
-<html lang=\"en\">\
-<head>\
-<meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>{escaped_title}</title>\
-<style>\
-* {{ box-sizing: border-box; }}\
-html, body {{ height: 100%; margin: 0; }}\
-body {{\
-  font-family: 'Work Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;\
-  color: #1a1a2e;\
-  background: radial-gradient(circle at 15% 10%, rgba(79, 70, 229, 0.14) 0%, rgba(79, 70, 229, 0) 42%), #fafafa;\
-}}\
-.wrap {{\
-  min-height: 100%;\
-  display: flex;\
-  align-items: center;\
-  justify-content: center;\
-  padding: 24px;\
-}}\
-.card {{\
-  width: min(560px, 100%);\
-  background: #ffffff;\
-  border: 1px solid #e8eaed;\
-  border-radius: 16px;\
-  box-shadow: 0 10px 36px rgba(15, 23, 42, 0.08);\
-  padding: 26px 24px;\
-}}\
-.badge {{\
-  display: inline-flex;\
-  align-items: center;\
-  justify-content: center;\
-  height: 28px;\
-  padding: 0 12px;\
-  border-radius: 999px;\
-  font-size: 12px;\
-  font-weight: 700;\
-  letter-spacing: 0.08em;\
-  color: {accent};\
-  background: {accent_bg};\
-}}\
-h1 {{\
-  margin: 14px 0 10px;\
-  font-size: 28px;\
-  line-height: 1.15;\
-  color: #16213e;\
-}}\
-p {{\
-  margin: 0;\
-  line-height: 1.55;\
-  color: #334155;\
-}}\
-.follow-up {{\
-  margin-top: 14px;\
-  color: #607d8b;\
-}}\
-</style>\
-</head>\
-<body>\
-<div class=\"wrap\">\
-<main class=\"card\">\
-<span class=\"badge\">{badge}</span>\
-<h1>{escaped_title}</h1>\
-<p>{escaped_body}</p>\
-<p class=\"follow-up\">{escaped_follow_up}</p>\
-</main>\
-</div>\
-</body>\
-</html>"
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escaped_title}</title>
+<style>
+* {{ box-sizing: border-box; }}
+html, body {{ height: 100%; margin: 0; }}
+body {{
+  font-family: 'Work Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #e2e8f0;
+  background:
+    radial-gradient(1200px 640px at 8% -5%, rgba(99, 102, 241, 0.26) 0%, rgba(99, 102, 241, 0) 58%),
+    radial-gradient(720px 460px at 92% 110%, rgba(30, 64, 175, 0.2) 0%, rgba(30, 64, 175, 0) 62%),
+    linear-gradient(180deg, #070b14 0%, #0b1020 100%);
+}}
+.wrap {{
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+}}
+.card {{
+  position: relative;
+  overflow: hidden;
+  width: min(640px, 100%);
+  text-align: left;
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.9) 0%, rgba(10, 15, 30, 0.92) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 24px;
+  box-shadow: 0 30px 72px rgba(2, 6, 23, 0.55);
+  padding: 58px 52px 56px;
+}}
+.card::before {{
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 7px;
+  background: linear-gradient(90deg, #1A1363 0%, #4f46e5 52%, #1e40af 100%);
+}}
+.brand {{
+  margin: 0 0 14px;
+  display: flex;
+  justify-content: flex-start;
+}}
+.brand-logo {{
+  display: block;
+  height: 66px;
+  width: auto;
+  max-width: 300px;
+  color: #ffffff;
+}}
+.brand-logo path {{
+  fill: #ffffff;
+}}
+.content {{
+  max-width: 40ch;
+  padding-left: 12px;
+}}
+h1 {{
+  margin: 0 0 14px;
+  font-size: 30px;
+  line-height: 1.14;
+  letter-spacing: -0.015em;
+  color: #f8fafc;
+}}
+p {{
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.5;
+  color: #cbd5e1;
+}}
+@media (max-width: 600px) {{
+  .wrap {{
+    padding: 20px;
+  }}
+  .card {{
+    border-radius: 20px;
+    padding: 44px 24px 40px;
+  }}
+  .brand-logo {{
+    height: 54px;
+    max-width: 250px;
+  }}
+  .content {{
+    padding-left: 8px;
+  }}
+  h1 {{
+    font-size: 24px;
+  }}
+  p {{
+    font-size: 16px;
+  }}
+}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<main class="card">
+<div class="brand" aria-label="Cadence">
+{brand_svg}
+</div>
+<div class="content">
+<h1>{escaped_title}</h1>
+<p>{escaped_body}</p>
+</div>
+</main>
+</div>
+</body>
+</html>"#
     )
 }
 
@@ -333,20 +358,22 @@ mod tests {
 
     #[test]
     fn callback_html_success_variant_is_styled() {
-        let html = render_callback_html(200, "Authentication complete. You can close this tab.");
+        let html = render_callback_html(200, "You can close this tab");
         assert!(html.contains("Authentication Complete"));
-        assert!(html.contains(">OK<"));
-        assert!(html.contains("#10b981"));
+        assert!(!html.contains(">OK<"));
         assert!(html.contains("Work Sans"));
+        assert!(html.contains("class=\"brand-logo\""));
+        assert!(html.contains("viewBox=\"0 0 770 300\""));
+        assert!(html.contains("fill=\"currentColor\""));
+        assert!(!html.contains("You can close this tab and return to your terminal."));
     }
 
     #[test]
     fn callback_html_error_variant_is_styled() {
         let html = render_callback_html(400, "State mismatch. Please retry cadence login.");
         assert!(html.contains("Authentication Failed"));
-        assert!(html.contains(">ERR<"));
-        assert!(html.contains("#ef4444"));
-        assert!(html.contains("run cadence login again"));
+        assert!(!html.contains(">ERR<"));
+        assert!(!html.contains("run cadence login again"));
     }
 
     #[test]

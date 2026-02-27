@@ -34,6 +34,8 @@ cargo build --release
 ```sh
 cadence install
 ```
+During install, Cadence asks whether to watch all repositories (`Y/n`).
+If you choose `N`, provide comma-separated absolute paths (repo root, or any file/dir inside each repo).
 
 2. Make commits as usual.
 
@@ -70,6 +72,19 @@ cadence keys setup
 
 Cadence uses built-in OpenPGP (Rust) and stores an encrypted private key in `~/.cadence/cli/`.
 The passphrase is stored in your OS keychain.
+
+## Optional: Watch Scope Config
+
+Switch back to all repositories:
+```sh
+cadence config set watch_all_repos true
+```
+
+Limit to selected repositories:
+```sh
+cadence config set watch_all_repos false
+cadence config set watched_repo_paths "/abs/repo-one,/abs/repo-two"
+```
 
 ## Uninstall
 
