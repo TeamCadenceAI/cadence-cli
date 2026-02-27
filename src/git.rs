@@ -216,7 +216,7 @@ pub fn check_enabled() -> bool {
 /// Check whether Cadence CLI is enabled for a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`check_enabled`], for use
-/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+/// by commands that operate on repos other than the CWD (e.g., `backfill`).
 ///
 /// Reads `git -C <repo> config ai.cadence.enabled`. If the value is exactly
 /// `"false"`, returns `false`. Any other value (including unset) returns `true`.
@@ -263,7 +263,7 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 /// in a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`note_exists`], for use
-/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+/// by commands that operate on repos other than the CWD (e.g., `backfill`).
 pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     validate_commit_hash(commit)?;
     let output = run_git_output_at(
@@ -278,7 +278,7 @@ pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
 /// Attach an AI-session note to a commit in a specific repository directory.
 ///
 /// This is the directory-parameterised version of [`add_note`], for use
-/// by commands that operate on repos other than the CWD (e.g., `hydrate`).
+/// by commands that operate on repos other than the CWD (e.g., `backfill`).
 ///
 /// **Precondition:** Callers must check [`note_exists_at`] first and skip if
 /// a note is already present.

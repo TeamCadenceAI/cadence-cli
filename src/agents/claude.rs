@@ -13,7 +13,7 @@ use super::{encode_repo_path, home_dir};
 /// Return ALL directories under `~/.claude/projects/`.
 ///
 /// Unlike `log_dirs`, this function is not scoped to a specific repository.
-/// It returns every project directory, for use by the `hydrate` command
+/// It returns every project directory, for use by the `backfill` command
 /// which needs to scan all sessions regardless of repo.
 ///
 /// Returns an empty `Vec` if:

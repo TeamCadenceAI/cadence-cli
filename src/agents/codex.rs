@@ -16,7 +16,7 @@ use super::home_dir;
 /// traverses the hierarchy to find the leaf directories that actually
 /// contain session log files.
 ///
-/// Used by the `hydrate` command to scan all sessions regardless of repo.
+/// Used by the `backfill` command to scan all sessions regardless of repo.
 pub fn all_log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,

@@ -1,17 +1,23 @@
-//! HTTP client for the AI Barometer API.
+//! HTTP client for Cadence API endpoints used by the CLI.
 //!
-//! Provides a thin wrapper around `reqwest::blocking::Client` for interacting
-//! with key management endpoints. All methods return `anyhow::Result` and
-//! translate HTTP errors into user-friendly messages per FR-8.
+//! Includes:
+//! - Public key retrieval for encryption setup
+//! - CLI auth exchange + revoke
+//! - Backfill-complete reporting
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Endpoint path constants
 // ---------------------------------------------------------------------------
 
 const KEYS_PUBLIC_PATH: &str = "/api/keys/public";
+const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
+const AUTH_REVOKE_PATH: &str = "/api/auth";
+const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
+
 // ---------------------------------------------------------------------------
 // Response DTOs
 // ---------------------------------------------------------------------------
@@ -29,17 +35,84 @@ pub struct ApiPublicKey {
     pub version: Option<String>,
 }
 
-/// Standard API response envelope used by current backend endpoints.
+/// Request body for `POST /api/auth/exchange`.
+#[derive(Debug, Serialize)]
+struct ExchangeRequest<'a> {
+    code: &'a str,
+}
+
+/// Data payload from `POST /api/auth/exchange`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CliTokenExchangeResult {
+    pub token: String,
+    pub login: String,
+    pub expires_at: String,
+}
+
+/// Request body for `POST /api/onboarding/backfill-complete`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillCompleteRequest {
+    pub window_days: i32,
+    pub notes_attached: i64,
+    pub notes_skipped: i64,
+    pub issues: Vec<String>,
+    pub repos_scanned: i32,
+    pub finished_at: String,
+    pub cli_version: String,
+}
+
+/// Data payload from `POST /api/onboarding/backfill-complete`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackfillCompleteResponse {
+    pub recorded: bool,
+    pub backfill_completed_at: String,
+    #[allow(dead_code)]
+    pub next_step: String,
+}
+
+/// Standard API response envelope used by backend endpoints.
 #[derive(Debug, Deserialize)]
 struct ApiResponseEnvelope<T> {
     data: T,
 }
 
 // ---------------------------------------------------------------------------
+// Classified authenticated request errors
+// ---------------------------------------------------------------------------
+
+/// Classified failures for authenticated CLI requests.
+#[derive(Debug)]
+pub enum AuthenticatedRequestError {
+    Unauthorized,
+    NotFound,
+    Server(String),
+    BadRequest(String),
+    Network(String),
+    Parse(String),
+    Unexpected(String),
+}
+
+impl std::fmt::Display for AuthenticatedRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized => write!(f, "unauthorized"),
+            Self::NotFound => write!(f, "not_found"),
+            Self::Server(msg) => write!(f, "server_error: {msg}"),
+            Self::BadRequest(msg) => write!(f, "bad_request: {msg}"),
+            Self::Network(msg) => write!(f, "network_error: {msg}"),
+            Self::Parse(msg) => write!(f, "parse_error: {msg}"),
+            Self::Unexpected(msg) => write!(f, "unexpected_error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthenticatedRequestError {}
+
+// ---------------------------------------------------------------------------
 // ApiClient
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the AI Barometer API.
+/// HTTP client for the Cadence API.
 ///
 /// Wraps `reqwest::blocking::Client` with a normalized base URL.
 pub struct ApiClient {
@@ -79,6 +152,83 @@ impl ApiClient {
         Ok(envelope.data)
     }
 
+    /// Exchange a short-lived CLI exchange code for a long-lived CLI JWT.
+    pub fn exchange_cli_code(
+        &self,
+        code: &str,
+        timeout: Duration,
+    ) -> Result<CliTokenExchangeResult> {
+        let url = self.url(AUTH_EXCHANGE_PATH);
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(timeout)
+            .json(&ExchangeRequest { code })
+            .send()
+            .with_context(|| format!("failed to connect to API at {url}"))?;
+
+        let body = map_http_error(resp)?;
+        let envelope: ApiResponseEnvelope<CliTokenExchangeResult> =
+            serde_json::from_str(&body).context("failed to parse auth exchange response")?;
+        Ok(envelope.data)
+    }
+
+    /// Revoke a bearer token via `DELETE /api/auth`.
+    pub fn revoke_token(
+        &self,
+        token: &str,
+        timeout: Duration,
+    ) -> std::result::Result<(), AuthenticatedRequestError> {
+        let url = self.url(AUTH_REVOKE_PATH);
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(token)
+            .timeout(timeout)
+            .send()
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        Err(map_authenticated_http_error(status, &body))
+    }
+
+    /// Report backfill completion to onboarding state.
+    pub fn report_backfill_complete(
+        &self,
+        token: &str,
+        report: &BackfillCompleteRequest,
+        timeout: Duration,
+    ) -> std::result::Result<BackfillCompleteResponse, AuthenticatedRequestError> {
+        let url = self.url(BACKFILL_COMPLETE_PATH);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .timeout(timeout)
+            .json(report)
+            .send()
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().unwrap_or_default();
+            return Err(map_authenticated_http_error(status, &body));
+        }
+
+        let body = resp
+            .text()
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        let envelope: ApiResponseEnvelope<BackfillCompleteResponse> =
+            serde_json::from_str(&body)
+                .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
+        Ok(envelope.data)
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -108,7 +258,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Read a response body and return it as a string, or map non-success status
-/// codes to user-friendly error messages.
+/// codes to user-friendly errors.
 fn map_http_error(resp: reqwest::blocking::Response) -> Result<String> {
     let status = resp.status();
     if status.is_success() {
@@ -135,6 +285,17 @@ fn map_http_error(resp: reqwest::blocking::Response) -> Result<String> {
         _ => {
             anyhow::bail!("Unexpected response (HTTP {status}): {body}");
         }
+    }
+}
+
+fn map_authenticated_http_error(status: u16, body: &str) -> AuthenticatedRequestError {
+    let detail = extract_error_message(body);
+    match status {
+        401 => AuthenticatedRequestError::Unauthorized,
+        400 | 409 => AuthenticatedRequestError::BadRequest(detail),
+        404 => AuthenticatedRequestError::NotFound,
+        500..=599 => AuthenticatedRequestError::Server(detail),
+        _ => AuthenticatedRequestError::Unexpected(format!("HTTP {status}: {detail}")),
     }
 }
 
@@ -176,5 +337,21 @@ mod tests {
             client.url("/api/keys/public"),
             "https://api.example.com/api/keys/public"
         );
+    }
+
+    #[test]
+    fn authenticated_error_maps_statuses() {
+        assert!(matches!(
+            map_authenticated_http_error(401, ""),
+            AuthenticatedRequestError::Unauthorized
+        ));
+        assert!(matches!(
+            map_authenticated_http_error(404, ""),
+            AuthenticatedRequestError::NotFound
+        ));
+        assert!(matches!(
+            map_authenticated_http_error(503, "{\"error\":\"bad\"}"),
+            AuthenticatedRequestError::Server(_)
+        ));
     }
 }

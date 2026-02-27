@@ -3,6 +3,7 @@ mod api_client;
 mod config;
 mod git;
 mod keychain;
+mod login;
 mod note;
 mod output;
 mod payload_pending;
@@ -20,8 +21,16 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::keychain::KeychainStore;
+
+const KEYCHAIN_SERVICE: &str = "cadence-cli";
+const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
+const LOGIN_TIMEOUT_SECS: u64 = 120;
+const API_TIMEOUT_SECS: u64 = 5;
+static API_URL_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 /// Cadence CLI: attach AI coding agent session logs to Git commits via git notes.
 ///
@@ -33,13 +42,18 @@ struct Cli {
     /// Enable verbose logging (e.g., git commands and output).
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// API base URL override for this command invocation.
+    #[arg(long, global = true)]
+    api_url: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install Cadence CLI: set up git hooks and run initial hydration.
+    /// Install Cadence CLI: set up git hooks.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
@@ -53,15 +67,21 @@ enum Command {
     },
 
     /// Backfill AI session notes for recent commits.
-    Hydrate {
+    Backfill {
         /// How far back to scan, e.g. "7d" for 7 days.
         #[arg(long, default_value = "7d")]
         since: String,
 
-        /// Push notes to remote after hydration.
+        /// Push notes to remote after backfill.
         #[arg(long)]
         push: bool,
     },
+
+    /// Sign in via browser OAuth and store a CLI token locally.
+    Login,
+
+    /// Revoke and clear local CLI authentication token.
+    Logout,
 
     /// Retry attaching notes for pending (unresolved) commits.
     Retry,
@@ -90,18 +110,24 @@ enum Command {
         yes: bool,
     },
 
+    /// View or modify CLI configuration.
+    Config {
+        #[command(subcommand)]
+        config_command: Option<ConfigCommand>,
+    },
+
     /// Manage encryption for local + API recipients.
     Keys {
         #[command(subcommand)]
         keys_command: Option<KeysCommands>,
     },
 
-    /// Clear bloated notes and re-hydrate in the optimized v2 format.
+    /// Clear bloated notes and re-backfill in the optimized v2 format.
     ///
-    /// Deletes the local and remote notes refs, then re-runs hydration
+    /// Deletes the local and remote notes refs, then re-runs backfill
     /// to regenerate notes with payload deduplication and compression.
     Gc {
-        /// How far back to re-hydrate, e.g. "30d" for 30 days.
+        /// How far back to re-backfill, e.g. "30d" for 30 days.
         #[arg(long, default_value = "30d")]
         since: String,
 
@@ -109,6 +135,24 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Set a configuration value.
+    Set {
+        /// Configuration key (e.g. auto_update, update_check_interval, api_url).
+        key: String,
+        /// Value to set.
+        value: String,
+    },
+    /// Get a configuration value.
+    Get {
+        /// Configuration key to read.
+        key: String,
+    },
+    /// List all configuration keys and their current values.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -284,6 +328,10 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+fn api_url_override() -> Option<&'static str> {
+    API_URL_OVERRIDE.get().map(String::as_str)
+}
+
 /// Resolve the cached API public key, refreshing if needed.
 fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
     let cached_key = pgp_keys::load_cached_api_public_key().unwrap_or(None);
@@ -299,7 +347,7 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
     }
 
     let cfg = config::CliConfig::load()?;
-    let resolved = cfg.resolve_api_url(None);
+    let resolved = cfg.resolve_api_url(api_url_override());
     let client = api_client::ApiClient::new(&resolved.url);
     let keys_url = format!("{}/api/keys/public", resolved.url.trim_end_matches('/'));
     let api_key = client
@@ -328,7 +376,7 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-/// The install subcommand: set up global git hooks and run initial hydration.
+/// The install subcommand: set up global git hooks.
 ///
 /// Steps:
 /// 1. Set `git config --global core.hooksPath ~/.git-hooks`
@@ -338,7 +386,6 @@ fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
 /// 5. Write `~/.git-hooks/pre-push` shim script
 /// 6. Make shims executable (chmod +x)
 /// 7. If `--org` provided, persist org filter to global git config
-/// 8. Run hydration for the last 30 days
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
@@ -454,6 +501,7 @@ fn ensure_notes_rewrite_config() -> Result<()> {
 /// Inner implementation of install, accepting an optional home directory override
 /// for testability. If `home_override` is `None`, uses the real home directory.
 fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path>) -> Result<()> {
+    println!();
     output::action("Installing", "hooks");
     let install_start = std::time::Instant::now();
 
@@ -682,24 +730,17 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
         }
     }
 
-    // Step 5.5: Optional encryption setup (before hydration)
+    // Step 5.5: Optional encryption setup
+    println!();
     if let Err(e) = run_install_encryption_setup() {
         output::fail("Install", &format!("stopped ({})", e));
         return Err(e);
     }
 
-    // Step 6: Run hydration for the last 7 days
-    output::action("Hydrating", "recent sessions (last 30 days)");
-    let hydrate_start = std::time::Instant::now();
-    if let Err(e) = run_hydrate("30d", true) {
-        output::fail("Hydration", &format!("stopped ({})", e));
-        had_errors = true;
-    }
-    output::success(
-        "Hydration",
-        &format!("done in {} ms", hydrate_start.elapsed().as_millis()),
-    );
+    // Step 5.6: Optional auto-update preference prompt
+    run_install_auto_update_prompt();
 
+    println!();
     if had_errors {
         output::fail("Install", "completed with issues");
     } else {
@@ -711,6 +752,142 @@ fn run_install_inner(org: Option<String>, home_override: Option<&std::path::Path
     ));
 
     Ok(())
+}
+
+fn run_login() -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+    let resolved = cfg.resolve_api_url(api_url_override());
+    output::detail(&format!("Using API URL: {}", resolved.url));
+    if resolved.is_non_https {
+        output::note(&format!(
+            "Using non-HTTPS API URL for login: {}",
+            resolved.url
+        ));
+    }
+
+    output::action("Login", "opening browser for authentication");
+    let exchanged =
+        login::login_via_browser(&resolved.url, Duration::from_secs(LOGIN_TIMEOUT_SECS))?;
+
+    cfg.api_url = Some(resolved.url.clone());
+    cfg.token = Some(exchanged.token.clone());
+    cfg.github_login = Some(exchanged.login.clone());
+    cfg.expires_at = Some(exchanged.expires_at.clone());
+    cfg.save()?;
+
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    if let Err(e) = keychain.set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token) {
+        output::note(&format!(
+            "Could not store token in OS keychain (using config fallback): {e}"
+        ));
+    }
+
+    output::success("Login", &format!("authenticated as {}", exchanged.login));
+    output::detail(&format!("Token expires at {}", exchanged.expires_at));
+    Ok(())
+}
+
+fn run_logout() -> Result<()> {
+    let mut cfg = config::CliConfig::load()?;
+    let resolved = cfg.resolve_api_url(api_url_override());
+
+    if let Some(token) = resolve_cli_auth_token(&cfg) {
+        let client = api_client::ApiClient::new(&resolved.url);
+        match client.revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS)) {
+            Ok(()) => output::detail("Revoked token on server."),
+            Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+                output::note("Token was already invalid or expired.");
+            }
+            Err(err) => {
+                output::note(&format!("Could not revoke token on server ({err})"));
+            }
+        }
+    } else {
+        output::note("No local token found; clearing local auth state.");
+    }
+
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+        output::note(&format!("Could not clear OS keychain token: {e}"));
+    }
+
+    cfg.clear_token()?;
+    output::success("Logout", "authentication cleared");
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BackfillSyncStats {
+    notes_attached: i64,
+    notes_skipped: i64,
+    issues: Vec<String>,
+    repos_scanned: i32,
+}
+
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
+    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
+        Ok(_) | Err(_) => cfg.token.clone().filter(|t| !t.trim().is_empty()),
+    }
+}
+
+fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
+    let cfg = match config::CliConfig::load() {
+        Ok(cfg) => cfg,
+        Err(_) => return,
+    };
+
+    let token = match resolve_cli_auth_token(&cfg) {
+        Some(token) => token,
+        None => {
+            output::note("Run `cadence login` to sync results");
+            return;
+        }
+    };
+
+    let resolved = cfg.resolve_api_url(api_url_override());
+    let client = api_client::ApiClient::new(&resolved.url);
+    let finished_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    let request = api_client::BackfillCompleteRequest {
+        window_days,
+        notes_attached: stats.notes_attached,
+        notes_skipped: stats.notes_skipped,
+        issues: stats.issues,
+        repos_scanned: stats.repos_scanned,
+        finished_at,
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    match client.report_backfill_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS)) {
+        Ok(response) => {
+            if response.recorded {
+                output::detail(&format!(
+                    "Backfill results synced to Cadence onboarding at {}.",
+                    response.backfill_completed_at
+                ));
+            } else {
+                output::detail("Backfill sync already recorded.");
+            }
+        }
+        Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+            output::note("Run `cadence login` to re-authenticate");
+        }
+        Err(api_client::AuthenticatedRequestError::Network(_)) => {
+            output::note("Notes are safely stored locally");
+        }
+        Err(api_client::AuthenticatedRequestError::NotFound) => {
+            output::note("API does not support this yet");
+        }
+        Err(api_client::AuthenticatedRequestError::Server(_)) => {
+            output::note("API returned an error");
+        }
+        Err(other) => {
+            output::detail(&format!("Backfill sync skipped: {other}"));
+        }
+    }
 }
 
 /// The post-commit hook handler. This is the critical hot path.
@@ -801,7 +978,7 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 
     // Step 2: Deduplication — if note already exists, exit early
     if git::note_exists(&head_hash)? {
-        // Note already attached (e.g., by hydrate). Clean up stale pending record.
+        // Note already attached (e.g., by backfill). Clean up stale pending record.
         let _ = pending::remove(&head_hash);
         return Ok(());
     }
@@ -1414,7 +1591,7 @@ fn parse_since_duration(since: &str) -> Result<i64> {
     }
 }
 
-/// The hydrate subcommand: backfill AI session notes for recent commits.
+/// The backfill subcommand: backfill AI session notes for recent commits.
 ///
 /// This scans ALL Claude and Codex log directories (not scoped to any
 /// single repo), finds commit hashes in session logs, resolves repos
@@ -1425,16 +1602,16 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - Prints verbose progress throughout
 /// - All errors are non-fatal (logged and continued)
 /// - Does NOT auto-push by default (use `--push` flag)
-fn run_hydrate(since: &str, do_push: bool) -> Result<()> {
-    run_hydrate_inner(since, do_push, None)
+fn run_backfill(since: &str, do_push: bool) -> Result<()> {
+    run_backfill_inner(since, do_push, None)
 }
 
-/// Inner implementation of hydrate that accepts an optional repo filter.
+/// Inner implementation of backfill that accepts an optional repo filter.
 ///
 /// When `repo_filter` is `Some`, only sessions whose resolved repo root
 /// matches the given path are processed. Used by `cadence gc` to scope
-/// re-hydration to the current repository.
-fn run_hydrate_inner(
+/// re-backfill to the current repository.
+fn run_backfill_inner(
     since: &str,
     do_push: bool,
     repo_filter: Option<&std::path::Path>,
@@ -1447,7 +1624,7 @@ fn run_hydrate_inner(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // Resolve encryption method once for this hydration run
+    // Resolve encryption method once for this backfill run
     let encryption_method = match resolve_encryption_method() {
         Ok(method) => method,
         Err(e) => EncryptionMethod::Unavailable(format!("{e}")),
@@ -1495,6 +1672,10 @@ fn run_hydrate_inner(
     let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut fallback_attached = 0usize;
+    let sync_remote_before_attach = should_sync_remote_before_attach(do_push);
+    if !sync_remote_before_attach {
+        output::detail("Remote notes sync skipped (no --push)");
+    }
 
     // Step 3: Pre-process each file to resolve repo and group by repo display
     struct SessionInfo {
@@ -1604,21 +1785,25 @@ fn run_hydrate_inner(
             }
         }
 
-        let repo_remote = if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
-            let fetch_start = std::time::Instant::now();
-            match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
-                Ok(()) => {
-                    output::detail(&format!(
-                        "Fetched notes from {} in {} ms",
-                        remote,
-                        fetch_start.elapsed().as_millis()
-                    ));
+        let repo_remote = if sync_remote_before_attach {
+            if let Ok(Some(remote)) = git::resolve_push_remote_at(&repo_root) {
+                let fetch_start = std::time::Instant::now();
+                match push::fetch_merge_notes_for_remote_at(&repo_root, &remote) {
+                    Ok(()) => {
+                        output::detail(&format!(
+                            "Fetched notes from {} in {} ms",
+                            remote,
+                            fetch_start.elapsed().as_millis()
+                        ));
+                    }
+                    Err(e) => {
+                        output::note(&format!("Could not fetch notes from {}: {}", remote, e));
+                    }
                 }
-                Err(e) => {
-                    output::note(&format!("Could not fetch notes from {}: {}", remote, e));
-                }
+                Some(remote)
+            } else {
+                None
             }
-            Some(remote)
         } else {
             None
         };
@@ -2031,14 +2216,31 @@ fn run_hydrate_inner(
 
     // Final summary
     output::success(
-        "Hydrate",
+        "Backfill",
         &format!(
             "{} attached, {} fallback attached, {} skipped, {} issues",
             attached, fallback_attached, skipped, errors
         ),
     );
-
+    let issues = if errors > 0 {
+        vec![format!("{errors} issue(s) encountered during backfill")]
+    } else {
+        Vec::new()
+    };
+    report_backfill_completion(
+        since_days as i32,
+        BackfillSyncStats {
+            notes_attached: attached as i64,
+            notes_skipped: skipped as i64,
+            issues,
+            repos_scanned: sessions_by_repo.len() as i32,
+        },
+    );
     Ok(())
+}
+
+fn should_sync_remote_before_attach(do_push: bool) -> bool {
+    do_push
 }
 
 fn run_retry() -> Result<()> {
@@ -2731,7 +2933,7 @@ fn run_keys_disable() -> Result<()> {
 }
 
 /// Optional encryption setup during install. Returns `Ok(())` if setup was
-/// skipped or completed, and `Err` if install should abort before hydration.
+/// skipped or completed, and `Err` if install should abort before backfill.
 fn run_install_encryption_setup() -> Result<()> {
     if !output::is_stderr_tty() || !Term::stdout().is_term() {
         return Ok(());
@@ -2781,13 +2983,98 @@ fn run_install_encryption_setup() -> Result<()> {
         output::fail_to_with_tty(
             &mut stdout,
             "Encryption",
-            "setup did not complete. Install will stop before hydration.",
+            "setup did not complete. Install will stop before backfill.",
             is_tty,
         );
         anyhow::bail!("encryption setup incomplete");
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Install: auto-update preference prompt
+// ---------------------------------------------------------------------------
+
+/// Prompt the user to enable automatic updates during install.
+///
+/// This is non-critical: failures are logged but never abort install.
+/// Skipped silently if stdin is not a TTY or auto_update is already configured.
+fn run_install_auto_update_prompt() {
+    let cfg = match config::CliConfig::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let config_path = match config::CliConfig::config_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut prompter = DialoguerPrompter::new();
+    run_install_auto_update_prompt_inner(&mut prompter, &cfg, &config_path);
+}
+
+/// Testable inner implementation of the auto-update prompt.
+///
+/// Accepts injectable prompter and config path for testing.
+fn run_install_auto_update_prompt_inner(
+    prompter: &mut dyn Prompter,
+    cfg: &config::CliConfig,
+    config_path: &std::path::Path,
+) {
+    // Skip if not a TTY
+    if !output::is_stderr_tty() || !Term::stdout().is_term() {
+        return;
+    }
+
+    // Skip if auto_update is already set (user already made a choice)
+    if cfg.auto_update.is_some() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+    let is_tty = Term::stdout().is_term();
+
+    println!();
+    output::action_to_with_tty(&mut stdout, "Auto-update", "setup", is_tty);
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Cadence can automatically install updates when available.",
+        is_tty,
+    );
+
+    let response = prompter.confirm("Enable automatic updates?", &mut stdout);
+    match response {
+        Ok(Some(enabled)) => {
+            let value = if enabled { "true" } else { "false" };
+            let mut cfg = cfg.clone();
+            if let Err(e) = cfg
+                .set_key(config::ConfigKey::AutoUpdate, value)
+                .and_then(|()| cfg.save_to(config_path))
+            {
+                output::note_to_with_tty(
+                    &mut stdout,
+                    &format!("Could not save auto-update preference: {e}"),
+                    is_tty,
+                );
+            } else if enabled {
+                output::success_to_with_tty(
+                    &mut stdout,
+                    "Auto-update",
+                    "enabled. Change anytime with `cadence config set auto_update false`.",
+                    is_tty,
+                );
+            } else {
+                output::detail_to_with_tty(
+                    &mut stdout,
+                    "Auto-update disabled. Run `cadence update` to check manually.",
+                    is_tty,
+                );
+            }
+        }
+        Ok(None) | Err(_) => {
+            // User cancelled or error — skip silently
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2934,13 +3221,44 @@ fn run_keys_setup_inner(
     git::config_set_global(pgp_keys::USER_FINGERPRINT_KEY, &fingerprint)
         .context("failed to save user fingerprint to git config")?;
 
-    writeln!(writer)?;
-    output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
     writeln!(writer, "Local key fingerprint: {}", fingerprint)?;
     if let Ok(Some(api_fpr)) = pgp_keys::get_api_fingerprint() {
         writeln!(writer, "API key fingerprint: {}", api_fpr)?;
     }
+    output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config subcommand handlers
+// ---------------------------------------------------------------------------
+
+/// Set a configuration value and persist to disk.
+fn run_config_set(key_str: &str, value: &str) -> Result<()> {
+    let key: config::ConfigKey = key_str.parse()?;
+    let mut cfg = config::CliConfig::load()?;
+    cfg.set_key(key, value)?;
+    cfg.save()?;
+    output::success("Set", &format!("{} = {}", key.name(), cfg.get_key(key)));
+    Ok(())
+}
+
+/// Print a single configuration value to stdout (machine-readable).
+fn run_config_get(key_str: &str) -> Result<()> {
+    let key: config::ConfigKey = key_str.parse()?;
+    let cfg = config::CliConfig::load()?;
+    println!("{}", cfg.get_key(key));
+    Ok(())
+}
+
+/// List all user-settable configuration keys with their current values.
+fn run_config_list() -> Result<()> {
+    let cfg = config::CliConfig::load()?;
+    for key in config::ALL_CONFIG_KEYS {
+        let value = cfg.get_key(*key);
+        println!("{} = {}", key.name(), value);
+    }
     Ok(())
 }
 
@@ -2956,7 +3274,7 @@ fn run_update(check: bool, yes: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// GC: clear bloated notes and re-hydrate
+// GC: clear bloated notes and re-backfill
 // ---------------------------------------------------------------------------
 
 fn run_gc(since: &str, confirm: bool) -> Result<()> {
@@ -2968,11 +3286,11 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
 
     if !confirm {
         output::note("This will DELETE all local and remote AI session notes for this repo,");
-        output::note("then re-hydrate them in the optimized v2 format.");
-        output::detail(&format!("Re-hydration window: last {} days", since_days));
+        output::note("then re-backfill them in the optimized v2 format.");
+        output::detail(&format!("Re-backfill window: last {} days", since_days));
         output::detail("Local ref:  refs/notes/ai-sessions  → deleted");
         output::detail("Remote ref: refs/notes/ai-sessions  → deleted");
-        output::detail("Then: cadence hydrate --since <window> --push");
+        output::detail("Then: cadence backfill --since <window> --push");
         eprintln!();
         output::fail("Aborted", "pass --confirm to proceed.");
         anyhow::bail!("gc requires --confirm to proceed");
@@ -3002,12 +3320,12 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
         Err(e) => output::detail(&format!("Could not delete local ref (continuing): {e}")),
     }
 
-    // Step 3: Re-hydrate in v2 format with push enabled (scoped to this repo).
+    // Step 3: Re-backfill in v2 format with push enabled (scoped to this repo).
     output::action(
         "GC",
-        &format!("Re-hydrating (last {} days) with push", since_days),
+        &format!("Re-backfilling (last {} days) with push", since_days),
     );
-    run_hydrate_inner(since, true, Some(&repo_root))?;
+    run_backfill_inner(since, true, Some(&repo_root))?;
 
     output::success("GC", "Complete. Notes have been regenerated in v2 format.");
     Ok(())
@@ -3020,6 +3338,9 @@ fn run_gc(since: &str, confirm: bool) -> Result<()> {
 fn main() {
     let cli = Cli::parse();
     output::set_verbose(cli.verbose);
+    if let Some(url) = cli.api_url.clone() {
+        let _ = API_URL_OVERRIDE.set(url);
+    }
 
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
@@ -3034,12 +3355,19 @@ fn main() {
                 timestamp,
             } => run_hook_post_commit_retry(&commit, &repo, timestamp),
         },
-        Command::Hydrate { since, push } => run_hydrate(&since, push),
+        Command::Backfill { since, push } => run_backfill(&since, push),
+        Command::Login => run_login(),
+        Command::Logout => run_logout(),
         Command::Retry => run_retry(),
         Command::Notes { notes_command } => match notes_command {
             NotesCommand::List { notes_ref } => run_notes_list(&notes_ref),
         },
         Command::Status => run_status(),
+        Command::Config { config_command } => match config_command.unwrap_or(ConfigCommand::List) {
+            ConfigCommand::Set { key, value } => run_config_set(&key, &value),
+            ConfigCommand::Get { key } => run_config_get(&key),
+            ConfigCommand::List => run_config_list(),
+        },
         Command::Doctor => run_doctor(),
         Command::Update { check, yes } => run_update(check, yes),
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
@@ -3092,6 +3420,36 @@ mod tests {
             }
             _ => panic!("expected Keys command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_login_command() {
+        let cli = Cli::parse_from(["cadence", "login"]);
+        assert!(matches!(cli.command, Command::Login));
+    }
+
+    #[test]
+    fn cli_parses_logout_command() {
+        let cli = Cli::parse_from(["cadence", "logout"]);
+        assert!(matches!(cli.command, Command::Logout));
+    }
+
+    #[test]
+    fn cli_parses_backfill_command() {
+        let cli = Cli::parse_from(["cadence", "backfill", "--since", "30d", "--push"]);
+        match cli.command {
+            Command::Backfill { since, push } => {
+                assert_eq!(since, "30d");
+                assert!(push);
+            }
+            _ => panic!("expected Backfill command"),
+        }
+    }
+
+    #[test]
+    fn backfill_remote_sync_depends_on_push_flag() {
+        assert!(should_sync_remote_before_attach(true));
+        assert!(!should_sync_remote_before_attach(false));
     }
 
     // -----------------------------------------------------------------------
@@ -3192,12 +3550,67 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Config command parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_config_set() {
+        let cli = Cli::parse_from(["cadence", "config", "set", "auto_update", "true"]);
+        match cli.command {
+            Command::Config { config_command } => match config_command {
+                Some(ConfigCommand::Set { key, value }) => {
+                    assert_eq!(key, "auto_update");
+                    assert_eq!(value, "true");
+                }
+                other => panic!("expected Config Set, got {:?}", other),
+            },
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
     #[test]
     fn cli_parses_doctor() {
         let cli = Cli::parse_from(["cadence", "doctor"]);
         match cli.command {
             Command::Doctor => {}
             _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_get() {
+        let cli = Cli::parse_from(["cadence", "config", "get", "auto_update"]);
+        match cli.command {
+            Command::Config { config_command } => match config_command {
+                Some(ConfigCommand::Get { key }) => {
+                    assert_eq!(key, "auto_update");
+                }
+                other => panic!("expected Config Get, got {:?}", other),
+            },
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_list() {
+        let cli = Cli::parse_from(["cadence", "config", "list"]);
+        match cli.command {
+            Command::Config { config_command } => {
+                assert!(matches!(config_command, Some(ConfigCommand::List)));
+            }
+            other => panic!("expected Config command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_parses_bare_config_defaults_to_none() {
+        let cli = Cli::parse_from(["cadence", "config"]);
+        match cli.command {
+            Command::Config { config_command } => {
+                assert!(config_command.is_none());
+            }
+            other => panic!("expected Config command, got {:?}", other),
         }
     }
 

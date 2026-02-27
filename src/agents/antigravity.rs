@@ -23,7 +23,7 @@ pub fn log_dirs() -> Vec<PathBuf> {
     log_dirs_in(&home)
 }
 
-/// Return all Antigravity log directories for hydrate (not repo-scoped).
+/// Return all Antigravity log directories for backfill (not repo-scoped).
 pub fn all_log_dirs() -> Vec<PathBuf> {
     log_dirs()
 }

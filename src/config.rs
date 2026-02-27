@@ -7,10 +7,6 @@
 //! all platforms rather than platform-aware config directories. This keeps the
 //! config path predictable across environments.
 
-// This module is a foundation for future auth/keys specs. The public API will
-// be consumed once those command handlers are added. Suppress dead_code until then.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -97,7 +93,7 @@ impl CliConfig {
     }
 
     /// Load config from a specific path. Returns defaults if the file does not exist.
-    fn load_from(path: &Path) -> Result<Self> {
+    pub(crate) fn load_from(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => toml::from_str(&contents)
                 .with_context(|| format!("failed to parse config file at {}", path.display())),
@@ -116,7 +112,7 @@ impl CliConfig {
     }
 
     /// Save config to a specific path, creating parent directories if needed.
-    fn save_to(&self, path: &Path) -> Result<()> {
+    pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create config directory at {}", parent.display())
@@ -137,14 +133,6 @@ impl CliConfig {
         self.github_login = None;
         self.expires_at = None;
         self.save()
-    }
-
-    /// Clear token credentials and save to a specific path.
-    fn clear_token_to(&mut self, path: &Path) -> Result<()> {
-        self.token = None;
-        self.github_login = None;
-        self.expires_at = None;
-        self.save_to(path)
     }
 
     /// Returns whether auto-update is enabled.
@@ -258,19 +246,11 @@ pub fn parse_duration_string(s: &str) -> Result<Duration> {
         })
 }
 
-/// Reads the cached latest-available version from the config directory.
-///
-/// Returns `None` if the cache file is absent, empty, or unreadable.
-/// This is intentionally non-failing to keep `cadence status` resilient.
-pub fn read_cached_latest_version() -> Option<String> {
-    let dir = CliConfig::config_dir()?;
-    read_cached_latest_version_from_dir(&dir)
-}
-
 /// Reads the cached latest-available version from a specific directory.
 ///
 /// Trims whitespace and strips a leading `v`/`V` prefix if present.
 /// Returns `None` if the file is absent, empty, or not valid UTF-8.
+#[cfg(test)]
 pub fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
     let path = dir.join(LATEST_VERSION_CACHE_FILE);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -318,6 +298,158 @@ pub fn write_cached_latest_version_to_dir(version: &str, dir: &Path) -> Result<(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ConfigKey enum + helpers for `cadence config` subcommand
+// ---------------------------------------------------------------------------
+
+/// User-settable configuration keys exposed via `cadence config set/get/list`.
+///
+/// Auth-managed keys (`token`, `github_login`, `expires_at`) are intentionally
+/// excluded — they are managed by the auth flow and should not be hand-edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKey {
+    AutoUpdate,
+    UpdateCheckInterval,
+    ApiUrl,
+}
+
+/// All user-settable configuration keys, in display order.
+pub const ALL_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::AutoUpdate,
+    ConfigKey::UpdateCheckInterval,
+    ConfigKey::ApiUrl,
+];
+
+/// Keys that are managed by the auth flow and cannot be set via `cadence config`.
+const AUTH_MANAGED_KEYS: &[&str] = &[
+    "token",
+    "github_login",
+    "github-login",
+    "expires_at",
+    "expires-at",
+];
+
+impl ConfigKey {
+    /// The canonical snake_case name used in config files and display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ConfigKey::AutoUpdate => "auto_update",
+            ConfigKey::UpdateCheckInterval => "update_check_interval",
+            ConfigKey::ApiUrl => "api_url",
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigKey {
+    type Err = anyhow::Error;
+
+    /// Parse a config key name, accepting both snake_case and kebab-case.
+    ///
+    /// Returns a clear error for auth-managed keys.
+    fn from_str(s: &str) -> Result<Self> {
+        // Normalize kebab-case to snake_case for matching
+        let normalized = s.trim().replace('-', "_").to_lowercase();
+
+        // Check for auth-managed keys first (also normalize those)
+        let is_auth = AUTH_MANAGED_KEYS
+            .iter()
+            .any(|k| k.replace('-', "_") == normalized);
+        if is_auth {
+            bail!(
+                "'{}' is managed by the auth flow and cannot be set via `cadence config`.\n\
+                 Use `cadence install` or the OAuth flow to manage credentials.",
+                s
+            );
+        }
+
+        match normalized.as_str() {
+            "auto_update" => Ok(ConfigKey::AutoUpdate),
+            "update_check_interval" => Ok(ConfigKey::UpdateCheckInterval),
+            "api_url" => Ok(ConfigKey::ApiUrl),
+            _ => bail!(
+                "unknown config key '{}'. Valid keys: {}",
+                s,
+                ALL_CONFIG_KEYS
+                    .iter()
+                    .map(|k| k.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Parse a boolean value from user input, accepting common variants.
+///
+/// Accepted: `true`, `false`, `yes`, `no`, `1`, `0` (case-insensitive).
+pub fn parse_bool_value(s: &str) -> Result<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "yes" | "1" => Ok(true),
+        "false" | "no" | "0" => Ok(false),
+        _ => bail!(
+            "invalid boolean value '{}'. Expected: true/false, yes/no, or 1/0",
+            s
+        ),
+    }
+}
+
+impl CliConfig {
+    /// Get the value of a user-settable config key as a display string.
+    ///
+    /// Returns `"(not set)"` for unset optional fields.
+    pub fn get_key(&self, key: ConfigKey) -> String {
+        match key {
+            ConfigKey::AutoUpdate => match self.auto_update {
+                Some(v) => v.to_string(),
+                None => "(not set)".to_string(),
+            },
+            ConfigKey::UpdateCheckInterval => match &self.update_check_interval {
+                Some(v) => v.clone(),
+                None => "(not set)".to_string(),
+            },
+            ConfigKey::ApiUrl => match &self.api_url {
+                Some(v) => v.clone(),
+                None => "(not set)".to_string(),
+            },
+        }
+    }
+
+    /// Set a user-settable config key, validating the value before storing.
+    ///
+    /// For `AutoUpdate`, the value is parsed as a boolean.
+    /// For `UpdateCheckInterval`, the value is validated as a duration string.
+    /// For `ApiUrl`, the value is stored as-is (trimmed).
+    pub fn set_key(&mut self, key: ConfigKey, value: &str) -> Result<()> {
+        match key {
+            ConfigKey::AutoUpdate => {
+                let b = parse_bool_value(value)?;
+                self.auto_update = Some(b);
+            }
+            ConfigKey::UpdateCheckInterval => {
+                let trimmed = value.trim().to_string();
+                // Validate the duration is parseable before storing
+                parse_duration_string(&trimmed)?;
+                self.update_check_interval = Some(trimmed);
+            }
+            ConfigKey::ApiUrl => {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    self.api_url = None;
+                } else {
+                    self.api_url = Some(trimmed);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Return the trimmed value if non-empty after trimming, otherwise `None`.
 fn non_empty_trimmed(value: Option<String>) -> Option<String> {
     value.and_then(|v| {
@@ -333,6 +465,21 @@ fn non_empty_trimmed(value: Option<String>) -> Option<String> {
 /// Resolve the user's home directory from the `HOME` environment variable.
 fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl CliConfig {
+    /// Clear token credentials and save to a specific path.
+    fn clear_token_to(&mut self, path: &Path) -> Result<()> {
+        self.token = None;
+        self.github_login = None;
+        self.expires_at = None;
+        self.save_to(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,5 +1359,235 @@ mod tests {
             read_cached_latest_version_from_dir(tmp.path()),
             Some("0.4.0".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ConfigKey::from_str
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_key_from_str_snake_case() {
+        assert_eq!(
+            "auto_update".parse::<ConfigKey>().unwrap(),
+            ConfigKey::AutoUpdate
+        );
+        assert_eq!(
+            "update_check_interval".parse::<ConfigKey>().unwrap(),
+            ConfigKey::UpdateCheckInterval
+        );
+        assert_eq!("api_url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
+    }
+
+    #[test]
+    fn test_config_key_from_str_kebab_case() {
+        assert_eq!(
+            "auto-update".parse::<ConfigKey>().unwrap(),
+            ConfigKey::AutoUpdate
+        );
+        assert_eq!(
+            "update-check-interval".parse::<ConfigKey>().unwrap(),
+            ConfigKey::UpdateCheckInterval
+        );
+        assert_eq!("api-url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
+    }
+
+    #[test]
+    fn test_config_key_from_str_case_insensitive() {
+        assert_eq!(
+            "AUTO_UPDATE".parse::<ConfigKey>().unwrap(),
+            ConfigKey::AutoUpdate
+        );
+        assert_eq!("Api-Url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
+    }
+
+    #[test]
+    fn test_config_key_from_str_with_whitespace() {
+        assert_eq!(
+            "  auto_update  ".parse::<ConfigKey>().unwrap(),
+            ConfigKey::AutoUpdate
+        );
+    }
+
+    #[test]
+    fn test_config_key_from_str_unknown() {
+        let result = "nonexistent".parse::<ConfigKey>();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown config key"), "got: {msg}");
+        assert!(
+            msg.contains("auto_update"),
+            "should list valid keys, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_config_key_from_str_auth_managed_token() {
+        let result = "token".parse::<ConfigKey>();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("managed by the auth flow"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_config_key_from_str_auth_managed_github_login() {
+        let result = "github_login".parse::<ConfigKey>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("auth flow"));
+    }
+
+    #[test]
+    fn test_config_key_from_str_auth_managed_kebab() {
+        let result = "github-login".parse::<ConfigKey>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("auth flow"));
+    }
+
+    #[test]
+    fn test_config_key_from_str_auth_managed_expires_at() {
+        let result = "expires_at".parse::<ConfigKey>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("auth flow"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_bool_value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_bool_value_true_variants() {
+        assert!(parse_bool_value("true").unwrap());
+        assert!(parse_bool_value("True").unwrap());
+        assert!(parse_bool_value("TRUE").unwrap());
+        assert!(parse_bool_value("yes").unwrap());
+        assert!(parse_bool_value("Yes").unwrap());
+        assert!(parse_bool_value("1").unwrap());
+    }
+
+    #[test]
+    fn test_parse_bool_value_false_variants() {
+        assert!(!parse_bool_value("false").unwrap());
+        assert!(!parse_bool_value("False").unwrap());
+        assert!(!parse_bool_value("FALSE").unwrap());
+        assert!(!parse_bool_value("no").unwrap());
+        assert!(!parse_bool_value("No").unwrap());
+        assert!(!parse_bool_value("0").unwrap());
+    }
+
+    #[test]
+    fn test_parse_bool_value_with_whitespace() {
+        assert!(parse_bool_value("  true  ").unwrap());
+        assert!(!parse_bool_value("  false  ").unwrap());
+    }
+
+    #[test]
+    fn test_parse_bool_value_invalid() {
+        let result = parse_bool_value("maybe");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("invalid boolean"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // set_key / get_key roundtrips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_get_auto_update() {
+        let mut cfg = CliConfig::default();
+        cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "true");
+        assert_eq!(cfg.auto_update, Some(true));
+
+        cfg.set_key(ConfigKey::AutoUpdate, "no").unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "false");
+        assert_eq!(cfg.auto_update, Some(false));
+    }
+
+    #[test]
+    fn test_set_get_update_check_interval() {
+        let mut cfg = CliConfig::default();
+        cfg.set_key(ConfigKey::UpdateCheckInterval, "24h").unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "24h");
+
+        cfg.set_key(ConfigKey::UpdateCheckInterval, "1d").unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "1d");
+    }
+
+    #[test]
+    fn test_set_update_check_interval_invalid() {
+        let mut cfg = CliConfig::default();
+        let result = cfg.set_key(ConfigKey::UpdateCheckInterval, "invalid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_get_api_url() {
+        let mut cfg = CliConfig::default();
+        cfg.set_key(ConfigKey::ApiUrl, "https://custom.example.com")
+            .unwrap();
+        assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "https://custom.example.com");
+    }
+
+    #[test]
+    fn test_set_api_url_empty_clears() {
+        let mut cfg = CliConfig {
+            api_url: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        cfg.set_key(ConfigKey::ApiUrl, "").unwrap();
+        assert_eq!(cfg.api_url, None);
+        assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "(not set)");
+    }
+
+    #[test]
+    fn test_get_key_unset_returns_not_set() {
+        let cfg = CliConfig::default();
+        assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "(not set)");
+        assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "(not set)");
+        assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "(not set)");
+    }
+
+    #[test]
+    fn test_set_key_auto_update_invalid_value() {
+        let mut cfg = CliConfig::default();
+        let result = cfg.set_key(ConfigKey::AutoUpdate, "maybe");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_key_roundtrip_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_path_in(tmp.path());
+
+        let mut cfg = CliConfig::default();
+        cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
+        cfg.set_key(ConfigKey::UpdateCheckInterval, "12h").unwrap();
+        cfg.set_key(ConfigKey::ApiUrl, "https://test.example.com")
+            .unwrap();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = CliConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.auto_update, Some(true));
+        assert_eq!(loaded.update_check_interval, Some("12h".to_string()));
+        assert_eq!(loaded.api_url, Some("https://test.example.com".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // ConfigKey display + name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_key_display() {
+        assert_eq!(ConfigKey::AutoUpdate.to_string(), "auto_update");
+        assert_eq!(
+            ConfigKey::UpdateCheckInterval.to_string(),
+            "update_check_interval"
+        );
+        assert_eq!(ConfigKey::ApiUrl.to_string(), "api_url");
+    }
+
+    #[test]
+    fn test_all_config_keys_count() {
+        assert_eq!(ALL_CONFIG_KEYS.len(), 3);
     }
 }
