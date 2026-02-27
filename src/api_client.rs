@@ -114,9 +114,9 @@ impl std::error::Error for AuthenticatedRequestError {}
 
 /// HTTP client for the Cadence API.
 ///
-/// Wraps `reqwest::blocking::Client` with a normalized base URL.
+/// Wraps `reqwest::Client` with a normalized base URL.
 pub struct ApiClient {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     base_url: String,
 }
 
@@ -128,7 +128,7 @@ impl ApiClient {
     pub fn new(base_url: &str) -> Self {
         let normalized = base_url.trim().trim_end_matches('/').to_string();
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
             base_url: normalized,
         }
     }
@@ -138,22 +138,23 @@ impl ApiClient {
     // -----------------------------------------------------------------------
 
     /// Fetch the current API public key.
-    pub fn get_api_public_key(&self) -> Result<ApiPublicKey> {
+    pub async fn get_api_public_key(&self) -> Result<ApiPublicKey> {
         let url = self.url(KEYS_PUBLIC_PATH);
         let resp = self
             .client
             .get(&url)
             .send()
+            .await
             .with_context(|| format!("failed to connect to API at {url}"))?;
 
-        let body = map_http_error(resp)?;
+        let body = map_http_error(resp).await?;
         let envelope: ApiResponseEnvelope<ApiPublicKey> =
             serde_json::from_str(&body).context("failed to parse api public key response")?;
         Ok(envelope.data)
     }
 
     /// Exchange a short-lived CLI exchange code for a long-lived CLI JWT.
-    pub fn exchange_cli_code(
+    pub async fn exchange_cli_code(
         &self,
         code: &str,
         timeout: Duration,
@@ -165,16 +166,17 @@ impl ApiClient {
             .timeout(timeout)
             .json(&ExchangeRequest { code })
             .send()
+            .await
             .with_context(|| format!("failed to connect to API at {url}"))?;
 
-        let body = map_http_error(resp)?;
+        let body = map_http_error(resp).await?;
         let envelope: ApiResponseEnvelope<CliTokenExchangeResult> =
             serde_json::from_str(&body).context("failed to parse auth exchange response")?;
         Ok(envelope.data)
     }
 
     /// Revoke a bearer token via `DELETE /api/auth`.
-    pub fn revoke_token(
+    pub async fn revoke_token(
         &self,
         token: &str,
         timeout: Duration,
@@ -186,6 +188,7 @@ impl ApiClient {
             .bearer_auth(token)
             .timeout(timeout)
             .send()
+            .await
             .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
 
         if resp.status().is_success() {
@@ -193,12 +196,12 @@ impl ApiClient {
         }
 
         let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         Err(map_authenticated_http_error(status, &body))
     }
 
     /// Report backfill completion to onboarding state.
-    pub fn report_backfill_complete(
+    pub async fn report_backfill_complete(
         &self,
         token: &str,
         report: &BackfillCompleteRequest,
@@ -212,16 +215,18 @@ impl ApiClient {
             .timeout(timeout)
             .json(report)
             .send()
+            .await
             .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp.text().unwrap_or_default();
+            let body = resp.text().await.unwrap_or_default();
             return Err(map_authenticated_http_error(status, &body));
         }
 
         let body = resp
             .text()
+            .await
             .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
         let envelope: ApiResponseEnvelope<BackfillCompleteResponse> =
             serde_json::from_str(&body)
@@ -259,14 +264,14 @@ where
 
 /// Read a response body and return it as a string, or map non-success status
 /// codes to user-friendly errors.
-fn map_http_error(resp: reqwest::blocking::Response) -> Result<String> {
+async fn map_http_error(resp: reqwest::Response) -> Result<String> {
     let status = resp.status();
     if status.is_success() {
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         return Ok(body);
     }
 
-    let body = resp.text().unwrap_or_default();
+    let body = resp.text().await.unwrap_or_default();
 
     match status.as_u16() {
         401 => anyhow::bail!("Unauthorized: API credentials rejected."),

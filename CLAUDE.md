@@ -36,3 +36,5 @@ cargo fmt                      # Auto-format
 - Make configuration discoverable (env vars and `--help`).
 - Keep hooks non-blocking unless a hard failure is intentional.
 - Prefer small, focused modules with thorough tests.
+- Use Tokio for production I/O (filesystem, network, subprocess, timers).
+- Do not block the Tokio runtime; run CPU-bound or sync-only work with `tokio::task::spawn_blocking`.

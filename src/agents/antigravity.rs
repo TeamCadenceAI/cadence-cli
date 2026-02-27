@@ -361,23 +361,29 @@ fn post_json(
         "{}://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/{}",
         scheme, port, method
     );
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()?;
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Connect-Protocol-Version", "1")
-        .header("X-Codeium-Csrf-Token", csrf)
-        .json(body)
-        .send()?;
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "antigravity API returned status {}",
-            response.status()
-        ));
-    }
-    Ok(response.json()?)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .header("X-Codeium-Csrf-Token", csrf)
+            .json(body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "antigravity API returned status {}",
+                response.status()
+            ));
+        }
+        Ok(response.json().await?)
+    })
 }
 
 fn extract_cascade_ids_from_value(value: &serde_json::Value) -> Vec<String> {

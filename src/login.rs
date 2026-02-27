@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use crate::api_client::{ApiClient, CliTokenExchangeResult};
 
 /// Complete browser-based CLI OAuth login flow.
-pub fn login_via_browser(api_base_url: &str, timeout: Duration) -> Result<CliTokenExchangeResult> {
+pub async fn login_via_browser(
+    api_base_url: &str,
+    timeout: Duration,
+) -> Result<CliTokenExchangeResult> {
     let nonce = generate_nonce();
 
     let listener =
@@ -38,6 +41,7 @@ pub fn login_via_browser(api_base_url: &str, timeout: Duration) -> Result<CliTok
     let client = ApiClient::new(api_base_url);
     client
         .exchange_cli_code(&exchange_code, Duration::from_secs(10))
+        .await
         .context("failed to exchange login code for CLI token")
 }
 

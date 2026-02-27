@@ -150,6 +150,39 @@ pub(crate) fn run_git_output_at(
     Ok(output)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn run_git_output_at_async(
+    repo: Option<&Path>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("git");
+
+    if let Some(repo) = repo {
+        cmd.args(["-C", &repo.to_string_lossy()]);
+    }
+
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+
+    if output::is_verbose() {
+        let mut display_parts = vec!["git".to_string()];
+        if let Some(repo) = repo {
+            display_parts.push("-C".to_string());
+            display_parts.push(repo.to_string_lossy().to_string());
+        }
+        display_parts.extend(args.iter().map(|s| s.to_string()));
+        output::detail(&display_parts.join(" "));
+    }
+
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    cmd.output().await.context("failed to execute git")
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Stream {
     Stdout,
@@ -264,6 +297,7 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 ///
 /// This is the directory-parameterised version of [`note_exists`], for use
 /// by commands that operate on repos other than the CWD (e.g., `backfill`).
+#[allow(dead_code)]
 pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     validate_commit_hash(commit)?;
     let output = run_git_output_at(

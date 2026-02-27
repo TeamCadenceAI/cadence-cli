@@ -78,6 +78,7 @@ pub fn detail(msg: &str) {
 
 /// Format a detail message for display without writing it.
 /// Used when output needs to be routed through a progress bar via `pb.println()`.
+#[allow(dead_code)]
 pub fn format_detail(msg: &str) -> String {
     if stderr_is_tty() {
         style(format!("  {msg}")).dim().to_string()
