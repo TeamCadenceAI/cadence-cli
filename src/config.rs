@@ -1593,22 +1593,40 @@ mod tests {
     // parse_repo_path_list
     // -----------------------------------------------------------------------
 
+    /// Returns an absolute path prefix suitable for the current platform.
+    /// On Unix: "/tmp"  On Windows: "C:\\tmp"
+    fn abs_prefix() -> &'static str {
+        if cfg!(windows) { "C:\\tmp" } else { "/tmp" }
+    }
+
     #[test]
     fn test_parse_repo_path_list_comma_separated() {
-        let paths = parse_repo_path_list("/tmp/a,/tmp/b").unwrap();
-        assert_eq!(paths, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+        let (a, b) = (
+            &format!("{}/a", abs_prefix()),
+            &format!("{}/b", abs_prefix()),
+        );
+        let input = format!("{a},{b}");
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![a.to_string(), b.to_string()]);
     }
 
     #[test]
     fn test_parse_repo_path_list_newline_separated() {
-        let paths = parse_repo_path_list("/tmp/a\n/tmp/b").unwrap();
-        assert_eq!(paths, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+        let (a, b) = (
+            &format!("{}/a", abs_prefix()),
+            &format!("{}/b", abs_prefix()),
+        );
+        let input = format!("{a}\n{b}");
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![a.to_string(), b.to_string()]);
     }
 
     #[test]
     fn test_parse_repo_path_list_deduplicates() {
-        let paths = parse_repo_path_list("/tmp/a, /tmp/a").unwrap();
-        assert_eq!(paths, vec!["/tmp/a".to_string()]);
+        let a = format!("{}/a", abs_prefix());
+        let input = format!("{a}, {a}");
+        let paths = parse_repo_path_list(&input).unwrap();
+        assert_eq!(paths, vec![a.to_string()]);
     }
 
     #[test]
@@ -1673,20 +1691,25 @@ mod tests {
 
     #[test]
     fn test_set_get_watched_repo_paths() {
+        let (a, b) = (
+            &format!("{}/a", abs_prefix()),
+            &format!("{}/b", abs_prefix()),
+        );
+        let input = format!("{a},{b}");
         let mut cfg = CliConfig::default();
-        cfg.set_key(ConfigKey::WatchedRepoPaths, "/tmp/a,/tmp/b")
-            .unwrap();
+        cfg.set_key(ConfigKey::WatchedRepoPaths, &input).unwrap();
         assert_eq!(
             cfg.watched_repo_paths,
-            Some(vec!["/tmp/a".to_string(), "/tmp/b".to_string()])
+            Some(vec![a.to_string(), b.to_string()])
         );
-        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), "/tmp/a,/tmp/b");
+        assert_eq!(cfg.get_key(ConfigKey::WatchedRepoPaths), format!("{a},{b}"));
     }
 
     #[test]
     fn test_set_watched_repo_paths_empty_clears() {
+        let a = format!("{}/a", abs_prefix());
         let mut cfg = CliConfig {
-            watched_repo_paths: Some(vec!["/tmp/a".to_string()]),
+            watched_repo_paths: Some(vec![a]),
             ..Default::default()
         };
         cfg.set_key(ConfigKey::WatchedRepoPaths, "").unwrap();
@@ -1727,13 +1750,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
+        let (r1, r2) = (
+            &format!("{}/r1", abs_prefix()),
+            &format!("{}/r2", abs_prefix()),
+        );
+        let repo_input = format!("{r1},{r2}");
+
         let mut cfg = CliConfig::default();
         cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
         cfg.set_key(ConfigKey::UpdateCheckInterval, "12h").unwrap();
         cfg.set_key(ConfigKey::ApiUrl, "https://test.example.com")
             .unwrap();
         cfg.set_key(ConfigKey::WatchAllRepos, "false").unwrap();
-        cfg.set_key(ConfigKey::WatchedRepoPaths, "/tmp/r1,/tmp/r2")
+        cfg.set_key(ConfigKey::WatchedRepoPaths, &repo_input)
             .unwrap();
         cfg.save_to(&path).unwrap();
 
@@ -1744,7 +1773,7 @@ mod tests {
         assert_eq!(loaded.watch_all_repos, Some(false));
         assert_eq!(
             loaded.watched_repo_paths,
-            Some(vec!["/tmp/r1".to_string(), "/tmp/r2".to_string()])
+            Some(vec![r1.to_string(), r2.to_string()])
         );
     }
 

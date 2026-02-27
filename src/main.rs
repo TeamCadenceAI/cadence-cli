@@ -4296,11 +4296,11 @@ mod tests {
 
     #[test]
     fn parse_install_repo_scope_paths_accepts_multiple_tokens() {
-        let paths = parse_install_repo_scope_paths("/tmp/repo-a,/tmp/repo-b").unwrap();
-        assert_eq!(
-            paths,
-            vec!["/tmp/repo-a".to_string(), "/tmp/repo-b".to_string()]
-        );
+        let prefix = if cfg!(windows) { "C:\\tmp" } else { "/tmp" };
+        let (a, b) = (format!("{prefix}/repo-a"), format!("{prefix}/repo-b"));
+        let input = format!("{a},{b}");
+        let paths = parse_install_repo_scope_paths(&input).unwrap();
+        assert_eq!(paths, vec![a, b]);
     }
 
     #[test]
