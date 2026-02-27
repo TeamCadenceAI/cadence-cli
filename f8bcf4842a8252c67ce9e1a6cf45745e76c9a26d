@@ -1,0 +1,14 @@
+---
+cadence_version: 2
+agent: codex
+session_id: 019c9d4b-34b0-7f02-a411-f28a295df813
+repo: /Users/zack/dev/cadence-cli
+commit: f8bcf4842a8252c67ce9e1a6cf45745e76c9a26d
+confidence: exact_hash_match
+session_start: 2026-02-27T04:11:17Z
+payload_blob: c0ff8ad17196197ec3a45e750604a08d92b3b485
+payload_sha256: 74239fc1c2b6d243554eb24654f1dfc109a97d3f0d50de39abc2d7d9cdf9c384
+payload_encoding: zstd+pgp
+match_score: 3.860
+match_reasons: short_hash_event_match,commit_event_pattern,time_distance
+---
