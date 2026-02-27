@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.8.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.7.0...v0.8.0) (2026-02-27)
+
+
+### Features
+
+* **matching:** unify commit/session matching across attach paths ([2a6a2db](https://github.com/TeamCadenceAI/cadence-cli/commit/2a6a2db256fcdce9c651d51a914c6086a1acbd9b))
+
+
+### Bug Fixes
+
+* **backfill:** recover codex/zed commits when session window is narrow ([3e48243](https://github.com/TeamCadenceAI/cadence-cli/commit/3e4824325a64cd831e808605bc23ac5794d00bae))
+* **retry:** prefix retry-attach log lines with cadence label ([a9acc97](https://github.com/TeamCadenceAI/cadence-cli/commit/a9acc972e3e44c7264dd2ed736ac25fed6e86957))
+* **scanner:** lower default match thresholds to favor overmatching ([0226146](https://github.com/TeamCadenceAI/cadence-cli/commit/0226146a4945164e341ecfe339514290651fcb3d))
+* **update:** avoid nested Tokio runtime panic ([4b33d2d](https://github.com/TeamCadenceAI/cadence-cli/commit/4b33d2d470a48ae639752552ee13ba9b7071a5e9))
+
+## [0.7.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.6.1...v0.7.0) (2026-02-27)
+
+
+### Features
+
+* **backfill:** migrate runtime to tokio and parallelize repository processing ([f8bcf48](https://github.com/TeamCadenceAI/cadence-cli/commit/f8bcf4842a8252c67ce9e1a6cf45745e76c9a26d))
+* **push:** speed up notes and payload ref synchronization ([1d61e39](https://github.com/TeamCadenceAI/cadence-cli/commit/1d61e3960e5a4c61e5ed86be68914da2b55055ba))
+* **scanner:** add ranked multi-signal session-to-commit matching ([f1e5019](https://github.com/TeamCadenceAI/cadence-cli/commit/f1e50192535809c06df04146b5a31a900521faab))
+
+
+### Bug Fixes
+
+* **backfill:** streamline progress output and quiet push sync ([eea868b](https://github.com/TeamCadenceAI/cadence-cli/commit/eea868bff346822abd528352687ce45e531a0481))
+* **ci:** disable fail-fast test execution and stabilize windows scanner fixture ([ba83d69](https://github.com/TeamCadenceAI/cadence-cli/commit/ba83d69e2a6a6ff404ae3aef50c97102dad2d6ff))
+* **runtime:** avoid nested Tokio block_on panic during install ([1a7e491](https://github.com/TeamCadenceAI/cadence-cli/commit/1a7e4911155d7250af4d3050ce4018a38671209a))
+
+
+### Performance Improvements
+
+* Push performance, Tokio runtime ([236c707](https://github.com/TeamCadenceAI/cadence-cli/commit/236c70738e8e191023b7d6eca9f8ce14f1cf7f66))
+* **scanner:** reduce matcher overhead in hook and hydrate ([4422def](https://github.com/TeamCadenceAI/cadence-cli/commit/4422def9b17ee502257785400585ebb0b95fbe07))
+
 ## [0.6.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.6.0...v0.6.1) (2026-02-25)
 
 

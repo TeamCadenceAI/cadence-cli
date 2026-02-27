@@ -1,6 +1,6 @@
 [package]
 name = "cadence-cli"
-version = "0.6.1"
+version = "0.8.0"
 edition = "2024"
 
 [lib]
@@ -24,7 +24,8 @@ tempfile = "3"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 rand = "0.9"
 rand08 = { package = "rand", version = "0.8" }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "net", "sync", "time"] }
 semver = "1"
 toml = "0.8"
 pgp = "0.14"
