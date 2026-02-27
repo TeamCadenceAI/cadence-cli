@@ -12,6 +12,14 @@ use std::process::Command;
 
 /// The dedicated git notes ref for AI session data.
 pub const NOTES_REF: &str = "refs/notes/ai-sessions";
+/// Dedicated ref that anchors payload blobs so push doesn't need full notes scans.
+pub const PAYLOAD_REF: &str = "refs/notes/ai-payloads";
+
+/// Result of fetching a single ref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchResult {
+    pub fetched: bool,
+}
 
 /// Validate that a commit hash is a valid hex string of 7-40 characters.
 ///
@@ -142,6 +150,39 @@ pub(crate) fn run_git_output_at(
     Ok(output)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn run_git_output_at_async(
+    repo: Option<&Path>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("git");
+
+    if let Some(repo) = repo {
+        cmd.args(["-C", &repo.to_string_lossy()]);
+    }
+
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+
+    if output::is_verbose() {
+        let mut display_parts = vec!["git".to_string()];
+        if let Some(repo) = repo {
+            display_parts.push("-C".to_string());
+            display_parts.push(repo.to_string_lossy().to_string());
+        }
+        display_parts.extend(args.iter().map(|s| s.to_string()));
+        output::detail(&display_parts.join(" "));
+    }
+
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    cmd.output().await.context("failed to execute git")
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Stream {
     Stdout,
@@ -256,6 +297,7 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 ///
 /// This is the directory-parameterised version of [`note_exists`], for use
 /// by commands that operate on repos other than the CWD (e.g., `backfill`).
+#[allow(dead_code)]
 pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     validate_commit_hash(commit)?;
     let output = run_git_output_at(
@@ -265,6 +307,24 @@ pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     )
     .context("failed to execute git notes show")?;
     Ok(output.status.success())
+}
+
+/// Read the AI-session note content for a commit in a specific repository.
+pub(crate) fn read_note_at(repo: Option<&Path>, commit: &str) -> Result<String> {
+    validate_commit_hash(commit)?;
+    let output = run_git_output_at(
+        repo,
+        &["notes", "--ref", NOTES_REF, "show", "--", commit],
+        &[],
+    )
+    .context("failed to execute git notes show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git notes show failed: {}", stderr.trim());
+    }
+
+    String::from_utf8(output.stdout).context("git notes show output was not valid UTF-8")
 }
 
 /// Attach an AI-session note to a commit in a specific repository directory.
@@ -296,6 +356,32 @@ pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git notes add failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Force-replace (or create) an AI-session note on a commit in a specific repo.
+pub(crate) fn add_note_force_at(repo: Option<&Path>, commit: &str, content: &str) -> Result<()> {
+    validate_commit_hash(commit)?;
+
+    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
+    tmp.write_all(content.as_bytes())
+        .context("failed to write note to temp file")?;
+    tmp.flush().context("failed to flush note temp file")?;
+    let tmp_path = tmp.path().to_string_lossy().to_string();
+
+    let output = run_git_output_at(
+        repo,
+        &[
+            "notes", "--ref", NOTES_REF, "add", "-f", "-F", &tmp_path, "--", commit,
+        ],
+        &[],
+    )
+    .context("failed to execute git notes add -f")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git notes add -f failed: {}", stderr.trim());
     }
     Ok(())
 }
@@ -386,6 +472,139 @@ pub(crate) fn list_notes_at(repo: Option<&Path>) -> Result<Vec<(String, String)>
     Ok(entries)
 }
 
+/// Convert a 40-char blob SHA into the payload tree fanout path `aa/<rest>`.
+pub(crate) fn payload_path_for_sha(sha: &str) -> Result<String> {
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid payload blob SHA: {}", sha);
+    }
+    Ok(format!("{}/{}", &sha[..2], &sha[2..]))
+}
+
+/// Alias for ls-tree helper, used by payload ref plumbing for readability.
+pub(crate) fn list_tree_entries_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<String>> {
+    ls_tree_at(repo, treeish)
+}
+
+/// Check whether a ref exists locally in a repository.
+pub(crate) fn ref_exists_at(repo: Option<&Path>, ref_name: &str) -> Result<bool> {
+    let output = run_git_output_at(repo, &["show-ref", "--verify", "--quiet", ref_name], &[])
+        .context("failed to execute git show-ref --verify")?;
+    Ok(output.status.success())
+}
+
+/// Get a local ref hash if present, `None` if it does not exist.
+pub(crate) fn local_ref_hash_at(repo: Option<&Path>, ref_name: &str) -> Result<Option<String>> {
+    let output = run_git_output_at(repo, &["show-ref", "--verify", "--hash", ref_name], &[])
+        .context("failed to execute git show-ref --hash")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let hash = stdout.trim();
+    if hash.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hash.to_string()))
+    }
+}
+
+/// Get the hash of a remote ref via `ls-remote`.
+pub(crate) fn remote_ref_hash_at(
+    repo: Option<&Path>,
+    remote: &str,
+    ref_name: &str,
+) -> Result<Option<String>> {
+    let output = run_git_output_at(
+        repo,
+        &[
+            "-c",
+            "protocol.version=2",
+            "ls-remote",
+            "--refs",
+            remote,
+            ref_name,
+        ],
+        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
+    )
+    .context("failed to execute git ls-remote")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git ls-remote failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let line = stdout.lines().next().unwrap_or("");
+    let hash = line.split_whitespace().next().unwrap_or("");
+    if hash.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hash.to_string()))
+    }
+}
+
+/// Fetch a specific remote ref into a temp local ref.
+///
+/// Returns `fetched=false` when the remote ref does not exist.
+pub(crate) fn fetch_ref_to_temp_at(
+    repo: Option<&Path>,
+    remote: &str,
+    src_ref: &str,
+    dst_temp_ref: &str,
+) -> Result<FetchResult> {
+    let fetch_spec = format!("+{}:{}", src_ref, dst_temp_ref);
+    let fetch_status = run_git_output_at(
+        repo,
+        &["fetch", remote, &fetch_spec],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git fetch")?;
+
+    if !fetch_status.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch_status.stderr);
+        let stderr_trim = stderr.trim();
+        if stderr_trim.contains("couldn't find remote ref") && stderr_trim.contains(src_ref) {
+            return Ok(FetchResult { fetched: false });
+        }
+        bail!("git fetch ref failed: {}", stderr_trim);
+    }
+
+    Ok(FetchResult { fetched: true })
+}
+
+fn force_with_lease_arg(ref_name: &str, remote_hash: &Option<String>) -> String {
+    match remote_hash {
+        Some(hash) => format!("--force-with-lease={}:{}", ref_name, hash),
+        None => format!(
+            "--force-with-lease={}:{}",
+            ref_name, "0000000000000000000000000000000000000000"
+        ),
+    }
+}
+
+/// Push a single ref with `--force-with-lease`.
+pub(crate) fn push_ref_with_lease_at(
+    repo: Option<&Path>,
+    remote: &str,
+    ref_name: &str,
+    expected_remote_hash: &Option<String>,
+) -> Result<()> {
+    let lease = force_with_lease_arg(ref_name, expected_remote_hash);
+    let output = run_git_output_at(
+        repo,
+        &["push", "--no-verify", &lease, remote, ref_name],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    )
+    .context("failed to execute git push with lease")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git push ref failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
 /// List top-level tree entries for a treeish (commit, tree, or ref).
 ///
 /// Returns raw `git ls-tree` output lines, one per entry, in the format:
@@ -407,6 +626,91 @@ pub(crate) fn ls_tree_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<Strin
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect())
+}
+
+fn parse_ls_tree_entry(line: &str) -> Option<(String, String, String, String)> {
+    let (meta, name) = line.split_once('\t')?;
+    let mut parts = meta.split_whitespace();
+    let mode = parts.next()?.to_string();
+    let kind = parts.next()?.to_string();
+    let sha = parts.next()?.to_string();
+    Some((mode, kind, sha, name.to_string()))
+}
+
+/// Ensure a payload blob is reachable from `refs/notes/ai-payloads`.
+///
+/// This is idempotent. If the path already exists, no ref update is performed.
+pub(crate) fn ensure_payload_blob_referenced_at(repo: &Path, blob_sha: &str) -> Result<()> {
+    let payload_path = payload_path_for_sha(blob_sha)?;
+    let mut path_parts = payload_path.splitn(2, '/');
+    let fanout_dir = path_parts.next().unwrap_or("");
+    let fanout_name = path_parts.next().unwrap_or("");
+    if fanout_dir.is_empty() || fanout_name.is_empty() {
+        bail!("invalid payload path {}", payload_path);
+    }
+
+    let tip = rev_parse_at(Some(repo), PAYLOAD_REF).ok();
+    let mut root_entries: Vec<(String, String, String, String)> = Vec::new();
+    if let Some(ref tip_sha) = tip {
+        let tree_rev = format!("{}^{{tree}}", tip_sha);
+        for line in ls_tree_at(Some(repo), &tree_rev)? {
+            if let Some(parsed) = parse_ls_tree_entry(&line) {
+                root_entries.push(parsed);
+            }
+        }
+    }
+
+    let existing_fanout_tree = root_entries
+        .iter()
+        .find(|(_, kind, _, name)| kind == "tree" && name == fanout_dir)
+        .map(|(_, _, sha, _)| sha.clone());
+
+    let mut fanout_entries: Vec<(String, String, String, String)> = Vec::new();
+    if let Some(tree_sha) = existing_fanout_tree {
+        for line in ls_tree_at(Some(repo), &tree_sha)? {
+            if let Some(parsed) = parse_ls_tree_entry(&line) {
+                fanout_entries.push(parsed);
+            }
+        }
+    }
+
+    if fanout_entries
+        .iter()
+        .any(|(_, _, sha, name)| name == fanout_name && sha == blob_sha)
+    {
+        return Ok(());
+    }
+
+    fanout_entries.retain(|(_, _, _, name)| name != fanout_name);
+    fanout_entries.push((
+        "100644".to_string(),
+        "blob".to_string(),
+        blob_sha.to_string(),
+        fanout_name.to_string(),
+    ));
+    let mut fanout_lines: Vec<String> = fanout_entries
+        .into_iter()
+        .map(|(mode, kind, sha, name)| format!("{mode} {kind} {sha}\t{name}"))
+        .collect();
+    fanout_lines.sort();
+    let fanout_tree = mktree_at(Some(repo), &fanout_lines)?;
+
+    root_entries.retain(|(_, _, _, name)| name != fanout_dir);
+    root_entries.push((
+        "040000".to_string(),
+        "tree".to_string(),
+        fanout_tree,
+        fanout_dir.to_string(),
+    ));
+    let mut root_lines: Vec<String> = root_entries
+        .into_iter()
+        .map(|(mode, kind, sha, name)| format!("{mode} {kind} {sha}\t{name}"))
+        .collect();
+    root_lines.sort();
+    let new_tree = mktree_at(Some(repo), &root_lines)?;
+    let new_commit = commit_tree_at(Some(repo), &new_tree, "cadence payloads", tip.as_deref())?;
+    update_ref_at(Some(repo), PAYLOAD_REF, &new_commit)?;
+    Ok(())
 }
 
 /// Create a tree object from `ls-tree`-formatted entry lines.
@@ -570,6 +874,67 @@ pub(crate) fn commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
+/// Return paths changed by a commit (relative to repo root).
+pub(crate) fn commit_changed_paths_at(repo: &Path, commit: &str) -> Result<Vec<String>> {
+    validate_commit_hash(commit)?;
+    let output = run_git_output_at(
+        Some(repo),
+        &["show", "--pretty=format:", "--name-only", "--", commit],
+        &[],
+    )
+    .context("failed to execute git show --name-only")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show --name-only failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .context("git show --name-only output was not valid UTF-8")?;
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if seen.insert(path.to_string()) {
+            paths.push(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+/// Return commit patch text, capped to `max_bytes` bytes.
+pub(crate) fn commit_patch_text_at(repo: &Path, commit: &str, max_bytes: usize) -> Result<String> {
+    validate_commit_hash(commit)?;
+    let output = run_git_output_at(
+        Some(repo),
+        &[
+            "show",
+            "--pretty=format:",
+            "--no-color",
+            "--no-ext-diff",
+            "--patch",
+            "--",
+            commit,
+        ],
+        &[],
+    )
+    .context("failed to execute git show --patch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show --patch failed: {}", stderr.trim());
+    }
+
+    let mut bytes = output.stdout;
+    if bytes.len() > max_bytes {
+        bytes.truncate(max_bytes);
+    }
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// Return full commit hashes within the given time range for a repository.
 ///
 /// Uses `git log --since=@<start> --until=@<end> --format=%H`.
@@ -630,6 +995,11 @@ pub fn note_exists(commit: &str) -> Result<bool> {
     git_succeeds(&["notes", "--ref", NOTES_REF, "show", "--", commit])
 }
 
+/// Read the AI-session note content for the given commit.
+pub fn read_note(commit: &str) -> Result<String> {
+    read_note_at(None, commit)
+}
+
 /// Attach an AI-session note to the given commit.
 ///
 /// **Precondition:** Callers must check [`note_exists`] first and skip if a note
@@ -660,6 +1030,11 @@ pub fn add_note(commit: &str, content: &str) -> Result<()> {
         bail!("git notes add failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+/// Force-replace (or create) an AI-session note on the given commit.
+pub fn add_note_force(commit: &str, content: &str) -> Result<()> {
+    add_note_force_at(None, commit, content)
 }
 
 /// A single `git log` entry annotated with whether it has a note.
@@ -1441,6 +1816,20 @@ mod tests {
         let note_content =
             git_output_in(path, &["notes", "--ref", NOTES_REF, "show", &hash]).unwrap();
         assert_eq!(note_content, "test note content");
+    }
+
+    #[test]
+    fn test_add_note_force_replaces_existing_note_content() {
+        let dir = init_temp_repo();
+        let path = dir.path();
+        let hash = run_git(path, &["rev-parse", "HEAD"]);
+
+        add_note_at(path, &hash, "first content").expect("add_note_at");
+        add_note_force_at(Some(path), &hash, "updated content").expect("add_note_force_at");
+
+        let note_content =
+            git_output_in(path, &["notes", "--ref", NOTES_REF, "show", &hash]).unwrap();
+        assert_eq!(note_content, "updated content");
     }
 
     // -----------------------------------------------------------------------
@@ -2343,5 +2732,32 @@ mod tests {
         let head = run_git(dir.path(), &["rev-parse", "HEAD"]);
         let resolved = rev_parse_at(Some(dir.path()), "HEAD").expect("rev_parse_at failed");
         assert_eq!(resolved, head);
+    }
+
+    #[test]
+    fn test_payload_path_for_sha_fanout() {
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+        let path = payload_path_for_sha(sha).expect("payload path");
+        assert_eq!(path, "ab/cdef0123456789abcdef0123456789abcdef01");
+    }
+
+    #[test]
+    fn test_payload_path_for_sha_rejects_invalid() {
+        let bad = payload_path_for_sha("not-a-sha");
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn test_ensure_payload_blob_referenced_idempotent() {
+        let dir = init_temp_repo();
+        let blob_sha = store_blob_at(Some(dir.path()), b"payload bytes").expect("blob");
+
+        ensure_payload_blob_referenced_at(dir.path(), &blob_sha).expect("first ensure");
+        let first_tip = rev_parse_at(Some(dir.path()), PAYLOAD_REF).expect("first tip");
+
+        ensure_payload_blob_referenced_at(dir.path(), &blob_sha).expect("second ensure");
+        let second_tip = rev_parse_at(Some(dir.path()), PAYLOAD_REF).expect("second tip");
+
+        assert_eq!(first_tip, second_tip, "second ensure should be no-op");
     }
 }

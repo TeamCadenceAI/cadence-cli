@@ -12,7 +12,7 @@ Common commands:
 ```sh
 cargo build
 cargo build --release
-cargo test
+cargo test --no-fail-fast
 cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
@@ -27,7 +27,7 @@ cargo fmt -- --check
 
 Run the full suite:
 ```sh
-cargo test
+cargo test --no-fail-fast
 ```
 
 Run a single test:

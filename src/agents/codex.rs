@@ -51,9 +51,25 @@ pub fn log_dirs() -> Vec<PathBuf> {
 /// Separated from `log_dirs` for testability -- tests pass a temp directory
 /// instead of the real home, avoiding `unsafe` env var manipulation.
 fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
-    let sessions_dir = home.join(".codex").join("sessions");
+    let codex_home = std::env::var("CODEX_HOME").ok().map(PathBuf::from);
+    log_dirs_in_with_codex_home(home, codex_home.as_deref())
+}
+
+fn log_dirs_in_with_codex_home(home: &Path, codex_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut session_roots = vec![home.join(".codex").join("sessions")];
+    if let Some(custom_home) = codex_home {
+        let candidate = custom_home.join("sessions");
+        if !session_roots.contains(&candidate) {
+            session_roots.push(candidate);
+        }
+    }
+
     let mut dirs = Vec::new();
-    collect_dirs_with_jsonl(&sessions_dir, &mut dirs);
+    for root in &session_roots {
+        collect_dirs_with_jsonl(root, &mut dirs);
+    }
+    dirs.sort();
+    dirs.dedup();
     dirs
 }
 
@@ -208,5 +224,40 @@ mod tests {
         let result = log_dirs_in(home.path());
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_log_dirs_supports_codex_home_override() {
+        let home = TempDir::new().unwrap();
+        let codex_home = TempDir::new().unwrap();
+        let override_day = codex_home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("10");
+        fs::create_dir_all(&override_day).unwrap();
+        fs::write(override_day.join("zed-session.jsonl"), "{}").unwrap();
+
+        let result = log_dirs_in_with_codex_home(home.path(), Some(codex_home.path()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], override_day);
+    }
+
+    #[test]
+    fn test_log_dirs_dedupes_default_and_override_roots() {
+        let home = TempDir::new().unwrap();
+        let shared_home = home.path().join(".codex");
+        let day = shared_home
+            .join("sessions")
+            .join("2026")
+            .join("02")
+            .join("10");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("session.jsonl"), "{}").unwrap();
+
+        let result = log_dirs_in_with_codex_home(home.path(), Some(&shared_home));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], day);
     }
 }
