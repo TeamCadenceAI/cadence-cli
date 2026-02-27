@@ -16,9 +16,11 @@ use time::format_description::well_known::Rfc3339;
 
 /// Confidence level of the match between session and commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Confidence {
     ExactHashMatch,
     TimeWindowMatch,
+    ScoredMatch,
 }
 
 impl std::fmt::Display for Confidence {
@@ -26,6 +28,7 @@ impl std::fmt::Display for Confidence {
         match self {
             Confidence::ExactHashMatch => write!(f, "exact_hash_match"),
             Confidence::TimeWindowMatch => write!(f, "time_window_match"),
+            Confidence::ScoredMatch => write!(f, "scored_match"),
         }
     }
 }
@@ -176,6 +179,7 @@ impl std::fmt::Display for PayloadEncoding {
 /// ---
 /// ```
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn format_v2(
     agent: &AgentType,
     session_id: &str,
@@ -186,6 +190,36 @@ pub fn format_v2(
     payload_blob: &str,
     payload_sha256_hex: &str,
     payload_encoding: PayloadEncoding,
+) -> anyhow::Result<String> {
+    format_v2_with_match_details(
+        agent,
+        session_id,
+        repo,
+        commit,
+        confidence,
+        session_start,
+        payload_blob,
+        payload_sha256_hex,
+        payload_encoding,
+        None,
+        None,
+    )
+}
+
+/// Produce a v2 pointer note with optional scoring diagnostics.
+#[allow(clippy::too_many_arguments)]
+pub fn format_v2_with_match_details(
+    agent: &AgentType,
+    session_id: &str,
+    repo: &str,
+    commit: &str,
+    confidence: Confidence,
+    session_start: Option<i64>,
+    payload_blob: &str,
+    payload_sha256_hex: &str,
+    payload_encoding: PayloadEncoding,
+    match_score: Option<f64>,
+    match_reasons: Option<&[String]>,
 ) -> anyhow::Result<String> {
     crate::git::validate_commit_hash(commit)?;
 
@@ -206,6 +240,14 @@ pub fn format_v2(
     note.push_str(&format!("payload_blob: {}\n", payload_blob));
     note.push_str(&format!("payload_sha256: {}\n", payload_sha256_hex));
     note.push_str(&format!("payload_encoding: {}\n", payload_encoding));
+    if let Some(score) = match_score {
+        note.push_str(&format!("match_score: {:.3}\n", score));
+    }
+    if let Some(reasons) = match_reasons
+        && !reasons.is_empty()
+    {
+        note.push_str(&format!("match_reasons: {}\n", reasons.join(",")));
+    }
     note.push_str("---\n");
 
     Ok(note)

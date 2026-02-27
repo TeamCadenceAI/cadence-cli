@@ -809,110 +809,61 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 3: Collect candidate files across all agents
     let candidate_files = agents::all_candidate_files(&repo_root, head_timestamp, 600);
 
-    // Step 5: Run scanner to find session match
-    let session_match = scanner::find_session_for_commit(&head_hash, &candidate_files);
+    let selected = select_session_for_commit(
+        &head_hash,
+        &repo_root,
+        head_timestamp,
+        &candidate_files,
+        600,
+    );
 
     let mut attached = false;
-    if let Some(ref matched) = session_match {
-        // Step 6a: Parse metadata and verify match
-        let metadata = scanner::parse_session_metadata(&matched.file_path);
-
-        if scanner::verify_match(&metadata, &repo_root, &head_hash) {
-            // Read the full session log. If the read fails (permissions,
-            // file deleted between match and read, etc.), fall through to
-            // the pending path so it can be retried later.
-            //
-            // Note: `read_to_string` loads the entire file into memory.
-            // This is acceptable because session logs are typically small
-            // (tens of KB to a few MB).
-            let session_log = match std::fs::read_to_string(&matched.file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    output::note(&format!("Could not read session log ({})", e));
-                    if let Err(e) =
-                        pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
-                    {
-                        output::note(&format!("Could not write pending record ({})", e));
-                    }
-                    spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
-                    // Skip note attachment; retry will pick this up later
-                    return Ok(());
+    if let Some(selected) = selected {
+        let scanner::SelectedSession {
+            candidate,
+            confidence,
+            reason_codes,
+        } = selected;
+        let session_log = match std::fs::read_to_string(&candidate.file_path) {
+            Ok(content) => content,
+            Err(e) => {
+                output::note(&format!("Could not read session log ({})", e));
+                if let Err(e) = pending::write_pending(&head_hash, &repo_root_str, head_timestamp) {
+                    output::note(&format!("Could not write pending record ({})", e));
                 }
-            };
+                spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
+                return Ok(());
+            }
+        };
 
-            let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
-            let session_start =
-                scanner::session_time_range(&matched.file_path).map(|(start, _)| start);
+        attach_note_from_log(
+            &candidate.agent_type,
+            &candidate.session_id,
+            &repo_root_str,
+            &head_hash,
+            &session_log,
+            confidence,
+            &encryption_method,
+            candidate.session_start,
+            Some(candidate.score),
+            Some(&reason_codes),
+        )
+        .map_err(|e| {
+            if encryption_method.is_configured() {
+                HookError::EncryptionFailed(format!("{:#}", e))
+            } else {
+                HookError::Soft(e)
+            }
+        })?;
 
-            // Attach the note (encryption failure blocks the commit when configured)
-            attach_note_from_log(
-                &matched.agent_type,
-                session_id,
-                &repo_root_str,
-                &head_hash,
-                &session_log,
-                note::Confidence::ExactHashMatch,
-                &encryption_method,
-                session_start,
-            )
-            .map_err(|e| {
-                if encryption_method.is_configured() {
-                    HookError::EncryptionFailed(format!("{:#}", e))
-                } else {
-                    HookError::Soft(e)
-                }
-            })?;
+        log_attached_session(
+            &candidate.agent_type,
+            &candidate.session_id,
+            &head_hash,
+            confidence,
+        );
 
-            log_attached_session(&matched.agent_type, session_id, &head_hash, false);
-
-            attached = true;
-        }
-    }
-
-    if !attached {
-        // Step 6b: No exact match found — attempt time-based fallback
-        if let Some(fallback) =
-            fallback_match_for_commit(head_timestamp, &repo_root, &candidate_files, 600)
-        {
-            let session_log = match std::fs::read_to_string(&fallback.file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    output::note(&format!("Could not read session log ({})", e));
-                    if let Err(e) =
-                        pending::write_pending(&head_hash, &repo_root_str, head_timestamp)
-                    {
-                        output::note(&format!("Could not write pending record ({})", e));
-                    }
-                    spawn_background_retry(&head_hash, &repo_root_str, head_timestamp);
-                    return Ok(());
-                }
-            };
-
-            let session_start =
-                scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
-
-            attach_note_from_log(
-                &fallback.agent_type,
-                &fallback.session_id,
-                &repo_root_str,
-                &head_hash,
-                &session_log,
-                note::Confidence::TimeWindowMatch,
-                &encryption_method,
-                session_start,
-            )
-            .map_err(|e| {
-                if encryption_method.is_configured() {
-                    HookError::EncryptionFailed(format!("{:#}", e))
-                } else {
-                    HookError::Soft(e)
-                }
-            })?;
-
-            log_attached_session(&fallback.agent_type, &fallback.session_id, &head_hash, true);
-
-            attached = true;
-        }
+        attached = true;
     }
 
     if !attached {
@@ -963,7 +914,7 @@ fn log_attached_session(
     agent: &scanner::AgentType,
     session_id: &str,
     commit_hash: &str,
-    is_fallback: bool,
+    confidence: note::Confidence,
 ) {
     let mut message = format!(
         "Attached {} session {} to commit {}",
@@ -971,8 +922,11 @@ fn log_attached_session(
         session_id,
         &commit_hash[..7]
     );
-    if is_fallback {
+    if confidence == note::Confidence::TimeWindowMatch {
         message.push_str(" (time window match)");
+    }
+    if confidence == note::Confidence::ScoredMatch {
+        message.push_str(" (scored match)");
     }
     output::success("[Cadence]", &message);
 }
@@ -989,18 +943,6 @@ const MAX_RETRY_ATTEMPTS: u32 = 20;
 /// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
 const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
 
-/// If two fallback candidates are within this many seconds, treat as ambiguous.
-const FALLBACK_AMBIGUITY_MARGIN_SECS: i64 = 120;
-
-/// Expand session time ranges by this many seconds when matching commits.
-const FALLBACK_RANGE_BUFFER_SECS: i64 = 300;
-
-struct FallbackMatch {
-    file_path: std::path::PathBuf,
-    agent_type: scanner::AgentType,
-    session_id: String,
-}
-
 fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
@@ -1008,89 +950,76 @@ fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     Some(mtime_epoch)
 }
 
-fn metadata_repo_matches(metadata: &scanner::SessionMetadata, repo_root: &std::path::Path) -> bool {
-    let cwd = match &metadata.cwd {
-        Some(c) => c,
-        None => return false,
-    };
-    let cwd_path = std::path::Path::new(cwd);
-    match git::repo_root_at(cwd_path) {
-        Ok(cwd_repo_root) => {
-            let canonical_repo = repo_root
-                .canonicalize()
-                .unwrap_or_else(|_| repo_root.to_path_buf());
-            let canonical_cwd_repo = cwd_repo_root.canonicalize().unwrap_or(cwd_repo_root);
-            canonical_repo == canonical_cwd_repo
-        }
-        Err(_) => false,
-    }
-}
-
-fn fallback_match_for_commit(
-    commit_time: i64,
-    repo_root: &std::path::Path,
-    candidate_files: &[std::path::PathBuf],
-    time_window: i64,
-) -> Option<FallbackMatch> {
-    let mut candidates: Vec<(i64, std::path::PathBuf, scanner::SessionMetadata)> = Vec::new();
-
-    for file_path in candidate_files {
-        let metadata = scanner::parse_session_metadata(file_path);
-        if !metadata_repo_matches(&metadata, repo_root) {
-            continue;
-        }
-
-        let distance = if let Some((start_ts, end_ts)) = scanner::session_time_range(file_path) {
-            let start = start_ts - FALLBACK_RANGE_BUFFER_SECS;
-            let end = end_ts + FALLBACK_RANGE_BUFFER_SECS;
-            if commit_time >= start && commit_time <= end {
-                0
-            } else {
-                let d1 = (commit_time - start_ts).abs();
-                let d2 = (commit_time - end_ts).abs();
-                d1.min(d2)
-            }
-        } else {
-            let mtime = match file_mtime_epoch(file_path) {
-                Some(t) => t,
-                None => continue,
-            };
-            (commit_time - mtime).abs()
-        };
-
-        if distance <= time_window {
-            candidates.push((distance, file_path.clone(), metadata));
-        }
-    }
-
-    if candidates.is_empty() {
+fn commit_timestamp_at(repo: &std::path::Path, commit: &str) -> Option<i64> {
+    let output = git::run_git_output_at(
+        Some(repo),
+        &["show", "-s", "--format=%ct", "--", commit],
+        &[],
+    )
+    .ok()?;
+    if !output.status.success() {
         return None;
     }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.trim().parse::<i64>().ok()
+}
 
-    candidates.sort_by_key(|(distance, _, _)| *distance);
-    if candidates.len() >= 2 {
-        let diff = (candidates[1].0 - candidates[0].0).abs();
-        if diff <= FALLBACK_AMBIGUITY_MARGIN_SECS {
-            return None;
+fn match_max_diff_bytes() -> usize {
+    const DEFAULT_MAX_DIFF_BYTES: usize = 131_072;
+    std::env::var("CADENCE_MATCH_MAX_DIFF_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_DIFF_BYTES)
+}
+
+fn select_session_for_commit(
+    commit: &str,
+    repo_root: &std::path::Path,
+    commit_time: i64,
+    candidate_files: &[std::path::PathBuf],
+    time_window: i64,
+) -> Option<scanner::SelectedSession> {
+    let commit_paths = git::commit_changed_paths_at(repo_root, commit).unwrap_or_default();
+    let commit_patch =
+        git::commit_patch_text_at(repo_root, commit, match_max_diff_bytes()).unwrap_or_default();
+    let ranked = scanner::rank_sessions_for_commit(
+        commit,
+        repo_root,
+        commit_time,
+        time_window,
+        candidate_files,
+        &commit_paths,
+        &commit_patch,
+    );
+
+    if output::is_verbose() {
+        for (idx, candidate) in ranked.iter().take(3).enumerate() {
+            output::detail(&format!(
+                "match candidate #{} score={:.3} session={} file={} reasons={}",
+                idx + 1,
+                candidate.score,
+                candidate.session_id,
+                candidate.file_path.display(),
+                candidate.reasons.join(",")
+            ));
         }
     }
 
-    let (_, file_path, metadata) = candidates.remove(0);
-    let agent_type = metadata
-        .agent_type
-        .clone()
-        .unwrap_or(scanner::AgentType::Claude);
-    let session_id = metadata
-        .session_id
-        .as_deref()
-        .unwrap_or("unknown")
-        .to_string();
-
-    Some(FallbackMatch {
-        file_path,
-        agent_type,
-        session_id,
-    })
+    let selected = scanner::select_best_session(&ranked);
+    if selected.is_none() && output::is_verbose() {
+        if let Some(top) = ranked.first() {
+            output::detail(&format!(
+                "no candidate selected: top score {:.3} below threshold {:.3} or ambiguous margin {:.3}",
+                top.score,
+                scanner::min_accept_score(),
+                scanner::min_margin_score()
+            ));
+        } else {
+            output::detail("no candidate selected: no repo-matching session candidates");
+        }
+    }
+    selected
 }
 
 /// Pre-computed payload blob info for deduplication across commits.
@@ -1113,6 +1042,8 @@ fn attach_note_from_log(
     confidence: note::Confidence,
     method: &EncryptionMethod,
     session_start: Option<i64>,
+    match_score: Option<f64>,
+    match_reasons: Option<&[String]>,
 ) -> Result<()> {
     attach_note_from_log_v2(
         agent_type,
@@ -1123,6 +1054,8 @@ fn attach_note_from_log(
         confidence,
         method,
         session_start,
+        match_score,
+        match_reasons,
         true,
         None, // no pre-stored payload — will store a new blob
         None, // use CWD repo
@@ -1143,6 +1076,8 @@ fn attach_note_from_log_v2(
     confidence: note::Confidence,
     method: &EncryptionMethod,
     session_start: Option<i64>,
+    match_score: Option<f64>,
+    match_reasons: Option<&[String]>,
     anchor_payload_ref: bool,
     existing_payload: Option<&PayloadInfo>,
     repo: Option<&std::path::Path>,
@@ -1158,7 +1093,7 @@ fn attach_note_from_log_v2(
     };
 
     // Build the v2 pointer note
-    let note_content = note::format_v2(
+    let note_content = note::format_v2_with_match_details(
         agent_type,
         session_id,
         repo_str,
@@ -1168,6 +1103,8 @@ fn attach_note_from_log_v2(
         &blob_sha,
         &payload_sha256,
         encoding,
+        match_score,
+        match_reasons,
     )?;
 
     // Pointer note stays plaintext — only the payload blob is encrypted.
@@ -1312,112 +1249,38 @@ fn try_resolve_single_commit(
     // Collect candidate files across all agents
     let candidate_files = agents::all_candidate_files(repo_root, commit_time, time_window);
 
-    let session_match = scanner::find_session_for_commit(commit, &candidate_files);
-
-    let matched = match session_match {
-        Some(m) => m,
-        None => {
-            if let Some(fallback) =
-                fallback_match_for_commit(commit_time, repo_root, &candidate_files, time_window)
-            {
-                let session_log = match std::fs::read_to_string(&fallback.file_path) {
-                    Ok(content) => content,
-                    Err(_) => return ResolveResult::TransientError,
-                };
-
-                let session_start =
-                    scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
-
-                if attach_note_from_log(
-                    &fallback.agent_type,
-                    &fallback.session_id,
-                    repo_str,
-                    commit,
-                    &session_log,
-                    note::Confidence::TimeWindowMatch,
-                    method,
-                    session_start,
-                )
-                .is_ok()
-                {
-                    output::success(
-                        "Retry",
-                        &format!(
-                            "attached session {} to commit {} (time window match)",
-                            fallback.session_id,
-                            &commit[..std::cmp::min(7, commit.len())]
-                        ),
-                    );
-
-                    return ResolveResult::Attached;
-                }
-                return ResolveResult::TransientError;
-            }
-
-            return ResolveResult::NotFound;
-        }
+    let selected = match select_session_for_commit(
+        commit,
+        repo_root,
+        commit_time,
+        &candidate_files,
+        time_window,
+    ) {
+        Some(s) => s,
+        None => return ResolveResult::NotFound,
     };
+    let scanner::SelectedSession {
+        candidate,
+        confidence,
+        reason_codes,
+    } = selected;
 
-    let metadata = scanner::parse_session_metadata(&matched.file_path);
-
-    if !scanner::verify_match(&metadata, repo_root, commit) {
-        if let Some(fallback) =
-            fallback_match_for_commit(commit_time, repo_root, &candidate_files, time_window)
-        {
-            let session_log = match std::fs::read_to_string(&fallback.file_path) {
-                Ok(content) => content,
-                Err(_) => return ResolveResult::TransientError,
-            };
-
-            let session_start =
-                scanner::session_time_range(&fallback.file_path).map(|(start, _)| start);
-
-            if attach_note_from_log(
-                &fallback.agent_type,
-                &fallback.session_id,
-                repo_str,
-                commit,
-                &session_log,
-                note::Confidence::TimeWindowMatch,
-                method,
-                session_start,
-            )
-            .is_ok()
-            {
-                output::success(
-                    "Retry",
-                    &format!(
-                        "attached session {} to commit {} (time window match)",
-                        fallback.session_id,
-                        &commit[..std::cmp::min(7, commit.len())]
-                    ),
-                );
-
-                return ResolveResult::Attached;
-            }
-            return ResolveResult::TransientError;
-        }
-
-        return ResolveResult::NotFound;
-    }
-
-    let session_log = match std::fs::read_to_string(&matched.file_path) {
+    let session_log = match std::fs::read_to_string(&candidate.file_path) {
         Ok(content) => content,
         Err(_) => return ResolveResult::TransientError,
     };
 
-    let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
-    let session_start = scanner::session_time_range(&matched.file_path).map(|(start, _)| start);
-
     if attach_note_from_log(
-        &matched.agent_type,
-        session_id,
+        &candidate.agent_type,
+        &candidate.session_id,
         repo_str,
         commit,
         &session_log,
-        note::Confidence::ExactHashMatch,
+        confidence,
         method,
-        session_start,
+        candidate.session_start,
+        Some(candidate.score),
+        Some(&reason_codes),
     )
     .is_ok()
     {
@@ -1425,7 +1288,7 @@ fn try_resolve_single_commit(
             "Retry",
             &format!(
                 "attached session {} to commit {}",
-                session_id,
+                candidate.session_id,
                 &commit[..std::cmp::min(7, commit.len())]
             ),
         );
@@ -1823,18 +1686,47 @@ fn run_hydrate_inner(
                             }
                         };
 
-                    if commits.len() != 1 {
-                        let status = if commits.is_empty() {
-                            "no commits in time window"
-                        } else {
-                            "ambiguous commits in time window"
-                        };
-                        print_detail(&format!("{} {}", header, status));
+                    if commits.is_empty() {
+                        print_detail(&format!("{} no commits in time window", header));
                         break 'process_session;
                     }
 
-                    let hash = &commits[0];
-                    match git::note_exists_at(&session.repo_root, hash) {
+                    let mut scored: Vec<(String, scanner::SelectedSession)> = Vec::new();
+                    for hash in &commits {
+                        let commit_time = match commit_timestamp_at(&session.repo_root, hash) {
+                            Some(ts) => ts,
+                            None => continue,
+                        };
+                        if let Some(selected) = select_session_for_commit(
+                            hash,
+                            &session.repo_root,
+                            commit_time,
+                            std::slice::from_ref(&session.file),
+                            86_400,
+                        ) {
+                            scored.push((hash.clone(), selected));
+                        }
+                    }
+                    scored.sort_by(|a, b| {
+                        b.1.candidate
+                            .score
+                            .partial_cmp(&a.1.candidate.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    if scored.is_empty() {
+                        print_detail(&format!("{} no high-confidence commit match", header));
+                        break 'process_session;
+                    }
+                    if scored.len() > 1
+                        && (scored[0].1.candidate.score - scored[1].1.candidate.score)
+                            < scanner::min_margin_score()
+                    {
+                        print_detail(&format!("{} ambiguous commits in time window", header));
+                        break 'process_session;
+                    }
+
+                    let (hash, selected) = scored.remove(0);
+                    match git::note_exists_at(&session.repo_root, &hash) {
                         Ok(true) => {
                             skipped += 1;
                             print_detail(&format!(
@@ -1883,22 +1775,27 @@ fn run_hydrate_inner(
                         &agent_type,
                         &session.session_id,
                         &repo_str,
-                        hash,
+                        &hash,
                         &session_log,
-                        note::Confidence::TimeWindowMatch,
+                        selected.confidence,
                         &encryption_method,
                         session_start,
+                        Some(selected.candidate.score),
+                        Some(&selected.reason_codes),
                         true,
                         None,
                         Some(&session.repo_root),
                     ) {
                         Ok(()) => {
                             attached += 1;
-                            fallback_attached += 1;
+                            if selected.confidence == note::Confidence::TimeWindowMatch {
+                                fallback_attached += 1;
+                            }
                             print_detail(&format!(
-                                "{} commit {} attached (time window match)",
+                                "{} commit {} attached ({})",
                                 header,
-                                &hash[..7]
+                                &hash[..7],
+                                selected.confidence
                             ));
                         }
                         Err(e) => {
@@ -2035,6 +1932,8 @@ fn run_hydrate_inner(
                         note::Confidence::ExactHashMatch,
                         &encryption_method,
                         session_start,
+                        None,
+                        None,
                         !payload_anchored,
                         Some(info),
                         Some(&session.repo_root),

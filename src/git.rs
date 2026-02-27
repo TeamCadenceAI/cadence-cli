@@ -796,6 +796,67 @@ pub(crate) fn commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
+/// Return paths changed by a commit (relative to repo root).
+pub(crate) fn commit_changed_paths_at(repo: &Path, commit: &str) -> Result<Vec<String>> {
+    validate_commit_hash(commit)?;
+    let output = run_git_output_at(
+        Some(repo),
+        &["show", "--pretty=format:", "--name-only", "--", commit],
+        &[],
+    )
+    .context("failed to execute git show --name-only")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show --name-only failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .context("git show --name-only output was not valid UTF-8")?;
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if seen.insert(path.to_string()) {
+            paths.push(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+/// Return commit patch text, capped to `max_bytes` bytes.
+pub(crate) fn commit_patch_text_at(repo: &Path, commit: &str, max_bytes: usize) -> Result<String> {
+    validate_commit_hash(commit)?;
+    let output = run_git_output_at(
+        Some(repo),
+        &[
+            "show",
+            "--pretty=format:",
+            "--no-color",
+            "--no-ext-diff",
+            "--patch",
+            "--",
+            commit,
+        ],
+        &[],
+    )
+    .context("failed to execute git show --patch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git show --patch failed: {}", stderr.trim());
+    }
+
+    let mut bytes = output.stdout;
+    if bytes.len() > max_bytes {
+        bytes.truncate(max_bytes);
+    }
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// Return full commit hashes within the given time range for a repository.
 ///
 /// Uses `git log --since=@<start> --until=@<end> --format=%H`.
