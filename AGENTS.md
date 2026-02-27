@@ -22,6 +22,7 @@ cargo fmt                      # Auto-format
 - Run `cargo fmt` and `cargo clippy` before committing.
 - Always run tests after changes.
 - Always commit once tests are passing.
+- Use Conventional Commits for every commit message (e.g., `feat(push): ...`, `fix(git): ...`, `docs(workflow): ...`).
 - Commit messages should be detailed so future readers can understand the full intent.
 
 ## Rust CLI Best Practices
