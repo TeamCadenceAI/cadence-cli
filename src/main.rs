@@ -1006,14 +1006,15 @@ fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     }
 
     // Step 3: Collect candidate files across all agents
-    let candidate_files = agents::all_candidate_files(&repo_root, head_timestamp, 600);
+    let candidate_files =
+        agents::all_candidate_files(&repo_root, head_timestamp, POST_COMMIT_MATCH_WINDOW_SECS);
 
     let selected = select_session_for_commit(
         &head_hash,
         &repo_root,
         head_timestamp,
         &candidate_files,
-        600,
+        POST_COMMIT_MATCH_WINDOW_SECS,
     );
 
     let mut attached = false;
@@ -1141,7 +1142,8 @@ const MAX_RETRY_ATTEMPTS: u32 = 20;
 /// Backoff schedule for background retry (in seconds).
 /// Total wait: 1 + 2 + 4 + 8 + 16 + 32 = 63 seconds.
 const BACKGROUND_RETRY_DELAYS: &[u64] = &[1, 2, 4, 8, 16, 32];
-const BACKFILL_RELAXED_LOOKUP_WINDOW_SECS: i64 = 86_400;
+const POST_COMMIT_MATCH_WINDOW_SECS: i64 = 1_800;
+const DAILY_MATCH_WINDOW_SECS: i64 = 86_400;
 
 fn file_mtime_epoch(path: &std::path::Path) -> Option<i64> {
     let metadata = std::fs::metadata(path).ok()?;
@@ -1161,8 +1163,8 @@ fn commit_lookup_windows_for_session(file: &std::path::Path) -> Vec<(i64, i64)> 
         return vec![
             (start.saturating_sub(tight), end.saturating_add(tight)),
             (
-                start.saturating_sub(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
-                end.saturating_add(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
+                start.saturating_sub(DAILY_MATCH_WINDOW_SECS),
+                end.saturating_add(DAILY_MATCH_WINDOW_SECS),
             ),
         ];
     }
@@ -1170,11 +1172,70 @@ fn commit_lookup_windows_for_session(file: &std::path::Path) -> Vec<(i64, i64)> 
     file_mtime_epoch(file)
         .map(|mtime| {
             vec![(
-                mtime.saturating_sub(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
-                mtime.saturating_add(BACKFILL_RELAXED_LOOKUP_WINDOW_SECS),
+                mtime.saturating_sub(DAILY_MATCH_WINDOW_SECS),
+                mtime.saturating_add(DAILY_MATCH_WINDOW_SECS),
             )]
         })
         .unwrap_or_default()
+}
+
+fn commits_for_backfill_session(
+    repo_root: &std::path::Path,
+    file: &std::path::Path,
+) -> Result<Vec<String>> {
+    let windows = commit_lookup_windows_for_session(file);
+    if windows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    for (start_ts, end_ts) in windows {
+        let commits = git::commits_in_time_range(repo_root, start_ts, end_ts)?;
+        if !commits.is_empty() {
+            return Ok(commits);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn best_ranked_commit_for_session(
+    repo_root: &std::path::Path,
+    file: &std::path::Path,
+    commits: &[String],
+    time_window: i64,
+) -> Option<(String, scanner::SelectedSession)> {
+    let mut scored: Vec<(String, scanner::SelectedSession)> = Vec::new();
+    let candidate_file = file.to_path_buf();
+    for hash in commits {
+        let commit_time = match commit_timestamp_at(repo_root, hash) {
+            Some(ts) => ts,
+            None => continue,
+        };
+        if let Some(selected) = select_session_for_commit(
+            hash,
+            repo_root,
+            commit_time,
+            std::slice::from_ref(&candidate_file),
+            time_window,
+        ) {
+            scored.push((hash.clone(), selected));
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        b.1.candidate
+            .score
+            .partial_cmp(&a.1.candidate.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if scored.len() > 1
+        && (scored[0].1.candidate.score - scored[1].1.candidate.score) < scanner::min_margin_score()
+    {
+        return None;
+    }
+
+    scored.into_iter().next()
 }
 
 fn commit_timestamp_at(repo: &std::path::Path, commit: &str) -> Option<i64> {
@@ -1446,8 +1507,14 @@ fn run_hook_post_commit_retry(commit: &str, repo: &str, timestamp: i64) -> Resul
     for delay in BACKGROUND_RETRY_DELAYS {
         std::thread::sleep(std::time::Duration::from_secs(*delay));
 
-        match try_resolve_single_commit(commit, repo, repo_root, timestamp, 600, &encryption_method)
-        {
+        match try_resolve_single_commit(
+            commit,
+            repo,
+            repo_root,
+            timestamp,
+            DAILY_MATCH_WINDOW_SECS,
+            &encryption_method,
+        ) {
             ResolveResult::Attached => {
                 let _ = pending::remove(commit);
                 return Ok(());
@@ -1486,7 +1553,7 @@ enum ResolveResult {
 /// (background retry with exponential backoff).
 ///
 /// The `time_window` parameter controls how wide the candidate file mtime
-/// window is (in seconds). The initial hook uses 600s (±10 min), retries
+/// window is (in seconds). The initial hook uses 1800s (±30 min), retries
 /// use 86400s (±24 hours).
 ///
 /// The `method` parameter controls optional encryption. In the retry
@@ -1606,7 +1673,7 @@ fn retry_pending_for_repo(repo_str: &str, repo_root: &std::path::Path, method: &
             repo_str,
             repo_root,
             record.commit_time,
-            86_400,
+            DAILY_MATCH_WINDOW_SECS,
             method,
         ) {
             ResolveResult::Attached | ResolveResult::AlreadyExists => {
@@ -1810,45 +1877,20 @@ fn process_repo_backfill(
         stats.commits_found += commit_hashes.len();
 
         if commit_hashes.is_empty() {
-            let windows = commit_lookup_windows_for_session(&session.file);
-            if windows.is_empty() {
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!(
-                        "commits={}, attached={}, skipped={}",
-                        stats.commits_found, stats.attached, stats.skipped
-                    ));
-                }
-                continue;
-            }
-
-            let mut commits = Vec::new();
-            let mut lookup_failed = false;
-            for (start_ts, end_ts) in windows {
-                match git::commits_in_time_range(&session.repo_root, start_ts, end_ts) {
-                    Ok(found) => {
-                        if !found.is_empty() {
-                            commits = found;
-                            break;
-                        }
+            let commits = match commits_for_backfill_session(&session.repo_root, &session.file) {
+                Ok(found) => found,
+                Err(_) => {
+                    stats.errors += 1;
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, errors={}",
+                            stats.commits_found, stats.errors
+                        ));
                     }
-                    Err(_) => {
-                        lookup_failed = true;
-                        break;
-                    }
+                    continue;
                 }
-            }
-            if lookup_failed {
-                stats.errors += 1;
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!(
-                        "commits={}, errors={}",
-                        stats.commits_found, stats.errors
-                    ));
-                }
-                continue;
-            }
+            };
             stats.commits_found += commits.len();
             if commits.is_empty() {
                 if let Some(pb) = &repo_progress {
@@ -1861,53 +1903,25 @@ fn process_repo_backfill(
                 continue;
             }
 
-            let mut scored: Vec<(String, scanner::SelectedSession)> = Vec::new();
-            for hash in &commits {
-                let commit_time = match commit_timestamp_at(&session.repo_root, hash) {
-                    Some(ts) => ts,
-                    None => continue,
-                };
-                if let Some(selected) = select_session_for_commit(
-                    hash,
-                    &session.repo_root,
-                    commit_time,
-                    std::slice::from_ref(&session.file),
-                    86_400,
-                ) {
-                    scored.push((hash.clone(), selected));
+            let (hash, selected) = match best_ranked_commit_for_session(
+                &session.repo_root,
+                &session.file,
+                &commits,
+                DAILY_MATCH_WINDOW_SECS,
+            ) {
+                Some(best) => best,
+                None => {
+                    if let Some(pb) = &repo_progress {
+                        pb.inc(1);
+                        pb.set_message(format!(
+                            "commits={}, attached={}, skipped={}",
+                            stats.commits_found, stats.attached, stats.skipped
+                        ));
+                    }
+                    continue;
                 }
-            }
-            scored.sort_by(|a, b| {
-                b.1.candidate
-                    .score
-                    .partial_cmp(&a.1.candidate.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            if scored.is_empty() {
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!(
-                        "commits={}, attached={}, skipped={}",
-                        stats.commits_found, stats.attached, stats.skipped
-                    ));
-                }
-                continue;
-            }
-            if scored.len() > 1
-                && (scored[0].1.candidate.score - scored[1].1.candidate.score)
-                    < scanner::min_margin_score()
-            {
-                if let Some(pb) = &repo_progress {
-                    pb.inc(1);
-                    pb.set_message(format!(
-                        "commits={}, attached={}, skipped={}",
-                        stats.commits_found, stats.attached, stats.skipped
-                    ));
-                }
-                continue;
-            }
+            };
 
-            let (hash, selected) = scored.remove(0);
             if noted_commits.contains(&hash) {
                 stats.skipped += 1;
                 if let Some(pb) = &repo_progress {
@@ -3783,6 +3797,12 @@ mod tests {
     }
 
     #[test]
+    fn match_window_defaults_are_stable() {
+        assert_eq!(POST_COMMIT_MATCH_WINDOW_SECS, 1_800);
+        assert_eq!(DAILY_MATCH_WINDOW_SECS, 86_400);
+    }
+
+    #[test]
     fn commit_lookup_windows_use_timestamp_primary_and_relaxed_fallback() {
         let dir = TempDir::new().expect("tempdir");
         let file = dir.path().join("session.jsonl");
@@ -3819,8 +3839,8 @@ mod tests {
         assert_eq!(
             windows[1],
             (
-                start - BACKFILL_RELAXED_LOOKUP_WINDOW_SECS,
-                end + BACKFILL_RELAXED_LOOKUP_WINDOW_SECS
+                start - DAILY_MATCH_WINDOW_SECS,
+                end + DAILY_MATCH_WINDOW_SECS
             )
         );
     }
@@ -3841,8 +3861,8 @@ mod tests {
         assert_eq!(
             windows[0],
             (
-                mtime - BACKFILL_RELAXED_LOOKUP_WINDOW_SECS,
-                mtime + BACKFILL_RELAXED_LOOKUP_WINDOW_SECS
+                mtime - DAILY_MATCH_WINDOW_SECS,
+                mtime + DAILY_MATCH_WINDOW_SECS
             )
         );
     }
