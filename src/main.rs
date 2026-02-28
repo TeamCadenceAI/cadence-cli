@@ -121,6 +121,10 @@ enum Command {
         keys_command: Option<KeysCommands>,
     },
 
+    /// Signal setup completion to the Cadence API.
+    #[command(hide = true)]
+    Complete,
+
     /// Clear bloated notes and re-backfill in the optimized v2 format.
     ///
     /// Deletes the local and remote notes refs, then re-runs backfill
@@ -887,6 +891,19 @@ fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
             output::detail(&format!("Backfill sync skipped: {other}"));
         }
     }
+}
+
+fn run_complete() -> Result<()> {
+    report_backfill_completion(
+        1,
+        BackfillSyncStats {
+            notes_attached: 0,
+            notes_skipped: 0,
+            issues: Vec::new(),
+            repos_scanned: 0,
+        },
+    );
+    Ok(())
 }
 
 /// The post-commit hook handler. This is the critical hot path.
@@ -3409,6 +3426,7 @@ fn main() {
             KeysCommands::Disable => run_keys_disable(),
             KeysCommands::Refresh => run_keys_refresh(),
         },
+        Command::Complete => run_complete(),
         Command::Gc { since, confirm } => run_gc(&since, confirm),
     };
 
