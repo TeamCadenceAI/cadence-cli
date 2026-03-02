@@ -10,24 +10,24 @@ use std::path::{Path, PathBuf};
 use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
 
 /// Return all Copilot log directories for use by the post-commit hook.
-pub fn log_dirs() -> Vec<PathBuf> {
+pub async fn log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
         None => return Vec::new(),
     };
-    log_dirs_in(&home)
+    log_dirs_in(&home).await
 }
 
 /// Return all Copilot log directories for backfill (not repo-scoped).
-pub fn all_log_dirs() -> Vec<PathBuf> {
-    log_dirs()
+pub async fn all_log_dirs() -> Vec<PathBuf> {
+    log_dirs().await
 }
 
-fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
+async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
     let ws_root = app_config_dir_in("Code", home)
         .join("User")
         .join("workspaceStorage");
-    find_chat_session_dirs(&ws_root)
+    find_chat_session_dirs(&ws_root).await
 }
 
 // ---------------------------------------------------------------------------
@@ -38,20 +38,19 @@ fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::agents::app_config_dir_in;
-    use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_copilot_log_dirs_collects_chat_sessions() {
+    #[tokio::test]
+    async fn test_copilot_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
         let ws_root = app_config_dir_in("Code", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")
             .join("chatSessions");
-        fs::create_dir_all(&ws_root).unwrap();
+        tokio::fs::create_dir_all(&ws_root).await.unwrap();
 
-        let dirs = log_dirs_in(home.path());
+        let dirs = log_dirs_in(home.path()).await;
         assert_eq!(dirs, vec![ws_root]);
     }
 }

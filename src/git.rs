@@ -1,13 +1,14 @@
 //! Git utility helpers.
 //!
-//! All functions shell out to `git` via `std::process::Command`.
+//! All functions shell out to `git` via `tokio::process::Command`.
 //! The notes ref used throughout is `refs/cadence/sessions/data`.
 
 use crate::output;
 use anyhow::{Context, Result, bail};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Output, Stdio};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 /// The dedicated git notes ref for AI session data.
 pub const NOTES_REF: &str = "refs/cadence/sessions/data";
@@ -63,7 +64,26 @@ pub(crate) fn run_git_output_at(
     repo: Option<&Path>,
     args: &[&str],
     envs: &[(&str, &str)],
-) -> Result<std::process::Output> {
+) -> Result<Output> {
+    block_on_tokio(run_git_output_at_async(repo, args, envs))
+}
+
+fn block_on_tokio<T>(fut: impl std::future::Future<Output = T>) -> T {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()
+            .expect("failed to create tokio runtime")
+            .block_on(fut)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn run_git_output_at_async(
+    repo: Option<&Path>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<Output> {
     let mut cmd = Command::new("git");
     let mut display_parts = vec!["git".to_string()];
 
@@ -81,116 +101,28 @@ pub(crate) fn run_git_output_at(
     display_parts.extend(args.iter().map(|s| s.to_string()));
     if output::is_verbose() {
         output::detail(&display_parts.join(" "));
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.args(args).spawn().context("failed to execute git")?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let (tx, rx) = std::sync::mpsc::channel::<(Stream, Vec<u8>)>();
-        if let Some(stdout) = stdout {
-            let tx = tx.clone();
-            std::thread::spawn(move || read_stream(Stream::Stdout, stdout, tx));
+        let output = cmd
+            .args(args)
+            .output()
+            .await
+            .context("failed to execute git")?;
+        if !output.stdout.is_empty() {
+            output::detail("stdout:");
+            emit_stream_chunk(&output.stdout);
         }
-        if let Some(stderr) = stderr {
-            let tx = tx.clone();
-            std::thread::spawn(move || read_stream(Stream::Stderr, stderr, tx));
+        if !output.stderr.is_empty() {
+            output::detail("stderr:");
+            emit_stream_chunk(&output.stderr);
         }
-        drop(tx);
-
-        let mut stdout_buf: Vec<u8> = Vec::new();
-        let mut stderr_buf: Vec<u8> = Vec::new();
-        let mut saw_stdout = false;
-        let mut saw_stderr = false;
-
-        while let Ok((stream, chunk)) = rx.recv() {
-            match stream {
-                Stream::Stdout => {
-                    if !saw_stdout {
-                        output::detail("stdout:");
-                        saw_stdout = true;
-                    }
-                    stdout_buf.extend_from_slice(&chunk);
-                    emit_stream_chunk(&chunk);
-                }
-                Stream::Stderr => {
-                    if !saw_stderr {
-                        output::detail("stderr:");
-                        saw_stderr = true;
-                    }
-                    stderr_buf.extend_from_slice(&chunk);
-                    emit_stream_chunk(&chunk);
-                }
-            }
-        }
-
-        let status = child.wait().context("failed to wait on git")?;
-        return Ok(std::process::Output {
-            status,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
-        });
+        return Ok(output);
     }
 
-    let output = cmd.args(args).output().context("failed to execute git")?;
+    let output = cmd
+        .args(args)
+        .output()
+        .await
+        .context("failed to execute git")?;
     Ok(output)
-}
-
-#[allow(dead_code)]
-pub(crate) async fn run_git_output_at_async(
-    repo: Option<&Path>,
-    args: &[&str],
-    envs: &[(&str, &str)],
-) -> Result<std::process::Output> {
-    let mut cmd = tokio::process::Command::new("git");
-
-    if let Some(repo) = repo {
-        cmd.args(["-C", &repo.to_string_lossy()]);
-    }
-
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-
-    if output::is_verbose() {
-        let mut display_parts = vec!["git".to_string()];
-        if let Some(repo) = repo {
-            display_parts.push("-C".to_string());
-            display_parts.push(repo.to_string_lossy().to_string());
-        }
-        display_parts.extend(args.iter().map(|s| s.to_string()));
-        output::detail(&display_parts.join(" "));
-    }
-
-    cmd.args(args);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    cmd.output().await.context("failed to execute git")
-}
-
-#[derive(Copy, Clone, Debug)]
-enum Stream {
-    Stdout,
-    Stderr,
-}
-
-fn read_stream<R: std::io::Read>(
-    stream: Stream,
-    mut reader: R,
-    tx: std::sync::mpsc::Sender<(Stream, Vec<u8>)>,
-) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let _ = tx.send((stream, buf[..n].to_vec()));
-            }
-            Err(_) => break,
-        }
-    }
 }
 
 fn emit_stream_chunk(chunk: &[u8]) {
@@ -276,40 +208,44 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 ///
 /// Uses `git hash-object -w --stdin` to write the blob to the object store.
 pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    if let Some(repo) = repo {
-        cmd.args(["-C", &repo.to_string_lossy()]);
-    }
-    cmd.args(["hash-object", "-w", "--stdin"]);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    block_on_tokio(async move {
+        let mut cmd = Command::new("git");
+        if let Some(repo) = repo {
+            cmd.args(["-C", &repo.to_string_lossy()]);
+        }
+        cmd.args(["hash-object", "-w", "--stdin"]);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().context("failed to spawn git hash-object")?;
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(data)
-            .context("failed to write blob data to git hash-object stdin")?;
-    }
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for git hash-object")?;
+        let mut child = cmd.spawn().context("failed to spawn git hash-object")?;
+        if let Some(ref mut stdin) = child.stdin {
+            stdin
+                .write_all(data)
+                .await
+                .context("failed to write blob data to git hash-object stdin")?;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .context("failed to wait for git hash-object")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git hash-object failed: {}", stderr.trim());
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git hash-object failed: {}", stderr.trim());
+        }
 
-    let sha = String::from_utf8(output.stdout)
-        .context("git hash-object output was not valid UTF-8")?
-        .trim()
-        .to_string();
+        let sha = String::from_utf8(output.stdout)
+            .context("git hash-object output was not valid UTF-8")?
+            .trim()
+            .to_string();
 
-    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("git hash-object returned invalid SHA: {}", sha);
-    }
+        if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("git hash-object returned invalid SHA: {}", sha);
+        }
 
-    Ok(sha)
+        Ok(sha)
+    })
 }
 
 /// Read a git blob by its SHA from a specific repository.
@@ -713,42 +649,47 @@ pub(crate) fn append_index_entry_at(
 /// Each entry must be: `<mode> <type> <sha>\t<name>`
 /// Returns the 40-char SHA of the new tree.
 pub(crate) fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    if let Some(repo) = repo {
-        cmd.args(["-C", &repo.to_string_lossy()]);
-    }
-    cmd.arg("mktree");
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn().context("failed to spawn git mktree")?;
-    if let Some(ref mut stdin) = child.stdin {
-        let input = entries.join("\n");
-        stdin
-            .write_all(input.as_bytes())
-            .context("failed to write to git mktree stdin")?;
-        if !input.is_empty() {
-            stdin
-                .write_all(b"\n")
-                .context("failed to write trailing newline to mktree")?;
+    block_on_tokio(async move {
+        let mut cmd = Command::new("git");
+        if let Some(repo) = repo {
+            cmd.args(["-C", &repo.to_string_lossy()]);
         }
-    }
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for git mktree")?;
+        cmd.arg("mktree");
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git mktree failed: {}", stderr.trim());
-    }
+        let mut child = cmd.spawn().context("failed to spawn git mktree")?;
+        if let Some(ref mut stdin) = child.stdin {
+            let input = entries.join("\n");
+            stdin
+                .write_all(input.as_bytes())
+                .await
+                .context("failed to write to git mktree stdin")?;
+            if !input.is_empty() {
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("failed to write trailing newline to mktree")?;
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .context("failed to wait for git mktree")?;
 
-    let sha = String::from_utf8(output.stdout)
-        .context("git mktree output was not valid UTF-8")?
-        .trim()
-        .to_string();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git mktree failed: {}", stderr.trim());
+        }
 
-    Ok(sha)
+        let sha = String::from_utf8(output.stdout)
+            .context("git mktree output was not valid UTF-8")?
+            .trim()
+            .to_string();
+
+        Ok(sha)
+    })
 }
 
 /// Create a commit from a tree object, optionally with a parent.
@@ -1412,7 +1353,6 @@ pub fn config_unset_global(key: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// Helper: create a temporary git repo with one commit.
@@ -1443,11 +1383,7 @@ mod tests {
 
     /// Run a git command inside the given directory, panicking on failure.
     fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(["-C", dir.to_str().unwrap()])
-            .args(args)
-            .output()
-            .expect("failed to run git");
+        let output = run_git_output_at(Some(dir), args, &[]).expect("failed to run git");
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("git {:?} failed: {}", args, stderr);
@@ -1460,11 +1396,7 @@ mod tests {
     /// Since our public functions don't take a path arg (they rely on cwd),
     /// we use a wrapper approach: spawn a git command with `-C`.
     fn git_output_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .args(["-C", dir.to_str().unwrap()])
-            .args(args)
-            .output()
-            .context("failed to execute git")?;
+        let output = run_git_output_at(Some(dir), args, &[]).context("failed to execute git")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1608,11 +1540,12 @@ mod tests {
     fn test_config_get_missing_key() {
         let dir = init_temp_repo();
         let path = dir.path();
-        let output = Command::new("git")
-            .args(["-C", path.to_str().unwrap()])
-            .args(["config", "--get", "ai.cadence.nonexistent"])
-            .output()
-            .unwrap();
+        let output = run_git_output_at(
+            Some(path),
+            &["config", "--get", "ai.cadence.nonexistent"],
+            &[],
+        )
+        .unwrap();
         // Should exit non-zero (key not set)
         assert!(!output.status.success());
     }

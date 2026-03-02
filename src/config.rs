@@ -301,7 +301,6 @@ pub async fn write_cached_latest_version_to_dir(version: &str, dir: &Path) -> Re
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------
 // ConfigKey enum + helpers for `cadence config` subcommand
 // ---------------------------------------------------------------------------
@@ -623,7 +622,9 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&path, "api_url = \"https://custom.example.com\"\n").await.unwrap();
+        tokio::fs::write(&path, "api_url = \"https://custom.example.com\"\n")
+            .await
+            .unwrap();
 
         let cfg = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(cfg.api_url, Some("https://custom.example.com".to_string()));
@@ -643,7 +644,9 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&path, "this is not valid toml {{{").await.unwrap();
+        tokio::fs::write(&path, "this is not valid toml {{{")
+            .await
+            .unwrap();
 
         let result = CliConfig::load_from(&path).await;
         assert!(result.is_err());
@@ -1064,7 +1067,9 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&path, "api_url = \"https://example.com\"\n").await.unwrap();
+        tokio::fs::write(&path, "api_url = \"https://example.com\"\n")
+            .await
+            .unwrap();
 
         let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded.auto_update, None);
@@ -1353,7 +1358,9 @@ mod tests {
     async fn test_write_cached_latest_version_creates_dir() {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("nested").join("dir");
-        write_cached_latest_version_to_dir("1.0.0", &sub).await.unwrap();
+        write_cached_latest_version_to_dir("1.0.0", &sub)
+            .await
+            .unwrap();
         assert_eq!(
             read_cached_latest_version_from_dir(&sub),
             Some("1.0.0".to_string())

@@ -12,9 +12,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 use crate::config::CliConfig;
 
@@ -164,7 +165,9 @@ async fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
         .rsplit('/')
         .next()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Could not extract version tag from redirect URL: {location}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("Could not extract version tag from redirect URL: {location}")
+        })?;
 
     Ok(tag.to_string())
 }
@@ -374,8 +377,9 @@ pub fn parse_checksums(content: &str) -> Result<HashMap<String, String>> {
 }
 
 /// Computes the SHA256 digest of a file and returns it as a lowercase hex string.
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)
+pub async fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
         .with_context(|| format!("Failed to open file for checksum: {}", path.display()))?;
 
     let mut hasher = Sha256::new();
@@ -383,6 +387,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     loop {
         let n = file
             .read(&mut buf)
+            .await
             .with_context(|| format!("Failed to read file for checksum: {}", path.display()))?;
         if n == 0 {
             break;
@@ -398,7 +403,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// `checksums` is the parsed map from `parse_checksums()`.
 /// `artifact_name` is the filename key to look up.
 /// `artifact_path` is the local file to hash.
-pub fn verify_checksum(
+pub async fn verify_checksum(
     checksums: &HashMap<String, String>,
     artifact_name: &str,
     artifact_path: &Path,
@@ -411,7 +416,7 @@ pub fn verify_checksum(
         )
     })?;
 
-    let actual = sha256_file(artifact_path)?;
+    let actual = sha256_file(artifact_path).await?;
 
     if actual != *expected {
         bail!(
@@ -507,22 +512,28 @@ fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
 /// Extracts the cadence binary from a release archive (tar.gz or zip).
 ///
 /// Dispatches to the appropriate extractor based on the archive file extension.
-pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
-    let name = archive_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+pub async fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    let archive_path = archive_path.to_path_buf();
+    let dest_dir = dest_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let name = archive_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
 
-    if name.ends_with(".tar.gz") {
-        extract_tar_gz(archive_path, dest_dir)
-    } else if name.ends_with(".zip") {
-        extract_zip(archive_path, dest_dir)
-    } else {
-        bail!(
-            "Unsupported archive format: '{}'. Expected .tar.gz or .zip",
-            archive_path.display()
-        )
-    }
+        if name.ends_with(".tar.gz") {
+            extract_tar_gz(&archive_path, &dest_dir)
+        } else if name.ends_with(".zip") {
+            extract_zip(&archive_path, &dest_dir)
+        } else {
+            bail!(
+                "Unsupported archive format: '{}'. Expected .tar.gz or .zip",
+                archive_path.display()
+            )
+        }
+    })
+    .await
+    .context("archive extraction task failed")?
 }
 
 // ---------------------------------------------------------------------------
@@ -705,22 +716,26 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
     .context("Failed to download release archive")?;
 
     // Step 6: Verify checksum
-    let checksums_content = std::fs::read_to_string(&checksums_path)
+    let checksums_content = tokio::fs::read_to_string(&checksums_path)
+        .await
         .context("Failed to read downloaded checksums file")?;
     let checksums = parse_checksums(&checksums_content)?;
-    verify_checksum(&checksums, &artifact_asset.name, &artifact_path)?;
+    verify_checksum(&checksums, &artifact_asset.name, &artifact_path).await?;
 
     // Step 7: Extract binary
     let extract_dir = tmp_dir.path().join("extracted");
-    std::fs::create_dir_all(&extract_dir).context("Failed to create extraction directory")?;
-    let new_binary = extract_binary(&artifact_path, &extract_dir)?;
+    tokio::fs::create_dir_all(&extract_dir)
+        .await
+        .context("Failed to create extraction directory")?;
+    let new_binary = extract_binary(&artifact_path, &extract_dir).await?;
 
     // Step 8: Set executable permission on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&new_binary, perms)
+        tokio::fs::set_permissions(&new_binary, perms)
+            .await
             .context("Failed to set executable permissions on extracted binary")?;
     }
 
@@ -756,8 +771,8 @@ fn last_update_check_path() -> Option<PathBuf> {
 ///
 /// Accepts both RFC 3339 timestamps and plain epoch seconds (integer).
 /// Returns `None` if the file is missing, empty, or contains unparseable content.
-pub fn read_last_check_timestamp(path: &Path) -> Option<std::time::SystemTime> {
-    let content = std::fs::read_to_string(path).ok()?;
+pub async fn read_last_check_timestamp(path: &Path) -> Option<std::time::SystemTime> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
     parse_timestamp_string(content.trim())
 }
 
@@ -790,16 +805,18 @@ fn parse_timestamp_string(s: &str) -> Option<std::time::SystemTime> {
 ///
 /// Creates parent directories if needed. Errors are returned (not swallowed)
 /// so callers can decide whether to ignore them.
-pub fn write_last_check_timestamp(path: &Path) -> Result<()> {
+pub async fn write_last_check_timestamp(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     let now = time::OffsetDateTime::now_utc();
     let formatted = now
         .format(&time::format_description::well_known::Rfc3339)
         .context("failed to format current time as RFC 3339")?;
-    std::fs::write(path, format!("{formatted}\n"))
+    tokio::fs::write(path, format!("{formatted}\n"))
+        .await
         .with_context(|| format!("failed to write timestamp to {}", path.display()))?;
     Ok(())
 }
@@ -845,7 +862,7 @@ pub async fn should_check_for_update(
     let timestamp_path = dir.join(LAST_UPDATE_CHECK_FILE);
 
     // If no timestamp file, check is due
-    let last_check = match read_last_check_timestamp(&timestamp_path) {
+    let last_check = match read_last_check_timestamp(&timestamp_path).await {
         Some(ts) => ts,
         None => return true,
     };
@@ -901,12 +918,11 @@ pub async fn passive_version_check_from_url(url: &str) {
     };
 
     // Perform the version check with a short timeout
-    let check_result =
-        check_latest_version_from_url_with_timeout(url, PASSIVE_CHECK_TIMEOUT).await;
+    let check_result = check_latest_version_from_url_with_timeout(url, PASSIVE_CHECK_TIMEOUT).await;
 
     // Always update the timestamp after an attempt (success or failure)
     // to prevent retry storms on persistent failures
-    let _ = write_last_check_timestamp(&timestamp_path);
+    let _ = write_last_check_timestamp(&timestamp_path).await;
 
     // Process the result if successful
     let release = match check_result {
@@ -1325,20 +1341,22 @@ mod tests {
     async fn verify_checksum_match() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.bin");
-        std::fs::write(&file_path, b"hello world").unwrap();
+        tokio::fs::write(&file_path, b"hello world").await.unwrap();
 
-        let actual_hash = sha256_file(&file_path).unwrap();
+        let actual_hash = sha256_file(&file_path).await.unwrap();
         let mut checksums = HashMap::new();
         checksums.insert("test.bin".to_string(), actual_hash);
 
-        verify_checksum(&checksums, "test.bin", &file_path).unwrap();
+        verify_checksum(&checksums, "test.bin", &file_path)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn verify_checksum_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.bin");
-        std::fs::write(&file_path, b"hello world").unwrap();
+        tokio::fs::write(&file_path, b"hello world").await.unwrap();
 
         let mut checksums = HashMap::new();
         checksums.insert(
@@ -1346,7 +1364,7 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         );
 
-        let result = verify_checksum(&checksums, "test.bin", &file_path);
+        let result = verify_checksum(&checksums, "test.bin", &file_path).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Checksum verification failed"), "err: {err}");
@@ -1357,11 +1375,11 @@ mod tests {
     async fn verify_checksum_missing_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.bin");
-        std::fs::write(&file_path, b"hello world").unwrap();
+        tokio::fs::write(&file_path, b"hello world").await.unwrap();
 
         let checksums = HashMap::new();
 
-        let result = verify_checksum(&checksums, "test.bin", &file_path);
+        let result = verify_checksum(&checksums, "test.bin", &file_path).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
@@ -1372,9 +1390,9 @@ mod tests {
     async fn sha256_known_value() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("known.bin");
-        std::fs::write(&file_path, b"hello world").unwrap();
+        tokio::fs::write(&file_path, b"hello world").await.unwrap();
 
-        let hash = sha256_file(&file_path).unwrap();
+        let hash = sha256_file(&file_path).await.unwrap();
         // Known SHA256 of "hello world"
         assert_eq!(
             hash,
@@ -1384,7 +1402,7 @@ mod tests {
 
     #[tokio::test]
     async fn sha256_nonexistent_file() {
-        let result = sha256_file(Path::new("/nonexistent/path/to/file"));
+        let result = sha256_file(Path::new("/nonexistent/path/to/file")).await;
         assert!(result.is_err());
     }
 
@@ -1413,13 +1431,13 @@ mod tests {
         }
 
         let extract_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&extract_dir).unwrap();
+        tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-        let result = extract_binary(&archive_path, &extract_dir).unwrap();
+        let result = extract_binary(&archive_path, &extract_dir).await.unwrap();
         assert_eq!(result.file_name().unwrap(), "cadence");
         assert!(result.exists());
 
-        let extracted_content = std::fs::read(&result).unwrap();
+        let extracted_content = tokio::fs::read(&result).await.unwrap();
         assert_eq!(extracted_content, b"#!/bin/sh\necho hello\n");
     }
 
@@ -1446,9 +1464,9 @@ mod tests {
         }
 
         let extract_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&extract_dir).unwrap();
+        tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-        let result = extract_binary(&archive_path, &extract_dir).unwrap();
+        let result = extract_binary(&archive_path, &extract_dir).await.unwrap();
         assert_eq!(result.file_name().unwrap(), "cadence");
     }
 
@@ -1474,9 +1492,9 @@ mod tests {
         }
 
         let extract_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&extract_dir).unwrap();
+        tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-        let result = extract_binary(&archive_path, &extract_dir);
+        let result = extract_binary(&archive_path, &extract_dir).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not contain"));
     }
@@ -1497,9 +1515,9 @@ mod tests {
         }
 
         let extract_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&extract_dir).unwrap();
+        tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-        let result = extract_binary(&archive_path, &extract_dir).unwrap();
+        let result = extract_binary(&archive_path, &extract_dir).await.unwrap();
         assert_eq!(result.file_name().unwrap(), "cadence.exe");
         assert!(result.exists());
     }
@@ -1519,9 +1537,9 @@ mod tests {
         }
 
         let extract_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&extract_dir).unwrap();
+        tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-        let result = extract_binary(&archive_path, &extract_dir);
+        let result = extract_binary(&archive_path, &extract_dir).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not contain"));
     }
@@ -1530,9 +1548,9 @@ mod tests {
     async fn extract_unsupported_format() {
         let tmp = tempfile::tempdir().unwrap();
         let archive_path = tmp.path().join("archive.rar");
-        std::fs::write(&archive_path, b"fake rar").unwrap();
+        tokio::fs::write(&archive_path, b"fake rar").await.unwrap();
 
-        let result = extract_binary(&archive_path, tmp.path());
+        let result = extract_binary(&archive_path, tmp.path()).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1707,31 +1725,31 @@ mod tests {
     async fn read_last_check_timestamp_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nonexistent");
-        assert!(read_last_check_timestamp(&path).is_none());
+        assert!(read_last_check_timestamp(&path).await.is_none());
     }
 
     #[tokio::test]
     async fn read_last_check_timestamp_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        std::fs::write(&path, "").unwrap();
-        assert!(read_last_check_timestamp(&path).is_none());
+        tokio::fs::write(&path, "").await.unwrap();
+        assert!(read_last_check_timestamp(&path).await.is_none());
     }
 
     #[tokio::test]
     async fn read_last_check_timestamp_whitespace_only() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        std::fs::write(&path, "  \n  ").unwrap();
-        assert!(read_last_check_timestamp(&path).is_none());
+        tokio::fs::write(&path, "  \n  ").await.unwrap();
+        assert!(read_last_check_timestamp(&path).await.is_none());
     }
 
     #[tokio::test]
     async fn read_last_check_timestamp_valid_epoch() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        std::fs::write(&path, "1700000000\n").unwrap();
-        let ts = read_last_check_timestamp(&path);
+        tokio::fs::write(&path, "1700000000\n").await.unwrap();
+        let ts = read_last_check_timestamp(&path).await;
         assert!(ts.is_some());
         assert_eq!(
             ts.unwrap()
@@ -1746,8 +1764,10 @@ mod tests {
     async fn read_last_check_timestamp_valid_rfc3339() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        std::fs::write(&path, "2024-01-15T10:30:00Z\n").unwrap();
-        let ts = read_last_check_timestamp(&path);
+        tokio::fs::write(&path, "2024-01-15T10:30:00Z\n")
+            .await
+            .unwrap();
+        let ts = read_last_check_timestamp(&path).await;
         assert!(ts.is_some());
     }
 
@@ -1755,17 +1775,17 @@ mod tests {
     async fn read_last_check_timestamp_malformed() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        std::fs::write(&path, "not-a-time\n").unwrap();
-        assert!(read_last_check_timestamp(&path).is_none());
+        tokio::fs::write(&path, "not-a-time\n").await.unwrap();
+        assert!(read_last_check_timestamp(&path).await.is_none());
     }
 
     #[tokio::test]
     async fn write_and_read_last_check_timestamp_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        write_last_check_timestamp(&path).unwrap();
+        write_last_check_timestamp(&path).await.unwrap();
 
-        let ts = read_last_check_timestamp(&path);
+        let ts = read_last_check_timestamp(&path).await;
         assert!(ts.is_some(), "should read back written timestamp");
 
         // Timestamp should be recent (within last 10 seconds)
@@ -1787,7 +1807,7 @@ mod tests {
             .join("sub")
             .join("dir")
             .join(LAST_UPDATE_CHECK_FILE);
-        write_last_check_timestamp(&path).unwrap();
+        write_last_check_timestamp(&path).await.unwrap();
         assert!(path.exists());
     }
 
@@ -1804,12 +1824,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // "0", "true", "yes" should NOT suppress — only "1" does
         assert!(should_check_for_update(Some("0"), true, Some(tmp.path())).await);
-        assert!(should_check_for_update(
-            Some("true"),
-            true,
-            Some(tmp.path())
-        )
-        .await);
+        assert!(should_check_for_update(Some("true"), true, Some(tmp.path())).await);
         assert!(should_check_for_update(Some(""), true, Some(tmp.path())).await);
     }
 
@@ -1831,7 +1846,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ts_path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
         // Write a current timestamp
-        write_last_check_timestamp(&ts_path).unwrap();
+        write_last_check_timestamp(&ts_path).await.unwrap();
         // Should NOT check (just checked)
         assert!(!should_check_for_update(None, true, Some(tmp.path())).await);
     }
@@ -1846,7 +1861,9 @@ mod tests {
             .unwrap()
             .as_secs()
             - 24 * 3600;
-        std::fs::write(&ts_path, format!("{old_epoch}\n")).unwrap();
+        tokio::fs::write(&ts_path, format!("{old_epoch}\n"))
+            .await
+            .unwrap();
         assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }
 
@@ -1860,7 +1877,9 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        std::fs::write(&ts_path, format!("{future_epoch}\n")).unwrap();
+        tokio::fs::write(&ts_path, format!("{future_epoch}\n"))
+            .await
+            .unwrap();
         // Clock went "backward" relative to stored time — should check
         assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }
@@ -1869,7 +1888,9 @@ mod tests {
     async fn should_check_corrupt_timestamp_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let ts_path = tmp.path().join(LAST_UPDATE_CHECK_FILE);
-        std::fs::write(&ts_path, "totally-corrupt-data").unwrap();
+        tokio::fs::write(&ts_path, "totally-corrupt-data")
+            .await
+            .unwrap();
         // Corrupt file = can't parse = treat as missing = should check
         assert!(should_check_for_update(None, true, Some(tmp.path())).await);
     }

@@ -5,53 +5,57 @@
 //! and temporary filesystem state. They avoid actually replacing the test
 //! runner binary.
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::thread;
+use std::io::Write;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// Start a minimal single-request HTTP server that returns a given status and body.
-fn spawn_one_shot_server(status: u16, body: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+async fn spawn_one_shot_server(status: u16, body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
 
     let body = body.to_string();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("failed to accept");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("failed to accept");
         let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        let _ = stream.read(&mut buf).await;
 
         let response = format!(
             "HTTP/1.1 {status} OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
     });
 
     url
 }
 
 /// Start a minimal HTTP server that returns a 302 redirect to a release tag URL.
-fn spawn_redirect_server(tag: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+async fn spawn_redirect_server(tag: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
 
     let tag = tag.to_string();
     let url_clone = url.clone();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("failed to accept");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("failed to accept");
         let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        let _ = stream.read(&mut buf).await;
 
         let location = format!("{url_clone}/releases/tag/{tag}");
         let response = format!(
             "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
     });
 
     url
@@ -135,17 +139,23 @@ async fn checksum_round_trip_with_real_file() {
 
     // Create a test file
     let test_file = tmp.path().join("test-binary.tar.gz");
-    std::fs::write(&test_file, b"fake binary content for checksum test").unwrap();
+    tokio::fs::write(&test_file, b"fake binary content for checksum test")
+        .await
+        .unwrap();
 
     // Compute its hash
-    let hash = sha256_file(&test_file).unwrap();
+    let hash = sha256_file(&test_file).await.unwrap();
 
     // Create checksums content in GNU format
     let checksums_content = format!("{hash}  test-binary.tar.gz\n");
 
     // Parse and verify
     let checksums = parse_checksums(&checksums_content).unwrap();
-    assert!(verify_checksum(&checksums, "test-binary.tar.gz", &test_file).is_ok());
+    assert!(
+        verify_checksum(&checksums, "test-binary.tar.gz", &test_file)
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -156,14 +166,16 @@ async fn checksum_verification_rejects_tampered_file() {
 
     // Create file
     let test_file = tmp.path().join("tampered.tar.gz");
-    std::fs::write(&test_file, b"original content").unwrap();
+    tokio::fs::write(&test_file, b"original content")
+        .await
+        .unwrap();
 
     // Create checksums with a different hash (as if file was tampered after checksum generation)
     let checksums_content =
         "0000000000000000000000000000000000000000000000000000000000000000  tampered.tar.gz\n";
     let checksums = parse_checksums(checksums_content).unwrap();
 
-    let result = verify_checksum(&checksums, "tampered.tar.gz", &test_file);
+    let result = verify_checksum(&checksums, "tampered.tar.gz", &test_file).await;
     assert!(result.is_err());
     assert!(
         result
@@ -179,13 +191,13 @@ async fn checksum_missing_entry_for_artifact() {
 
     let tmp = tempfile::tempdir().unwrap();
     let test_file = tmp.path().join("missing.tar.gz");
-    std::fs::write(&test_file, b"content").unwrap();
+    tokio::fs::write(&test_file, b"content").await.unwrap();
 
     let checksums_content =
         "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  other-file.tar.gz\n";
     let checksums = parse_checksums(checksums_content).unwrap();
 
-    let result = verify_checksum(&checksums, "missing.tar.gz", &test_file);
+    let result = verify_checksum(&checksums, "missing.tar.gz", &test_file).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("not found"));
 }
@@ -219,13 +231,13 @@ async fn extract_tar_gz_integration() {
     }
 
     let extract_dir = tmp.path().join("extracted");
-    std::fs::create_dir_all(&extract_dir).unwrap();
+    tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-    let binary_path = extract_binary(&archive_path, &extract_dir).unwrap();
+    let binary_path = extract_binary(&archive_path, &extract_dir).await.unwrap();
     assert!(binary_path.exists());
     assert_eq!(binary_path.file_name().unwrap(), "cadence");
 
-    let content = std::fs::read_to_string(&binary_path).unwrap();
+    let content = tokio::fs::read_to_string(&binary_path).await.unwrap();
     assert!(content.contains("echo test binary"));
 }
 
@@ -247,9 +259,9 @@ async fn extract_zip_integration() {
     }
 
     let extract_dir = tmp.path().join("extracted");
-    std::fs::create_dir_all(&extract_dir).unwrap();
+    tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
-    let binary_path = extract_binary(&archive_path, &extract_dir).unwrap();
+    let binary_path = extract_binary(&archive_path, &extract_dir).await.unwrap();
     assert!(binary_path.exists());
     assert_eq!(binary_path.file_name().unwrap(), "cadence.exe");
 }
@@ -264,7 +276,7 @@ async fn update_install_already_up_to_date() {
 
     // Serve a redirect with the same version as the current binary
     let tag = format!("v{}", current_version());
-    let url = spawn_redirect_server(&tag);
+    let url = spawn_redirect_server(&tag).await;
 
     // Should succeed and indicate already up to date
     let result = run_update_install_from_url(&url, true).await;
@@ -328,23 +340,25 @@ async fn download_to_file_success() {
     use cadence_cli::update::download_to_file;
 
     let body = b"file content for download test";
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}/test-file.bin");
 
     let body_owned = body.to_vec();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("failed to accept");
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("failed to accept");
         let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        let _ = stream.read(&mut buf).await;
 
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body_owned.len()
         );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.write_all(&body_owned);
-        let _ = stream.flush();
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(&body_owned).await;
+        let _ = stream.flush().await;
     });
 
     let tmp = tempfile::tempdir().unwrap();
@@ -352,14 +366,14 @@ async fn download_to_file_success() {
         .await
         .unwrap();
     assert!(result.exists());
-    assert_eq!(std::fs::read(&result).unwrap(), body);
+    assert_eq!(tokio::fs::read(&result).await.unwrap(), body);
 }
 
 #[tokio::test]
 async fn download_to_file_http_error() {
     use cadence_cli::update::download_to_file;
 
-    let url = spawn_one_shot_server(500, "Internal Server Error");
+    let url = spawn_one_shot_server(500, "Internal Server Error").await;
 
     let tmp = tempfile::tempdir().unwrap();
     let result = download_to_file(

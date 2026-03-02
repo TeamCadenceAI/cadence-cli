@@ -366,16 +366,10 @@ pub fn check_org_filter_remote(remote: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::process::Command as ProcessCommand;
     use tempfile::TempDir;
 
     fn run_git(repo: &Path, args: &[&str]) -> String {
-        let out = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("run git");
+        let out = crate::git::run_git_output_at(Some(repo), args, &[]).expect("run git");
         assert!(
             out.status.success(),
             "git failed: {}",

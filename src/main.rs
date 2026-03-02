@@ -1288,7 +1288,9 @@ async fn ingest_recent_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let session_start = scanner::session_time_range(&file).await.map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&file)
+            .await
+            .map(|(start, _)| start);
         let observed_commits = scanner::extract_commit_hashes(&file).await;
         let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
         let session_log = match tokio::fs::read_to_string(&file).await {
@@ -1417,7 +1419,9 @@ async fn ingest_incremental_sessions_for_repo(
             .unwrap_or(scanner::AgentType::Claude);
         let observed_commits = scanner::extract_commit_hashes(&file).await;
         let explicit_branch_keys = branch_keys_for_repo_and_commits(repo_root, &observed_commits);
-        let session_start = scanner::session_time_range(&file).await.map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&file)
+            .await
+            .map(|(start, _)| start);
         let session_log = match tokio::fs::read_to_string(&file).await {
             Ok(content) => content,
             Err(_) => continue,
@@ -1765,7 +1769,9 @@ async fn process_repo_backfill(
             }
         };
         let repo_str = session.repo_root.to_string_lossy().to_string();
-        let session_start = scanner::session_time_range(&session.file).await.map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&session.file)
+            .await
+            .map(|(start, _)| start);
 
         let branch_keys = branch_keys_for_repo_and_commits(&session.repo_root, &commit_hashes);
         match ingest_session_from_log(
@@ -2541,7 +2547,9 @@ async fn build_local_session_labels_for_repo(
         };
         let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
         let agent = metadata.agent_type.unwrap_or(scanner::AgentType::Claude);
-        let session_start = scanner::session_time_range(&file).await.map(|(start, _)| start);
+        let session_start = scanner::session_time_range(&file)
+            .await
+            .map(|(start, _)| start);
         let content_sha256 = note::content_sha256(&session_log);
         let session_uid = note::compute_session_uid(
             &agent,
@@ -3924,16 +3932,10 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command as ProcessCommand;
     use tempfile::TempDir;
 
     fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
-        let out = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("run git");
+        let out = crate::git::run_git_output_at(Some(repo), args, &[]).expect("run git");
         assert!(
             out.status.success(),
             "git failed: {}",
@@ -4267,7 +4269,7 @@ mod tests {
         assert_eq!(missing_meta, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn ingest_session_without_commit_writes_data_and_indexes() {
         let repo = init_repo();
         run_git(
@@ -4311,7 +4313,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn ingest_session_with_explicit_branch_keys_indexes_each_branch() {
         let repo = init_repo();
         run_git(
@@ -4354,7 +4356,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn ingest_session_is_stable_across_commit_hints_when_observed_commits_match() {
         let repo = init_repo();
         run_git(
@@ -4411,7 +4413,7 @@ mod tests {
         assert_eq!(first_info.session_uid, second_info.session_uid);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn backfill_uploads_session_when_no_candidate_commits() {
         let repo = init_repo();
         let session_file = repo.path().join("session-no-candidate.jsonl");
@@ -4446,7 +4448,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn backfill_uploads_session_when_explicit_commits_are_unavailable() {
         let repo = init_repo();
         let session_file = repo.path().join("session-missing-commit.jsonl");

@@ -34,11 +34,11 @@ async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
     let user_root = app_config_dir_in("Antigravity", home).join("User");
 
     let mut dirs = BTreeSet::new();
-    for dir in find_chat_session_dirs(&ws_root) {
+    for dir in find_chat_session_dirs(&ws_root).await {
         dirs.insert(dir);
     }
     // Some forks store chatSessions outside workspaceStorage; scan User root too.
-    for dir in find_chat_session_dirs(&user_root) {
+    for dir in find_chat_session_dirs(&user_root).await {
         dirs.insert(dir);
     }
 
@@ -86,24 +86,24 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     let preferred_connect = override_connect_port();
     let probed_connect = probe_connect_port(&ports, &process.csrf_token).await;
     let (scheme, port) = match preferred_connect.or(probed_connect) {
-            Some(p) => p,
-            None => {
-                if let Some(ext_port) = process.extension_port {
-                    if debug {
-                        eprintln!(
-                            "[cadence] antigravity: probe failed, using extension port {}",
-                            ext_port
-                        );
-                    }
-                    ("http", ext_port)
-                } else {
-                    if debug {
-                        eprintln!("[cadence] antigravity: no connect port found");
-                    }
-                    return None;
+        Some(p) => p,
+        None => {
+            if let Some(ext_port) = process.extension_port {
+                if debug {
+                    eprintln!(
+                        "[cadence] antigravity: probe failed, using extension port {}",
+                        ext_port
+                    );
                 }
+                ("http", ext_port)
+            } else {
+                if debug {
+                    eprintln!("[cadence] antigravity: no connect port found");
+                }
+                return None;
             }
-        };
+        }
+    };
 
     if debug {
         eprintln!(
@@ -472,7 +472,7 @@ mod tests {
     use super::*;
     use crate::agents::app_config_dir_in;
     use serde_json::json;
-    
+
     use tempfile::TempDir;
 
     #[tokio::test]

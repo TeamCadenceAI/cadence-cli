@@ -77,7 +77,6 @@ pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
         Err(_) => return metadata,
     };
     for line in content.lines() {
-
         // Attempt to parse as JSON
         let value: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -353,7 +352,6 @@ async fn read_json_value(file: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&content).ok()
 }
 
-
 fn extract_cwd_from_value(value: &serde_json::Value) -> Option<String> {
     if let Some(path) = value.pointer("/baseUri/fsPath").and_then(|v| v.as_str()) {
         return Some(normalize_cwd_path(path));
@@ -449,7 +447,7 @@ fn collect_timestamp_candidates(value: &serde_json::Value, out: &mut Vec<serde_j
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -460,7 +458,9 @@ mod tests {
 
     async fn write_temp_file(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        tokio::fs::write(&path, content).await.expect("failed to write temp file");
+        tokio::fs::write(&path, content)
+            .await
+            .expect("failed to write temp file");
         path
     }
 
