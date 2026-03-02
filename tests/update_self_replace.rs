@@ -215,19 +215,25 @@ async fn extract_tar_gz_integration() {
     // Build a tar.gz containing a "cadence" binary
     let archive_path = tmp.path().join("cadence-cli-test.tar.gz");
     {
-        let file = std::fs::File::create(&archive_path).unwrap();
-        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        let mut tar_builder = tar::Builder::new(encoder);
+        let file = tokio::fs::File::create(&archive_path).await.unwrap();
+        let std_file = file.into_std().await;
+        tokio::task::spawn_blocking(move || {
+            let encoder =
+                flate2::write::GzEncoder::new(std_file, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(encoder);
 
-        let content = b"#!/bin/sh\necho test binary\n";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        tar_builder
-            .append_data(&mut header, "cadence", &content[..])
-            .unwrap();
-        tar_builder.finish().unwrap();
+            let content = b"#!/bin/sh\necho test binary\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "cadence", &content[..])
+                .unwrap();
+            tar_builder.finish().unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     let extract_dir = tmp.path().join("extracted");
@@ -249,13 +255,18 @@ async fn extract_zip_integration() {
 
     let archive_path = tmp.path().join("cadence-cli-test.zip");
     {
-        let file = std::fs::File::create(&archive_path).unwrap();
-        let mut zip_writer = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        zip_writer.start_file("cadence.exe", options).unwrap();
-        zip_writer.write_all(b"MZ fake exe content").unwrap();
-        zip_writer.finish().unwrap();
+        let file = tokio::fs::File::create(&archive_path).await.unwrap();
+        let std_file = file.into_std().await;
+        tokio::task::spawn_blocking(move || {
+            let mut zip_writer = zip::ZipWriter::new(std_file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip_writer.start_file("cadence.exe", options).unwrap();
+            zip_writer.write_all(b"MZ fake exe content").unwrap();
+            zip_writer.finish().unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     let extract_dir = tmp.path().join("extracted");

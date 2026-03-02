@@ -457,6 +457,7 @@ name = "cadence-cli"
 version = "0.8.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "console",
  "dialoguer",

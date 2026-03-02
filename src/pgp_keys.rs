@@ -53,7 +53,7 @@ async fn read_optional_file(path: Option<PathBuf>) -> Result<Option<String>> {
     match tokio::fs::read_to_string(&path).await {
         Ok(contents) if contents.trim().is_empty() => Ok(None),
         Ok(contents) => Ok(Some(contents)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == tokio::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
 }
@@ -167,7 +167,7 @@ pub async fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadat
                 })?;
             Ok(Some(parsed))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == tokio::io::ErrorKind::NotFound => Ok(None),
         Err(e) => {
             Err(e).with_context(|| format!("failed to read api key metadata at {}", path.display()))
         }

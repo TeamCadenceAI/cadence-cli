@@ -14,6 +14,7 @@ mod sync_pending;
 mod update;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use console::Term;
 use dialoguer::{Confirm, theme::ColorfulTheme};
@@ -21,7 +22,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::OnceLock;
+use tokio::sync::OnceCell;
 use std::time::Duration;
 
 use crate::keychain::KeychainStore;
@@ -30,7 +31,7 @@ const KEYCHAIN_SERVICE: &str = "cadence-cli";
 const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
-static API_URL_OVERRIDE: OnceLock<String> = OnceLock::new();
+static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
 /// Cadence CLI: store AI coding agent sessions in Git refs.
 ///
@@ -294,8 +295,13 @@ async fn encode_and_store_session_object_at(
     session_object_bytes: &[u8],
     method: &EncryptionMethod,
 ) -> Result<(String, note::ContentEncoding)> {
-    let compressed =
-        note::compress_bytes(session_object_bytes).context("session object compression failed")?;
+    let compressed = tokio::task::spawn_blocking({
+        let data = session_object_bytes.to_vec();
+        move || note::compress_bytes(&data)
+    })
+    .await
+    .context("session object compression task failed")?
+    .context("session object compression failed")?;
 
     // Step 2: Optionally encrypt (binary, not armored)
     let (encoded, encoding) = match method {
@@ -741,7 +747,10 @@ async fn run_login() -> Result<()> {
     cfg.save().await?;
 
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    if let Err(e) = keychain.set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token) {
+    if let Err(e) = keychain
+        .set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token)
+        .await
+    {
         output::note(&format!(
             "Could not store token in OS keychain (using config fallback): {e}"
         ));
@@ -756,7 +765,7 @@ async fn run_logout() -> Result<()> {
     let mut cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override());
 
-    if let Some(token) = resolve_cli_auth_token(&cfg) {
+    if let Some(token) = resolve_cli_auth_token(&cfg).await {
         let client = api_client::ApiClient::new(&resolved.url);
         match client
             .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
@@ -775,7 +784,7 @@ async fn run_logout() -> Result<()> {
     }
 
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
         output::note(&format!("Could not clear OS keychain token: {e}"));
     }
 
@@ -792,9 +801,9 @@ struct BackfillSyncStats {
     repos_scanned: i32,
 }
 
-fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT) {
+    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
         Ok(Some(token)) if !token.trim().is_empty() => Some(token),
         Ok(_) | Err(_) => cfg.token.clone().filter(|t| !t.trim().is_empty()),
     }
@@ -806,7 +815,7 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
         Err(_) => return,
     };
 
-    let token = match resolve_cli_auth_token(&cfg) {
+    let token = match resolve_cli_auth_token(&cfg).await {
         Some(token) => token,
         None => {
             output::note("Run `cadence login` to sync results");
@@ -2519,7 +2528,7 @@ async fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
         return Some(blob.to_vec());
     }
 
-    if let Ok(decoded) = zstd::decode_all(std::io::Cursor::new(blob))
+    if let Ok(decoded) = zstd_decode_all_async(blob.to_vec()).await
         && serde_json::from_slice::<note::SessionEnvelope>(&decoded).is_ok()
     {
         return Some(decoded);
@@ -2531,11 +2540,11 @@ async fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
         .flatten()?;
     let fingerprint = pgp_keys::get_user_fingerprint().await.ok().flatten()?;
     let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    let passphrase = keychain.get(&fingerprint).ok().flatten()?;
+    let passphrase = keychain.get(&fingerprint).await.ok().flatten()?;
     let decrypted =
         pgp_keys::decrypt_with_private_key_binary(blob, &private_key, &passphrase).ok()?;
 
-    if let Ok(decoded) = zstd::decode_all(std::io::Cursor::new(&decrypted))
+    if let Ok(decoded) = zstd_decode_all_async(decrypted.clone()).await
         && serde_json::from_slice::<note::SessionEnvelope>(&decoded).is_ok()
     {
         return Some(decoded);
@@ -2544,6 +2553,13 @@ async fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
         return Some(decrypted);
     }
     None
+}
+
+async fn zstd_decode_all_async(data: Vec<u8>) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || zstd::decode_all(std::io::Cursor::new(data)))
+        .await
+        .context("zstd decode task failed")?
+        .context("zstd decode failed")
 }
 
 async fn build_local_session_labels_for_repo(
@@ -3535,8 +3551,9 @@ async fn run_install_encryption_setup() -> Result<()> {
         is_tty,
     );
 
-    let Some(enable) =
-        prompter.confirm("Encrypt attached session notes? (Recommended)", &mut stdout)?
+    let Some(enable) = prompter
+        .confirm("Encrypt attached session notes? (Recommended)", &mut stdout)
+        .await?
     else {
         output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
         return Ok(());
@@ -3628,7 +3645,9 @@ async fn run_install_auto_update_prompt_inner(
         is_tty,
     );
 
-    let response = prompter.confirm("Enable automatic updates?", &mut stdout);
+    let response = prompter
+        .confirm("Enable automatic updates?", &mut stdout)
+        .await;
     match response {
         Ok(Some(enabled)) => {
             let value = if enabled { "true" } else { "false" };
@@ -3670,27 +3689,39 @@ async fn run_install_auto_update_prompt_inner(
 // Keys setup: prompter abstraction
 // ---------------------------------------------------------------------------
 
+#[async_trait]
 trait Prompter {
-    fn confirm(&mut self, prompt: &str, writer: &mut dyn std::io::Write) -> Result<Option<bool>>;
+    async fn confirm(
+        &mut self,
+        prompt: &str,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<Option<bool>>;
 }
 
 struct DialoguerPrompter {
-    theme: ColorfulTheme,
 }
 
 impl DialoguerPrompter {
     fn new() -> Self {
-        Self {
-            theme: ColorfulTheme::default(),
-        }
+        Self {}
     }
 }
 
+#[async_trait]
 impl Prompter for DialoguerPrompter {
-    fn confirm(&mut self, prompt: &str, _writer: &mut dyn std::io::Write) -> Result<Option<bool>> {
-        let result = Confirm::with_theme(&self.theme)
-            .with_prompt(prompt)
-            .interact();
+    async fn confirm(
+        &mut self,
+        prompt: &str,
+        _writer: &mut dyn std::io::Write,
+    ) -> Result<Option<bool>> {
+        let prompt = prompt.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(prompt)
+                .interact()
+        })
+        .await
+        .context("prompt task failed")?;
         match result {
             Ok(value) => Ok(Some(value)),
             Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -3776,10 +3807,12 @@ async fn run_keys_setup_inner(
         output::detail_to_with_tty(writer, "Reusing cached local keypair.", is_tty);
         pgp_keys::fingerprint_from_public_key(public)?
     } else {
-        let Some(store_in_keychain) = prompter.confirm(
-            "Store encryption passphrase in OS keychain? (Recommended)",
-            writer,
-        )?
+        let Some(store_in_keychain) = prompter
+            .confirm(
+                "Store encryption passphrase in OS keychain? (Recommended)",
+                writer,
+            )
+            .await?
         else {
             anyhow::bail!("setup cancelled");
         };
@@ -3801,6 +3834,7 @@ async fn run_keys_setup_inner(
         let keychain = keychain::KeyringStore::new("cadence-cli");
         keychain
             .set(&fingerprint, &passphrase)
+            .await
             .context("failed to store passphrase in OS keychain")?;
 
         pgp_keys::save_user_keys(&armored_public_key, &armored_private_key)

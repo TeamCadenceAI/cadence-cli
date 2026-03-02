@@ -439,10 +439,11 @@ const BINARY_NAME: &str = "cadence";
 
 /// Extracts the cadence binary from a tar.gz archive into `dest_dir`.
 /// Returns the path to the extracted binary.
-fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
-
+fn extract_tar_gz_from_file(
+    file: std::fs::File,
+    archive_path: &Path,
+    dest_dir: &Path,
+) -> Result<PathBuf> {
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
 
@@ -477,10 +478,11 @@ fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
 
 /// Extracts the cadence binary from a zip archive into `dest_dir`.
 /// Returns the path to the extracted binary.
-fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
-
+fn extract_zip_from_file(
+    file: std::fs::File,
+    archive_path: &Path,
+    dest_dir: &Path,
+) -> Result<PathBuf> {
     let mut archive = zip::ZipArchive::new(file).context("Failed to read zip archive")?;
 
     let binary_name_exe = format!("{BINARY_NAME}.exe");
@@ -513,24 +515,36 @@ fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
 ///
 /// Dispatches to the appropriate extractor based on the archive file extension.
 pub async fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    enum ArchiveKind {
+        TarGz,
+        Zip,
+    }
+
     let archive_path = archive_path.to_path_buf();
     let dest_dir = dest_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let name = archive_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+    let name = archive_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let kind = if name.ends_with(".tar.gz") {
+        ArchiveKind::TarGz
+    } else if name.ends_with(".zip") {
+        ArchiveKind::Zip
+    } else {
+        bail!(
+            "Unsupported archive format: '{}'. Expected .tar.gz or .zip",
+            archive_path.display()
+        );
+    };
 
-        if name.ends_with(".tar.gz") {
-            extract_tar_gz(&archive_path, &dest_dir)
-        } else if name.ends_with(".zip") {
-            extract_zip(&archive_path, &dest_dir)
-        } else {
-            bail!(
-                "Unsupported archive format: '{}'. Expected .tar.gz or .zip",
-                archive_path.display()
-            )
-        }
+    let file = tokio::fs::File::open(&archive_path)
+        .await
+        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
+    let std_file = file.into_std().await;
+
+    tokio::task::spawn_blocking(move || match kind {
+        ArchiveKind::TarGz => extract_tar_gz_from_file(std_file, &archive_path, &dest_dir),
+        ArchiveKind::Zip => extract_zip_from_file(std_file, &archive_path, &dest_dir),
     })
     .await
     .context("archive extraction task failed")?
@@ -1415,19 +1429,25 @@ mod tests {
         // Create a tar.gz archive containing a "cadence" binary
         let archive_path = tmp.path().join("test.tar.gz");
         {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-            let mut tar_builder = tar::Builder::new(encoder);
+            let file = tokio::fs::File::create(&archive_path).await.unwrap();
+            let std_file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                let encoder =
+                    flate2::write::GzEncoder::new(std_file, flate2::Compression::default());
+                let mut tar_builder = tar::Builder::new(encoder);
 
-            let content = b"#!/bin/sh\necho hello\n";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            tar_builder
-                .append_data(&mut header, "cadence", &content[..])
-                .unwrap();
-            tar_builder.finish().unwrap();
+                let content = b"#!/bin/sh\necho hello\n";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                tar_builder
+                    .append_data(&mut header, "cadence", &content[..])
+                    .unwrap();
+                tar_builder.finish().unwrap();
+            })
+            .await
+            .unwrap();
         }
 
         let extract_dir = tmp.path().join("out");
@@ -1448,19 +1468,25 @@ mod tests {
         // Create a tar.gz with cadence nested in a subdirectory
         let archive_path = tmp.path().join("nested.tar.gz");
         {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-            let mut tar_builder = tar::Builder::new(encoder);
+            let file = tokio::fs::File::create(&archive_path).await.unwrap();
+            let std_file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                let encoder =
+                    flate2::write::GzEncoder::new(std_file, flate2::Compression::default());
+                let mut tar_builder = tar::Builder::new(encoder);
 
-            let content = b"nested binary";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            tar_builder
-                .append_data(&mut header, "release/cadence", &content[..])
-                .unwrap();
-            tar_builder.finish().unwrap();
+                let content = b"nested binary";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                tar_builder
+                    .append_data(&mut header, "release/cadence", &content[..])
+                    .unwrap();
+                tar_builder.finish().unwrap();
+            })
+            .await
+            .unwrap();
         }
 
         let extract_dir = tmp.path().join("out");
@@ -1476,19 +1502,25 @@ mod tests {
 
         let archive_path = tmp.path().join("empty.tar.gz");
         {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-            let mut tar_builder = tar::Builder::new(encoder);
+            let file = tokio::fs::File::create(&archive_path).await.unwrap();
+            let std_file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                let encoder =
+                    flate2::write::GzEncoder::new(std_file, flate2::Compression::default());
+                let mut tar_builder = tar::Builder::new(encoder);
 
-            let content = b"readme content";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar_builder
-                .append_data(&mut header, "README.md", &content[..])
-                .unwrap();
-            tar_builder.finish().unwrap();
+                let content = b"readme content";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder
+                    .append_data(&mut header, "README.md", &content[..])
+                    .unwrap();
+                tar_builder.finish().unwrap();
+            })
+            .await
+            .unwrap();
         }
 
         let extract_dir = tmp.path().join("out");
@@ -1505,13 +1537,18 @@ mod tests {
 
         let archive_path = tmp.path().join("test.zip");
         {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let mut zip_writer = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zip_writer.start_file("cadence.exe", options).unwrap();
-            zip_writer.write_all(b"MZ fake exe").unwrap();
-            zip_writer.finish().unwrap();
+            let file = tokio::fs::File::create(&archive_path).await.unwrap();
+            let std_file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                let mut zip_writer = zip::ZipWriter::new(std_file);
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zip_writer.start_file("cadence.exe", options).unwrap();
+                zip_writer.write_all(b"MZ fake exe").unwrap();
+                zip_writer.finish().unwrap();
+            })
+            .await
+            .unwrap();
         }
 
         let extract_dir = tmp.path().join("out");
@@ -1528,12 +1565,17 @@ mod tests {
 
         let archive_path = tmp.path().join("empty.zip");
         {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let mut zip_writer = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default();
-            zip_writer.start_file("README.txt", options).unwrap();
-            zip_writer.write_all(b"readme").unwrap();
-            zip_writer.finish().unwrap();
+            let file = tokio::fs::File::create(&archive_path).await.unwrap();
+            let std_file = file.into_std().await;
+            tokio::task::spawn_blocking(move || {
+                let mut zip_writer = zip::ZipWriter::new(std_file);
+                let options = zip::write::SimpleFileOptions::default();
+                zip_writer.start_file("README.txt", options).unwrap();
+                zip_writer.write_all(b"readme").unwrap();
+                zip_writer.finish().unwrap();
+            })
+            .await
+            .unwrap();
         }
 
         let extract_dir = tmp.path().join("out");
