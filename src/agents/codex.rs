@@ -25,23 +25,6 @@ pub fn all_log_dirs() -> Vec<PathBuf> {
     log_dirs_in(&home)
 }
 
-/// Return all directories containing `.jsonl` files under `~/.codex/sessions/`.
-///
-/// Codex does not encode the repo path into the directory name, so all
-/// session directories are returned as candidates. The caller is responsible
-/// for filtering by time window and content.
-///
-/// Returns an empty `Vec` if:
-/// - The home directory cannot be resolved
-/// - `~/.codex/sessions/` does not exist
-pub fn log_dirs() -> Vec<PathBuf> {
-    let home = match home_dir() {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
-    log_dirs_in(&home)
-}
-
 /// Internal: find Codex session directories under a given home directory.
 ///
 /// Recursively traverses `~/.codex/sessions/` to find directories that

@@ -1,6 +1,6 @@
 ## Project Overview
 
-**Cadence CLI** is a single Rust CLI binary that attaches AI coding agent session logs (Claude Code, Codex) to Git commits using **git notes** (ref: `refs/notes/ai-sessions`).
+**Cadence CLI** is a single Rust CLI binary that stores AI coding agent session data (Claude Code, Codex) in Git refs (`refs/cadence/sessions/data`, `refs/cadence/sessions/index/branch`, `refs/cadence/sessions/index/committer`).
 It provides provenance and measurement of AI-assisted development without polluting commit history.
 
 ## Build & Development Commands

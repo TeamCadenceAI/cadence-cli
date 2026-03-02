@@ -109,8 +109,8 @@ fn filename_timestamp(now: OffsetDateTime) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_with_now_creates_timestamped_log_file() {
+    #[tokio::test]
+    async fn new_with_now_creates_timestamped_log_file() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let now = OffsetDateTime::from_unix_timestamp(1_706_795_445).expect("ts");
 
@@ -125,8 +125,8 @@ mod tests {
         assert!(file_name.starts_with(&expected_prefix));
     }
 
-    #[test]
-    fn event_writes_jsonl_row() {
+    #[tokio::test]
+    async fn event_writes_jsonl_row() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let logger = BackfillLogger::new_with_now(
             tmp.path(),

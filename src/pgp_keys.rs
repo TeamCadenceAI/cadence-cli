@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use pgp::ArmorOptions;
 use pgp::KeyType;
 use pgp::composed::key::{SecretKeyParamsBuilder, SubkeyParamsBuilder};
-use pgp::composed::{Deserializable, Message, SignedPublicKey};
+use pgp::composed::{Deserializable, Message, SignedPublicKey, SignedSecretKey};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::ser::Serialize;
 use pgp::types::PublicKeyTrait;
@@ -317,4 +317,33 @@ pub fn encrypt_to_public_keys_binary(
     encrypted
         .to_bytes()
         .context("rpgp encrypt failed: binary serialization error")
+}
+
+/// Decrypt binary OpenPGP message bytes using an armored private key + passphrase.
+///
+/// Returns the decrypted literal payload bytes.
+pub fn decrypt_with_private_key_binary(
+    encrypted: &[u8],
+    armored_private_key: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>> {
+    let trimmed_key = armored_private_key.trim();
+    if trimmed_key.is_empty() {
+        bail!("rpgp decrypt: private key material must not be blank");
+    }
+    if passphrase.trim().is_empty() {
+        bail!("rpgp decrypt: passphrase must not be blank");
+    }
+
+    let (secret_key, _headers) =
+        SignedSecretKey::from_string(trimmed_key).context("rpgp decrypt: private key parse error")?;
+    let message = Message::from_bytes(encrypted).context("rpgp decrypt: message parse error")?;
+    let (decrypted, _recipient_ids) = message
+        .decrypt(|| passphrase.to_string(), &[&secret_key])
+        .context("rpgp decrypt: message decryption failed")?;
+    let content = decrypted
+        .get_content()
+        .context("rpgp decrypt: failed to extract message content")?
+        .ok_or_else(|| anyhow::anyhow!("rpgp decrypt: decrypted message has no content"))?;
+    Ok(content)
 }
