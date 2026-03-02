@@ -1229,6 +1229,7 @@ async fn ingest_session_from_log(
     };
 
     let session_bytes = note::serialize_session_object(record, session_log.to_string())?;
+    let _ = git::migrate_legacy_session_ref_at(Some(&repo_path)).await?;
     let (blob_sha, encoding) =
         encode_and_store_session_object_at(Some(&repo_path), &session_bytes, method).await?;
     let fanout_path = git::fanout_path_for_key_hash(&session_uid)?;

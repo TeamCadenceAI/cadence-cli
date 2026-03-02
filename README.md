@@ -1,6 +1,9 @@
 # Cadence CLI
 
-Cadence CLI attaches AI coding agent session logs to Git commits using git notes (ref: `refs/notes/ai-sessions`).
+Cadence CLI stores AI coding agent session logs in dedicated Git refs:
+- `refs/cadence/sessions/data`
+- `refs/cadence/sessions/index/branch`
+- `refs/cadence/sessions/index/committer`
 It adds provenance for AI-assisted development without altering your commit history.
 
 ## Install
@@ -37,9 +40,9 @@ cadence install
 
 2. Make commits as usual.
 
-3. View the attached session note:
+3. Inspect session refs:
 ```sh
-git notes --ref refs/notes/ai-sessions show HEAD
+git show-ref refs/cadence/sessions/data
 ```
 
 4. Diagnose install issues (hooks, rewrite safety):
@@ -49,9 +52,12 @@ cadence doctor
 
 ## How It Works
 
-Cadence installs global Git hooks that scan for recent AI session logs, then attaches matching logs as Git notes after each commit.
+Cadence installs global Git hooks that scan for recent AI session logs, then stores canonical session objects and indexes after each commit.
 It also configures Git note rewrite settings so notes follow rewritten commits during rebase/amend.
 Notes can be synced alongside commits without modifying commit history.
+
+If a repository still has the legacy ref `refs/notes/ai-sessions`, Cadence will migrate it to
+`refs/cadence/sessions/data` when new session data is ingested.
 
 ## Supported Agents
 

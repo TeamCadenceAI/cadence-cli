@@ -14,6 +14,8 @@ use tokio::process::Command;
 pub const NOTES_REF: &str = "refs/cadence/sessions/data";
 /// Canonical encrypted session objects.
 pub const SESSION_DATA_REF: &str = "refs/cadence/sessions/data";
+/// Legacy notes ref used by older Cadence versions.
+pub const LEGACY_SESSION_NOTES_REF: &str = "refs/notes/ai-sessions";
 /// Branch-oriented index of session objects.
 pub const SESSION_INDEX_BRANCH_REF: &str = "refs/cadence/sessions/index/branch";
 /// Committer-oriented index of session objects.
@@ -291,6 +293,23 @@ pub(crate) async fn local_ref_hash_at(
     } else {
         Ok(Some(hash.to_string()))
     }
+}
+
+/// One-time migration for legacy session notes ref.
+///
+/// If the canonical session data ref is missing and the legacy notes ref exists,
+/// this copies the legacy ref tip to `refs/cadence/sessions/data`.
+/// Returns `true` when migration was applied.
+pub(crate) async fn migrate_legacy_session_ref_at(repo: Option<&Path>) -> Result<bool> {
+    if ref_exists_at(repo, SESSION_DATA_REF).await? {
+        return Ok(false);
+    }
+
+    let Some(legacy_tip) = local_ref_hash_at(repo, LEGACY_SESSION_NOTES_REF).await? else {
+        return Ok(false);
+    };
+    update_ref_at(repo, SESSION_DATA_REF, &legacy_tip).await?;
+    Ok(true)
 }
 
 /// Get the hash of a remote ref via `ls-remote`.
@@ -2255,5 +2274,63 @@ mod tests {
             .await
             .expect("rev_parse_at failed");
         assert_eq!(resolved, head);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_legacy_session_ref_copies_when_new_missing() {
+        let dir = init_temp_repo().await;
+        let head = rev_parse_at(Some(dir.path()), "HEAD")
+            .await
+            .expect("head sha");
+        update_ref_at(Some(dir.path()), LEGACY_SESSION_NOTES_REF, &head)
+            .await
+            .expect("set legacy ref");
+
+        let migrated = migrate_legacy_session_ref_at(Some(dir.path()))
+            .await
+            .expect("migrate");
+        assert!(migrated);
+
+        let canonical = rev_parse_at(Some(dir.path()), SESSION_DATA_REF)
+            .await
+            .expect("canonical ref");
+        assert_eq!(canonical, head);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_legacy_session_ref_noop_when_canonical_exists() {
+        let dir = init_temp_repo().await;
+        let head = rev_parse_at(Some(dir.path()), "HEAD")
+            .await
+            .expect("head sha");
+        update_ref_at(Some(dir.path()), SESSION_DATA_REF, &head)
+            .await
+            .expect("set canonical ref");
+
+        let other_blob = store_blob_at(Some(dir.path()), b"legacy")
+            .await
+            .expect("blob");
+        let legacy_tree = mktree_at(
+            Some(dir.path()),
+            &[format!("100644 blob {}\tlegacy.txt", other_blob)],
+        )
+        .await
+        .expect("legacy tree");
+        let legacy_commit = commit_tree_at(Some(dir.path()), &legacy_tree, "legacy", None)
+            .await
+            .expect("legacy commit");
+        update_ref_at(Some(dir.path()), LEGACY_SESSION_NOTES_REF, &legacy_commit)
+            .await
+            .expect("set legacy ref");
+
+        let migrated = migrate_legacy_session_ref_at(Some(dir.path()))
+            .await
+            .expect("migrate");
+        assert!(!migrated);
+
+        let canonical = rev_parse_at(Some(dir.path()), SESSION_DATA_REF)
+            .await
+            .expect("canonical ref");
+        assert_eq!(canonical, head, "canonical ref should not be overwritten");
     }
 }
