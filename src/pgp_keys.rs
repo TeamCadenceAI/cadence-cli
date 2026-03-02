@@ -335,8 +335,8 @@ pub fn decrypt_with_private_key_binary(
         bail!("rpgp decrypt: passphrase must not be blank");
     }
 
-    let (secret_key, _headers) =
-        SignedSecretKey::from_string(trimmed_key).context("rpgp decrypt: private key parse error")?;
+    let (secret_key, _headers) = SignedSecretKey::from_string(trimmed_key)
+        .context("rpgp decrypt: private key parse error")?;
     let message = Message::from_bytes(encrypted).context("rpgp decrypt: message parse error")?;
     let (decrypted, _recipient_ids) = message
         .decrypt(|| passphrase.to_string(), &[&secret_key])
