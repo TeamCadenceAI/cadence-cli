@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.9.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.8.1...v0.9.0) (2026-03-03)
+
+
+### Features
+
+* Branch/committer session storage ([7cdc164](https://github.com/TeamCadenceAI/cadence-cli/commit/7cdc16415579d68bdd65b6ab1331938d64d22494))
+* **hooks:** show cadence spinner/check status for session sync ([f162591](https://github.com/TeamCadenceAI/cadence-cli/commit/f16259105ce626a2e0b3e8a21189291ed44d1e64))
+* refactor keychain operations to use async functions and update dependencies ([41a847a](https://github.com/TeamCadenceAI/cadence-cli/commit/41a847a2e4b5e1598bf761e6b6071dcf43a7d0a6))
+* **storage:** migrate legacy ai-session ref to canonical session ref ([68e8a97](https://github.com/TeamCadenceAI/cadence-cli/commit/68e8a97d5e8799f321f0e3fe285a9345f1d3720d))
+* **sync-cursors:** implement persistent index-ingest cursors ([b21bf60](https://github.com/TeamCadenceAI/cadence-cli/commit/b21bf6070af3081f59e5ff23d7d37a50761d8fbb))
+
+
+### Bug Fixes
+
+* **backfill:** treat existing notes as skipped during backfill ([f30f2a5](https://github.com/TeamCadenceAI/cadence-cli/commit/f30f2a5dc9e1ce0ebdb998a081b5e685ec033a36))
+* **decrypt:** improve error context for private key parsing ([b14b68b](https://github.com/TeamCadenceAI/cadence-cli/commit/b14b68b55a3725abd0a1125bce764d79d20e2f7c))
+* Fix GC not GCing all refs ([bbc337d](https://github.com/TeamCadenceAI/cadence-cli/commit/bbc337d3f348eb63620a5f08e4f35048cafd2435))
+* **hook:** add newline for better readability in spinner output ([62d1e8c](https://github.com/TeamCadenceAI/cadence-cli/commit/62d1e8c7e80acc98b5c9af639187d5c52d389083))
+* **sync:** harden cursor I/O and async traversal behavior ([b24834d](https://github.com/TeamCadenceAI/cadence-cli/commit/b24834d368065fe53a99956e463eae270f905322))
+* **sync:** preserve index entries during ref merges and align post-commit branch indexing ([9fd3fe4](https://github.com/TeamCadenceAI/cadence-cli/commit/9fd3fe4d1c3e91be3233c24614561f3146d2cf21))
+
 ## [0.8.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.8.0...v0.8.1) (2026-03-01)
 
 
