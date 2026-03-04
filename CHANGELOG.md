@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.10.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.9.0...v0.10.0) (2026-03-04)
+
+
+### Features
+
+* Add Warp support ([681f666](https://github.com/TeamCadenceAI/cadence-cli/commit/681f6665eb19049cb0e2385d7f40fd422e8364f1)), closes [#41](https://github.com/TeamCadenceAI/cadence-cli/issues/41)
+* **login:** add Cadence branding to OAuth callback success/error screen ([c33b12f](https://github.com/TeamCadenceAI/cadence-cli/commit/c33b12fe6c0e67e599d56963ea2072a315c2825b))
+* **sync:** add deferred non-blocking cadence sync worker ([691fed1](https://github.com/TeamCadenceAI/cadence-cli/commit/691fed1f4ac44d8f7aebdde5663b0176daeb7a55))
+* **sync:** add detailed per-ref deferred sync tracing ([1a07b60](https://github.com/TeamCadenceAI/cadence-cli/commit/1a07b6070825d1c6fbab53d056a4f63d056e1751))
+* Warp support ([f039ac0](https://github.com/TeamCadenceAI/cadence-cli/commit/f039ac005affffd4e2917ea8147153a973b9abaa))
+
+
+### Bug Fixes
+
+* Deferred sync, performance improvements and discovery logging ([6a4e29c](https://github.com/TeamCadenceAI/cadence-cli/commit/6a4e29c80b6c532fbf464968a16f5650205783de))
+* **merge:** resolve conflicts with main ([7c7e300](https://github.com/TeamCadenceAI/cadence-cli/commit/7c7e3008047f99fac73b0e27e8a21c26aca50631))
+* **sync:** avoid temp-file collisions in atomic queue writes ([9f2de13](https://github.com/TeamCadenceAI/cadence-cli/commit/9f2de13a6f6c70b41d83533e9d414f46f309a7d2))
+* **sync:** capture full deferred-sync tracing in log files ([a2ba111](https://github.com/TeamCadenceAI/cadence-cli/commit/a2ba111ff8d903cd6a51810056097daace5620c7))
+* **sync:** harden deferred sync execution and ref sync safety ([7e3373e](https://github.com/TeamCadenceAI/cadence-cli/commit/7e3373eb4315259b7efff0cb6e0ea6f7e0353d2e))
+* **warp:** include task-only sessions and preserve envelope meta events ([fe6314a](https://github.com/TeamCadenceAI/cadence-cli/commit/fe6314ade5399bef0f061e0e182569d642018d1f))
+
+
+### Performance Improvements
+
+* **hooks:** optimize ingest discovery and ref sync hot paths ([8334808](https://github.com/TeamCadenceAI/cadence-cli/commit/8334808959143b25d5f7ef6a1fae12e5d7fb0a44))
+
 ## [0.9.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.8.1...v0.9.0) (2026-03-03)
 
 
