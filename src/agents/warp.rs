@@ -107,11 +107,10 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
 
     let cutoff = now - since_secs;
     let rows = fetch_ai_query_rows(&conn, cutoff);
-    if rows.is_empty() {
+    let tasks_by_conversation = fetch_agent_tasks_by_conversation(&conn, cutoff);
+    if rows.is_empty() && tasks_by_conversation.is_empty() {
         return out;
     }
-
-    let tasks_by_conversation = fetch_agent_tasks_by_conversation(&conn, cutoff);
 
     let mut by_conversation: BTreeMap<String, Vec<AiQueryRow>> = BTreeMap::new();
     let mut unknown_idx = 0usize;
@@ -127,17 +126,17 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
             });
         by_conversation.entry(key).or_default().push(row);
     }
+    for conversation_id in tasks_by_conversation.keys() {
+        by_conversation.entry(conversation_id.clone()).or_default();
+    }
 
     for (conversation_id, rows) in by_conversation {
-        if rows.is_empty() {
-            continue;
-        }
-
         let mut max_start = 0i64;
         let mut has_non_success_status = false;
         let mut conversation_cwd: Option<String> = None;
         let mut events = Vec::new();
         let mut ord = 0usize;
+        let task_rows = tasks_by_conversation.get(&conversation_id);
 
         for row in &rows {
             max_start = max_start.max(row.start_ts);
@@ -188,7 +187,7 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
             }
         }
 
-        if let Some(task_rows) = tasks_by_conversation.get(&conversation_id) {
+        if let Some(task_rows) = task_rows {
             for task in task_rows {
                 max_start = max_start.max(task.last_modified_ts);
                 let decoded = decode_warp_task(&task.task_blob);
@@ -225,36 +224,57 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
         let mut deduped = dedupe_adjacent(events.into_iter().map(|e| e.value).collect());
 
         if deduped.is_empty() {
-            let first = &rows[0];
-            let mut obj = base_event("warp_meta", &conversation_id, first.start_ts, "ai_queries");
-            if let Some(exchange_id) = first.exchange_id.as_deref() {
-                obj.insert(
-                    "exchange_id".to_string(),
-                    Value::String(exchange_id.to_string()),
+            if let Some(first) = rows.first() {
+                let mut obj =
+                    base_event("warp_meta", &conversation_id, first.start_ts, "ai_queries");
+                if let Some(exchange_id) = first.exchange_id.as_deref() {
+                    obj.insert(
+                        "exchange_id".to_string(),
+                        Value::String(exchange_id.to_string()),
+                    );
+                }
+                if let Some(cwd) = conversation_cwd.as_deref() {
+                    obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
+                }
+                if let Some(status) = first.output_status.as_deref().and_then(clean_status) {
+                    obj.insert("status".to_string(), Value::String(status));
+                }
+                if let Some(model) = first.model_id.as_deref().and_then(non_empty_str) {
+                    obj.insert("model_id".to_string(), Value::String(model.to_string()));
+                }
+                if let Some(model) = first.planning_model_id.as_deref().and_then(non_empty_str) {
+                    obj.insert(
+                        "planning_model_id".to_string(),
+                        Value::String(model.to_string()),
+                    );
+                }
+                if let Some(model) = first.coding_model_id.as_deref().and_then(non_empty_str) {
+                    obj.insert(
+                        "coding_model_id".to_string(),
+                        Value::String(model.to_string()),
+                    );
+                }
+                deduped.push(Value::Object(obj));
+            } else if let Some(first_task) = task_rows.and_then(|rows| rows.first()) {
+                let mut obj = base_event(
+                    "warp_meta",
+                    &conversation_id,
+                    first_task.last_modified_ts,
+                    "agent_tasks",
                 );
-            }
-            if let Some(cwd) = conversation_cwd.as_deref() {
-                obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
-            }
-            if let Some(status) = first.output_status.as_deref().and_then(clean_status) {
-                obj.insert("status".to_string(), Value::String(status));
-            }
-            if let Some(model) = first.model_id.as_deref().and_then(non_empty_str) {
-                obj.insert("model_id".to_string(), Value::String(model.to_string()));
-            }
-            if let Some(model) = first.planning_model_id.as_deref().and_then(non_empty_str) {
                 obj.insert(
-                    "planning_model_id".to_string(),
-                    Value::String(model.to_string()),
+                    "task_id".to_string(),
+                    Value::String(first_task.task_id.clone()),
                 );
+                if let Some(cwd) = conversation_cwd.as_deref() {
+                    obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
+                }
+                deduped.push(Value::Object(obj));
             }
-            if let Some(model) = first.coding_model_id.as_deref().and_then(non_empty_str) {
-                obj.insert(
-                    "coding_model_id".to_string(),
-                    Value::String(model.to_string()),
-                );
-            }
-            deduped.push(Value::Object(obj));
+        }
+
+        if deduped.is_empty() {
+            continue;
         }
 
         for value in deduped {
@@ -376,6 +396,7 @@ fn normalize_task_events(
     let mut out = Vec::new();
     for (_, env) in by_envelope {
         let ts = env.timestamp.unwrap_or(task.last_modified_ts);
+        let mut envelope_events = Vec::new();
 
         for (text, path) in dedupe_text_pairs(env.user_texts) {
             let mut obj = base_event("user", conversation_id, ts, "agent_tasks");
@@ -386,7 +407,7 @@ fn normalize_task_events(
             if let Some(cwd) = cwd {
                 obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
             }
-            out.push(Value::Object(obj));
+            envelope_events.push(Value::Object(obj));
         }
 
         for (text, path) in dedupe_text_pairs(env.assistant_texts) {
@@ -398,7 +419,7 @@ fn normalize_task_events(
             if let Some(cwd) = cwd {
                 obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
             }
-            out.push(Value::Object(obj));
+            envelope_events.push(Value::Object(obj));
         }
 
         if env.tool_call_name.is_some() || !env.tool_call_args.is_empty() {
@@ -439,7 +460,7 @@ fn normalize_task_events(
             if let Some(cwd) = cwd {
                 obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
             }
-            out.push(Value::Object(obj));
+            envelope_events.push(Value::Object(obj));
         }
 
         if !env.tool_result_outputs.is_empty() {
@@ -471,10 +492,10 @@ fn normalize_task_events(
             if let Some(cwd) = cwd {
                 obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
             }
-            out.push(Value::Object(obj));
+            envelope_events.push(Value::Object(obj));
         }
 
-        if out.is_empty() {
+        if envelope_events.is_empty() {
             for (text, path) in dedupe_text_pairs(env.meta) {
                 let mut obj = base_event("warp_meta", conversation_id, ts, "agent_tasks");
                 obj.insert("content".to_string(), Value::String(text));
@@ -483,9 +504,11 @@ fn normalize_task_events(
                 if let Some(cwd) = cwd {
                     obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
                 }
-                out.push(Value::Object(obj));
+                envelope_events.push(Value::Object(obj));
             }
         }
+
+        out.extend(envelope_events);
     }
 
     out
@@ -1505,6 +1528,40 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn warp_discovers_task_only_conversation() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("warp.sqlite");
+        let conn = create_db(&db_path);
+
+        let blob = build_task_with_user_assistant_and_tool();
+        conn.execute(
+            "INSERT INTO agent_tasks (conversation_id, task_id, task, last_modified_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            ("conv-task-only", "task-1", blob, "2026-03-04 00:04:50"),
+        )
+        .expect("insert task");
+
+        unsafe {
+            std::env::set_var("WARP_DB_PATH", &db_path);
+        }
+        let logs = WarpExplorer.discover_recent(1_772_583_000, 10_000).await;
+        unsafe {
+            std::env::remove_var("WARP_DB_PATH");
+        }
+
+        assert_eq!(logs.len(), 1);
+        let log = logs.first().expect("log");
+        assert_eq!(log.updated_at, Some(1_772_582_690));
+        let content = match &log.source {
+            SessionSource::Inline { content, .. } => content,
+            _ => panic!("expected inline"),
+        };
+        assert!(content.contains("\"conversation_id\":\"conv-task-only\""));
+        assert!(content.contains("\"type\":\"assistant\""));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn warp_normalizes_agent_tasks_to_turns_and_tools() {
         let tmp = TempDir::new().expect("tmp");
         let db_path = tmp.path().join("warp.sqlite");
@@ -1606,5 +1663,46 @@ mod tests {
             WarpSchemaProfile::classify("5.5.2.5.1"),
             WarpSemanticRole::ToolResultOutput
         );
+    }
+
+    #[test]
+    fn normalize_task_events_keeps_meta_for_later_envelope() {
+        let task = AgentTaskRow {
+            conversation_id: "conv-1".to_string(),
+            task_id: "task-1".to_string(),
+            last_modified_ts: 1_700_000_000,
+            task_blob: Vec::new(),
+        };
+        let decoded = WarpDecodedTask {
+            flat_nodes: vec![
+                WarpFlatNode {
+                    field_path: "5.2.1".to_string(),
+                    timestamp_candidate: Some(1_700_000_001),
+                    string_value: Some("first user prompt".to_string()),
+                    envelope_index: Some(0),
+                },
+                WarpFlatNode {
+                    field_path: "9.1.1".to_string(),
+                    timestamp_candidate: Some(1_700_000_002),
+                    string_value: Some("Task failed after timeout".to_string()),
+                    envelope_index: Some(1),
+                },
+            ],
+        };
+
+        let events = normalize_task_events("conv-1", &task, Some(&decoded), Some("/tmp/repo"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("user"))
+        );
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("warp_meta")
+                && event
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("failed")
+        }));
     }
 }
