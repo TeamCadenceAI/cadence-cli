@@ -368,3 +368,4 @@
 {"session_uid":"ed741b3ca3ea88f95bc9cc1efd0b1bc39d45241325f259e8b1ea3a04c325d602","session_blob_sha":"9b307fd5f22f46812fe4accdcf0bd92041bc963e","session_start":1770958995,"agent":"claude-code","ingested_at":"2026-02-13T05:03:15Z"}
 {"session_uid":"d6b681e5e308333c19ba624bd2fdd5f7d3817d3751ccbdb1127f8342533b86f0","session_blob_sha":"747edcfc9009426f9bda22b91b3bab9af2c2b184","session_start":1771380530,"agent":"claude-code","ingested_at":"2026-02-18T02:08:50Z"}
 {"session_uid":"6add50c9c6d778e4ab804d1df4ea46dd14694dbc2069c773a6820071318f242b","session_blob_sha":"366361c7675d4a69463f2122ebd0abfe704aac64","session_start":1770995219,"agent":"claude-code","ingested_at":"2026-02-13T15:06:59Z"}
+{"session_uid":"095e26adde087220f125b083dbc9c1a953093a18137bdf9ebe5639ccc12be0c5","session_blob_sha":"b52338c609c1a8c28be9ab31e7cb714929f9d4d6","session_start":1771220471,"agent":"claude-code","ingested_at":"2026-02-16T05:41:11Z"}
