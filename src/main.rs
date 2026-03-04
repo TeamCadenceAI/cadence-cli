@@ -97,28 +97,6 @@ enum Command {
     /// Diagnose hook and session-ref configuration issues.
     Doctor,
 
-    /// Sync Cadence session refs (supports deferred background retries).
-    Sync {
-        /// Repository path to sync (defaults to current repository).
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// Remote name to sync (defaults to push remote or origin).
-        #[arg(long)]
-        remote: Option<String>,
-        /// Process queued pending sync jobs.
-        #[arg(long)]
-        all_pending: bool,
-        /// Internal: background worker mode.
-        #[arg(long)]
-        background: bool,
-        /// Max pending jobs to process in this invocation.
-        #[arg(long, default_value_t = 4)]
-        max_items: usize,
-        /// Max time budget for this invocation in milliseconds.
-        #[arg(long, default_value_t = 8000)]
-        time_budget_ms: u64,
-    },
-
     /// Check for and install updates.
     Update {
         /// Only check if a newer version is available; do not download or install.
@@ -184,6 +162,27 @@ enum HookCommand {
         remote: String,
         /// Remote URL provided by git.
         url: String,
+    },
+    /// Deferred sync worker: process queued session-ref sync jobs.
+    DeferredSync {
+        /// Repository path to sync (defaults to current repository).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Remote name to sync (defaults to push remote or origin).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Process queued pending sync jobs.
+        #[arg(long)]
+        all_pending: bool,
+        /// Internal: background worker mode.
+        #[arg(long)]
+        background: bool,
+        /// Max pending jobs to process in this invocation.
+        #[arg(long, default_value_t = 4)]
+        max_items: usize,
+        /// Max time budget for this invocation in milliseconds.
+        #[arg(long, default_value_t = 8000)]
+        time_budget_ms: u64,
     },
 }
 
@@ -4101,7 +4100,7 @@ async fn main() {
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
     // Opportunistic sweep of pending sync jobs for normal CLI flows.
-    if !matches!(cli.command, Command::Hook { .. } | Command::Sync { .. }) {
+    if !matches!(cli.command, Command::Hook { .. }) {
         let _ = deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
             repo: None,
             remote: None,
@@ -4122,25 +4121,25 @@ async fn main() {
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
             HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url).await,
-        },
-        Command::Sync {
-            repo,
-            remote,
-            all_pending,
-            background,
-            max_items,
-            time_budget_ms,
-        } => {
-            run_sync(
+            HookCommand::DeferredSync {
                 repo,
                 remote,
                 all_pending,
                 background,
                 max_items,
                 time_budget_ms,
-            )
-            .await
-        }
+            } => {
+                run_sync(
+                    repo,
+                    remote,
+                    all_pending,
+                    background,
+                    max_items,
+                    time_budget_ms,
+                )
+                .await
+            }
+        },
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
         Command::Logout => run_logout().await,
@@ -4383,25 +4382,28 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_sync_defaults() {
-        let cli = Cli::parse_from(["cadence", "sync"]);
+    fn cli_parses_hook_deferred_sync_defaults() {
+        let cli = Cli::parse_from(["cadence", "hook", "deferred-sync"]);
         match cli.command {
-            Command::Sync {
-                repo,
-                remote,
-                all_pending,
-                background,
-                max_items,
-                time_budget_ms,
-            } => {
-                assert!(repo.is_none());
-                assert!(remote.is_none());
-                assert!(!all_pending);
-                assert!(!background);
-                assert_eq!(max_items, 4);
-                assert_eq!(time_budget_ms, 8000);
-            }
-            _ => panic!("expected Sync command"),
+            Command::Hook { hook_command } => match hook_command {
+                HookCommand::DeferredSync {
+                    repo,
+                    remote,
+                    all_pending,
+                    background,
+                    max_items,
+                    time_budget_ms,
+                } => {
+                    assert!(repo.is_none());
+                    assert!(remote.is_none());
+                    assert!(!all_pending);
+                    assert!(!background);
+                    assert_eq!(max_items, 4);
+                    assert_eq!(time_budget_ms, 8000);
+                }
+                _ => panic!("expected DeferredSync hook command"),
+            },
+            _ => panic!("expected Hook command"),
         }
     }
 

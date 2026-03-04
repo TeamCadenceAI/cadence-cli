@@ -4,7 +4,7 @@
 //! - pending sync queue records
 //! - robust per-job lock acquisition with stale/corrupt lock cleanup
 //! - detached background worker spawning
-//! - `cadence sync` execution entrypoint
+//! - `cadence hook deferred-sync` execution entrypoint
 
 use anyhow::{Context, Result};
 use rand08::Rng;
@@ -29,22 +29,35 @@ const REF_SYNC_JOB_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct SyncRunOptions {
+    /// Optional repository path to sync. Uses current repo when unset.
     pub repo: Option<PathBuf>,
+    /// Optional remote to sync. Resolves push remote when unset.
     pub remote: Option<String>,
+    /// Process persisted pending jobs instead of creating an explicit one.
     pub all_pending: bool,
+    /// Whether this invocation is running as a detached background worker.
     pub background: bool,
+    /// Maximum number of pending jobs to process in this invocation.
     pub max_items: usize,
+    /// Total runtime budget for this invocation in milliseconds.
     pub time_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingSyncRecord {
+    /// Canonical repo root path for the queued sync job.
     pub repo_root: String,
+    /// Git remote name for this sync job.
     pub remote: String,
+    /// RFC3339 enqueue timestamp.
     pub enqueued_at: String,
+    /// RFC3339 update timestamp.
     pub updated_at: String,
+    /// Number of failed attempts.
     pub attempt_count: u32,
+    /// Earliest epoch second when this job can be retried.
     pub next_attempt_at_epoch: i64,
+    /// Last sync error, if any.
     pub last_error: Option<String>,
 }
 
@@ -69,6 +82,10 @@ impl Drop for SyncLockGuard {
     }
 }
 
+/// Upsert a pending sync job for `(repo, remote)`.
+///
+/// If a record already exists, this refreshes `updated_at` and makes it
+/// immediately eligible for retry.
 pub async fn enqueue_pending_sync(repo_root: &Path, remote: &str) -> Result<()> {
     let repo_root_str = repo_root.to_string_lossy().to_string();
     let key = pending_key(&repo_root_str, remote);
@@ -119,10 +136,15 @@ pub async fn enqueue_pending_sync(repo_root: &Path, remote: &str) -> Result<()> 
     write_json_atomic(&path, &record).await
 }
 
+/// Spawn a detached one-shot background worker that runs:
+/// `cadence hook deferred-sync --background ...`
+///
+/// The worker is intentionally short-lived and relies on queue-based retries.
 pub async fn spawn_background_sync(repo_root: &Path, remote: &str) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable for background sync")?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("sync")
+    cmd.arg("hook")
+        .arg("deferred-sync")
         .arg("--background")
         .arg("--repo")
         .arg(repo_root)
@@ -156,11 +178,21 @@ pub async fn spawn_background_sync(repo_root: &Path, remote: &str) -> Result<()>
 }
 
 pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
+    run_startup_maintenance().await?;
+
+    let jobs = collect_runnable_jobs(&opts).await?;
+    execute_jobs_bounded(jobs, opts.background, opts.time_budget_ms).await
+}
+
+/// Run lock/log maintenance before processing jobs.
+async fn run_startup_maintenance() -> Result<()> {
     sweep_stale_locks().await?;
     sweep_old_logs().await?;
-    sweep_log_size().await?;
+    sweep_log_size().await
+}
 
-    let start = std::time::Instant::now();
+/// Resolve and cap runnable jobs for the current invocation.
+async fn collect_runnable_jobs(opts: &SyncRunOptions) -> Result<Vec<PendingSyncRecord>> {
     let mut jobs = if opts.all_pending {
         load_pending_records().await?
     } else {
@@ -168,21 +200,31 @@ pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
     };
     jobs.sort_by(|a, b| a.repo_root.cmp(&b.repo_root).then(a.remote.cmp(&b.remote)));
     if jobs.is_empty() {
-        return Ok(());
+        return Ok(jobs);
     }
 
     let now = now_epoch();
     jobs.retain(|j| j.next_attempt_at_epoch <= now);
-    let cap = opts.max_items.max(1);
-    jobs.truncate(cap);
+    jobs.truncate(opts.max_items.max(1));
+    Ok(jobs)
+}
 
+/// Execute jobs with bounded concurrency and a global time budget.
+async fn execute_jobs_bounded(
+    jobs: Vec<PendingSyncRecord>,
+    background: bool,
+    time_budget_ms: u64,
+) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
     let mut set = JoinSet::new();
     let mut in_flight = 0usize;
     let mut idx = 0usize;
     while idx < jobs.len() || in_flight > 0 {
         while idx < jobs.len() && in_flight < REF_SYNC_JOB_CONCURRENCY {
             let job = jobs[idx].clone();
-            let background = opts.background;
             set.spawn(async move { run_one_pending_job(job, background).await });
             idx += 1;
             in_flight += 1;
@@ -193,7 +235,7 @@ pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
         };
         in_flight -= 1;
         let _ = done?;
-        if start.elapsed().as_millis() as u64 > opts.time_budget_ms {
+        if start.elapsed().as_millis() as u64 > time_budget_ms {
             break;
         }
     }
@@ -322,6 +364,11 @@ async fn acquire_lock(
     acquire_lock_in_dir(&dir, repo_root, remote, worker_id).await
 }
 
+/// Acquire a lock file for a specific `(repo, remote)` job.
+///
+/// Returns:
+/// - `Some(guard)` when the caller now owns the lock.
+/// - `None` when another healthy worker currently owns the lock.
 async fn acquire_lock_in_dir(
     dir: &Path,
     repo_root: &str,
@@ -388,6 +435,7 @@ async fn acquire_lock_in_dir(
     Ok(None)
 }
 
+/// Try to atomically create a lock file. Returns `false` if it already exists.
 async fn try_create_lock(path: &Path, lock: &SyncLockRecord) -> Result<bool> {
     let data = serde_json::to_vec_pretty(lock)?;
     let mut opts = tokio::fs::OpenOptions::new();
@@ -402,6 +450,7 @@ async fn try_create_lock(path: &Path, lock: &SyncLockRecord) -> Result<bool> {
     Ok(true)
 }
 
+/// Rename malformed lock files so operators can inspect them later.
 async fn quarantine_broken_lock(path: &Path) -> Result<()> {
     let ts = now_epoch();
     let broken = path.with_extension(format!("broken.{ts}"));
@@ -409,6 +458,7 @@ async fn quarantine_broken_lock(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort startup sweep to remove stale/dead/corrupt lock files.
 async fn sweep_stale_locks() -> Result<()> {
     let dir = lock_dir().await?;
     let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -460,6 +510,7 @@ async fn update_pending_retry(job: &PendingSyncRecord, error_message: String) ->
     write_json_atomic(&path, &next).await
 }
 
+/// Remove a pending job after successful sync.
 async fn clear_pending_record(repo_root: &str, remote: &str) -> Result<()> {
     let dir = pending_dir().await?;
     let path = pending_path_for(repo_root, remote, &dir);
@@ -469,6 +520,7 @@ async fn clear_pending_record(repo_root: &str, remote: &str) -> Result<()> {
     Ok(())
 }
 
+/// Load all pending sync records from disk.
 async fn load_pending_records() -> Result<Vec<PendingSyncRecord>> {
     let dir = pending_dir().await?;
     let mut out = Vec::new();
@@ -492,6 +544,7 @@ async fn load_pending_records() -> Result<Vec<PendingSyncRecord>> {
     Ok(out)
 }
 
+/// Build a single explicit sync job and ensure it exists in the pending queue.
 async fn build_explicit_jobs(
     repo: Option<&Path>,
     remote: Option<&str>,
@@ -578,6 +631,7 @@ fn init_tracing_for_worker(
     Ok(tracing::subscriber::set_default(subscriber))
 }
 
+/// Delete old per-worker logs based on retention-days policy.
 async fn sweep_old_logs() -> Result<()> {
     let dir = log_dir().await?;
     let retention = log_retention_days().max(1);
@@ -607,6 +661,7 @@ async fn sweep_old_logs() -> Result<()> {
     Ok(())
 }
 
+/// Enforce an optional total-size cap for sync worker logs.
 async fn sweep_log_size() -> Result<()> {
     let Some(max_bytes) = max_log_bytes() else {
         return Ok(());
@@ -650,6 +705,7 @@ async fn sweep_log_size() -> Result<()> {
     Ok(())
 }
 
+/// Write JSON atomically via a temp file + rename.
 async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_vec_pretty(value)?;
