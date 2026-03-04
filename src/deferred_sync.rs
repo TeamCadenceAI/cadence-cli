@@ -707,11 +707,45 @@ async fn sweep_log_size() -> Result<()> {
 
 /// Write JSON atomically via a temp file + rename.
 async fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_vec_pretty(value)?;
-    tokio::fs::write(&tmp, data).await?;
-    tokio::fs::rename(&tmp, path).await?;
-    Ok(())
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing parent for {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("pending");
+    let pid = std::process::id();
+
+    for attempt in 0..8u32 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_name = format!(".{file_name}.{pid}.{nonce}.{attempt}.tmp");
+        let tmp = parent.join(tmp_name);
+
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        match opts.open(&tmp).await {
+            Ok(mut file) => {
+                tokio::io::AsyncWriteExt::write_all(&mut file, &data).await?;
+                drop(file);
+                tokio::fs::rename(&tmp, path).await?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("create temp file for {}", path.display()));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to create unique temp file for {}",
+        path.display()
+    ))
 }
 
 async fn cadence_cli_dir() -> Result<PathBuf> {
