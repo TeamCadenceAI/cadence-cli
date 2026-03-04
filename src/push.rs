@@ -4,6 +4,7 @@ use crate::{git, output};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
+use tokio::task::JoinSet;
 
 const SESSION_REFS: [&str; 3] = [
     git::SESSION_DATA_REF,
@@ -54,29 +55,36 @@ async fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_pro
     }
 }
 
-/// Legacy name retained for call-site compatibility; now syncs canonical session refs.
-pub async fn sync_notes_for_remote(remote: &str) {
-    let result = async {
-        let repo_root = git::repo_root().await?;
-        sync_session_refs_for_remote_at(&repo_root, remote).await
-    }
-    .await;
-
-    if let Err(e) = result {
-        output::note(&format!(
-            "Could not sync session refs with {}: {}",
-            remote, e
-        ));
-    }
-}
-
-async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
+pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
     if remote.is_empty() || remote == "." {
         anyhow::bail!("invalid remote name");
     }
 
+    // Fast no-op path: skip all work if local and remote hashes match for all refs.
+    let remote_hashes = git::remote_ref_hashes_at(Some(repo), remote, &SESSION_REFS)
+        .await
+        .unwrap_or_default();
+    let local_hashes = git::local_ref_hashes_at(Some(repo), &SESSION_REFS)
+        .await
+        .unwrap_or_default();
+    let all_match = SESSION_REFS
+        .iter()
+        .all(|r| local_hashes.get(*r) == remote_hashes.get(*r));
+    if all_match {
+        return Ok(());
+    }
+
+    // Sync refs concurrently; each ref uses independent temp refs and merges.
+    let mut set = JoinSet::new();
     for ref_name in SESSION_REFS {
-        sync_ref_for_remote_at(repo, remote, ref_name).await?;
+        let repo = repo.to_path_buf();
+        let remote = remote.to_string();
+        let ref_name = ref_name.to_string();
+        set.spawn(async move { sync_ref_for_remote_at(&repo, &remote, &ref_name).await });
+    }
+
+    while let Some(next) = set.join_next().await {
+        next??;
     }
     Ok(())
 }

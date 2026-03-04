@@ -2,6 +2,7 @@ mod agents;
 mod api_client;
 mod backfill_log;
 mod config;
+mod deferred_sync;
 mod git;
 mod keychain;
 mod login;
@@ -95,6 +96,28 @@ enum Command {
 
     /// Diagnose hook and session-ref configuration issues.
     Doctor,
+
+    /// Sync Cadence session refs (supports deferred background retries).
+    Sync {
+        /// Repository path to sync (defaults to current repository).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Remote name to sync (defaults to push remote or origin).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Process queued pending sync jobs.
+        #[arg(long)]
+        all_pending: bool,
+        /// Internal: background worker mode.
+        #[arg(long)]
+        background: bool,
+        /// Max pending jobs to process in this invocation.
+        #[arg(long, default_value_t = 4)]
+        max_items: usize,
+        /// Max time budget for this invocation in milliseconds.
+        #[arg(long, default_value_t = 8000)]
+        time_budget_ms: u64,
+    },
 
     /// Check for and install updates.
     Update {
@@ -1009,16 +1032,10 @@ async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
         {
             output::note(&format!("Pre-push ingest issue: {}", e));
         }
-        let pushing_progress = hook_status_spinner_start("Pushing AI sessions");
-        let sync_start = std::time::Instant::now();
-        push::sync_notes_for_remote(remote).await;
-        hook_status_spinner_finish_ok(pushing_progress, "Pushing AI sessions");
-        if output::is_verbose() {
-            output::detail(&format!(
-                "Pre-push sync in {} ms",
-                sync_start.elapsed().as_millis()
-            ));
-        }
+        let queue_progress = hook_status_spinner_start("Queueing AI session sync");
+        deferred_sync::enqueue_pending_sync(&repo_root, remote).await?;
+        let _ = deferred_sync::spawn_background_sync(&repo_root, remote).await;
+        hook_status_spinner_finish_ok(queue_progress, "Queueing AI session sync");
     }
 
     Ok(())
@@ -4083,12 +4100,47 @@ async fn main() {
 
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
+    // Opportunistic sweep of pending sync jobs for normal CLI flows.
+    if !matches!(cli.command, Command::Hook { .. } | Command::Sync { .. }) {
+        let _ = deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
+            repo: None,
+            remote: None,
+            all_pending: true,
+            background: false,
+            max_items: 2,
+            time_budget_ms: std::env::var("CADENCE_SYNC_LOCK_SWEEP_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs * 1000)
+                .unwrap_or(1500),
+        })
+        .await;
+    }
+
     let result = match cli.command {
         Command::Install { org } => run_install(org).await,
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
             HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url).await,
         },
+        Command::Sync {
+            repo,
+            remote,
+            all_pending,
+            background,
+            max_items,
+            time_budget_ms,
+        } => {
+            run_sync(
+                repo,
+                remote,
+                all_pending,
+                background,
+                max_items,
+                time_budget_ms,
+            )
+            .await
+        }
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
         Command::Logout => run_logout().await,
@@ -4327,6 +4379,29 @@ mod tests {
         match cli.command {
             Command::Doctor => {}
             _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_sync_defaults() {
+        let cli = Cli::parse_from(["cadence", "sync"]);
+        match cli.command {
+            Command::Sync {
+                repo,
+                remote,
+                all_pending,
+                background,
+                max_items,
+                time_budget_ms,
+            } => {
+                assert!(repo.is_none());
+                assert!(remote.is_none());
+                assert!(!all_pending);
+                assert!(!background);
+                assert_eq!(max_items, 4);
+                assert_eq!(time_budget_ms, 8000);
+            }
+            _ => panic!("expected Sync command"),
         }
     }
 
@@ -4779,4 +4854,22 @@ mod tests {
         let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
         assert!(excerpt.starts_with("Review the Warp output"));
     }
+}
+async fn run_sync(
+    repo: Option<PathBuf>,
+    remote: Option<String>,
+    all_pending: bool,
+    background: bool,
+    max_items: usize,
+    time_budget_ms: u64,
+) -> Result<()> {
+    deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
+        repo,
+        remote,
+        all_pending,
+        background,
+        max_items,
+        time_budget_ms,
+    })
+    .await
 }

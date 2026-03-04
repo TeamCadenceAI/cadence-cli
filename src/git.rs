@@ -5,6 +5,7 @@
 
 use crate::output;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use tokio::io::AsyncWriteExt;
@@ -346,6 +347,60 @@ pub(crate) async fn remote_ref_hash_at(
     } else {
         Ok(Some(hash.to_string()))
     }
+}
+
+/// Get remote ref hashes for multiple refs via a single `ls-remote` call.
+pub(crate) async fn remote_ref_hashes_at(
+    repo: Option<&Path>,
+    remote: &str,
+    refs: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    if refs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut args = vec!["-c", "protocol.version=2", "ls-remote", "--refs", remote];
+    args.extend_from_slice(refs);
+    let output = run_git_output_at(
+        repo,
+        &args,
+        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
+    )
+    .await
+    .context("failed to execute git ls-remote")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git ls-remote failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let mut out = BTreeMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(ref_name) = parts.next() else {
+            continue;
+        };
+        if !hash.is_empty() && !ref_name.is_empty() {
+            out.insert(ref_name.to_string(), hash.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Get local ref hashes for multiple refs.
+pub(crate) async fn local_ref_hashes_at(
+    repo: Option<&Path>,
+    refs: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for ref_name in refs {
+        if let Some(hash) = local_ref_hash_at(repo, ref_name).await? {
+            out.insert((*ref_name).to_string(), hash);
+        }
+    }
+    Ok(out)
 }
 
 /// Fetch a specific remote ref into a temp local ref.
