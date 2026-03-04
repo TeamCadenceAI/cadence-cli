@@ -1,10 +1,9 @@
 //! Push decision and sync logic for canonical session refs.
 
 use crate::{git, output};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
-use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 const SESSION_REFS: [&str; 3] = [
@@ -64,10 +63,10 @@ pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Resul
     // Fast no-op path: skip all work if local and remote hashes match for all refs.
     let remote_hashes = git::remote_ref_hashes_at(Some(repo), remote, &SESSION_REFS)
         .await
-        .unwrap_or_default();
+        .with_context(|| format!("read remote ref hashes for {remote}"))?;
     let local_hashes = git::local_ref_hashes_at(Some(repo), &SESSION_REFS)
         .await
-        .unwrap_or_default();
+        .context("read local session ref hashes")?;
     let all_match = SESSION_REFS
         .iter()
         .all(|r| local_hashes.get(*r) == remote_hashes.get(*r));
@@ -83,38 +82,29 @@ pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Resul
         return Ok(());
     }
 
-    // Sync refs concurrently; each ref uses independent temp refs and merges.
-    let mut set = JoinSet::new();
+    // Sync refs serially to avoid concurrent fetch/update-ref lock contention
+    // in the same repository.
     for ref_name in SESSION_REFS {
-        let repo = repo.to_path_buf();
-        let remote = remote.to_string();
-        let ref_name = ref_name.to_string();
-        let pre_remote_hash = remote_hashes.get(ref_name.as_str()).cloned();
-        let local_hash = local_hashes.get(ref_name.as_str()).cloned();
-        set.spawn(async move {
-            info!(
+        let pre_remote_hash = remote_hashes.get(ref_name).cloned();
+        let local_hash = local_hashes.get(ref_name).cloned();
+        info!(
+            remote = %remote,
+            ref_name = %ref_name,
+            remote_tip = %short_hash(pre_remote_hash.as_deref()),
+            local_tip = %short_hash(local_hash.as_deref()),
+            "starting per-ref sync"
+        );
+        if let Err(e) =
+            sync_ref_for_remote_with_state(repo, remote, ref_name, pre_remote_hash, local_hash)
+                .await
+        {
+            warn!(
                 remote = %remote,
                 ref_name = %ref_name,
-                remote_tip = %short_hash(pre_remote_hash.as_deref()),
-                local_tip = %short_hash(local_hash.as_deref()),
-                "queued per-ref sync task"
+                error = %e,
+                "per-ref sync failed"
             );
-            sync_ref_for_remote_with_state(&repo, &remote, &ref_name, pre_remote_hash, local_hash)
-                .await
-        });
-    }
-
-    while let Some(next) = set.join_next().await {
-        match next {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(remote = %remote, error = %e, "session ref sync task failed");
-                return Err(e);
-            }
-            Err(e) => {
-                warn!(remote = %remote, error = %e, "session ref sync task join error");
-                return Err(e.into());
-            }
+            return Err(e);
         }
     }
     info!(remote = %remote, "session ref sync finished");
@@ -661,6 +651,18 @@ mod tests {
         dir
     }
 
+    async fn init_repo_with_remote() -> (TempDir, TempDir) {
+        let local = init_repo().await;
+        let remote = TempDir::new().expect("tempdir");
+        run_git(remote.path(), &["init", "--bare", "-q"]).await;
+        run_git(
+            local.path(),
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        )
+        .await;
+        (local, remote)
+    }
+
     async fn write_ref_map(repo: &Path, ref_name: &str, map: &BTreeMap<String, String>) {
         let tree = build_tree_from_map(repo, map).await.expect("build tree");
         let parent = git::rev_parse_at(Some(repo), ref_name).await.ok();
@@ -723,5 +725,75 @@ mod tests {
         let merged_text = String::from_utf8(merged_blob).expect("utf8");
         assert!(merged_text.contains("\"session_uid\":\"local\""));
         assert!(merged_text.contains("\"session_uid\":\"remote\""));
+    }
+
+    #[tokio::test]
+    async fn sync_session_refs_returns_error_when_remote_hash_lookup_fails() {
+        let repo = init_repo().await;
+        let err = sync_session_refs_for_remote_at(repo.path(), "origin")
+            .await
+            .expect_err("missing remote should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read remote ref hashes") || msg.contains("ls-remote"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_session_refs_pushes_local_content_when_remote_ref_missing() {
+        let (local, remote) = init_repo_with_remote().await;
+        let mut map = BTreeMap::new();
+        let blob = git::store_blob_at(Some(local.path()), br#"{"k":"v"}"#)
+            .await
+            .expect("store blob");
+        map.insert("item.json".to_string(), blob);
+        write_ref_map(local.path(), git::SESSION_DATA_REF, &map).await;
+
+        sync_session_refs_for_remote_at(local.path(), "origin")
+            .await
+            .expect("sync refs");
+
+        let local_tip = git::rev_parse_at(Some(local.path()), git::SESSION_DATA_REF)
+            .await
+            .expect("local tip");
+        let remote_tip = git::rev_parse_at(Some(remote.path()), git::SESSION_DATA_REF)
+            .await
+            .expect("remote tip");
+        assert_eq!(local_tip, remote_tip);
+    }
+
+    #[tokio::test]
+    async fn sync_session_refs_fetches_remote_content_when_local_ref_missing() {
+        let (local, remote) = init_repo_with_remote().await;
+        let mut map = BTreeMap::new();
+        let blob = git::store_blob_at(Some(local.path()), br#"{"k":"v2"}"#)
+            .await
+            .expect("store blob");
+        map.insert("item.json".to_string(), blob);
+        write_ref_map(local.path(), git::SESSION_DATA_REF, &map).await;
+        sync_session_refs_for_remote_at(local.path(), "origin")
+            .await
+            .expect("initial push");
+
+        run_git(local.path(), &["update-ref", "-d", git::SESSION_DATA_REF]).await;
+        assert!(
+            !git::ref_exists_at(Some(local.path()), git::SESSION_DATA_REF)
+                .await
+                .expect("ref exists check"),
+            "local ref should be deleted before sync"
+        );
+
+        sync_session_refs_for_remote_at(local.path(), "origin")
+            .await
+            .expect("sync should fetch remote ref");
+
+        let local_tip = git::rev_parse_at(Some(local.path()), git::SESSION_DATA_REF)
+            .await
+            .expect("local tip restored");
+        let remote_tip = git::rev_parse_at(Some(remote.path()), git::SESSION_DATA_REF)
+            .await
+            .expect("remote tip");
+        assert_eq!(local_tip, remote_tip);
     }
 }

@@ -4259,17 +4259,24 @@ async fn main() {
     let is_update_command = matches!(cli.command, Command::Update { .. });
 
     // Opportunistic sweep of pending sync jobs for normal CLI flows.
-    if !matches!(cli.command, Command::Hook { .. }) {
+    if !matches!(cli.command, Command::Hook { .. }) && deferred_sync::has_pending_sync_jobs().await
+    {
         let _ = deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
             repo: None,
             remote: None,
             all_pending: true,
             background: false,
             max_items: 2,
-            time_budget_ms: std::env::var("CADENCE_SYNC_LOCK_SWEEP_INTERVAL_SECS")
+            time_budget_ms: std::env::var("CADENCE_SYNC_SWEEP_TIME_BUDGET_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .map(|secs| secs * 1000)
+                // Deprecated compatibility path: legacy var was in seconds.
+                .or_else(|| {
+                    std::env::var("CADENCE_SYNC_LOCK_SWEEP_INTERVAL_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(|secs| secs * 1000)
+                })
                 .unwrap_or(1500),
         })
         .await;
@@ -4330,6 +4337,25 @@ async fn main() {
         output::fail("Failed", &format!("{}", e));
         process::exit(1);
     }
+}
+
+async fn run_sync(
+    repo: Option<PathBuf>,
+    remote: Option<String>,
+    all_pending: bool,
+    background: bool,
+    max_items: usize,
+    time_budget_ms: u64,
+) -> Result<()> {
+    deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
+        repo,
+        remote,
+        all_pending,
+        background,
+        max_items,
+        time_budget_ms,
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -5015,22 +5041,4 @@ mod tests {
         let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
         assert!(excerpt.starts_with("Review the Warp output"));
     }
-}
-async fn run_sync(
-    repo: Option<PathBuf>,
-    remote: Option<String>,
-    all_pending: bool,
-    background: bool,
-    max_items: usize,
-    time_budget_ms: u64,
-) -> Result<()> {
-    deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
-        repo,
-        remote,
-        all_pending,
-        background,
-        max_items,
-        time_budget_ms,
-    })
-    .await
 }

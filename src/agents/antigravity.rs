@@ -256,10 +256,46 @@ async fn save_probe_cache(path: &Path, cache: &ProbeCache) -> anyhow::Result<()>
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp = path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(cache)?).await?;
-    tokio::fs::rename(&tmp, path).await?;
-    Ok(())
+    let data = serde_json::to_vec_pretty(cache)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing parent for {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("probe-cache");
+    let pid = std::process::id();
+
+    for attempt in 0..8u32 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = parent.join(format!(".{file_name}.{pid}.{nonce}.{attempt}.tmp"));
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        match opts.open(&tmp).await {
+            Ok(mut file) => {
+                tokio::io::AsyncWriteExt::write_all(&mut file, &data).await?;
+                drop(file);
+                tokio::fs::rename(&tmp, path).await?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "create temp file for {}: {}",
+                    path.display(),
+                    err
+                ));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to create unique temp file for {}",
+        path.display()
+    ))
 }
 
 fn now_epoch() -> i64 {

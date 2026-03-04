@@ -179,10 +179,13 @@ pub async fn spawn_background_sync(repo_root: &Path, remote: &str) -> Result<()>
 }
 
 pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
+    let jobs = collect_runnable_jobs(&opts).await?;
+    if jobs.is_empty() {
+        return Ok(());
+    }
     let _ = init_tracing_for_run(opts.background);
     run_startup_maintenance().await?;
 
-    let jobs = collect_runnable_jobs(&opts).await?;
     info!(
         background = opts.background,
         max_items = opts.max_items,
@@ -220,16 +223,13 @@ async fn collect_runnable_jobs(opts: &SyncRunOptions) -> Result<Vec<PendingSyncR
 
 /// Execute jobs with bounded concurrency and a global time budget.
 async fn execute_jobs_bounded(jobs: Vec<PendingSyncRecord>, time_budget_ms: u64) -> Result<()> {
-    if jobs.is_empty() {
-        info!("no deferred sync jobs were runnable");
-        return Ok(());
-    }
     let start = std::time::Instant::now();
     let mut set = JoinSet::new();
     let mut in_flight = 0usize;
     let mut idx = 0usize;
+    let mut stop_spawning = false;
     while idx < jobs.len() || in_flight > 0 {
-        while idx < jobs.len() && in_flight < REF_SYNC_JOB_CONCURRENCY {
+        while !stop_spawning && idx < jobs.len() && in_flight < REF_SYNC_JOB_CONCURRENCY {
             let job = jobs[idx].clone();
             set.spawn(async move { run_one_pending_job(job).await });
             idx += 1;
@@ -241,13 +241,15 @@ async fn execute_jobs_bounded(jobs: Vec<PendingSyncRecord>, time_budget_ms: u64)
         };
         in_flight -= 1;
         let _ = done?;
-        if start.elapsed().as_millis() as u64 > time_budget_ms {
+        if !stop_spawning && start.elapsed().as_millis() as u64 > time_budget_ms {
+            stop_spawning = true;
             info!(
                 time_budget_ms,
                 elapsed_ms = start.elapsed().as_millis() as u64,
-                "stopping deferred sync invocation due to time budget"
+                in_flight,
+                remaining_jobs = jobs.len().saturating_sub(idx),
+                "time budget reached; stopping new sync job starts and draining in-flight jobs"
             );
-            break;
         }
     }
     info!(
@@ -255,6 +257,23 @@ async fn execute_jobs_bounded(jobs: Vec<PendingSyncRecord>, time_budget_ms: u64)
         "deferred sync invocation finished"
     );
     Ok(())
+}
+
+pub async fn has_pending_sync_jobs() -> bool {
+    let dir = match pending_dir().await {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+            return true;
+        }
+    }
+    false
 }
 
 async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
