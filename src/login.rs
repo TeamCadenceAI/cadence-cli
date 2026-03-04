@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use rand08::RngCore;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::api_client::{ApiClient, CliTokenExchangeResult};
 
@@ -15,12 +15,9 @@ pub async fn login_via_browser(
 ) -> Result<CliTokenExchangeResult> {
     let nonce = generate_nonce();
 
-    let listener =
-        TcpListener::bind("127.0.0.1:0").context("failed to bind local callback port")?;
-    listener
-        .set_nonblocking(true)
-        .context("failed to configure callback listener")?;
-
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind local callback port")?;
     let local_port = listener
         .local_addr()
         .context("failed to read local callback address")?
@@ -38,7 +35,7 @@ pub async fn login_via_browser(
     })?;
 
     let deadline = Instant::now() + timeout;
-    let exchange_code = wait_for_exchange_code(&listener, &nonce, deadline)?;
+    let exchange_code = wait_for_exchange_code(&listener, &nonce, deadline).await?;
 
     let client = ApiClient::new(api_base_url);
     client
@@ -63,7 +60,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn wait_for_exchange_code(
+async fn wait_for_exchange_code(
     listener: &TcpListener,
     expected_state: &str,
     deadline: Instant,
@@ -73,28 +70,26 @@ fn wait_for_exchange_code(
             bail!("login timed out waiting for browser callback");
         }
 
-        match listener.accept() {
-            Ok((mut stream, _addr)) => {
-                if let Some(code) = handle_callback_request(&mut stream, expected_state)? {
+        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+            Ok(Ok((mut stream, _addr))) => {
+                if let Some(code) = handle_callback_request(&mut stream, expected_state).await? {
                     return Ok(code);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(e).context("failed while waiting for browser callback"),
+            Ok(Err(e)) => return Err(e).context("failed while waiting for browser callback"),
+            Err(_) => continue,
         }
     }
 }
 
-fn handle_callback_request(stream: &mut TcpStream, expected_state: &str) -> Result<Option<String>> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .context("failed to set callback read timeout")?;
-
+async fn handle_callback_request(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<Option<String>> {
     let mut buffer = [0u8; 8192];
-    let n = stream
-        .read(&mut buffer)
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buffer))
+        .await
+        .context("timed out reading callback request")?
         .context("failed to read callback request")?;
     if n == 0 {
         return Ok(None);
@@ -117,12 +112,13 @@ fn handle_callback_request(stream: &mut TcpStream, expected_state: &str) -> Resu
             405,
             "Method Not Allowed",
             "Only GET callbacks are supported.",
-        )?;
+        )
+        .await?;
         return Ok(None);
     }
 
     if !target.starts_with("/callback") {
-        write_http_response(stream, 404, "Not Found", "Not a Cadence callback URL.")?;
+        write_http_response(stream, 404, "Not Found", "Not a Cadence callback URL.").await?;
         return Ok(None);
     }
 
@@ -157,7 +153,8 @@ fn handle_callback_request(stream: &mut TcpStream, expected_state: &str) -> Resu
             400,
             "Bad Request",
             "Missing exchange code in callback.",
-        )?;
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -167,16 +164,17 @@ fn handle_callback_request(stream: &mut TcpStream, expected_state: &str) -> Resu
             400,
             "Bad Request",
             "State mismatch. Please retry `cadence login`.",
-        )?;
+        )
+        .await?;
         return Ok(None);
     }
 
-    write_http_response(stream, 200, "OK", "You can close this tab")?;
+    write_http_response(stream, 200, "OK", "You can close this tab").await?;
 
     Ok(Some(code))
 }
 
-fn write_http_response(
+async fn write_http_response(
     stream: &mut TcpStream,
     status_code: u16,
     status_text: &str,
@@ -190,9 +188,11 @@ fn write_http_response(
     );
     stream
         .write_all(response.as_bytes())
+        .await
         .context("failed to write callback response")?;
     stream
         .flush()
+        .await
         .context("failed to flush callback response")?;
     Ok(())
 }

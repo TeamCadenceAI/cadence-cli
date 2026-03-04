@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 #[allow(dead_code)]
+#[async_trait]
 pub trait KeychainStore {
-    fn get(&self, account: &str) -> Result<Option<String>>;
-    fn set(&self, account: &str, value: &str) -> Result<()>;
-    fn delete(&self, account: &str) -> Result<()>;
+    async fn get(&self, account: &str) -> Result<Option<String>>;
+    async fn set(&self, account: &str, value: &str) -> Result<()>;
+    async fn delete(&self, account: &str) -> Result<()>;
 }
 
 pub struct KeyringStore {
@@ -19,37 +21,56 @@ impl KeyringStore {
             service: service.to_string(),
         }
     }
-
-    fn entry(&self, account: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(&self.service, account).context("failed to open keychain entry")
-    }
 }
 
+#[async_trait]
 impl KeychainStore for KeyringStore {
-    fn get(&self, account: &str) -> Result<Option<String>> {
-        let entry = self.entry(account)?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(err).context("failed to read keychain entry"),
-        }
+    async fn get(&self, account: &str) -> Result<Option<String>> {
+        let service = self.service.clone();
+        let account = account.to_string();
+        tokio::task::spawn_blocking(move || {
+            let entry =
+                keyring::Entry::new(&service, &account).context("failed to open keychain entry")?;
+            match entry.get_password() {
+                Ok(value) => Ok(Some(value)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(err) => Err(err).context("failed to read keychain entry"),
+            }
+        })
+        .await
+        .context("keychain get task failed")?
     }
 
-    fn set(&self, account: &str, value: &str) -> Result<()> {
-        let entry = self.entry(account)?;
-        entry
-            .set_password(value)
-            .context("failed to store keychain entry")?;
-        Ok(())
+    async fn set(&self, account: &str, value: &str) -> Result<()> {
+        let service = self.service.clone();
+        let account = account.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let entry =
+                keyring::Entry::new(&service, &account).context("failed to open keychain entry")?;
+            entry
+                .set_password(&value)
+                .context("failed to store keychain entry")?;
+            Ok(())
+        })
+        .await
+        .context("keychain set task failed")?
     }
 
-    fn delete(&self, account: &str) -> Result<()> {
-        let entry = self.entry(account)?;
-        match entry.delete_password() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(err).context("failed to delete keychain entry"),
-        }
+    async fn delete(&self, account: &str) -> Result<()> {
+        let service = self.service.clone();
+        let account = account.to_string();
+        tokio::task::spawn_blocking(move || {
+            let entry =
+                keyring::Entry::new(&service, &account).context("failed to open keychain entry")?;
+            match entry.delete_password() {
+                Ok(()) => Ok(()),
+                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(err) => Err(err).context("failed to delete keychain entry"),
+            }
+        })
+        .await
+        .context("keychain delete task failed")?
     }
 }
 
@@ -66,21 +87,22 @@ impl InMemoryKeychain {
     }
 }
 
+#[async_trait]
 impl KeychainStore for InMemoryKeychain {
-    fn get(&self, account: &str) -> Result<Option<String>> {
-        Ok(self.values.lock().unwrap().get(account).cloned())
+    async fn get(&self, account: &str) -> Result<Option<String>> {
+        Ok(self.values.lock().await.get(account).cloned())
     }
 
-    fn set(&self, account: &str, value: &str) -> Result<()> {
+    async fn set(&self, account: &str, value: &str) -> Result<()> {
         self.values
             .lock()
-            .unwrap()
+            .await
             .insert(account.to_string(), value.to_string());
         Ok(())
     }
 
-    fn delete(&self, account: &str) -> Result<()> {
-        self.values.lock().unwrap().remove(account);
+    async fn delete(&self, account: &str) -> Result<()> {
+        self.values.lock().await.remove(account);
         Ok(())
     }
 }

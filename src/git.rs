@@ -1,40 +1,31 @@
 //! Git utility helpers.
 //!
-//! All functions shell out to `git` via `std::process::Command`.
-//! The notes ref used throughout is `refs/notes/ai-sessions`.
+//! All functions shell out to `git` via `tokio::process::Command`.
+//! The notes ref used throughout is `refs/cadence/sessions/data`.
 
 use crate::output;
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Output, Stdio};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 /// The dedicated git notes ref for AI session data.
-pub const NOTES_REF: &str = "refs/notes/ai-sessions";
-/// Dedicated ref that anchors payload blobs so push doesn't need full notes scans.
-pub const PAYLOAD_REF: &str = "refs/notes/ai-payloads";
+pub const NOTES_REF: &str = "refs/cadence/sessions/data";
+/// Canonical encrypted session objects.
+pub const SESSION_DATA_REF: &str = "refs/cadence/sessions/data";
+/// Legacy notes ref used by older Cadence versions.
+pub const LEGACY_SESSION_NOTES_REF: &str = "refs/notes/ai-sessions";
+/// Branch-oriented index of session objects.
+pub const SESSION_INDEX_BRANCH_REF: &str = "refs/cadence/sessions/index/branch";
+/// Committer-oriented index of session objects.
+pub const SESSION_INDEX_COMMITTER_REF: &str = "refs/cadence/sessions/index/committer";
 
 /// Result of fetching a single ref.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FetchResult {
     pub fetched: bool,
-}
-
-/// Validate that a commit hash is a valid hex string of 7-40 characters.
-///
-/// This prevents flag injection (e.g., passing `--help` as a commit) and
-/// ensures we only pass well-formed refs to git.
-pub(crate) fn validate_commit_hash(commit: &str) -> Result<()> {
-    let is_valid =
-        commit.len() >= 7 && commit.len() <= 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
-    if !is_valid {
-        bail!(
-            "invalid commit hash {:?}: must be 7-40 lowercase hex characters",
-            commit
-        );
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -43,8 +34,8 @@ pub(crate) fn validate_commit_hash(commit: &str) -> Result<()> {
 
 /// Run a git command and return its stdout as a trimmed `String`.
 /// Returns an error if the command exits with a non-zero status.
-fn git_output(args: &[&str]) -> Result<String> {
-    let output = run_git_output_at(None, args, &[])?;
+async fn git_output(args: &[&str]) -> Result<String> {
+    let output = run_git_output_at(None, args, &[]).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -60,8 +51,8 @@ fn git_output(args: &[&str]) -> Result<String> {
     Ok(stdout.trim().to_string())
 }
 
-fn git_output_in(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = run_git_output_at(Some(repo), args, &[])?;
+async fn git_output_in(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = run_git_output_at(Some(repo), args, &[]).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -72,11 +63,11 @@ fn git_output_in(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(stdout.trim().to_string())
 }
 
-pub(crate) fn run_git_output_at(
+pub(crate) async fn run_git_output_at(
     repo: Option<&Path>,
     args: &[&str],
     envs: &[(&str, &str)],
-) -> Result<std::process::Output> {
+) -> Result<Output> {
     let mut cmd = Command::new("git");
     let mut display_parts = vec!["git".to_string()];
 
@@ -94,116 +85,28 @@ pub(crate) fn run_git_output_at(
     display_parts.extend(args.iter().map(|s| s.to_string()));
     if output::is_verbose() {
         output::detail(&display_parts.join(" "));
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.args(args).spawn().context("failed to execute git")?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let (tx, rx) = std::sync::mpsc::channel::<(Stream, Vec<u8>)>();
-        if let Some(stdout) = stdout {
-            let tx = tx.clone();
-            std::thread::spawn(move || read_stream(Stream::Stdout, stdout, tx));
+        let output = cmd
+            .args(args)
+            .output()
+            .await
+            .context("failed to execute git")?;
+        if !output.stdout.is_empty() {
+            output::detail("stdout:");
+            emit_stream_chunk(&output.stdout);
         }
-        if let Some(stderr) = stderr {
-            let tx = tx.clone();
-            std::thread::spawn(move || read_stream(Stream::Stderr, stderr, tx));
+        if !output.stderr.is_empty() {
+            output::detail("stderr:");
+            emit_stream_chunk(&output.stderr);
         }
-        drop(tx);
-
-        let mut stdout_buf: Vec<u8> = Vec::new();
-        let mut stderr_buf: Vec<u8> = Vec::new();
-        let mut saw_stdout = false;
-        let mut saw_stderr = false;
-
-        while let Ok((stream, chunk)) = rx.recv() {
-            match stream {
-                Stream::Stdout => {
-                    if !saw_stdout {
-                        output::detail("stdout:");
-                        saw_stdout = true;
-                    }
-                    stdout_buf.extend_from_slice(&chunk);
-                    emit_stream_chunk(&chunk);
-                }
-                Stream::Stderr => {
-                    if !saw_stderr {
-                        output::detail("stderr:");
-                        saw_stderr = true;
-                    }
-                    stderr_buf.extend_from_slice(&chunk);
-                    emit_stream_chunk(&chunk);
-                }
-            }
-        }
-
-        let status = child.wait().context("failed to wait on git")?;
-        return Ok(std::process::Output {
-            status,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
-        });
+        return Ok(output);
     }
 
-    let output = cmd.args(args).output().context("failed to execute git")?;
+    let output = cmd
+        .args(args)
+        .output()
+        .await
+        .context("failed to execute git")?;
     Ok(output)
-}
-
-#[allow(dead_code)]
-pub(crate) async fn run_git_output_at_async(
-    repo: Option<&Path>,
-    args: &[&str],
-    envs: &[(&str, &str)],
-) -> Result<std::process::Output> {
-    let mut cmd = tokio::process::Command::new("git");
-
-    if let Some(repo) = repo {
-        cmd.args(["-C", &repo.to_string_lossy()]);
-    }
-
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-
-    if output::is_verbose() {
-        let mut display_parts = vec!["git".to_string()];
-        if let Some(repo) = repo {
-            display_parts.push("-C".to_string());
-            display_parts.push(repo.to_string_lossy().to_string());
-        }
-        display_parts.extend(args.iter().map(|s| s.to_string()));
-        output::detail(&display_parts.join(" "));
-    }
-
-    cmd.args(args);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    cmd.output().await.context("failed to execute git")
-}
-
-#[derive(Copy, Clone, Debug)]
-enum Stream {
-    Stdout,
-    Stderr,
-}
-
-fn read_stream<R: std::io::Read>(
-    stream: Stream,
-    mut reader: R,
-    tx: std::sync::mpsc::Sender<(Stream, Vec<u8>)>,
-) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let _ = tx.send((stream, buf[..n].to_vec()));
-            }
-            Err(_) => break,
-        }
-    }
 }
 
 fn emit_stream_chunk(chunk: &[u8]) {
@@ -215,14 +118,6 @@ fn emit_stream_chunk(chunk: &[u8]) {
         let line = segment.trim_end_matches('\r');
         output::detail(&format!("  {}", line));
     }
-}
-
-/// Run a git command and return whether it succeeded (exit code 0).
-/// Does not treat non-zero exit as an error — just returns `false`.
-fn git_succeeds(args: &[&str]) -> Result<bool> {
-    let output = run_git_output_at(None, args, &[])?;
-    let status = output.status;
-    Ok(status.success())
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +133,8 @@ fn git_succeeds(args: &[&str]) -> Result<bool> {
 ///
 /// This is placed in the `git` module (not `push`) because it gates
 /// the entire hook lifecycle, not just the push decision.
-pub fn check_enabled() -> bool {
-    match config_get("ai.cadence.enabled") {
+pub async fn check_enabled() -> bool {
+    match config_get("ai.cadence.enabled").await {
         Ok(Some(val)) => val != "false",
         // Unset or error: default to enabled
         _ => true,
@@ -253,12 +148,17 @@ pub fn check_enabled() -> bool {
 ///
 /// Reads `git -C <repo> config ai.cadence.enabled`. If the value is exactly
 /// `"false"`, returns `false`. Any other value (including unset) returns `true`.
-pub(crate) fn check_enabled_at(repo: &Path) -> bool {
-    let output =
-        match run_git_output_at(Some(repo), &["config", "--get", "ai.cadence.enabled"], &[]) {
-            Ok(o) => o,
-            Err(_) => return true,
-        };
+pub(crate) async fn check_enabled_at(repo: &Path) -> bool {
+    let output = match run_git_output_at(
+        Some(repo),
+        &["config", "--get", "ai.cadence.enabled"],
+        &[],
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(_) => return true,
+    };
 
     if output.status.success() {
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -270,8 +170,8 @@ pub(crate) fn check_enabled_at(repo: &Path) -> bool {
 }
 
 /// Return the repository root (`git rev-parse --show-toplevel`).
-pub fn repo_root() -> Result<PathBuf> {
-    let path = git_output(&["rev-parse", "--show-toplevel"])?;
+pub async fn repo_root() -> Result<PathBuf> {
+    let path = git_output(&["rev-parse", "--show-toplevel"]).await?;
     Ok(PathBuf::from(path))
 }
 
@@ -279,8 +179,9 @@ pub fn repo_root() -> Result<PathBuf> {
 ///
 /// Runs `git -C <dir> rev-parse --show-toplevel`. This handles the case
 /// where `dir` is a subdirectory of the repo.
-pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
+pub(crate) async fn repo_root_at(dir: &Path) -> Result<PathBuf> {
     let output = run_git_output_at(Some(dir), &["rev-parse", "--show-toplevel"], &[])
+        .await
         .context("failed to execute git rev-parse --show-toplevel")?;
 
     if !output.status.success() {
@@ -292,122 +193,30 @@ pub(crate) fn repo_root_at(dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(stdout.trim()))
 }
 
-/// Check whether an AI-session note already exists for the given commit,
-/// in a specific repository directory.
-///
-/// This is the directory-parameterised version of [`note_exists`], for use
-/// by commands that operate on repos other than the CWD (e.g., `backfill`).
-#[allow(dead_code)]
-pub(crate) fn note_exists_at(repo: &Path, commit: &str) -> Result<bool> {
-    validate_commit_hash(commit)?;
-    let output = run_git_output_at(
-        Some(repo),
-        &["notes", "--ref", NOTES_REF, "show", "--", commit],
-        &[],
-    )
-    .context("failed to execute git notes show")?;
-    Ok(output.status.success())
-}
-
-/// Read the AI-session note content for a commit in a specific repository.
-pub(crate) fn read_note_at(repo: Option<&Path>, commit: &str) -> Result<String> {
-    validate_commit_hash(commit)?;
-    let output = run_git_output_at(
-        repo,
-        &["notes", "--ref", NOTES_REF, "show", "--", commit],
-        &[],
-    )
-    .context("failed to execute git notes show")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git notes show failed: {}", stderr.trim());
-    }
-
-    String::from_utf8(output.stdout).context("git notes show output was not valid UTF-8")
-}
-
-/// Attach an AI-session note to a commit in a specific repository directory.
-///
-/// This is the directory-parameterised version of [`add_note`], for use
-/// by commands that operate on repos other than the CWD (e.g., `backfill`).
-///
-/// **Precondition:** Callers must check [`note_exists_at`] first and skip if
-/// a note is already present.
-pub(crate) fn add_note_at(repo: &Path, commit: &str, content: &str) -> Result<()> {
-    validate_commit_hash(commit)?;
-
-    // Write content to a temp file to avoid ARG_MAX limits on large notes.
-    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
-    tmp.write_all(content.as_bytes())
-        .context("failed to write note to temp file")?;
-    tmp.flush().context("failed to flush note temp file")?;
-    let tmp_path = tmp.path().to_string_lossy().to_string();
-
-    let output = run_git_output_at(
-        Some(repo),
-        &[
-            "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
-        ],
-        &[],
-    )
-    .context("failed to execute git notes add")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git notes add failed: {}", stderr.trim());
-    }
-    Ok(())
-}
-
-/// Force-replace (or create) an AI-session note on a commit in a specific repo.
-pub(crate) fn add_note_force_at(repo: Option<&Path>, commit: &str, content: &str) -> Result<()> {
-    validate_commit_hash(commit)?;
-
-    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
-    tmp.write_all(content.as_bytes())
-        .context("failed to write note to temp file")?;
-    tmp.flush().context("failed to flush note temp file")?;
-    let tmp_path = tmp.path().to_string_lossy().to_string();
-
-    let output = run_git_output_at(
-        repo,
-        &[
-            "notes", "--ref", NOTES_REF, "add", "-f", "-F", &tmp_path, "--", commit,
-        ],
-        &[],
-    )
-    .context("failed to execute git notes add -f")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git notes add -f failed: {}", stderr.trim());
-    }
-    Ok(())
-}
-
 /// Store arbitrary bytes as a git blob in a specific repository and return its
 /// 40-char SHA-1 hash.
 ///
 /// Uses `git hash-object -w --stdin` to write the blob to the object store.
-pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
+pub async fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
     let mut cmd = Command::new("git");
     if let Some(repo) = repo {
         cmd.args(["-C", &repo.to_string_lossy()]);
     }
     cmd.args(["hash-object", "-w", "--stdin"]);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("failed to spawn git hash-object")?;
     if let Some(ref mut stdin) = child.stdin {
         stdin
             .write_all(data)
+            .await
             .context("failed to write blob data to git hash-object stdin")?;
     }
     let output = child
         .wait_with_output()
+        .await
         .context("failed to wait for git hash-object")?;
 
     if !output.status.success() {
@@ -430,8 +239,9 @@ pub fn store_blob_at(repo: Option<&Path>, data: &[u8]) -> Result<String> {
 /// Read a git blob by its SHA from a specific repository.
 ///
 /// Uses `git cat-file blob <sha>`.
-pub fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
+pub async fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
     let output = run_git_output_at(repo, &["cat-file", "blob", sha], &[])
+        .await
         .context("failed to execute git cat-file blob")?;
 
     if !output.status.success() {
@@ -442,59 +252,37 @@ pub fn read_blob_at(repo: Option<&Path>, sha: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-// ---------------------------------------------------------------------------
-// Plumbing helpers for notes ref squashing (Phase 2)
-// ---------------------------------------------------------------------------
-
-/// List all notes in the AI-session notes ref.
-///
-/// Returns `Vec<(note_blob_sha, commit_sha)>` — one entry per attached note.
-/// Returns an empty vec if the notes ref doesn't exist.
-pub(crate) fn list_notes_at(repo: Option<&Path>) -> Result<Vec<(String, String)>> {
-    let output = run_git_output_at(repo, &["notes", "--ref", NOTES_REF, "list"], &[])
-        .context("failed to execute git notes list")?;
-
-    if !output.status.success() {
-        // Empty notes ref returns exit 1 — not an error for us.
-        return Ok(Vec::new());
+/// Convert a 64-char key hash into a fanout path `aa/<rest>`.
+pub(crate) fn fanout_path_for_key_hash(key_hash: &str) -> Result<String> {
+    if key_hash.len() != 64 || !key_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid key hash: {}", key_hash);
     }
-
-    let stdout =
-        String::from_utf8(output.stdout).context("git notes list output was not valid UTF-8")?;
-
-    let mut entries = Vec::new();
-    for line in stdout.lines() {
-        let mut parts = line.split_whitespace();
-        if let (Some(note_sha), Some(commit_sha)) = (parts.next(), parts.next()) {
-            entries.push((note_sha.to_string(), commit_sha.to_string()));
-        }
-    }
-    Ok(entries)
-}
-
-/// Convert a 40-char blob SHA into the payload tree fanout path `aa/<rest>`.
-pub(crate) fn payload_path_for_sha(sha: &str) -> Result<String> {
-    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("invalid payload blob SHA: {}", sha);
-    }
-    Ok(format!("{}/{}", &sha[..2], &sha[2..]))
+    Ok(format!("{}/{}", &key_hash[..2], &key_hash[2..]))
 }
 
 /// Alias for ls-tree helper, used by payload ref plumbing for readability.
-pub(crate) fn list_tree_entries_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<String>> {
-    ls_tree_at(repo, treeish)
+pub(crate) async fn list_tree_entries_at(
+    repo: Option<&Path>,
+    treeish: &str,
+) -> Result<Vec<String>> {
+    ls_tree_at(repo, treeish).await
 }
 
 /// Check whether a ref exists locally in a repository.
-pub(crate) fn ref_exists_at(repo: Option<&Path>, ref_name: &str) -> Result<bool> {
+pub(crate) async fn ref_exists_at(repo: Option<&Path>, ref_name: &str) -> Result<bool> {
     let output = run_git_output_at(repo, &["show-ref", "--verify", "--quiet", ref_name], &[])
+        .await
         .context("failed to execute git show-ref --verify")?;
     Ok(output.status.success())
 }
 
 /// Get a local ref hash if present, `None` if it does not exist.
-pub(crate) fn local_ref_hash_at(repo: Option<&Path>, ref_name: &str) -> Result<Option<String>> {
+pub(crate) async fn local_ref_hash_at(
+    repo: Option<&Path>,
+    ref_name: &str,
+) -> Result<Option<String>> {
     let output = run_git_output_at(repo, &["show-ref", "--verify", "--hash", ref_name], &[])
+        .await
         .context("failed to execute git show-ref --hash")?;
     if !output.status.success() {
         return Ok(None);
@@ -508,8 +296,25 @@ pub(crate) fn local_ref_hash_at(repo: Option<&Path>, ref_name: &str) -> Result<O
     }
 }
 
+/// One-time migration for legacy session notes ref.
+///
+/// If the canonical session data ref is missing and the legacy notes ref exists,
+/// this copies the legacy ref tip to `refs/cadence/sessions/data`.
+/// Returns `true` when migration was applied.
+pub(crate) async fn migrate_legacy_session_ref_at(repo: Option<&Path>) -> Result<bool> {
+    if ref_exists_at(repo, SESSION_DATA_REF).await? {
+        return Ok(false);
+    }
+
+    let Some(legacy_tip) = local_ref_hash_at(repo, LEGACY_SESSION_NOTES_REF).await? else {
+        return Ok(false);
+    };
+    update_ref_at(repo, SESSION_DATA_REF, &legacy_tip).await?;
+    Ok(true)
+}
+
 /// Get the hash of a remote ref via `ls-remote`.
-pub(crate) fn remote_ref_hash_at(
+pub(crate) async fn remote_ref_hash_at(
     repo: Option<&Path>,
     remote: &str,
     ref_name: &str,
@@ -526,6 +331,7 @@ pub(crate) fn remote_ref_hash_at(
         ],
         &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
     )
+    .await
     .context("failed to execute git ls-remote")?;
 
     if !output.status.success() {
@@ -543,10 +349,64 @@ pub(crate) fn remote_ref_hash_at(
     }
 }
 
+/// Get remote ref hashes for multiple refs via a single `ls-remote` call.
+pub(crate) async fn remote_ref_hashes_at(
+    repo: Option<&Path>,
+    remote: &str,
+    refs: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    if refs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut args = vec!["-c", "protocol.version=2", "ls-remote", "--refs", remote];
+    args.extend_from_slice(refs);
+    let output = run_git_output_at(
+        repo,
+        &args,
+        &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
+    )
+    .await
+    .context("failed to execute git ls-remote")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git ls-remote failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let mut out = BTreeMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(ref_name) = parts.next() else {
+            continue;
+        };
+        if !hash.is_empty() && !ref_name.is_empty() {
+            out.insert(ref_name.to_string(), hash.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Get local ref hashes for multiple refs.
+pub(crate) async fn local_ref_hashes_at(
+    repo: Option<&Path>,
+    refs: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for ref_name in refs {
+        if let Some(hash) = local_ref_hash_at(repo, ref_name).await? {
+            out.insert((*ref_name).to_string(), hash);
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch a specific remote ref into a temp local ref.
 ///
 /// Returns `fetched=false` when the remote ref does not exist.
-pub(crate) fn fetch_ref_to_temp_at(
+pub(crate) async fn fetch_ref_to_temp_at(
     repo: Option<&Path>,
     remote: &str,
     src_ref: &str,
@@ -558,6 +418,7 @@ pub(crate) fn fetch_ref_to_temp_at(
         &["fetch", remote, &fetch_spec],
         &[("GIT_TERMINAL_PROMPT", "0")],
     )
+    .await
     .context("failed to execute git fetch")?;
 
     if !fetch_status.status.success() {
@@ -583,7 +444,7 @@ fn force_with_lease_arg(ref_name: &str, remote_hash: &Option<String>) -> String 
 }
 
 /// Push a single ref with `--force-with-lease`.
-pub(crate) fn push_ref_with_lease_at(
+pub(crate) async fn push_ref_with_lease_at(
     repo: Option<&Path>,
     remote: &str,
     ref_name: &str,
@@ -595,6 +456,7 @@ pub(crate) fn push_ref_with_lease_at(
         &["push", "--no-verify", &lease, remote, ref_name],
         &[("GIT_TERMINAL_PROMPT", "0")],
     )
+    .await
     .context("failed to execute git push with lease")?;
 
     if !output.status.success() {
@@ -609,8 +471,9 @@ pub(crate) fn push_ref_with_lease_at(
 ///
 /// Returns raw `git ls-tree` output lines, one per entry, in the format:
 /// `<mode> <type> <sha>\t<name>`
-pub(crate) fn ls_tree_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<String>> {
+pub(crate) async fn ls_tree_at(repo: Option<&Path>, treeish: &str) -> Result<Vec<String>> {
     let output = run_git_output_at(repo, &["ls-tree", treeish], &[])
+        .await
         .context("failed to execute git ls-tree")?;
 
     if !output.status.success() {
@@ -637,23 +500,29 @@ fn parse_ls_tree_entry(line: &str) -> Option<(String, String, String, String)> {
     Some((mode, kind, sha, name.to_string()))
 }
 
-/// Ensure a payload blob is reachable from `refs/notes/ai-payloads`.
+/// Ensure a blob is reachable from a ref under a fanout path.
 ///
-/// This is idempotent. If the path already exists, no ref update is performed.
-pub(crate) fn ensure_payload_blob_referenced_at(repo: &Path, blob_sha: &str) -> Result<()> {
-    let payload_path = payload_path_for_sha(blob_sha)?;
-    let mut path_parts = payload_path.splitn(2, '/');
+/// This is idempotent. If the path already exists with the same SHA, no ref
+/// update is performed.
+pub(crate) async fn ensure_blob_referenced_in_ref_at(
+    repo: &Path,
+    ref_name: &str,
+    fanout_path: &str,
+    blob_sha: &str,
+    commit_message: &str,
+) -> Result<()> {
+    let mut path_parts = fanout_path.splitn(2, '/');
     let fanout_dir = path_parts.next().unwrap_or("");
     let fanout_name = path_parts.next().unwrap_or("");
     if fanout_dir.is_empty() || fanout_name.is_empty() {
-        bail!("invalid payload path {}", payload_path);
+        bail!("invalid fanout path {}", fanout_path);
     }
 
-    let tip = rev_parse_at(Some(repo), PAYLOAD_REF).ok();
+    let tip = rev_parse_at(Some(repo), ref_name).await.ok();
     let mut root_entries: Vec<(String, String, String, String)> = Vec::new();
     if let Some(ref tip_sha) = tip {
         let tree_rev = format!("{}^{{tree}}", tip_sha);
-        for line in ls_tree_at(Some(repo), &tree_rev)? {
+        for line in ls_tree_at(Some(repo), &tree_rev).await? {
             if let Some(parsed) = parse_ls_tree_entry(&line) {
                 root_entries.push(parsed);
             }
@@ -667,7 +536,7 @@ pub(crate) fn ensure_payload_blob_referenced_at(repo: &Path, blob_sha: &str) -> 
 
     let mut fanout_entries: Vec<(String, String, String, String)> = Vec::new();
     if let Some(tree_sha) = existing_fanout_tree {
-        for line in ls_tree_at(Some(repo), &tree_sha)? {
+        for line in ls_tree_at(Some(repo), &tree_sha).await? {
             if let Some(parsed) = parse_ls_tree_entry(&line) {
                 fanout_entries.push(parsed);
             }
@@ -693,7 +562,7 @@ pub(crate) fn ensure_payload_blob_referenced_at(repo: &Path, blob_sha: &str) -> 
         .map(|(mode, kind, sha, name)| format!("{mode} {kind} {sha}\t{name}"))
         .collect();
     fanout_lines.sort();
-    let fanout_tree = mktree_at(Some(repo), &fanout_lines)?;
+    let fanout_tree = mktree_at(Some(repo), &fanout_lines).await?;
 
     root_entries.retain(|(_, _, _, name)| name != fanout_dir);
     root_entries.push((
@@ -707,9 +576,146 @@ pub(crate) fn ensure_payload_blob_referenced_at(repo: &Path, blob_sha: &str) -> 
         .map(|(mode, kind, sha, name)| format!("{mode} {kind} {sha}\t{name}"))
         .collect();
     root_lines.sort();
-    let new_tree = mktree_at(Some(repo), &root_lines)?;
-    let new_commit = commit_tree_at(Some(repo), &new_tree, "cadence payloads", tip.as_deref())?;
-    update_ref_at(Some(repo), PAYLOAD_REF, &new_commit)?;
+    let new_tree = mktree_at(Some(repo), &root_lines).await?;
+    let new_commit = commit_tree_at(Some(repo), &new_tree, commit_message, tip.as_deref()).await?;
+    update_ref_at(Some(repo), ref_name, &new_commit).await?;
+    Ok(())
+}
+
+/// Append a line to a keyed NDJSON shard in an index ref with size-aware rotation.
+///
+/// The key is hashed and stored under `<aa>/<rest>--<shard>.ndjson`.
+pub(crate) async fn append_index_entry_at(
+    repo: &Path,
+    ref_name: &str,
+    key_hash: &str,
+    line: &str,
+    target_size: usize,
+    hard_size: usize,
+    commit_message: &str,
+) -> Result<()> {
+    let fanout_path = fanout_path_for_key_hash(key_hash)?;
+    let mut key_parts = fanout_path.splitn(2, '/');
+    let fanout_dir = key_parts.next().unwrap_or("");
+    let key_prefix = key_parts.next().unwrap_or("");
+    if fanout_dir.is_empty() || key_prefix.is_empty() {
+        bail!("invalid fanout path {}", fanout_path);
+    }
+
+    let tip = rev_parse_at(Some(repo), ref_name).await.ok();
+    let mut root_entries: Vec<(String, String, String, String)> = Vec::new();
+    if let Some(ref tip_sha) = tip {
+        let tree_rev = format!("{}^{{tree}}", tip_sha);
+        for line in ls_tree_at(Some(repo), &tree_rev).await? {
+            if let Some(parsed) = parse_ls_tree_entry(&line) {
+                root_entries.push(parsed);
+            }
+        }
+    }
+
+    let existing_fanout_tree = root_entries
+        .iter()
+        .find(|(_, kind, _, name)| kind == "tree" && name == fanout_dir)
+        .map(|(_, _, sha, _)| sha.clone());
+
+    let mut fanout_entries: Vec<(String, String, String, String)> = Vec::new();
+    if let Some(tree_sha) = existing_fanout_tree {
+        for line in ls_tree_at(Some(repo), &tree_sha).await? {
+            if let Some(parsed) = parse_ls_tree_entry(&line) {
+                fanout_entries.push(parsed);
+            }
+        }
+    }
+
+    let file_prefix = format!("{key_prefix}--");
+    let mut shard_entries: Vec<(u32, String, String)> = fanout_entries
+        .iter()
+        .filter_map(|(_, kind, sha, name)| {
+            if kind != "blob" || !name.starts_with(&file_prefix) || !name.ends_with(".ndjson") {
+                return None;
+            }
+            let shard_part = &name[file_prefix.len()..name.len() - ".ndjson".len()];
+            let shard = shard_part.parse::<u32>().ok()?;
+            Some((shard, name.clone(), sha.clone()))
+        })
+        .collect();
+    shard_entries.sort_by_key(|(shard, _, _)| *shard);
+
+    let mut target_shard = 1u32;
+    let mut target_name = format!("{key_prefix}--{:04}.ndjson", target_shard);
+    let mut content = String::new();
+    if let Some((shard, name, sha)) = shard_entries.last() {
+        target_shard = *shard;
+        target_name = name.clone();
+        let existing = read_blob_at(Some(repo), sha).await.unwrap_or_default();
+        content = String::from_utf8_lossy(&existing).to_string();
+    }
+
+    if content.lines().any(|l| l == line) {
+        return Ok(());
+    }
+
+    let mut next_content = content.clone();
+    if !next_content.is_empty() && !next_content.ends_with('\n') {
+        next_content.push('\n');
+    }
+    next_content.push_str(line);
+    next_content.push('\n');
+
+    let write_new_shard = if content.is_empty() {
+        false
+    } else if next_content.len() > hard_size {
+        true
+    } else {
+        content.len() >= target_size && next_content.len() > target_size
+    };
+
+    if write_new_shard {
+        target_shard += 1;
+        target_name = format!("{key_prefix}--{:04}.ndjson", target_shard);
+        next_content = format!("{line}\n");
+    }
+
+    let new_blob = store_blob_at(Some(repo), next_content.as_bytes()).await?;
+    fanout_entries.retain(|(_, _, _, name)| name != &target_name);
+    fanout_entries.push((
+        "100644".to_string(),
+        "blob".to_string(),
+        new_blob,
+        target_name,
+    ));
+
+    let mut fanout_lines: Vec<String> = fanout_entries
+        .into_iter()
+        .map(|(mode, kind, sha, name)| format!("{mode} {kind} {sha}\t{name}"))
+        .collect();
+    fanout_lines.sort();
+    let fanout_tree = mktree_at(Some(repo), &fanout_lines).await?;
+
+    root_entries.retain(|(_, _, _, name)| name != fanout_dir);
+    root_entries.push((
+        "040000".to_string(),
+        "tree".to_string(),
+        fanout_tree,
+        fanout_dir.to_string(),
+    ));
+    let mut root_lines: Vec<String> = root_entries
+        .into_iter()
+        .map(|(mode, kind, sha, name)| format!("{mode} {kind} {sha}\t{name}"))
+        .collect();
+    root_lines.sort();
+    let new_tree = mktree_at(Some(repo), &root_lines).await?;
+    let current_tree = match tip.as_deref() {
+        Some(_) => rev_parse_at(Some(repo), &format!("{}^{{tree}}", ref_name))
+            .await
+            .ok(),
+        None => None,
+    };
+    if current_tree.as_deref() == Some(new_tree.as_str()) {
+        return Ok(());
+    }
+    let commit = commit_tree_at(Some(repo), &new_tree, commit_message, tip.as_deref()).await?;
+    update_ref_at(Some(repo), ref_name, &commit).await?;
     Ok(())
 }
 
@@ -717,30 +723,33 @@ pub(crate) fn ensure_payload_blob_referenced_at(repo: &Path, blob_sha: &str) -> 
 ///
 /// Each entry must be: `<mode> <type> <sha>\t<name>`
 /// Returns the 40-char SHA of the new tree.
-pub(crate) fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<String> {
+pub(crate) async fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<String> {
     let mut cmd = Command::new("git");
     if let Some(repo) = repo {
         cmd.args(["-C", &repo.to_string_lossy()]);
     }
     cmd.arg("mktree");
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("failed to spawn git mktree")?;
     if let Some(ref mut stdin) = child.stdin {
         let input = entries.join("\n");
         stdin
             .write_all(input.as_bytes())
+            .await
             .context("failed to write to git mktree stdin")?;
         if !input.is_empty() {
             stdin
                 .write_all(b"\n")
+                .await
                 .context("failed to write trailing newline to mktree")?;
         }
     }
     let output = child
         .wait_with_output()
+        .await
         .context("failed to wait for git mktree")?;
 
     if !output.status.success() {
@@ -761,7 +770,7 @@ pub(crate) fn mktree_at(repo: Option<&Path>, entries: &[String]) -> Result<Strin
 /// If `parent` is `None`, creates an orphan commit (no parents).
 /// If `parent` is `Some(sha)`, creates a commit with that parent.
 /// Returns the 40-char SHA of the new commit.
-pub(crate) fn commit_tree_at(
+pub(crate) async fn commit_tree_at(
     repo: Option<&Path>,
     tree: &str,
     message: &str,
@@ -772,8 +781,9 @@ pub(crate) fn commit_tree_at(
         args.push("-p");
         args.push(p);
     }
-    let output =
-        run_git_output_at(repo, &args, &[]).context("failed to execute git commit-tree")?;
+    let output = run_git_output_at(repo, &args, &[])
+        .await
+        .context("failed to execute git commit-tree")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -789,8 +799,9 @@ pub(crate) fn commit_tree_at(
 }
 
 /// Update a ref to point to a new commit.
-pub(crate) fn update_ref_at(repo: Option<&Path>, ref_name: &str, commit: &str) -> Result<()> {
+pub(crate) async fn update_ref_at(repo: Option<&Path>, ref_name: &str, commit: &str) -> Result<()> {
     let output = run_git_output_at(repo, &["update-ref", ref_name, commit], &[])
+        .await
         .context("failed to execute git update-ref")?;
 
     if !output.status.success() {
@@ -800,11 +811,12 @@ pub(crate) fn update_ref_at(repo: Option<&Path>, ref_name: &str, commit: &str) -
     Ok(())
 }
 
-/// Delete a local ref (e.g. `refs/notes/ai-sessions`).
+/// Delete a local ref (e.g. `refs/cadence/sessions/data`).
 ///
 /// Wraps `git update-ref -d <ref>`. Returns Ok even if the ref didn't exist.
-pub(crate) fn delete_local_ref_at(repo: Option<&Path>, ref_name: &str) -> Result<()> {
+pub(crate) async fn delete_local_ref_at(repo: Option<&Path>, ref_name: &str) -> Result<()> {
     let output = run_git_output_at(repo, &["update-ref", "-d", ref_name], &[])
+        .await
         .context("failed to execute git update-ref -d")?;
 
     // Tolerate "not found" — the ref may not exist locally.
@@ -817,11 +829,11 @@ pub(crate) fn delete_local_ref_at(repo: Option<&Path>, ref_name: &str) -> Result
     Ok(())
 }
 
-/// Delete a ref on a remote (e.g. `refs/notes/ai-sessions`).
+/// Delete a ref on a remote (e.g. `refs/cadence/sessions/data`).
 ///
 /// Wraps `git push <remote> --delete <ref>`. Returns Ok even if the remote ref
 /// didn't exist.
-pub(crate) fn delete_remote_ref_at(
+pub(crate) async fn delete_remote_ref_at(
     repo: Option<&Path>,
     remote: &str,
     ref_name: &str,
@@ -833,6 +845,7 @@ pub(crate) fn delete_remote_ref_at(
         &["push", "--no-verify", remote, "--delete", ref_name],
         &[],
     )
+    .await
     .context("failed to execute git push --delete")?;
 
     // Tolerate "not found" — the remote ref may not exist.
@@ -846,8 +859,9 @@ pub(crate) fn delete_remote_ref_at(
 }
 
 /// Resolve a revision expression to its SHA.
-pub(crate) fn rev_parse_at(repo: Option<&Path>, rev: &str) -> Result<String> {
+pub(crate) async fn rev_parse_at(repo: Option<&Path>, rev: &str) -> Result<String> {
     let output = run_git_output_at(repo, &["rev-parse", rev], &[])
+        .await
         .context("failed to execute git rev-parse")?;
 
     if !output.status.success() {
@@ -863,264 +877,80 @@ pub(crate) fn rev_parse_at(repo: Option<&Path>, rev: &str) -> Result<String> {
     Ok(sha)
 }
 
-/// Check whether a commit exists in a given repository.
-///
-/// Runs `git -C <repo> cat-file -t -- <commit>` and checks for success.
-/// The `--` separator prevents the commit argument from being interpreted
-/// as a flag.
-pub(crate) fn commit_exists_at(repo: &Path, commit: &str) -> Result<bool> {
-    let output = run_git_output_at(Some(repo), &["cat-file", "-t", "--", commit], &[])
-        .context("failed to execute git cat-file")?;
-    Ok(output.status.success())
-}
-
-/// Return paths changed by a commit (relative to repo root).
-pub(crate) fn commit_changed_paths_at(repo: &Path, commit: &str) -> Result<Vec<String>> {
-    validate_commit_hash(commit)?;
+/// Return the current branch name for a repo, if HEAD is attached.
+pub(crate) async fn current_branch_at(repo: &Path) -> Result<Option<String>> {
     let output = run_git_output_at(
         Some(repo),
-        &["show", "--pretty=format:", "--name-only", "--", commit],
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
         &[],
     )
-    .context("failed to execute git show --name-only")?;
-
+    .await
+    .context("failed to execute git symbolic-ref")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git show --name-only failed: {}", stderr.trim());
+        return Ok(None);
     }
-
-    let stdout = String::from_utf8(output.stdout)
-        .context("git show --name-only output was not valid UTF-8")?;
-    let mut seen = HashSet::new();
-    let mut paths = Vec::new();
-    for line in stdout.lines() {
-        let path = line.trim();
-        if path.is_empty() {
-            continue;
-        }
-        if seen.insert(path.to_string()) {
-            paths.push(path.to_string());
-        }
-    }
-    Ok(paths)
-}
-
-/// Return commit patch text, capped to `max_bytes` bytes.
-pub(crate) fn commit_patch_text_at(repo: &Path, commit: &str, max_bytes: usize) -> Result<String> {
-    validate_commit_hash(commit)?;
-    let output = run_git_output_at(
-        Some(repo),
-        &[
-            "show",
-            "--pretty=format:",
-            "--no-color",
-            "--no-ext-diff",
-            "--patch",
-            "--",
-            commit,
-        ],
-        &[],
-    )
-    .context("failed to execute git show --patch")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git show --patch failed: {}", stderr.trim());
-    }
-
-    let mut bytes = output.stdout;
-    if bytes.len() > max_bytes {
-        bytes.truncate(max_bytes);
-    }
-    Ok(String::from_utf8_lossy(&bytes).to_string())
-}
-
-/// Return full commit hashes within the given time range for a repository.
-///
-/// Uses `git log --since=@<start> --until=@<end> --format=%H`.
-pub(crate) fn commits_in_time_range(
-    repo: &Path,
-    start_ts: i64,
-    end_ts: i64,
-) -> Result<Vec<String>> {
-    let (start, end) = if start_ts <= end_ts {
-        (start_ts, end_ts)
+    let branch = String::from_utf8(output.stdout).context("branch output was not valid UTF-8")?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        Ok(None)
     } else {
-        (end_ts, start_ts)
-    };
+        Ok(Some(branch.to_string()))
+    }
+}
 
-    let since = format!("@{}", start);
-    let until = format!("@{}", end);
-
+/// Return all local branch names (`refs/heads/*`) for a repository.
+pub(crate) async fn local_branches_at(repo: &Path) -> Result<Vec<String>> {
     let output = run_git_output_at(
         Some(repo),
-        &["log", "--since", &since, "--until", &until, "--format=%H"],
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
         &[],
     )
-    .context("failed to execute git log")?;
-
+    .await
+    .context("failed to execute git for-each-ref")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git log failed: {}", stderr.trim());
+        bail!("git for-each-ref failed: {}", stderr.trim());
     }
-
-    let stdout = String::from_utf8(output.stdout).context("git log output was not valid UTF-8")?;
-    let mut commits = Vec::new();
-    for line in stdout.lines() {
-        let hash = line.trim();
-        if hash.is_empty() {
-            continue;
-        }
-        commits.push(hash.to_string());
-    }
-    Ok(commits)
+    let stdout =
+        String::from_utf8(output.stdout).context("git for-each-ref output was not valid UTF-8")?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
-/// Return the full 40-character SHA of HEAD.
-pub fn head_hash() -> Result<String> {
-    git_output(&["rev-parse", "HEAD"])
-}
-
-/// Return the commit timestamp of HEAD as a Unix epoch `i64`.
-pub fn head_timestamp() -> Result<i64> {
-    let ts_str = git_output(&["show", "-s", "--format=%ct", "HEAD"])?;
-    ts_str
-        .parse::<i64>()
-        .context("failed to parse HEAD timestamp as i64")
-}
-
-/// Check whether an AI-session note already exists for the given commit.
-pub fn note_exists(commit: &str) -> Result<bool> {
-    validate_commit_hash(commit)?;
-    git_succeeds(&["notes", "--ref", NOTES_REF, "show", "--", commit])
-}
-
-/// Read the AI-session note content for the given commit.
-pub fn read_note(commit: &str) -> Result<String> {
-    read_note_at(None, commit)
-}
-
-/// Attach an AI-session note to the given commit.
-///
-/// **Precondition:** Callers must check [`note_exists`] first and skip if a note
-/// is already present. `git notes add` will fail if a note already exists for the
-/// given commit. The PLAN.md deduplication rules require checking before attaching:
-/// "if a note already exists, treat as success, do nothing."
-pub fn add_note(commit: &str, content: &str) -> Result<()> {
-    validate_commit_hash(commit)?;
-
-    // Write content to a temp file to avoid ARG_MAX limits on large notes.
-    let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file for note")?;
-    tmp.write_all(content.as_bytes())
-        .context("failed to write note to temp file")?;
-    tmp.flush().context("failed to flush note temp file")?;
-    let tmp_path = tmp.path().to_string_lossy().to_string();
-
+/// Return local branches that contain the given commit.
+pub(crate) async fn branches_containing_commit_at(
+    repo: &Path,
+    commit: &str,
+) -> Result<Vec<String>> {
     let output = run_git_output_at(
-        None,
+        Some(repo),
         &[
-            "notes", "--ref", NOTES_REF, "add", "-F", &tmp_path, "--", commit,
+            "for-each-ref",
+            "--contains",
+            commit,
+            "--format=%(refname:short)",
+            "refs/heads",
         ],
         &[],
     )
-    .context("failed to execute git notes add")?;
-
+    .await
+    .context("failed to execute git for-each-ref --contains")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git notes add failed: {}", stderr.trim());
+        bail!("git for-each-ref --contains failed: {}", stderr.trim());
     }
-    Ok(())
-}
-
-/// Force-replace (or create) an AI-session note on the given commit.
-pub fn add_note_force(commit: &str, content: &str) -> Result<()> {
-    add_note_force_at(None, commit, content)
-}
-
-/// A single `git log` entry annotated with whether it has a note.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitNoteMarker {
-    pub short: String,
-    pub date: String,
-    pub subject: String,
-    pub has_note: bool,
-}
-
-/// Return `git log` entries annotated with note presence from the given notes ref.
-///
-/// This mirrors:
-/// `git log --date=short --format='%H%x09%h%x09%ad%x09%s'`
-/// plus a per-commit note existence check against `notes_ref`.
-pub fn list_commits_with_note_markers(notes_ref: &str) -> Result<Vec<CommitNoteMarker>> {
-    let log_output = run_git_output_at(
-        None,
-        &["log", "--date=short", "--format=%H%x09%h%x09%ad%x09%s"],
-        &[],
-    )
-    .context("failed to execute git log")?;
-
-    if !log_output.status.success() {
-        let stderr = String::from_utf8_lossy(&log_output.stderr);
-        bail!("git log failed: {}", stderr.trim());
-    }
-
-    let notes_output = run_git_output_at(None, &["notes", "--ref", notes_ref, "list"], &[])
-        .context("failed to execute git notes list")?;
-
-    if !notes_output.status.success() {
-        let stderr = String::from_utf8_lossy(&notes_output.stderr);
-        bail!(
-            "git notes list failed for ref {:?}: {}",
-            notes_ref,
-            stderr.trim()
-        );
-    }
-
-    let notes_stdout = String::from_utf8(notes_output.stdout)
-        .context("git notes list output was not valid UTF-8")?;
-    let noted_commit_ids = parse_noted_commit_ids(&notes_stdout);
-
-    let log_stdout =
-        String::from_utf8(log_output.stdout).context("git log output was not valid UTF-8")?;
-    let mut entries = Vec::new();
-    for line in log_stdout.lines() {
-        if let Some((full, short, date, subject)) = parse_log_line(line) {
-            entries.push(CommitNoteMarker {
-                short,
-                date,
-                subject,
-                has_note: noted_commit_ids.contains(full.as_str()),
-            });
-        }
-    }
-
-    Ok(entries)
-}
-
-fn parse_log_line(line: &str) -> Option<(String, String, String, String)> {
-    let mut parts = line.splitn(4, '\t');
-    let full = parts.next()?.to_string();
-    let short = parts.next()?.to_string();
-    let date = parts.next()?.to_string();
-    let subject = parts.next().unwrap_or("").to_string();
-
-    if full.is_empty() || short.is_empty() || date.is_empty() {
-        return None;
-    }
-
-    Some((full, short, date, subject))
-}
-
-fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
-    notes_list_stdout
+    let stdout = String::from_utf8(output.stdout)
+        .context("git for-each-ref --contains output was not valid UTF-8")?;
+    Ok(stdout
         .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let _note_object = parts.next()?;
-            let commit_object = parts.next()?;
-            Some(commit_object.to_string())
-        })
-        .collect()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// Push the AI-session notes ref to the provided remote.
@@ -1128,17 +958,18 @@ fn parse_noted_commit_ids(notes_list_stdout: &str) -> HashSet<String> {
 /// Note: Production push paths now use inline force-with-lease pushes
 /// (see `push.rs`). This function is retained for test use.
 #[allow(dead_code)]
-pub fn push_notes(remote: &str) -> Result<()> {
-    push_notes_at(None, remote)
+pub async fn push_notes(remote: &str) -> Result<()> {
+    push_notes_at(None, remote).await
 }
 
 #[allow(dead_code)]
-pub fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
+pub async fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
     let output = run_git_output_at(
         repo,
         &["push", "--no-verify", remote, NOTES_REF],
         &[("GIT_TERMINAL_PROMPT", "0")],
     )
+    .await
     .context("failed to execute git push")?;
 
     if !output.status.success() {
@@ -1154,8 +985,8 @@ pub fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
 /// rather than propagating the error. This matches the `git_succeeds` pattern
 /// used by `note_exists` and makes the function safe to call defensively.
 #[allow(dead_code)]
-pub fn has_upstream() -> Result<bool> {
-    match git_output(&["remote"]) {
+pub async fn has_upstream() -> Result<bool> {
+    match git_output(&["remote"]).await {
         Ok(remotes) => Ok(!remotes.is_empty()),
         Err(_) => Ok(false),
     }
@@ -1172,8 +1003,9 @@ pub fn has_upstream() -> Result<bool> {
 ///
 /// Returns `Ok(None)` when HEAD is detached or the remote is "."/empty.
 #[cfg(test)]
-pub fn resolve_push_remote() -> Result<Option<String>> {
+pub async fn resolve_push_remote() -> Result<Option<String>> {
     let output = run_git_output_at(None, &["symbolic-ref", "--quiet", "--short", "HEAD"], &[])
+        .await
         .context("failed to execute git symbolic-ref")?;
 
     if !output.status.success() {
@@ -1188,14 +1020,14 @@ pub fn resolve_push_remote() -> Result<Option<String>> {
     }
 
     let push_remote_key = format!("branch.{}.pushRemote", branch);
-    if let Ok(Some(remote)) = config_get(&push_remote_key)
+    if let Ok(Some(remote)) = config_get(&push_remote_key).await
         && !remote.is_empty()
         && remote != "."
     {
         return Ok(Some(remote));
     }
 
-    if let Ok(Some(remote)) = config_get("remote.pushDefault")
+    if let Ok(Some(remote)) = config_get("remote.pushDefault").await
         && !remote.is_empty()
         && remote != "."
     {
@@ -1203,14 +1035,14 @@ pub fn resolve_push_remote() -> Result<Option<String>> {
     }
 
     let branch_remote_key = format!("branch.{}.remote", branch);
-    if let Ok(Some(remote)) = config_get(&branch_remote_key)
+    if let Ok(Some(remote)) = config_get(&branch_remote_key).await
         && !remote.is_empty()
         && remote != "."
     {
         return Ok(Some(remote));
     }
 
-    let remotes = match git_output(&["remote"]) {
+    let remotes = match git_output(&["remote"]).await {
         Ok(list) => list,
         Err(_) => return Ok(None),
     };
@@ -1224,8 +1056,24 @@ pub fn resolve_push_remote() -> Result<Option<String>> {
 }
 
 /// Return the URL for a named remote (if any).
-pub fn remote_url(remote: &str) -> Result<Option<String>> {
+pub async fn remote_url(remote: &str) -> Result<Option<String>> {
     let output = run_git_output_at(None, &["remote", "get-url", remote], &[])
+        .await
+        .context("failed to execute git remote get-url")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let url = String::from_utf8(output.stdout)
+        .context("git remote get-url output was not valid UTF-8")?;
+    Ok(Some(url.trim().to_string()))
+}
+
+/// Return the URL for a named remote in a specific repository (if any).
+pub async fn remote_url_at(repo: &Path, remote: &str) -> Result<Option<String>> {
+    let output = run_git_output_at(Some(repo), &["remote", "get-url", remote], &[])
+        .await
         .context("failed to execute git remote get-url")?;
 
     if !output.status.success() {
@@ -1238,12 +1086,13 @@ pub fn remote_url(remote: &str) -> Result<Option<String>> {
 }
 
 /// Resolve the push remote for a specific repository.
-pub fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
+pub async fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
     let output = run_git_output_at(
         Some(repo),
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
         &[],
     )
+    .await
     .context("failed to execute git symbolic-ref")?;
 
     if !output.status.success() {
@@ -1258,14 +1107,14 @@ pub fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
     }
 
     let push_remote_key = format!("branch.{}.pushRemote", branch);
-    if let Ok(Some(remote)) = config_get_at(repo, &push_remote_key)
+    if let Ok(Some(remote)) = config_get_at(repo, &push_remote_key).await
         && !remote.is_empty()
         && remote != "."
     {
         return Ok(Some(remote));
     }
 
-    if let Ok(Some(remote)) = config_get_at(repo, "remote.pushDefault")
+    if let Ok(Some(remote)) = config_get_at(repo, "remote.pushDefault").await
         && !remote.is_empty()
         && remote != "."
     {
@@ -1273,14 +1122,14 @@ pub fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
     }
 
     let branch_remote_key = format!("branch.{}.remote", branch);
-    if let Ok(Some(remote)) = config_get_at(repo, &branch_remote_key)
+    if let Ok(Some(remote)) = config_get_at(repo, &branch_remote_key).await
         && !remote.is_empty()
         && remote != "."
     {
         return Ok(Some(remote));
     }
 
-    let remotes = match git_output_in(repo, &["remote"]) {
+    let remotes = match git_output_in(repo, &["remote"]).await {
         Ok(list) => list,
         Err(_) => return Ok(None),
     };
@@ -1297,9 +1146,10 @@ pub fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
 ///
 /// Returns `None` if no remotes are configured. Returns an error only if
 /// the git commands themselves fail unexpectedly.
-pub(crate) fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
-    let output =
-        run_git_output_at(Some(repo), &["remote"], &[]).context("failed to execute git remote")?;
+pub(crate) async fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
+    let output = run_git_output_at(Some(repo), &["remote"], &[])
+        .await
+        .context("failed to execute git remote")?;
 
     if !output.status.success() {
         return Ok(None);
@@ -1313,6 +1163,7 @@ pub(crate) fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
     };
 
     let url_output = run_git_output_at(Some(repo), &["remote", "get-url", first], &[])
+        .await
         .context("failed to execute git remote get-url")?;
 
     if !url_output.status.success() {
@@ -1335,15 +1186,15 @@ pub(crate) fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
 ///
 /// Returns an empty Vec if no remotes are configured or no URLs can be parsed.
 #[allow(dead_code)]
-pub fn remote_orgs() -> Result<Vec<String>> {
-    let remotes = git_output(&["remote"])?;
+pub async fn remote_orgs() -> Result<Vec<String>> {
+    let remotes = git_output(&["remote"]).await?;
     let mut orgs = Vec::new();
 
     for remote_name in remotes.lines() {
         if remote_name.is_empty() {
             continue;
         }
-        if let Ok(url) = git_output(&["remote", "get-url", remote_name])
+        if let Ok(url) = git_output(&["remote", "get-url", remote_name]).await
             && let Some(org) = parse_org_from_url(&url)
             && !orgs
                 .iter()
@@ -1360,15 +1211,15 @@ pub fn remote_orgs() -> Result<Vec<String>> {
 ///
 /// Returns a deduplicated list of org names extracted from all configured
 /// remotes. Deduplication is case-insensitive.
-pub fn remote_orgs_at(repo: &Path) -> Result<Vec<String>> {
-    let remotes = git_output_in(repo, &["remote"])?;
+pub async fn remote_orgs_at(repo: &Path) -> Result<Vec<String>> {
+    let remotes = git_output_in(repo, &["remote"]).await?;
     let mut orgs = Vec::new();
 
     for remote_name in remotes.lines() {
         if remote_name.is_empty() {
             continue;
         }
-        if let Ok(url) = git_output_in(repo, &["remote", "get-url", remote_name])
+        if let Ok(url) = git_output_in(repo, &["remote", "get-url", remote_name]).await
             && let Some(org) = parse_org_from_url(&url)
             && !orgs
                 .iter()
@@ -1419,8 +1270,9 @@ pub fn parse_org_from_url(url: &str) -> Option<String> {
 ///
 /// Distinguishes exit code 1 (key not set) from other exit codes (e.g., 2 for
 /// invalid config file) to avoid silently swallowing genuine errors.
-pub fn config_get(key: &str) -> Result<Option<String>> {
+pub async fn config_get(key: &str) -> Result<Option<String>> {
     let output = run_git_output_at(None, &["config", "--get", key], &[])
+        .await
         .context("failed to execute git config --get")?;
 
     if !output.status.success() {
@@ -1445,8 +1297,9 @@ pub fn config_get(key: &str) -> Result<Option<String>> {
 }
 
 /// Read a git config value from a specific repo. Returns `Ok(None)` if unset.
-pub fn config_get_at(repo: &Path, key: &str) -> Result<Option<String>> {
+pub async fn config_get_at(repo: &Path, key: &str) -> Result<Option<String>> {
     let output = run_git_output_at(Some(repo), &["config", "--get", key], &[])
+        .await
         .context("failed to execute git config --get")?;
 
     if !output.status.success() {
@@ -1469,8 +1322,9 @@ pub fn config_get_at(repo: &Path, key: &str) -> Result<Option<String>> {
 }
 
 /// Read a repo-local git config value (ignores global/system). Returns `Ok(None)` if unset.
-pub fn config_get_local_at(repo: &Path, key: &str) -> Result<Option<String>> {
+pub async fn config_get_local_at(repo: &Path, key: &str) -> Result<Option<String>> {
     let output = run_git_output_at(Some(repo), &["config", "--local", "--get", key], &[])
+        .await
         .context("failed to execute git config --local --get")?;
 
     if !output.status.success() {
@@ -1496,8 +1350,9 @@ pub fn config_get_local_at(repo: &Path, key: &str) -> Result<Option<String>> {
 ///
 /// Uses `--global` flag to read only the global config, not repo-local.
 /// This is used for settings like `ai.cadence.org` that are set at install time.
-pub fn config_get_global(key: &str) -> Result<Option<String>> {
+pub async fn config_get_global(key: &str) -> Result<Option<String>> {
     let output = run_git_output_at(None, &["config", "--global", "--get", key], &[])
+        .await
         .context("failed to execute git config --global --get")?;
 
     if !output.status.success() {
@@ -1519,46 +1374,15 @@ pub fn config_get_global(key: &str) -> Result<Option<String>> {
     Ok(Some(value.trim().to_string()))
 }
 
-/// Read all values for a global git config key (`--global --get-all`).
-///
-/// Returns an empty vector if the key is not set.
-pub fn config_get_global_all(key: &str) -> Result<Vec<String>> {
-    let output = run_git_output_at(None, &["config", "--global", "--get-all", key], &[])
-        .context("failed to execute git config --global --get-all")?;
-
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        if code != 1 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "git config --global --get-all {:?} failed (exit {}): {}",
-                key,
-                code,
-                stderr.trim()
-            );
-        }
-        return Ok(Vec::new());
-    }
-
-    let value =
-        String::from_utf8(output.stdout).context("git config output was not valid UTF-8")?;
-    Ok(value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
 /// Check org filter for a specific repository. If a global org is configured,
 /// verify that at least one remote matches that org (case-insensitive).
-pub fn repo_matches_org_filter(repo: &Path) -> Result<bool> {
-    let configured_org = match config_get_global("ai.cadence.org") {
+pub async fn repo_matches_org_filter(repo: &Path) -> Result<bool> {
+    let configured_org = match config_get_global("ai.cadence.org").await {
         Ok(Some(org)) => org,
         _ => return Ok(true),
     };
 
-    let remote_orgs = remote_orgs_at(repo)?;
+    let remote_orgs = remote_orgs_at(repo).await?;
     Ok(remote_orgs
         .iter()
         .any(|org| org.eq_ignore_ascii_case(&configured_org)))
@@ -1566,8 +1390,9 @@ pub fn repo_matches_org_filter(repo: &Path) -> Result<bool> {
 
 /// Write a git config value (repo-local scope).
 #[cfg(test)]
-pub fn config_set(key: &str, value: &str) -> Result<()> {
+pub async fn config_set(key: &str, value: &str) -> Result<()> {
     let output = run_git_output_at(None, &["config", key, value], &[])
+        .await
         .context("failed to execute git config set")?;
 
     if !output.status.success() {
@@ -1581,8 +1406,9 @@ pub fn config_set(key: &str, value: &str) -> Result<()> {
 ///
 /// Used by the `install` subcommand to persist settings like
 /// `core.hooksPath` and `ai.cadence.org` globally.
-pub fn config_set_global(key: &str, value: &str) -> Result<()> {
+pub async fn config_set_global(key: &str, value: &str) -> Result<()> {
     let output = run_git_output_at(None, &["config", "--global", key, value], &[])
+        .await
         .context("failed to execute git config --global set")?;
 
     if !output.status.success() {
@@ -1592,24 +1418,13 @@ pub fn config_set_global(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Add a git config value in global scope (`--global --add`).
-pub fn config_add_global(key: &str, value: &str) -> Result<()> {
-    let output = run_git_output_at(None, &["config", "--global", "--add", key, value], &[])
-        .context("failed to execute git config --global --add")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git config --global --add failed: {}", stderr.trim());
-    }
-    Ok(())
-}
-
 /// Remove a git config key from global scope (`--global --unset`).
 ///
 /// Returns `Ok(())` if the key was removed or was already absent.
 /// Returns an error only on genuine git failures.
-pub fn config_unset_global(key: &str) -> Result<()> {
+pub async fn config_unset_global(key: &str) -> Result<()> {
     let output = run_git_output_at(None, &["config", "--global", "--unset", key], &[])
+        .await
         .context("failed to execute git config --global --unset")?;
 
     if !output.status.success() {
@@ -1636,7 +1451,6 @@ pub fn config_unset_global(key: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// Helper: create a temporary git repo with one commit.
@@ -1646,31 +1460,31 @@ mod tests {
     /// Note: since we cannot change the process-wide CWD safely in
     /// parallel tests, all git commands in tests must use `-C <path>`.
     /// We provide a `git_in` helper for this.
-    fn init_temp_repo() -> TempDir {
+    async fn init_temp_repo() -> TempDir {
         let dir = TempDir::new().expect("failed to create temp dir");
         let path = dir.path();
 
         // git init
-        run_git(path, &["init"]);
+        run_git(path, &["init"]).await;
         // Set required user config for commits
-        run_git(path, &["config", "user.email", "test@test.com"]);
-        run_git(path, &["config", "user.name", "Test User"]);
+        run_git(path, &["config", "user.email", "test@test.com"]).await;
+        run_git(path, &["config", "user.name", "Test User"]).await;
         // Override hooksPath to prevent the global post-commit hook from firing
-        run_git(path, &["config", "core.hooksPath", "/dev/null"]);
+        run_git(path, &["config", "core.hooksPath", "/dev/null"]).await;
         // Create an initial commit
-        std::fs::write(path.join("README.md"), "hello").unwrap();
-        run_git(path, &["add", "README.md"]);
-        run_git(path, &["commit", "-m", "initial commit"]);
+        tokio::fs::write(path.join("README.md"), "hello")
+            .await
+            .unwrap();
+        run_git(path, &["add", "README.md"]).await;
+        run_git(path, &["commit", "-m", "initial commit"]).await;
 
         dir
     }
 
     /// Run a git command inside the given directory, panicking on failure.
-    fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(["-C", dir.to_str().unwrap()])
-            .args(args)
-            .output()
+    async fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = run_git_output_at(Some(dir), args, &[])
+            .await
             .expect("failed to run git");
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1683,11 +1497,9 @@ mod tests {
     /// by temporarily overriding GIT_DIR behaviour via `-C`.
     /// Since our public functions don't take a path arg (they rely on cwd),
     /// we use a wrapper approach: spawn a git command with `-C`.
-    fn git_output_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .args(["-C", dir.to_str().unwrap()])
-            .args(args)
-            .output()
+    async fn git_output_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+        let output = run_git_output_at(Some(dir), args, &[])
+            .await
             .context("failed to execute git")?;
 
         if !output.status.success() {
@@ -1699,42 +1511,16 @@ mod tests {
         Ok(stdout.trim().to_string())
     }
 
-    #[test]
-    fn test_parse_log_line_valid() {
-        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tabc1234\t2026-02-12\tsubject";
-        let parsed = parse_log_line(line).expect("expected parsed log line");
-        assert_eq!(parsed.0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(parsed.1, "abc1234");
-        assert_eq!(parsed.2, "2026-02-12");
-        assert_eq!(parsed.3, "subject");
-    }
-
-    #[test]
-    fn test_parse_log_line_invalid() {
-        assert!(parse_log_line("bad-line").is_none());
-        assert!(parse_log_line("\tabc1234\t2026-02-12\tsubject").is_none());
-    }
-
-    #[test]
-    fn test_parse_noted_commit_ids_uses_second_column() {
-        let input = "\
-1111111111111111111111111111111111111111 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-2222222222222222222222222222222222222222 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-";
-        let ids = parse_noted_commit_ids(input);
-        assert!(ids.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-        assert!(ids.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-        assert!(!ids.contains("1111111111111111111111111111111111111111"));
-    }
-
     // -----------------------------------------------------------------------
     // repo_root — tested via direct git command in temp dir
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_repo_root() {
-        let dir = init_temp_repo();
-        let root = git_output_in(dir.path(), &["rev-parse", "--show-toplevel"]).unwrap();
+    #[tokio::test]
+    async fn test_repo_root() {
+        let dir = init_temp_repo().await;
+        let root = git_output_in(dir.path(), &["rev-parse", "--show-toplevel"])
+            .await
+            .unwrap();
         let root_path = PathBuf::from(&root);
         // The root should be the temp dir (possibly canonicalized)
         assert!(root_path.exists());
@@ -1746,10 +1532,12 @@ mod tests {
     // head_hash
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_head_hash() {
-        let dir = init_temp_repo();
-        let hash = git_output_in(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+    #[tokio::test]
+    async fn test_head_hash() {
+        let dir = init_temp_repo().await;
+        let hash = git_output_in(dir.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
         // Full SHA is 40 hex characters
         assert_eq!(hash.len(), 40);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1759,93 +1547,31 @@ mod tests {
     // head_timestamp
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_head_timestamp() {
-        let dir = init_temp_repo();
-        let ts_str = git_output_in(dir.path(), &["show", "-s", "--format=%ct", "HEAD"]).unwrap();
+    #[tokio::test]
+    async fn test_head_timestamp() {
+        let dir = init_temp_repo().await;
+        let ts_str = git_output_in(dir.path(), &["show", "-s", "--format=%ct", "HEAD"])
+            .await
+            .unwrap();
         let ts: i64 = ts_str.parse().unwrap();
         // Should be a reasonable Unix timestamp (after 2020)
         assert!(ts > 1_577_836_800);
     }
 
     // -----------------------------------------------------------------------
-    // note_exists + add_note
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_note_exists_false_then_true_after_add() {
-        let dir = init_temp_repo();
-        let path = dir.path();
-        let hash = run_git(path, &["rev-parse", "HEAD"]);
-
-        // No note yet
-        let status = Command::new("git")
-            .args(["-C", path.to_str().unwrap()])
-            .args(["notes", "--ref", NOTES_REF, "show", &hash])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(!status.success());
-
-        // Add a note
-        run_git(
-            path,
-            &[
-                "notes",
-                "--ref",
-                NOTES_REF,
-                "add",
-                "-m",
-                "test note content",
-                &hash,
-            ],
-        );
-
-        // Now note exists
-        let status = Command::new("git")
-            .args(["-C", path.to_str().unwrap()])
-            .args(["notes", "--ref", NOTES_REF, "show", &hash])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        // Verify content
-        let note_content =
-            git_output_in(path, &["notes", "--ref", NOTES_REF, "show", &hash]).unwrap();
-        assert_eq!(note_content, "test note content");
-    }
-
-    #[test]
-    fn test_add_note_force_replaces_existing_note_content() {
-        let dir = init_temp_repo();
-        let path = dir.path();
-        let hash = run_git(path, &["rev-parse", "HEAD"]);
-
-        add_note_at(path, &hash, "first content").expect("add_note_at");
-        add_note_force_at(Some(path), &hash, "updated content").expect("add_note_force_at");
-
-        let note_content =
-            git_output_in(path, &["notes", "--ref", NOTES_REF, "show", &hash]).unwrap();
-        assert_eq!(note_content, "updated content");
-    }
-
-    // -----------------------------------------------------------------------
     // has_upstream
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_has_upstream_false_when_no_remote() {
-        let dir = init_temp_repo();
-        let remotes = git_output_in(dir.path(), &["remote"]).unwrap();
+    #[tokio::test]
+    async fn test_has_upstream_false_when_no_remote() {
+        let dir = init_temp_repo().await;
+        let remotes = git_output_in(dir.path(), &["remote"]).await.unwrap();
         assert!(remotes.is_empty());
     }
 
-    #[test]
-    fn test_has_upstream_true_when_remote_added() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_has_upstream_true_when_remote_added() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
         run_git(
             path,
@@ -1855,8 +1581,9 @@ mod tests {
                 "origin",
                 "https://github.com/test-org/test-repo.git",
             ],
-        );
-        let remotes = git_output_in(path, &["remote"]).unwrap();
+        )
+        .await;
+        let remotes = git_output_in(path, &["remote"]).await.unwrap();
         assert!(!remotes.is_empty());
     }
 
@@ -1864,32 +1591,32 @@ mod tests {
     // remote_org (via parse_org_from_url — pure function)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_org_from_ssh_url() {
+    #[tokio::test]
+    async fn test_parse_org_from_ssh_url() {
         let org = parse_org_from_url("git@github.com:my-org/my-repo.git");
         assert_eq!(org, Some("my-org".to_string()));
     }
 
-    #[test]
-    fn test_parse_org_from_https_url() {
+    #[tokio::test]
+    async fn test_parse_org_from_https_url() {
         let org = parse_org_from_url("https://github.com/other-org/some-repo.git");
         assert_eq!(org, Some("other-org".to_string()));
     }
 
-    #[test]
-    fn test_parse_org_from_http_url() {
+    #[tokio::test]
+    async fn test_parse_org_from_http_url() {
         let org = parse_org_from_url("http://github.com/http-org/repo.git");
         assert_eq!(org, Some("http-org".to_string()));
     }
 
-    #[test]
-    fn test_parse_org_from_unknown_url() {
+    #[tokio::test]
+    async fn test_parse_org_from_unknown_url() {
         let org = parse_org_from_url("svn://example.com/repo");
         assert_eq!(org, None);
     }
 
-    #[test]
-    fn test_parse_org_empty_url() {
+    #[tokio::test]
+    async fn test_parse_org_empty_url() {
         let org = parse_org_from_url("");
         assert_eq!(org, None);
     }
@@ -1898,9 +1625,9 @@ mod tests {
     // parse_org_from_url (integration test with temp repo)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_org_from_url_integration() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_parse_org_from_url_integration() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
         run_git(
             path,
@@ -1910,8 +1637,11 @@ mod tests {
                 "origin",
                 "git@github.com:acme-corp/widgets.git",
             ],
-        );
-        let url = git_output_in(path, &["remote", "get-url", "origin"]).unwrap();
+        )
+        .await;
+        let url = git_output_in(path, &["remote", "get-url", "origin"])
+            .await
+            .unwrap();
         let org = parse_org_from_url(&url);
         assert_eq!(org, Some("acme-corp".to_string()));
     }
@@ -1920,228 +1650,114 @@ mod tests {
     // config_get + config_set
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_config_get_missing_key() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_config_get_missing_key() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
-        let output = Command::new("git")
-            .args(["-C", path.to_str().unwrap()])
-            .args(["config", "--get", "ai.cadence.nonexistent"])
-            .output()
-            .unwrap();
+        let output = run_git_output_at(
+            Some(path),
+            &["config", "--get", "ai.cadence.nonexistent"],
+            &[],
+        )
+        .await
+        .unwrap();
         // Should exit non-zero (key not set)
         assert!(!output.status.success());
     }
 
-    #[test]
-    fn test_config_set_then_get() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_config_set_then_get() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
         // Set a config value
-        run_git(path, &["config", "ai.cadence.enabled", "true"]);
+        run_git(path, &["config", "ai.cadence.enabled", "true"]).await;
 
         // Read it back
-        let value = git_output_in(path, &["config", "--get", "ai.cadence.enabled"]).unwrap();
+        let value = git_output_in(path, &["config", "--get", "ai.cadence.enabled"])
+            .await
+            .unwrap();
         assert_eq!(value, "true");
     }
 
-    #[test]
-    fn test_config_overwrite() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_config_overwrite() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
-        run_git(path, &["config", "ai.cadence.org", "first-org"]);
-        run_git(path, &["config", "ai.cadence.org", "second-org"]);
+        run_git(path, &["config", "ai.cadence.org", "first-org"]).await;
+        run_git(path, &["config", "ai.cadence.org", "second-org"]).await;
 
-        let value = git_output_in(path, &["config", "--get", "ai.cadence.org"]).unwrap();
+        let value = git_output_in(path, &["config", "--get", "ai.cadence.org"])
+            .await
+            .unwrap();
         assert_eq!(value, "second-org");
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_get_global_all_returns_empty_when_unset() {
-        let dir = init_temp_repo();
-        let global_config = dir.path().join("fake-global-gitconfig");
-        std::fs::write(&global_config, "").unwrap();
-
-        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
-        }
-
-        let values = config_get_global_all("notes.rewriteRef").expect("config_get_global_all");
-        assert!(values.is_empty());
-
-        unsafe {
-            match original_global {
-                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
-                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_add_global_and_get_all_roundtrip() {
-        let dir = init_temp_repo();
-        let global_config = dir.path().join("fake-global-gitconfig");
-        std::fs::write(&global_config, "").unwrap();
-
-        let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
-        }
-
-        config_add_global("notes.rewriteRef", "refs/notes/commits").expect("first add");
-        config_add_global("notes.rewriteRef", "refs/notes/ai-sessions").expect("second add");
-        let values = config_get_global_all("notes.rewriteRef").expect("config_get_global_all");
-        assert_eq!(
-            values,
-            vec![
-                "refs/notes/commits".to_string(),
-                "refs/notes/ai-sessions".to_string()
-            ]
-        );
-
-        unsafe {
-            match original_global {
-                Some(g) => std::env::set_var("GIT_CONFIG_GLOBAL", g),
-                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
     // Multiple commits — verify head_hash changes
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_head_hash_changes_after_new_commit() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_head_hash_changes_after_new_commit() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
-        let hash1 = run_git(path, &["rev-parse", "HEAD"]);
+        let hash1 = run_git(path, &["rev-parse", "HEAD"]).await;
 
         // Make another commit
-        std::fs::write(path.join("file2.txt"), "content").unwrap();
-        run_git(path, &["add", "file2.txt"]);
-        run_git(path, &["commit", "-m", "second commit"]);
+        tokio::fs::write(path.join("file2.txt"), "content")
+            .await
+            .unwrap();
+        run_git(path, &["add", "file2.txt"]).await;
+        run_git(path, &["commit", "-m", "second commit"]).await;
 
-        let hash2 = run_git(path, &["rev-parse", "HEAD"]);
+        let hash2 = run_git(path, &["rev-parse", "HEAD"]).await;
 
         assert_ne!(hash1, hash2);
         assert_eq!(hash2.len(), 40);
     }
 
     // -----------------------------------------------------------------------
-    // validate_commit_hash
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_validate_commit_hash_valid_short() {
-        assert!(validate_commit_hash("abcdef0").is_ok());
-    }
-
-    #[test]
-    fn test_validate_commit_hash_valid_full() {
-        assert!(validate_commit_hash("abcdef0123456789abcdef0123456789abcdef01").is_ok());
-    }
-
-    #[test]
-    fn test_validate_commit_hash_rejects_flag_injection() {
-        assert!(validate_commit_hash("--help").is_err());
-    }
-
-    #[test]
-    fn test_validate_commit_hash_rejects_too_short() {
-        assert!(validate_commit_hash("abc").is_err());
-    }
-
-    #[test]
-    fn test_validate_commit_hash_rejects_non_hex() {
-        assert!(validate_commit_hash("ghijklm").is_err());
-    }
-
-    #[test]
-    fn test_validate_commit_hash_rejects_empty() {
-        assert!(validate_commit_hash("").is_err());
-    }
-
-    #[test]
-    fn test_validate_commit_hash_rejects_too_long() {
-        assert!(validate_commit_hash("a".repeat(41).as_str()).is_err());
-    }
-
-    // -----------------------------------------------------------------------
     // parse_org_from_url — edge cases
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_org_from_url_https_with_trailing_slash() {
+    #[tokio::test]
+    async fn test_parse_org_from_url_https_with_trailing_slash() {
         // Trailing slash after org — org segment should still parse
         let org = parse_org_from_url("https://github.com/org/");
         assert_eq!(org, Some("org".to_string()));
     }
 
-    #[test]
-    fn test_parse_org_from_url_https_host_only() {
+    #[tokio::test]
+    async fn test_parse_org_from_url_https_host_only() {
         // No org segment after host
         let org = parse_org_from_url("https://github.com/");
         assert_eq!(org, None);
     }
 
-    #[test]
-    fn test_parse_org_from_url_https_host_no_trailing_slash() {
+    #[tokio::test]
+    async fn test_parse_org_from_url_https_host_no_trailing_slash() {
         let org = parse_org_from_url("https://github.com");
         assert_eq!(org, None);
     }
 
-    #[test]
-    fn test_parse_org_from_url_ssh_nested_path() {
+    #[tokio::test]
+    async fn test_parse_org_from_url_ssh_nested_path() {
         // SSH with nested paths — org is the first segment after the colon
         let org = parse_org_from_url("git@github.com:org/sub/repo.git");
         assert_eq!(org, Some("org".to_string()));
     }
 
-    // -----------------------------------------------------------------------
-    // commits_in_time_range
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_commits_in_time_range_includes_commit() {
-        let dir = init_temp_repo();
-        let path = dir.path();
-
-        let hash = run_git(path, &["rev-parse", "HEAD"]);
-        let ts_str = run_git(path, &["show", "-s", "--format=%ct", "HEAD"]);
-        let ts: i64 = ts_str.parse().unwrap();
-
-        let commits = commits_in_time_range(path, ts - 10, ts + 10).unwrap();
-        assert!(commits.contains(&hash));
-    }
-
-    #[test]
-    fn test_commits_in_time_range_empty_outside_window() {
-        let dir = init_temp_repo();
-        let path = dir.path();
-
-        let ts_str = run_git(path, &["show", "-s", "--format=%ct", "HEAD"]);
-        let ts: i64 = ts_str.parse().unwrap();
-
-        let commits = commits_in_time_range(path, ts - 10_000, ts - 9_000).unwrap();
-        assert!(commits.is_empty());
-    }
-
-    #[test]
-    fn test_parse_org_from_url_https_with_port() {
+    #[tokio::test]
+    async fn test_parse_org_from_url_https_with_port() {
         let org = parse_org_from_url("https://github.com:443/org/repo.git");
         // The host segment is "github.com:443", org is next path segment
         assert_eq!(org, Some("org".to_string()));
     }
 
-    #[test]
-    fn test_parse_org_from_url_https_with_auth() {
+    #[tokio::test]
+    async fn test_parse_org_from_url_https_with_auth() {
         // URL with authentication credentials embedded
         let org = parse_org_from_url("https://user:pass@github.com/org/repo.git");
         // "user:pass@github.com" is treated as host, "org" is the org
@@ -2159,71 +1775,34 @@ mod tests {
     /// Helper: create a temp repo and chdir into it. Returns the TempDir
     /// (must be kept alive to prevent cleanup) and the original cwd for
     /// restoration.
-    fn enter_temp_repo() -> (TempDir, PathBuf) {
+    async fn enter_temp_repo() -> (TempDir, PathBuf) {
         let original_cwd = std::env::current_dir().expect("failed to get cwd");
-        let dir = init_temp_repo();
+        let dir = init_temp_repo().await;
         std::env::set_current_dir(dir.path()).expect("failed to chdir into temp repo");
         (dir, original_cwd)
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_api_repo_root() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        let root = repo_root().expect("repo_root failed");
+    async fn test_api_repo_root() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
+        let root = repo_root().await.expect("repo_root failed");
         assert!(root.join("README.md").exists());
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_api_head_hash() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        let hash = head_hash().expect("head_hash failed");
-        assert_eq!(hash.len(), 40);
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    async fn test_api_has_upstream_no_remote() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
+        assert!(!has_upstream().await.expect("has_upstream failed"));
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_api_head_timestamp() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        let ts = head_timestamp().expect("head_timestamp failed");
-        assert!(ts > 1_577_836_800); // After 2020
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_note_exists_and_add_note() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        let hash = head_hash().expect("head_hash failed");
-
-        // No note yet
-        assert!(!note_exists(&hash).expect("note_exists failed"));
-
-        // Add a note via the public API
-        add_note(&hash, "test session data").expect("add_note failed");
-
-        // Now it should exist
-        assert!(note_exists(&hash).expect("note_exists failed after add"));
-
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_has_upstream_no_remote() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        assert!(!has_upstream().expect("has_upstream failed"));
-        std::env::set_current_dir(original_cwd).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_api_has_upstream_with_remote() {
-        let (dir, original_cwd) = enter_temp_repo();
+    async fn test_api_has_upstream_with_remote() {
+        let (dir, original_cwd) = enter_temp_repo().await;
         run_git(
             dir.path(),
             &[
@@ -2232,8 +1811,9 @@ mod tests {
                 "origin",
                 "https://github.com/test-org/test-repo.git",
             ],
-        );
-        assert!(has_upstream().expect("has_upstream failed"));
+        )
+        .await;
+        assert!(has_upstream().await.expect("has_upstream failed"));
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
@@ -2241,11 +1821,11 @@ mod tests {
     // resolve_push_remote
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_push_remote_prefers_branch_push_remote() {
-        let (dir, original_cwd) = enter_temp_repo();
-        let branch = run_git(dir.path(), &["symbolic-ref", "--short", "HEAD"]);
+    async fn test_resolve_push_remote_prefers_branch_push_remote() {
+        let (dir, original_cwd) = enter_temp_repo().await;
+        let branch = run_git(dir.path(), &["symbolic-ref", "--short", "HEAD"]).await;
 
         run_git(
             dir.path(),
@@ -2255,7 +1835,8 @@ mod tests {
                 "upstream",
                 "https://github.com/example/upstream.git",
             ],
-        );
+        )
+        .await;
         run_git(
             dir.path(),
             &[
@@ -2263,18 +1844,21 @@ mod tests {
                 &format!("branch.{}.pushRemote", branch),
                 "upstream",
             ],
-        );
+        )
+        .await;
 
-        let resolved = resolve_push_remote().expect("resolve_push_remote failed");
+        let resolved = resolve_push_remote()
+            .await
+            .expect("resolve_push_remote failed");
         assert_eq!(resolved, Some("upstream".to_string()));
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_push_remote_uses_push_default() {
-        let (dir, original_cwd) = enter_temp_repo();
+    async fn test_resolve_push_remote_uses_push_default() {
+        let (dir, original_cwd) = enter_temp_repo().await;
 
         run_git(
             dir.path(),
@@ -2284,20 +1868,23 @@ mod tests {
                 "fork",
                 "https://github.com/example/fork.git",
             ],
-        );
-        run_git(dir.path(), &["config", "remote.pushDefault", "fork"]);
+        )
+        .await;
+        run_git(dir.path(), &["config", "remote.pushDefault", "fork"]).await;
 
-        let resolved = resolve_push_remote().expect("resolve_push_remote failed");
+        let resolved = resolve_push_remote()
+            .await
+            .expect("resolve_push_remote failed");
         assert_eq!(resolved, Some("fork".to_string()));
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_push_remote_uses_branch_remote() {
-        let (dir, original_cwd) = enter_temp_repo();
-        let branch = run_git(dir.path(), &["symbolic-ref", "--short", "HEAD"]);
+    async fn test_resolve_push_remote_uses_branch_remote() {
+        let (dir, original_cwd) = enter_temp_repo().await;
+        let branch = run_git(dir.path(), &["symbolic-ref", "--short", "HEAD"]).await;
 
         run_git(
             dir.path(),
@@ -2307,22 +1894,26 @@ mod tests {
                 "origin",
                 "https://github.com/example/origin.git",
             ],
-        );
+        )
+        .await;
         run_git(
             dir.path(),
             &["config", &format!("branch.{}.remote", branch), "origin"],
-        );
+        )
+        .await;
 
-        let resolved = resolve_push_remote().expect("resolve_push_remote failed");
+        let resolved = resolve_push_remote()
+            .await
+            .expect("resolve_push_remote failed");
         assert_eq!(resolved, Some("origin".to_string()));
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_push_remote_uses_single_remote_fallback() {
-        let (dir, original_cwd) = enter_temp_repo();
+    async fn test_resolve_push_remote_uses_single_remote_fallback() {
+        let (dir, original_cwd) = enter_temp_repo().await;
 
         run_git(
             dir.path(),
@@ -2332,41 +1923,52 @@ mod tests {
                 "solo",
                 "https://github.com/example/solo.git",
             ],
-        );
+        )
+        .await;
 
-        let resolved = resolve_push_remote().expect("resolve_push_remote failed");
+        let resolved = resolve_push_remote()
+            .await
+            .expect("resolve_push_remote failed");
         assert_eq!(resolved, Some("solo".to_string()));
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_push_remote_detached_head_returns_none() {
-        let (dir, original_cwd) = enter_temp_repo();
-        run_git(dir.path(), &["checkout", "--detach", "HEAD"]);
+    async fn test_resolve_push_remote_detached_head_returns_none() {
+        let (dir, original_cwd) = enter_temp_repo().await;
+        run_git(dir.path(), &["checkout", "--detach", "HEAD"]).await;
 
-        let resolved = resolve_push_remote().expect("resolve_push_remote failed");
+        let resolved = resolve_push_remote()
+            .await
+            .expect("resolve_push_remote failed");
         assert_eq!(resolved, None);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_api_config_get_missing() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        let val = config_get("ai.cadence.nonexistent").expect("config_get failed");
+    async fn test_api_config_get_missing() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
+        let val = config_get("ai.cadence.nonexistent")
+            .await
+            .expect("config_get failed");
         assert_eq!(val, None);
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_api_config_set_then_get() {
-        let (_dir, original_cwd) = enter_temp_repo();
-        config_set("ai.cadence.enabled", "true").expect("config_set failed");
-        let val = config_get("ai.cadence.enabled").expect("config_get failed");
+    async fn test_api_config_set_then_get() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
+        config_set("ai.cadence.enabled", "true")
+            .await
+            .expect("config_set failed");
+        let val = config_get("ai.cadence.enabled")
+            .await
+            .expect("config_get failed");
         assert_eq!(val, Some("true".to_string()));
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -2375,46 +1977,46 @@ mod tests {
     // check_enabled
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_check_enabled_default_true() {
-        let (_dir, original_cwd) = enter_temp_repo();
+    async fn test_check_enabled_default_true() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
 
         // No config set -- should default to enabled
-        assert!(check_enabled());
+        assert!(check_enabled().await);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_check_enabled_explicitly_true() {
-        let (dir, original_cwd) = enter_temp_repo();
+    async fn test_check_enabled_explicitly_true() {
+        let (dir, original_cwd) = enter_temp_repo().await;
 
-        run_git(dir.path(), &["config", "ai.cadence.enabled", "true"]);
-        assert!(check_enabled());
+        run_git(dir.path(), &["config", "ai.cadence.enabled", "true"]).await;
+        assert!(check_enabled().await);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_check_enabled_explicitly_false() {
-        let (dir, original_cwd) = enter_temp_repo();
+    async fn test_check_enabled_explicitly_false() {
+        let (dir, original_cwd) = enter_temp_repo().await;
 
-        run_git(dir.path(), &["config", "ai.cadence.enabled", "false"]);
-        assert!(!check_enabled());
+        run_git(dir.path(), &["config", "ai.cadence.enabled", "false"]).await;
+        assert!(!check_enabled().await);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_check_enabled_other_value_treated_as_true() {
-        let (dir, original_cwd) = enter_temp_repo();
+    async fn test_check_enabled_other_value_treated_as_true() {
+        let (dir, original_cwd) = enter_temp_repo().await;
 
-        run_git(dir.path(), &["config", "ai.cadence.enabled", "yes"]);
-        assert!(check_enabled());
+        run_git(dir.path(), &["config", "ai.cadence.enabled", "yes"]).await;
+        assert!(check_enabled().await);
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
@@ -2423,93 +2025,77 @@ mod tests {
     // Phase 12 hardening: detached HEAD
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_head_hash_works_in_detached_head() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_head_hash_works_in_detached_head() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
         // Get the current HEAD hash, then detach HEAD
-        let hash = run_git(path, &["rev-parse", "HEAD"]);
-        run_git(path, &["checkout", "--detach", "HEAD"]);
+        let hash = run_git(path, &["rev-parse", "HEAD"]).await;
+        run_git(path, &["checkout", "--detach", "HEAD"]).await;
 
         // `git rev-parse HEAD` should still return the same hash in detached state
-        let detached_hash = git_output_in(path, &["rev-parse", "HEAD"]).unwrap();
+        let detached_hash = git_output_in(path, &["rev-parse", "HEAD"]).await.unwrap();
         assert_eq!(hash, detached_hash);
         assert_eq!(detached_hash.len(), 40);
     }
 
-    #[test]
-    fn test_head_timestamp_works_in_detached_head() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_head_timestamp_works_in_detached_head() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
         // Get the timestamp before detaching
-        let ts_before = git_output_in(path, &["show", "-s", "--format=%ct", "HEAD"]).unwrap();
+        let ts_before = git_output_in(path, &["show", "-s", "--format=%ct", "HEAD"])
+            .await
+            .unwrap();
 
-        run_git(path, &["checkout", "--detach", "HEAD"]);
+        run_git(path, &["checkout", "--detach", "HEAD"]).await;
 
         // Timestamp should still be readable in detached state
-        let ts_after = git_output_in(path, &["show", "-s", "--format=%ct", "HEAD"]).unwrap();
+        let ts_after = git_output_in(path, &["show", "-s", "--format=%ct", "HEAD"])
+            .await
+            .unwrap();
         assert_eq!(ts_before, ts_after);
-    }
-
-    #[test]
-    fn test_note_operations_work_in_detached_head() {
-        let dir = init_temp_repo();
-        let path = dir.path();
-
-        let hash = run_git(path, &["rev-parse", "HEAD"]);
-        run_git(path, &["checkout", "--detach", "HEAD"]);
-
-        // note_exists_at should work in detached HEAD
-        let exists = note_exists_at(path, &hash).expect("note_exists_at failed in detached HEAD");
-        assert!(!exists);
-
-        // add_note_at should work in detached HEAD
-        add_note_at(path, &hash, "test detached note")
-            .expect("add_note_at failed in detached HEAD");
-
-        // Verify the note was attached
-        let exists = note_exists_at(path, &hash).expect("note_exists_at failed after add");
-        assert!(exists);
     }
 
     // -----------------------------------------------------------------------
     // Phase 12 hardening: repo with no remotes
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_push_notes_fails_gracefully_no_remote() {
-        let (_dir, original_cwd) = enter_temp_repo();
+    async fn test_push_notes_fails_gracefully_no_remote() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
 
         // push_notes should fail (no remote) but not panic
         let result = push_notes("origin");
-        assert!(result.is_err());
+        assert!(result.await.is_err());
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_remote_orgs_empty_when_no_remotes() {
-        let (_dir, original_cwd) = enter_temp_repo();
+    async fn test_remote_orgs_empty_when_no_remotes() {
+        let (_dir, original_cwd) = enter_temp_repo().await;
 
-        let orgs = remote_orgs().expect("remote_orgs failed");
+        let orgs = remote_orgs().await.expect("remote_orgs failed");
         assert!(orgs.is_empty());
 
         std::env::set_current_dir(original_cwd).unwrap();
     }
 
-    #[test]
-    fn test_remote_orgs_at_collects_orgs() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_remote_orgs_at_collects_orgs() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
         run_git(
             path,
             &["remote", "add", "origin", "git@github.com:org-one/repo.git"],
-        );
+        )
+        .await;
         run_git(
             path,
             &[
@@ -2518,38 +2104,48 @@ mod tests {
                 "upstream",
                 "https://github.com/org-two/repo.git",
             ],
-        );
+        )
+        .await;
 
-        let orgs = remote_orgs_at(path).expect("remote_orgs_at failed");
+        let orgs = remote_orgs_at(path).await.expect("remote_orgs_at failed");
         assert_eq!(orgs.len(), 2);
         assert!(orgs.contains(&"org-one".to_string()));
         assert!(orgs.contains(&"org-two".to_string()));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_repo_matches_org_filter() {
-        let dir = init_temp_repo();
+    async fn test_repo_matches_org_filter() {
+        let dir = init_temp_repo().await;
         let path = dir.path();
 
         run_git(
             path,
             &["remote", "add", "origin", "git@github.com:my-org/repo.git"],
-        );
+        )
+        .await;
 
         let global_config = path.join("fake-global-gitconfig");
-        std::fs::write(&global_config, "[ai \"cadence\"]\n    org = my-org\n").unwrap();
+        tokio::fs::write(&global_config, "[ai \"cadence\"]\n    org = my-org\n")
+            .await
+            .unwrap();
 
         let original_global = std::env::var("GIT_CONFIG_GLOBAL").ok();
         unsafe {
             std::env::set_var("GIT_CONFIG_GLOBAL", &global_config);
         }
 
-        let matches = repo_matches_org_filter(path).expect("repo_matches_org_filter failed");
+        let matches = repo_matches_org_filter(path)
+            .await
+            .expect("repo_matches_org_filter failed");
         assert!(matches);
 
-        std::fs::write(&global_config, "[ai \"cadence\"]\n    org = other-org\n").unwrap();
-        let matches = repo_matches_org_filter(path).expect("repo_matches_org_filter failed");
+        tokio::fs::write(&global_config, "[ai \"cadence\"]\n    org = other-org\n")
+            .await
+            .unwrap();
+        let matches = repo_matches_org_filter(path)
+            .await
+            .expect("repo_matches_org_filter failed");
         assert!(!matches);
 
         unsafe {
@@ -2564,141 +2160,132 @@ mod tests {
     // store_blob / read_blob
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_store_and_read_blob_roundtrip() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_store_and_read_blob_roundtrip() {
+        let dir = init_temp_repo().await;
         let data = b"hello, this is a test blob";
 
-        let sha = store_blob_at(Some(dir.path()), data).expect("store_blob_at failed");
+        let sha = store_blob_at(Some(dir.path()), data)
+            .await
+            .expect("store_blob_at failed");
         assert_eq!(sha.len(), 40);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha)
+            .await
+            .expect("read_blob_at failed");
         assert_eq!(read_back, data);
     }
 
-    #[test]
-    fn test_store_blob_binary_data() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_store_blob_binary_data() {
+        let dir = init_temp_repo().await;
         // Binary data including null bytes
         let data: Vec<u8> = (0..=255).collect();
 
-        let sha = store_blob_at(Some(dir.path()), &data).expect("store_blob_at failed");
-        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+        let sha = store_blob_at(Some(dir.path()), &data)
+            .await
+            .expect("store_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha)
+            .await
+            .expect("read_blob_at failed");
         assert_eq!(read_back, data);
     }
 
-    #[test]
-    fn test_store_blob_empty() {
-        let dir = init_temp_repo();
-        let sha = store_blob_at(Some(dir.path()), b"").expect("store_blob_at failed");
-        let read_back = read_blob_at(Some(dir.path()), &sha).expect("read_blob_at failed");
+    #[tokio::test]
+    async fn test_store_blob_empty() {
+        let dir = init_temp_repo().await;
+        let sha = store_blob_at(Some(dir.path()), b"")
+            .await
+            .expect("store_blob_at failed");
+        let read_back = read_blob_at(Some(dir.path()), &sha)
+            .await
+            .expect("read_blob_at failed");
         assert!(read_back.is_empty());
     }
 
-    #[test]
-    fn test_store_blob_deterministic() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_store_blob_deterministic() {
+        let dir = init_temp_repo().await;
         let data = b"same content";
 
-        let sha1 = store_blob_at(Some(dir.path()), data).expect("first store failed");
-        let sha2 = store_blob_at(Some(dir.path()), data).expect("second store failed");
+        let sha1 = store_blob_at(Some(dir.path()), data)
+            .await
+            .expect("first store failed");
+        let sha2 = store_blob_at(Some(dir.path()), data)
+            .await
+            .expect("second store failed");
         assert_eq!(sha1, sha2, "same content should produce same SHA");
     }
 
-    #[test]
-    fn test_read_blob_nonexistent() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_read_blob_nonexistent() {
+        let dir = init_temp_repo().await;
         let result = read_blob_at(Some(dir.path()), "0000000000000000000000000000000000000000");
-        assert!(result.is_err());
+        assert!(result.await.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2 plumbing: list_notes_at, ls_tree_at, mktree_at, commit_tree_at,
-    //                    update_ref_at, rev_parse_at
+    // Tree/ref plumbing: ls_tree_at, mktree_at, commit_tree_at, update_ref_at,
+    // rev_parse_at
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_list_notes_at_empty() {
-        let dir = init_temp_repo();
-        let notes = list_notes_at(Some(dir.path())).expect("list_notes_at failed");
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn test_list_notes_at_with_notes() {
-        let dir = init_temp_repo();
-        let commit = run_git(dir.path(), &["rev-parse", "HEAD"]);
-
-        run_git(
-            dir.path(),
-            &[
-                "notes",
-                "--ref",
-                NOTES_REF,
-                "add",
-                "-m",
-                "test note",
-                &commit,
-            ],
-        );
-
-        let notes = list_notes_at(Some(dir.path())).expect("list_notes_at failed");
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].1, commit);
-        // note blob SHA should be 40 hex chars
-        assert_eq!(notes[0].0.len(), 40);
-    }
-
-    #[test]
-    fn test_ls_tree_at() {
-        let dir = init_temp_repo();
-        let commit = run_git(dir.path(), &["rev-parse", "HEAD"]);
-
-        run_git(
-            dir.path(),
-            &["notes", "--ref", NOTES_REF, "add", "-m", "hi", &commit],
-        );
-
-        let tree_rev = format!("{}^{{tree}}", NOTES_REF);
-        let entries = ls_tree_at(Some(dir.path()), &tree_rev).expect("ls_tree_at failed");
+    #[tokio::test]
+    async fn test_ls_tree_at() {
+        let dir = init_temp_repo().await;
+        let tree_rev = "HEAD^{tree}";
+        let entries = ls_tree_at(Some(dir.path()), &tree_rev)
+            .await
+            .expect("ls_tree_at failed");
         assert!(!entries.is_empty());
         // Each entry should have a tab-separated name
         assert!(entries[0].contains('\t'));
     }
 
-    #[test]
-    fn test_mktree_at_roundtrip() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_mktree_at_roundtrip() {
+        let dir = init_temp_repo().await;
 
         // Store a blob and create a tree containing it.
-        let sha = store_blob_at(Some(dir.path()), b"content").expect("store_blob failed");
+        let sha = store_blob_at(Some(dir.path()), b"content")
+            .await
+            .expect("store_blob failed");
         let entry = format!("100644 blob {}\tfile.txt", sha);
-        let tree_sha =
-            mktree_at(Some(dir.path()), std::slice::from_ref(&entry)).expect("mktree failed");
+        let tree_sha = mktree_at(Some(dir.path()), std::slice::from_ref(&entry))
+            .await
+            .expect("mktree failed");
 
         // Read it back.
-        let entries = ls_tree_at(Some(dir.path()), &tree_sha).expect("ls_tree failed");
+        let entries = ls_tree_at(Some(dir.path()), &tree_sha)
+            .await
+            .expect("ls_tree failed");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], entry);
     }
 
-    #[test]
-    fn test_commit_tree_at_creates_orphan() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_commit_tree_at_creates_orphan() {
+        let dir = init_temp_repo().await;
 
         // Create a tree.
-        let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
+        let sha = store_blob_at(Some(dir.path()), b"data")
+            .await
+            .expect("store_blob failed");
         let entry = format!("100644 blob {}\tfile.txt", sha);
-        let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
+        let tree = mktree_at(Some(dir.path()), &[entry])
+            .await
+            .expect("mktree failed");
 
         // Create orphan commit.
         let commit = commit_tree_at(Some(dir.path()), &tree, "test commit", None)
+            .await
             .expect("commit_tree failed");
         assert_eq!(commit.len(), 40);
 
         // Verify no parents.
-        let parents = git_output_in(dir.path(), &["log", "--format=%P", &commit]).unwrap();
+        let parents = git_output_in(dir.path(), &["log", "--format=%P", &commit])
+            .await
+            .unwrap();
         assert!(
             parents.is_empty(),
             "orphan commit should have no parents, got: {:?}",
@@ -2706,58 +2293,99 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_update_ref_at() {
-        let dir = init_temp_repo();
+    #[tokio::test]
+    async fn test_update_ref_at() {
+        let dir = init_temp_repo().await;
 
         // Create a tree and commit.
-        let sha = store_blob_at(Some(dir.path()), b"data").expect("store_blob failed");
+        let sha = store_blob_at(Some(dir.path()), b"data")
+            .await
+            .expect("store_blob failed");
         let entry = format!("100644 blob {}\tfile.txt", sha);
-        let tree = mktree_at(Some(dir.path()), &[entry]).expect("mktree failed");
-        let commit =
-            commit_tree_at(Some(dir.path()), &tree, "test", None).expect("commit_tree failed");
+        let tree = mktree_at(Some(dir.path()), &[entry])
+            .await
+            .expect("mktree failed");
+        let commit = commit_tree_at(Some(dir.path()), &tree, "test", None)
+            .await
+            .expect("commit_tree failed");
 
         // Update a ref.
-        update_ref_at(Some(dir.path()), "refs/test/foo", &commit).expect("update_ref_at failed");
+        update_ref_at(Some(dir.path()), "refs/test/foo", &commit)
+            .await
+            .expect("update_ref_at failed");
 
         // Verify.
-        let resolved =
-            rev_parse_at(Some(dir.path()), "refs/test/foo").expect("rev_parse_at failed");
+        let resolved = rev_parse_at(Some(dir.path()), "refs/test/foo")
+            .await
+            .expect("rev_parse_at failed");
         assert_eq!(resolved, commit);
     }
 
-    #[test]
-    fn test_rev_parse_at() {
-        let dir = init_temp_repo();
-        let head = run_git(dir.path(), &["rev-parse", "HEAD"]);
-        let resolved = rev_parse_at(Some(dir.path()), "HEAD").expect("rev_parse_at failed");
+    #[tokio::test]
+    async fn test_rev_parse_at() {
+        let dir = init_temp_repo().await;
+        let head = run_git(dir.path(), &["rev-parse", "HEAD"]).await;
+        let resolved = rev_parse_at(Some(dir.path()), "HEAD")
+            .await
+            .expect("rev_parse_at failed");
         assert_eq!(resolved, head);
     }
 
-    #[test]
-    fn test_payload_path_for_sha_fanout() {
-        let sha = "abcdef0123456789abcdef0123456789abcdef01";
-        let path = payload_path_for_sha(sha).expect("payload path");
-        assert_eq!(path, "ab/cdef0123456789abcdef0123456789abcdef01");
+    #[tokio::test]
+    async fn test_migrate_legacy_session_ref_copies_when_new_missing() {
+        let dir = init_temp_repo().await;
+        let head = rev_parse_at(Some(dir.path()), "HEAD")
+            .await
+            .expect("head sha");
+        update_ref_at(Some(dir.path()), LEGACY_SESSION_NOTES_REF, &head)
+            .await
+            .expect("set legacy ref");
+
+        let migrated = migrate_legacy_session_ref_at(Some(dir.path()))
+            .await
+            .expect("migrate");
+        assert!(migrated);
+
+        let canonical = rev_parse_at(Some(dir.path()), SESSION_DATA_REF)
+            .await
+            .expect("canonical ref");
+        assert_eq!(canonical, head);
     }
 
-    #[test]
-    fn test_payload_path_for_sha_rejects_invalid() {
-        let bad = payload_path_for_sha("not-a-sha");
-        assert!(bad.is_err());
-    }
+    #[tokio::test]
+    async fn test_migrate_legacy_session_ref_noop_when_canonical_exists() {
+        let dir = init_temp_repo().await;
+        let head = rev_parse_at(Some(dir.path()), "HEAD")
+            .await
+            .expect("head sha");
+        update_ref_at(Some(dir.path()), SESSION_DATA_REF, &head)
+            .await
+            .expect("set canonical ref");
 
-    #[test]
-    fn test_ensure_payload_blob_referenced_idempotent() {
-        let dir = init_temp_repo();
-        let blob_sha = store_blob_at(Some(dir.path()), b"payload bytes").expect("blob");
+        let other_blob = store_blob_at(Some(dir.path()), b"legacy")
+            .await
+            .expect("blob");
+        let legacy_tree = mktree_at(
+            Some(dir.path()),
+            &[format!("100644 blob {}\tlegacy.txt", other_blob)],
+        )
+        .await
+        .expect("legacy tree");
+        let legacy_commit = commit_tree_at(Some(dir.path()), &legacy_tree, "legacy", None)
+            .await
+            .expect("legacy commit");
+        update_ref_at(Some(dir.path()), LEGACY_SESSION_NOTES_REF, &legacy_commit)
+            .await
+            .expect("set legacy ref");
 
-        ensure_payload_blob_referenced_at(dir.path(), &blob_sha).expect("first ensure");
-        let first_tip = rev_parse_at(Some(dir.path()), PAYLOAD_REF).expect("first tip");
+        let migrated = migrate_legacy_session_ref_at(Some(dir.path()))
+            .await
+            .expect("migrate");
+        assert!(!migrated);
 
-        ensure_payload_blob_referenced_at(dir.path(), &blob_sha).expect("second ensure");
-        let second_tip = rev_parse_at(Some(dir.path()), PAYLOAD_REF).expect("second tip");
-
-        assert_eq!(first_tip, second_tip, "second ensure should be no-op");
+        let canonical = rev_parse_at(Some(dir.path()), SESSION_DATA_REF)
+            .await
+            .expect("canonical ref");
+        assert_eq!(canonical, head, "canonical ref should not be overwritten");
     }
 }

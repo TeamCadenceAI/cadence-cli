@@ -8,120 +8,65 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod warp;
 
-use std::fs;
+use crate::scanner::AgentType;
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// Encode a repository path into the format Claude Code uses for project directories.
-///
-/// Replaces all `/` characters with `-`. The leading `/` becomes a leading `-`.
-///
-/// # Examples
-/// - `/Users/foo/bar` -> `-Users-foo-bar`
-/// - `/home/user/dev/my-repo` -> `-home-user-dev-my-repo`
-pub fn encode_repo_path(path: &Path) -> String {
-    let mut path_str = path.to_string_lossy().replace('\\', "/");
-    if path_str.contains(':') && !path_str.starts_with('/') {
-        path_str = format!("/{}", path_str.replace(':', ""));
-    } else {
-        path_str = path_str.replace(':', "");
-    }
-    path_str.replace('/', "-")
+#[async_trait]
+pub trait AgentExplorer {
+    async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog>;
 }
 
-/// Filter files in the given directories whose modification time falls within
-/// +/- `window_secs` of `commit_time`, and whose extension matches `exts`.
-pub fn candidate_files_with_exts(
-    dirs: &[PathBuf],
-    commit_time: i64,
-    window_secs: i64,
-    exts: &[&str],
-) -> Vec<PathBuf> {
-    let mut results = Vec::new();
+#[derive(Debug, Clone)]
+pub enum SessionSource {
+    File(PathBuf),
+    Inline { label: String, content: String },
+}
 
-    for dir in dirs {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
+#[derive(Debug, Clone)]
+pub struct SessionLog {
+    pub agent_type: AgentType,
+    pub source: SessionSource,
+    pub updated_at: Option<i64>,
+    pub match_reasons: Vec<String>,
+}
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-
-            // Only consider files with matching extensions
-            let ext = match path.extension().and_then(|e| e.to_str()) {
-                Some(e) => e.to_ascii_lowercase(),
-                None => continue,
-            };
-            if !exts
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&ext))
-            {
-                continue;
-            }
-
-            // Only consider regular files (not directories).
-            // Use fs::metadata instead of entry.metadata() so that symlinks
-            // are followed -- entry.metadata() uses lstat on Unix, which
-            // would cause symlinked files to be skipped.
-            let metadata = match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-
-            // Check modification time against the commit time window
-            let mtime = match metadata.modified() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            let mtime_epoch = match mtime.duration_since(UNIX_EPOCH) {
-                Ok(d) => d.as_secs() as i64,
-                Err(_) => continue, // mtime before Unix epoch -- skip
-            };
-
-            let diff = (mtime_epoch - commit_time).abs();
-            if diff <= window_secs {
-                results.push(path);
-            }
+impl SessionLog {
+    pub fn source_label(&self) -> String {
+        match &self.source {
+            SessionSource::File(path) => path.to_string_lossy().to_string(),
+            SessionSource::Inline { label, .. } => label.clone(),
         }
     }
+}
 
-    results
+#[derive(Debug, Clone)]
+pub struct DiscoveredFile {
+    pub path: PathBuf,
+    pub mtime_epoch: i64,
 }
 
 /// Find files in the given directories whose modification time is within
 /// `since_secs` of `now`, and whose extension matches `exts`.
-pub fn recent_files_with_exts(
+pub async fn recent_files_with_exts(
     dirs: &[PathBuf],
     now: i64,
     since_secs: i64,
     exts: &[&str],
-) -> Vec<PathBuf> {
+) -> Vec<DiscoveredFile> {
     let cutoff = now - since_secs;
     let mut results = Vec::new();
 
     for dir in dirs {
-        let entries = match fs::read_dir(dir) {
+        let mut entries = match tokio::fs::read_dir(dir).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
 
             // Only consider files with matching extensions
@@ -137,7 +82,7 @@ pub fn recent_files_with_exts(
             }
 
             // Only consider regular files (follow symlinks)
-            let metadata = match fs::metadata(&path) {
+            let metadata = match tokio::fs::metadata(&path).await {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -157,7 +102,7 @@ pub fn recent_files_with_exts(
             };
 
             if mtime_epoch >= cutoff {
-                results.push(path);
+                results.push(DiscoveredFile { path, mtime_epoch });
             }
         }
     }
@@ -203,24 +148,23 @@ pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
 }
 
 /// Recursively find directories named `chatSessions` under a workspaceStorage root.
-pub fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
+pub async fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
                 Err(_) => continue,
             };
-
-            let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 if path.file_name().and_then(|n| n.to_str()) == Some("chatSessions") {
                     results.push(path);
                 } else {
@@ -233,98 +177,24 @@ pub fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
     results
 }
 
-/// Collect candidate files across all supported agents for a specific commit.
-pub fn all_candidate_files(repo_root: &Path, commit_time: i64, window_secs: i64) -> Vec<PathBuf> {
+/// Collect recent session logs across all supported agents.
+pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionLog> {
+    let (claude_logs, codex_logs, cursor_logs, copilot_logs, antigravity_logs, warp_logs) = tokio::join!(
+        claude::ClaudeExplorer.discover_recent(now, since_secs),
+        codex::CodexExplorer.discover_recent(now, since_secs),
+        cursor::CursorExplorer.discover_recent(now, since_secs),
+        copilot::CopilotExplorer.discover_recent(now, since_secs),
+        antigravity::AntigravityExplorer.discover_recent(now, since_secs),
+        warp::WarpExplorer.discover_recent(now, since_secs),
+    );
+
     let mut results = Vec::new();
-
-    let mut claude_dirs = Vec::new();
-    claude_dirs.extend(claude::log_dirs(repo_root));
-    results.extend(candidate_files_with_exts(
-        &claude_dirs,
-        commit_time,
-        window_secs,
-        &["jsonl"],
-    ));
-
-    let codex_dirs = codex::log_dirs();
-    results.extend(candidate_files_with_exts(
-        &codex_dirs,
-        commit_time,
-        window_secs,
-        &["jsonl"],
-    ));
-
-    let cursor_dirs = cursor::log_dirs();
-    results.extend(candidate_files_with_exts(
-        &cursor_dirs,
-        commit_time,
-        window_secs,
-        &["json", "txt"],
-    ));
-
-    let copilot_dirs = copilot::log_dirs();
-    results.extend(candidate_files_with_exts(
-        &copilot_dirs,
-        commit_time,
-        window_secs,
-        &["json"],
-    ));
-
-    let antigravity_dirs = antigravity::log_dirs();
-    results.extend(candidate_files_with_exts(
-        &antigravity_dirs,
-        commit_time,
-        window_secs,
-        &["json"],
-    ));
-
-    results
-}
-
-/// Collect recent files across all supported agents.
-pub fn all_recent_files(now: i64, since_secs: i64) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-
-    let claude_dirs = claude::all_log_dirs();
-    results.extend(recent_files_with_exts(
-        &claude_dirs,
-        now,
-        since_secs,
-        &["jsonl"],
-    ));
-
-    let codex_dirs = codex::all_log_dirs();
-    results.extend(recent_files_with_exts(
-        &codex_dirs,
-        now,
-        since_secs,
-        &["jsonl"],
-    ));
-
-    let cursor_dirs = cursor::all_log_dirs();
-    results.extend(recent_files_with_exts(
-        &cursor_dirs,
-        now,
-        since_secs,
-        &["json", "txt"],
-    ));
-
-    let copilot_dirs = copilot::all_log_dirs();
-    results.extend(recent_files_with_exts(
-        &copilot_dirs,
-        now,
-        since_secs,
-        &["json"],
-    ));
-
-    let antigravity_dirs = antigravity::all_log_dirs();
-    results.extend(recent_files_with_exts(
-        &antigravity_dirs,
-        now,
-        since_secs,
-        &["json"],
-    ));
-
+    results.extend(claude_logs);
+    results.extend(codex_logs);
+    results.extend(cursor_logs);
+    results.extend(copilot_logs);
+    results.extend(antigravity_logs);
+    results.extend(warp_logs);
     results
 }
 
@@ -347,299 +217,90 @@ pub(crate) fn set_file_mtime(path: &Path, epoch_secs: i64) {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::fs;
     use tempfile::TempDir;
-
-    // -----------------------------------------------------------------------
-    // encode_repo_path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_encode_typical_path() {
-        let path = Path::new("/Users/foo/bar");
-        assert_eq!(encode_repo_path(path), "-Users-foo-bar");
-    }
-
-    #[test]
-    fn test_encode_deep_path() {
-        let path = Path::new("/home/user/dev/my-repo");
-        assert_eq!(encode_repo_path(path), "-home-user-dev-my-repo");
-    }
-
-    #[test]
-    fn test_encode_root_path() {
-        let path = Path::new("/");
-        assert_eq!(encode_repo_path(path), "-");
-    }
-
-    #[test]
-    fn test_encode_single_component() {
-        let path = Path::new("/myrepo");
-        assert_eq!(encode_repo_path(path), "-myrepo");
-    }
-
-    #[test]
-    fn test_encode_path_with_hyphens() {
-        let path = Path::new("/Users/my-user/my-project");
-        assert_eq!(encode_repo_path(path), "-Users-my-user-my-project");
-    }
-
-    #[test]
-    fn test_encode_preserves_dots() {
-        let path = Path::new("/Users/foo/bar.baz");
-        assert_eq!(encode_repo_path(path), "-Users-foo-bar.baz");
-    }
-
-    #[test]
-    fn test_encode_windows_path_normalizes_drive_and_separators() {
-        let path = Path::new("C:\\Users\\foo\\bar");
-        assert_eq!(encode_repo_path(path), "-C-Users-foo-bar");
-    }
-
-    // -----------------------------------------------------------------------
-    // candidate_files
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_candidate_files_within_window() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-
-        // Create a .jsonl file and set its mtime to commit_time
-        let file = dir.path().join("session.jsonl");
-        fs::write(&file, "{}").unwrap();
-        set_file_mtime(&file, commit_time);
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], file);
-    }
-
-    #[test]
-    fn test_candidate_files_at_window_boundary() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-        let window: i64 = 600;
-
-        // File at exactly +window seconds (should be included, diff == window)
-        let file = dir.path().join("boundary.jsonl");
-        fs::write(&file, "{}").unwrap();
-        set_file_mtime(&file, commit_time + window);
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn test_candidate_files_outside_window() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-        let window: i64 = 600;
-
-        // File at +window+1 seconds (should be excluded)
-        let file = dir.path().join("too-late.jsonl");
-        fs::write(&file, "{}").unwrap();
-        set_file_mtime(&file, commit_time + window + 1);
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_candidate_files_before_window() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-        let window: i64 = 600;
-
-        // File at -window-1 seconds (should be excluded)
-        let file = dir.path().join("too-early.jsonl");
-        fs::write(&file, "{}").unwrap();
-        set_file_mtime(&file, commit_time - window - 1);
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_candidate_files_ignores_non_jsonl() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-
-        // Create a .txt file with matching mtime
-        let txt_file = dir.path().join("session.txt");
-        fs::write(&txt_file, "{}").unwrap();
-        set_file_mtime(&txt_file, commit_time);
-
-        // Create a .json file (not .jsonl)
-        let json_file = dir.path().join("session.json");
-        fs::write(&json_file, "{}").unwrap();
-        set_file_mtime(&json_file, commit_time);
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_candidate_files_multiple_dirs() {
-        let dir1 = TempDir::new().unwrap();
-        let dir2 = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-
-        let file1 = dir1.path().join("a.jsonl");
-        fs::write(&file1, "{}").unwrap();
-        set_file_mtime(&file1, commit_time);
-
-        let file2 = dir2.path().join("b.jsonl");
-        fs::write(&file2, "{}").unwrap();
-        set_file_mtime(&file2, commit_time);
-
-        let result = candidate_files_with_exts(
-            &[dir1.path().to_path_buf(), dir2.path().to_path_buf()],
-            commit_time,
-            600,
-            &["jsonl"],
-        );
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_candidate_files_empty_dirs() {
-        let result = candidate_files_with_exts(&[], 1_700_000_000, 600, &["jsonl"]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_candidate_files_nonexistent_dir() {
-        let result = candidate_files_with_exts(
-            &[PathBuf::from("/nonexistent/dir/that/does/not/exist")],
-            1_700_000_000,
-            600,
-            &["jsonl"],
-        );
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_candidate_files_mixed_in_and_out_of_window() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-        let window: i64 = 600;
-
-        // In window
-        let in_file = dir.path().join("in.jsonl");
-        fs::write(&in_file, "{}").unwrap();
-        set_file_mtime(&in_file, commit_time + 300);
-
-        // Out of window
-        let out_file = dir.path().join("out.jsonl");
-        fs::write(&out_file, "{}").unwrap();
-        set_file_mtime(&out_file, commit_time + 1000);
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, window, &["jsonl"]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], in_file);
-    }
-
-    #[test]
-    fn test_candidate_files_ignores_directories_with_jsonl_name() {
-        let dir = TempDir::new().unwrap();
-        let commit_time: i64 = 1_700_000_000;
-
-        // Create a directory named something.jsonl (should be ignored)
-        let fake_dir = dir.path().join("sneaky.jsonl");
-        fs::create_dir(&fake_dir).unwrap();
-
-        let result =
-            candidate_files_with_exts(&[dir.path().to_path_buf()], commit_time, 600, &["jsonl"]);
-        assert!(result.is_empty());
-    }
 
     // -----------------------------------------------------------------------
     // recent_files
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_recent_files_within_window() {
+    #[tokio::test]
+    async fn test_recent_files_within_window() {
         let dir = TempDir::new().unwrap();
         let now: i64 = 1_700_000_000;
         let since_secs: i64 = 7 * 86_400; // 7 days
 
         // File modified recently (within window)
         let file = dir.path().join("recent.jsonl");
-        fs::write(&file, "{}").unwrap();
+        tokio::fs::write(&file, "{}").await.unwrap();
         set_file_mtime(&file, now - 3 * 86_400); // 3 days ago
 
         let result =
-            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]).await;
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], file);
+        assert_eq!(result[0].path, file);
     }
 
-    #[test]
-    fn test_recent_files_outside_window() {
+    #[tokio::test]
+    async fn test_recent_files_outside_window() {
         let dir = TempDir::new().unwrap();
         let now: i64 = 1_700_000_000;
         let since_secs: i64 = 7 * 86_400; // 7 days
 
         // File modified too long ago
         let file = dir.path().join("old.jsonl");
-        fs::write(&file, "{}").unwrap();
+        tokio::fs::write(&file, "{}").await.unwrap();
         set_file_mtime(&file, now - 10 * 86_400); // 10 days ago
 
         let result =
-            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]).await;
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_recent_files_at_boundary() {
+    #[tokio::test]
+    async fn test_recent_files_at_boundary() {
         let dir = TempDir::new().unwrap();
         let now: i64 = 1_700_000_000;
         let since_secs: i64 = 7 * 86_400;
 
         // File at exact cutoff (mtime == now - since_secs)
         let file = dir.path().join("boundary.jsonl");
-        fs::write(&file, "{}").unwrap();
+        tokio::fs::write(&file, "{}").await.unwrap();
         set_file_mtime(&file, now - since_secs); // exactly at the cutoff
 
         let result =
-            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]);
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, since_secs, &["jsonl"]).await;
         assert_eq!(result.len(), 1, "file at exact cutoff should be included");
     }
 
-    #[test]
-    fn test_recent_files_ignores_non_jsonl() {
+    #[tokio::test]
+    async fn test_recent_files_ignores_non_jsonl() {
         let dir = TempDir::new().unwrap();
         let now: i64 = 1_700_000_000;
 
         let txt_file = dir.path().join("session.txt");
-        fs::write(&txt_file, "{}").unwrap();
+        tokio::fs::write(&txt_file, "{}").await.unwrap();
         set_file_mtime(&txt_file, now);
 
-        let result = recent_files_with_exts(&[dir.path().to_path_buf()], now, 86_400, &["jsonl"]);
+        let result =
+            recent_files_with_exts(&[dir.path().to_path_buf()], now, 86_400, &["jsonl"]).await;
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_recent_files_empty_dirs() {
-        let result = recent_files_with_exts(&[], 1_700_000_000, 86_400, &["jsonl"]);
+    #[tokio::test]
+    async fn test_recent_files_empty_dirs() {
+        let result = recent_files_with_exts(&[], 1_700_000_000, 86_400, &["jsonl"]).await;
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_recent_files_nonexistent_dir() {
+    #[tokio::test]
+    async fn test_recent_files_nonexistent_dir() {
         let result = recent_files_with_exts(
             &[PathBuf::from("/nonexistent/dir")],
             1_700_000_000,
             86_400,
             &["jsonl"],
-        );
+        )
+        .await;
         assert!(result.is_empty());
     }
 

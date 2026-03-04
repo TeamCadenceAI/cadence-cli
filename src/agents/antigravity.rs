@@ -10,40 +10,64 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use super::{app_config_dir_in, find_chat_session_dirs, home_dir};
+use super::{
+    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, find_chat_session_dirs, home_dir,
+    recent_files_with_exts,
+};
+use crate::scanner::AgentType;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// Return all Antigravity log directories for use by the post-commit hook.
-pub fn log_dirs() -> Vec<PathBuf> {
+pub async fn log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
         None => return Vec::new(),
     };
-    log_dirs_in(&home)
+    log_dirs_in(&home).await
 }
 
 /// Return all Antigravity log directories for backfill (not repo-scoped).
-pub fn all_log_dirs() -> Vec<PathBuf> {
-    log_dirs()
+pub async fn all_log_dirs() -> Vec<PathBuf> {
+    log_dirs().await
 }
 
-fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
+pub struct AntigravityExplorer;
+
+#[async_trait]
+impl AgentExplorer for AntigravityExplorer {
+    async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
+        let dirs = all_log_dirs().await;
+        recent_files_with_exts(&dirs, now, since_secs, &["json"])
+            .await
+            .into_iter()
+            .map(|file| SessionLog {
+                agent_type: AgentType::Antigravity,
+                source: SessionSource::File(file.path),
+                updated_at: Some(file.mtime_epoch),
+                match_reasons: Vec::new(),
+            })
+            .collect()
+    }
+}
+
+async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
     let ws_root = app_config_dir_in("Antigravity", home)
         .join("User")
         .join("workspaceStorage");
     let user_root = app_config_dir_in("Antigravity", home).join("User");
 
     let mut dirs = BTreeSet::new();
-    for dir in find_chat_session_dirs(&ws_root) {
+    for dir in find_chat_session_dirs(&ws_root).await {
         dirs.insert(dir);
     }
     // Some forks store chatSessions outside workspaceStorage; scan User root too.
-    for dir in find_chat_session_dirs(&user_root) {
+    for dir in find_chat_session_dirs(&user_root).await {
         dirs.insert(dir);
     }
 
-    if let Some(dir) = api_log_dir(home) {
+    if let Some(dir) = api_log_dir(home).await {
         dirs.insert(dir);
     }
 
@@ -61,49 +85,86 @@ struct LspProcess {
     extension_port: Option<u16>,
 }
 
-fn api_log_dir(home: &Path) -> Option<PathBuf> {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProbeCache {
+    last_checked_epoch: i64,
+    last_success_epoch: Option<i64>,
+    cached_log_dir: Option<String>,
+}
+
+async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     if std::env::var("CADENCE_DISABLE_ANTIGRAVITY_API").is_ok() {
         return None;
     }
     let debug = std::env::var("CADENCE_ANTIGRAVITY_DEBUG").is_ok();
+    let now = now_epoch();
 
     let cache_dir = api_cache_dir(home);
-    if ensure_dir(&cache_dir).is_err() {
+    if ensure_dir(&cache_dir).await.is_err() {
         if debug {
             eprintln!("[cadence] antigravity: failed to create cache dir");
         }
         return None;
     }
-    let _ = clear_json_files(&cache_dir);
+    let probe_ttl_secs = std::env::var("CADENCE_ANTIGRAVITY_PROBE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(90);
+    let cache_path = probe_cache_path(home);
+    let mut probe_cache = load_probe_cache(&cache_path).await.unwrap_or_default();
+    if now.saturating_sub(probe_cache.last_checked_epoch) < probe_ttl_secs {
+        if let Some(cached_dir) = probe_cache.cached_log_dir.as_deref() {
+            let candidate = PathBuf::from(cached_dir);
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
 
-    let process = discover_lsp_process()?;
+    probe_cache.last_checked_epoch = now;
+    let _ = save_probe_cache(&cache_path, &probe_cache).await;
+    let _ = clear_json_files(&cache_dir).await;
+
+    let process = match discover_lsp_process().await {
+        Some(v) => v,
+        None => {
+            probe_cache.cached_log_dir = None;
+            let _ = save_probe_cache(&cache_path, &probe_cache).await;
+            return None;
+        }
+    };
     if debug {
         eprintln!(
             "[cadence] antigravity: pid={}, extension_port={:?}",
             process.pid, process.extension_port
         );
     }
-    let ports = discover_listening_ports(process.pid);
-    let (scheme, port) =
-        match override_connect_port().or_else(|| probe_connect_port(&ports, &process.csrf_token)) {
-            Some(p) => p,
-            None => {
-                if let Some(ext_port) = process.extension_port {
-                    if debug {
-                        eprintln!(
-                            "[cadence] antigravity: probe failed, using extension port {}",
-                            ext_port
-                        );
-                    }
-                    ("http", ext_port)
-                } else {
-                    if debug {
-                        eprintln!("[cadence] antigravity: no connect port found");
-                    }
-                    return None;
+    let ports = discover_listening_ports(process.pid).await;
+    let preferred_connect = override_connect_port();
+    let probed_connect = probe_connect_port(&ports, &process.csrf_token).await;
+    let (scheme, port) = match preferred_connect.or(probed_connect) {
+        Some(p) => p,
+        None => {
+            if let Some(ext_port) = process.extension_port {
+                if debug {
+                    eprintln!(
+                        "[cadence] antigravity: probe failed, using extension port {}",
+                        ext_port
+                    );
                 }
+                ("http", ext_port)
+            } else {
+                if debug {
+                    eprintln!("[cadence] antigravity: no connect port found");
+                }
+                probe_cache.cached_log_dir = None;
+                let _ = save_probe_cache(&cache_path, &probe_cache).await;
+                return None;
             }
-        };
+        }
+    };
 
     if debug {
         eprintln!(
@@ -112,12 +173,14 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
         );
     }
 
-    let cascade_ids = match fetch_cascade_ids(scheme, port, &process.csrf_token) {
+    let cascade_ids = match fetch_cascade_ids(scheme, port, &process.csrf_token).await {
         Ok(ids) => ids,
         Err(e) => {
             if debug {
                 eprintln!("[cadence] antigravity: list failed: {e}");
             }
+            probe_cache.cached_log_dir = None;
+            let _ = save_probe_cache(&cache_path, &probe_cache).await;
             return None;
         }
     };
@@ -126,12 +189,14 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
         if debug {
             eprintln!("[cadence] antigravity: no cascade ids found");
         }
+        probe_cache.cached_log_dir = None;
+        let _ = save_probe_cache(&cache_path, &probe_cache).await;
         return None;
     }
 
     let mut wrote_any = false;
     for (idx, cascade_id) in cascade_ids.iter().enumerate() {
-        match fetch_cascade_steps(scheme, port, &process.csrf_token, cascade_id) {
+        match fetch_cascade_steps(scheme, port, &process.csrf_token, cascade_id).await {
             Ok(steps) => {
                 let workspace_uri = extract_workspace_uri(&steps);
                 let payload = serde_json::json!({
@@ -144,7 +209,7 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
                 });
                 let filename = format!("{}.json", sanitize_filename(cascade_id, idx));
                 let path = cache_dir.join(filename);
-                if std::fs::write(&path, payload.to_string()).is_ok() {
+                if tokio::fs::write(&path, payload.to_string()).await.is_ok() {
                     wrote_any = true;
                 } else if debug {
                     eprintln!("[cadence] antigravity: failed to write {}", path.display());
@@ -162,40 +227,110 @@ fn api_log_dir(home: &Path) -> Option<PathBuf> {
         }
     }
 
-    if wrote_any { Some(cache_dir) } else { None }
+    if wrote_any {
+        probe_cache.last_success_epoch = Some(now);
+        probe_cache.cached_log_dir = Some(cache_dir.to_string_lossy().to_string());
+        let _ = save_probe_cache(&cache_path, &probe_cache).await;
+        Some(cache_dir)
+    } else {
+        probe_cache.cached_log_dir = None;
+        let _ = save_probe_cache(&cache_path, &probe_cache).await;
+        None
+    }
 }
 
 fn api_cache_dir(home: &Path) -> PathBuf {
     home.join(".cadence/cli").join("antigravity-api")
 }
 
-fn ensure_dir(dir: &Path) -> anyhow::Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
+fn probe_cache_path(home: &Path) -> PathBuf {
+    home.join(".cadence/cli").join("antigravity-probe.json")
+}
+
+async fn load_probe_cache(path: &Path) -> Option<ProbeCache> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+async fn save_probe_cache(path: &Path, cache: &ProbeCache) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let data = serde_json::to_vec_pretty(cache)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing parent for {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("probe-cache");
+    let pid = std::process::id();
+
+    for attempt in 0..8u32 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = parent.join(format!(".{file_name}.{pid}.{nonce}.{attempt}.tmp"));
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        match opts.open(&tmp).await {
+            Ok(mut file) => {
+                tokio::io::AsyncWriteExt::write_all(&mut file, &data).await?;
+                drop(file);
+                tokio::fs::rename(&tmp, path).await?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "create temp file for {}: {}",
+                    path.display(),
+                    err
+                ));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to create unique temp file for {}",
+        path.display()
+    ))
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+async fn ensure_dir(dir: &Path) -> anyhow::Result<()> {
+    if !tokio::fs::try_exists(dir).await.unwrap_or(false) {
+        tokio::fs::create_dir_all(dir).await?;
     }
     Ok(())
 }
 
-fn clear_json_files(dir: &Path) -> anyhow::Result<()> {
-    let entries = std::fs::read_dir(dir)?;
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+async fn clear_json_files(dir: &Path) -> anyhow::Result<()> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    loop {
+        let Some(entry) = entries.next_entry().await? else {
+            break;
         };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
         }
     }
     Ok(())
 }
 
-fn discover_lsp_process() -> Option<LspProcess> {
-    let output = Command::new("ps")
+async fn discover_lsp_process() -> Option<LspProcess> {
+    let output = tokio::process::Command::new("ps")
         .args(["-ax", "-o", "pid=,command="])
         .output()
+        .await
         .ok()?;
     if !output.status.success() {
         return None;
@@ -240,11 +375,12 @@ fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
     None
 }
 
-fn discover_listening_ports(pid: u32) -> Vec<u16> {
-    let output = Command::new("lsof")
+async fn discover_listening_ports(pid: u32) -> Vec<u16> {
+    let output = tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-p"])
         .arg(pid.to_string())
-        .output();
+        .output()
+        .await;
     let output = match output {
         Ok(o) => o,
         Err(_) => return Vec::new(),
@@ -277,7 +413,7 @@ fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
-fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, u16)> {
+async fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, u16)> {
     for port in ports {
         if post_json(
             "https",
@@ -286,6 +422,7 @@ fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, u16)> 
             csrf,
             &serde_json::json!({}),
         )
+        .await
         .is_ok()
         {
             return Some(("https", *port));
@@ -299,6 +436,7 @@ fn probe_connect_port(ports: &[u16], csrf: &str) -> Option<(&'static str, u16)> 
             csrf,
             &serde_json::json!({}),
         )
+        .await
         .is_ok()
         {
             return Some(("http", *port));
@@ -322,14 +460,14 @@ fn override_connect_port() -> Option<(&'static str, u16)> {
     Some((scheme, port))
 }
 
-fn fetch_cascade_ids(scheme: &str, port: u16, csrf: &str) -> anyhow::Result<Vec<String>> {
+async fn fetch_cascade_ids(scheme: &str, port: u16, csrf: &str) -> anyhow::Result<Vec<String>> {
     let method = std::env::var("ANTIGRAVITY_LSP_LIST_METHOD")
         .unwrap_or_else(|_| "GetAllCascadeTrajectories".to_string());
-    let response = post_json(scheme, port, &method, csrf, &serde_json::json!({}))?;
+    let response = post_json(scheme, port, &method, csrf, &serde_json::json!({})).await?;
     Ok(extract_cascade_ids_from_value(&response))
 }
 
-fn fetch_cascade_steps(
+async fn fetch_cascade_steps(
     scheme: &str,
     port: u16,
     csrf: &str,
@@ -347,10 +485,10 @@ fn fetch_cascade_steps(
         "startIndex": 0,
         "endIndex": end_index
     });
-    post_json(scheme, port, &method, csrf, &body)
+    post_json(scheme, port, &method, csrf, &body).await
 }
 
-fn post_json(
+async fn post_json(
     scheme: &str,
     port: u16,
     method: &str,
@@ -364,26 +502,21 @@ fn post_json(
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let response = client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Connect-Protocol-Version", "1")
-            .header("X-Codeium-Csrf-Token", csrf)
-            .json(body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "antigravity API returned status {}",
-                response.status()
-            ));
-        }
-        Ok(response.json().await?)
-    })
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .header("X-Codeium-Csrf-Token", csrf)
+        .json(body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "antigravity API returned status {}",
+            response.status()
+        ));
+    }
+    Ok(response.json().await?)
 }
 
 fn extract_cascade_ids_from_value(value: &serde_json::Value) -> Vec<String> {
@@ -475,31 +608,31 @@ mod tests {
     use super::*;
     use crate::agents::app_config_dir_in;
     use serde_json::json;
-    use std::fs;
+
     use tempfile::TempDir;
 
-    #[test]
-    fn test_antigravity_log_dirs_collects_chat_sessions() {
+    #[tokio::test]
+    async fn test_antigravity_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
         let ws_root = app_config_dir_in("Antigravity", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")
             .join("chatSessions");
-        fs::create_dir_all(&ws_root).unwrap();
+        tokio::fs::create_dir_all(&ws_root).await.unwrap();
         let other_root = app_config_dir_in("Antigravity", home.path())
             .join("User")
             .join("other")
             .join("chatSessions");
-        fs::create_dir_all(&other_root).unwrap();
+        tokio::fs::create_dir_all(&other_root).await.unwrap();
 
-        let dirs = log_dirs_in(home.path());
+        let dirs = log_dirs_in(home.path()).await;
         assert!(dirs.contains(&ws_root));
         assert!(dirs.contains(&other_root));
     }
 
-    #[test]
-    fn test_extract_cascade_ids_from_trajectory_summaries_keys() {
+    #[tokio::test]
+    async fn test_extract_cascade_ids_from_trajectory_summaries_keys() {
         let value = json!({
             "trajectorySummaries": {
                 "abc-123": { "summary": "one" },
@@ -511,8 +644,8 @@ mod tests {
         assert!(ids.contains(&"def-456".to_string()));
     }
 
-    #[test]
-    fn test_extract_cascade_ids_from_nested_fields() {
+    #[tokio::test]
+    async fn test_extract_cascade_ids_from_nested_fields() {
         let value = json!({
             "items": [
                 { "cascadeId": "foo" },
@@ -524,8 +657,8 @@ mod tests {
         assert!(ids.contains(&"bar".to_string()));
     }
 
-    #[test]
-    fn test_extract_workspace_uri_prefers_active_document() {
+    #[tokio::test]
+    async fn test_extract_workspace_uri_prefers_active_document() {
         let value = json!({
             "steps": [{
                 "userInput": {
@@ -540,8 +673,8 @@ mod tests {
         assert_eq!(uri.as_deref(), Some("file:///Users/zack/dev/cadence"));
     }
 
-    #[test]
-    fn test_extract_workspace_uri_falls_back_to_open_documents() {
+    #[tokio::test]
+    async fn test_extract_workspace_uri_falls_back_to_open_documents() {
         let value = json!({
             "steps": [{
                 "userInput": {

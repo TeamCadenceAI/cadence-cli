@@ -1,6 +1,6 @@
 [package]
 name = "cadence-cli"
-version = "0.8.1"
+version = "1.0.0"
 edition = "2024"
 
 [lib]
@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 console = "0.15"
 dialoguer = "0.11"
@@ -36,6 +37,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 keyring = "2.3"
 zstd = "0.13"
 open = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+protobuf = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "std", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sysinfo = "0.30"
 
 [dev-dependencies]
 serial_test = "3"

@@ -84,17 +84,17 @@ impl CliConfig {
     ///
     /// Parse errors and I/O errors (other than file-not-found) are surfaced as
     /// hard failures to prevent silently operating on corrupted state.
-    pub fn load() -> Result<Self> {
+    pub async fn load() -> Result<Self> {
         let path = match Self::config_path() {
             Some(p) => p,
             None => return Ok(Self::default()),
         };
-        Self::load_from(&path)
+        Self::load_from(&path).await
     }
 
     /// Load config from a specific path. Returns defaults if the file does not exist.
-    pub(crate) fn load_from(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
+    pub(crate) async fn load_from(path: &Path) -> Result<Self> {
+        match tokio::fs::read_to_string(path).await {
             Ok(contents) => toml::from_str(&contents)
                 .with_context(|| format!("failed to parse config file at {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -105,21 +105,22 @@ impl CliConfig {
     }
 
     /// Save config to disk, creating parent directories if needed.
-    pub fn save(&self) -> Result<()> {
+    pub async fn save(&self) -> Result<()> {
         let path = Self::config_path()
             .ok_or_else(|| anyhow::anyhow!("cannot determine config path: $HOME is not set"))?;
-        self.save_to(&path)
+        self.save_to(&path).await
     }
 
     /// Save config to a specific path, creating parent directories if needed.
-    pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
+    pub(crate) async fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("failed to create config directory at {}", parent.display())
             })?;
         }
         let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
-        std::fs::write(path, &contents)
+        tokio::fs::write(path, &contents)
+            .await
             .with_context(|| format!("failed to write config file at {}", path.display()))?;
         Ok(())
     }
@@ -128,11 +129,11 @@ impl CliConfig {
     ///
     /// Preserves `api_url`. This operation is idempotent — clearing already-absent
     /// fields is a no-op aside from the save.
-    pub fn clear_token(&mut self) -> Result<()> {
+    pub async fn clear_token(&mut self) -> Result<()> {
         self.token = None;
         self.github_login = None;
         self.expires_at = None;
-        self.save()
+        self.save().await
     }
 
     /// Returns whether auto-update is enabled.
@@ -251,9 +252,9 @@ pub fn parse_duration_string(s: &str) -> Result<Duration> {
 /// Trims whitespace and strips a leading `v`/`V` prefix if present.
 /// Returns `None` if the file is absent, empty, or not valid UTF-8.
 #[cfg(test)]
-pub fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
+pub async fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
     let path = dir.join(LATEST_VERSION_CACHE_FILE);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
@@ -276,24 +277,26 @@ pub fn read_cached_latest_version_from_dir(dir: &Path) -> Option<String> {
 ///
 /// Creates the config directory if it doesn't exist. Returns an error if
 /// the home directory can't be resolved or the file can't be written.
-pub fn write_cached_latest_version(version: &str) -> Result<()> {
+pub async fn write_cached_latest_version(version: &str) -> Result<()> {
     let dir = CliConfig::config_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine config directory: $HOME is not set"))?;
-    write_cached_latest_version_to_dir(version, &dir)
+    write_cached_latest_version_to_dir(version, &dir).await
 }
 
 /// Writes the latest discovered release version to a specific directory.
 ///
 /// Exposed for testing with temp directories.
-pub fn write_cached_latest_version_to_dir(version: &str, dir: &Path) -> Result<()> {
+pub async fn write_cached_latest_version_to_dir(version: &str, dir: &Path) -> Result<()> {
     let trimmed = version.trim();
     if trimmed.is_empty() {
         bail!("cannot cache empty version string");
     }
-    std::fs::create_dir_all(dir)
+    tokio::fs::create_dir_all(dir)
+        .await
         .with_context(|| format!("failed to create config directory at {}", dir.display()))?;
     let path = dir.join(LATEST_VERSION_CACHE_FILE);
-    std::fs::write(&path, format!("{trimmed}\n"))
+    tokio::fs::write(&path, format!("{trimmed}\n"))
+        .await
         .with_context(|| format!("failed to write version cache at {}", path.display()))?;
     Ok(())
 }
@@ -474,11 +477,11 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 impl CliConfig {
     /// Clear token credentials and save to a specific path.
-    fn clear_token_to(&mut self, path: &Path) -> Result<()> {
+    async fn clear_token_to(&mut self, path: &Path) -> Result<()> {
         self.token = None;
         self.github_login = None;
         self.expires_at = None;
-        self.save_to(path)
+        self.save_to(path).await
     }
 }
 
@@ -533,8 +536,8 @@ mod tests {
     // CliConfig struct defaults
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_default_config_all_none() {
+    #[tokio::test]
+    async fn test_default_config_all_none() {
         let cfg = CliConfig::default();
         assert_eq!(cfg.api_url, None);
         assert_eq!(cfg.token, None);
@@ -546,16 +549,16 @@ mod tests {
     // Config path resolution
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_config_path_with_home() {
+    #[tokio::test]
+    async fn test_config_path_with_home() {
         let home = PathBuf::from("/home/tester");
         let path = CliConfig::config_path_with_home(&home).unwrap();
         assert_eq!(path, PathBuf::from("/home/tester/.cadence/cli/config.toml"));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_config_path_uses_home_env() {
+    async fn test_config_path_uses_home_env() {
         let guard = EnvGuard::new("HOME");
         guard.set("/tmp/fake-home");
 
@@ -567,9 +570,9 @@ mod tests {
         drop(guard);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_config_path_returns_none_when_home_missing() {
+    async fn test_config_path_returns_none_when_home_missing() {
         let guard = EnvGuard::new("HOME");
         guard.remove();
 
@@ -582,12 +585,12 @@ mod tests {
     // load() — missing file returns defaults
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_load_missing_file_returns_defaults() {
+    #[tokio::test]
+    async fn test_load_missing_file_returns_defaults() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
         // File does not exist
-        let cfg = CliConfig::load_from(&path).unwrap();
+        let cfg = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(cfg, CliConfig::default());
     }
 
@@ -595,14 +598,16 @@ mod tests {
     // load() — empty file returns defaults (all fields optional)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_load_empty_file_returns_defaults() {
+    #[tokio::test]
+    async fn test_load_empty_file_returns_defaults() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "").unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "").await.unwrap();
 
-        let cfg = CliConfig::load_from(&path).unwrap();
+        let cfg = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(cfg, CliConfig::default());
     }
 
@@ -610,14 +615,18 @@ mod tests {
     // load() — partial fields
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_load_partial_fields() {
+    #[tokio::test]
+    async fn test_load_partial_fields() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "api_url = \"https://custom.example.com\"\n").unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "api_url = \"https://custom.example.com\"\n")
+            .await
+            .unwrap();
 
-        let cfg = CliConfig::load_from(&path).unwrap();
+        let cfg = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(cfg.api_url, Some("https://custom.example.com".to_string()));
         assert_eq!(cfg.token, None);
         assert_eq!(cfg.github_login, None);
@@ -628,14 +637,18 @@ mod tests {
     // load() — malformed TOML returns error
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_load_malformed_toml_returns_error() {
+    #[tokio::test]
+    async fn test_load_malformed_toml_returns_error() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "this is not valid toml {{{").unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "this is not valid toml {{{")
+            .await
+            .unwrap();
 
-        let result = CliConfig::load_from(&path);
+        let result = CliConfig::load_from(&path).await;
         assert!(result.is_err());
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
@@ -649,8 +662,8 @@ mod tests {
     // save() / load() roundtrip
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_save_load_roundtrip() {
+    #[tokio::test]
+    async fn test_save_load_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
@@ -661,27 +674,27 @@ mod tests {
             expires_at: Some("2025-12-31T23:59:59Z".to_string()),
             ..Default::default()
         };
-        cfg.save_to(&path).unwrap();
+        cfg.save_to(&path).await.unwrap();
 
-        let loaded = CliConfig::load_from(&path).unwrap();
+        let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded, cfg);
     }
 
-    #[test]
-    fn test_save_creates_parent_directories() {
+    #[tokio::test]
+    async fn test_save_creates_parent_directories() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
         // Parent dir should NOT exist yet
         assert!(!path.parent().unwrap().exists());
 
         let cfg = CliConfig::default();
-        cfg.save_to(&path).unwrap();
+        cfg.save_to(&path).await.unwrap();
 
         assert!(path.exists());
     }
 
-    #[test]
-    fn test_save_overwrites_existing_file() {
+    #[tokio::test]
+    async fn test_save_overwrites_existing_file() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
@@ -689,15 +702,15 @@ mod tests {
             token: Some("first".to_string()),
             ..Default::default()
         };
-        cfg1.save_to(&path).unwrap();
+        cfg1.save_to(&path).await.unwrap();
 
         let cfg2 = CliConfig {
             token: Some("second".to_string()),
             ..Default::default()
         };
-        cfg2.save_to(&path).unwrap();
+        cfg2.save_to(&path).await.unwrap();
 
-        let loaded = CliConfig::load_from(&path).unwrap();
+        let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded.token, Some("second".to_string()));
     }
 
@@ -705,8 +718,8 @@ mod tests {
     // clear_token()
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_clear_token_removes_credentials_preserves_api_url() {
+    #[tokio::test]
+    async fn test_clear_token_removes_credentials_preserves_api_url() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
@@ -717,8 +730,8 @@ mod tests {
             expires_at: Some("2025-01-01T00:00:00Z".to_string()),
             ..Default::default()
         };
-        cfg.save_to(&path).unwrap();
-        cfg.clear_token_to(&path).unwrap();
+        cfg.save_to(&path).await.unwrap();
+        cfg.clear_token_to(&path).await.unwrap();
 
         // In-memory state
         assert_eq!(cfg.api_url, Some("https://custom.example.com".to_string()));
@@ -727,7 +740,7 @@ mod tests {
         assert_eq!(cfg.expires_at, None);
 
         // On-disk state
-        let loaded = CliConfig::load_from(&path).unwrap();
+        let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(
             loaded.api_url,
             Some("https://custom.example.com".to_string())
@@ -737,8 +750,8 @@ mod tests {
         assert_eq!(loaded.expires_at, None);
     }
 
-    #[test]
-    fn test_clear_token_idempotent() {
+    #[tokio::test]
+    async fn test_clear_token_idempotent() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
@@ -747,7 +760,7 @@ mod tests {
             ..Default::default()
         };
         // Clearing when no credentials exist should succeed
-        cfg.clear_token_to(&path).unwrap();
+        cfg.clear_token_to(&path).await.unwrap();
         assert_eq!(cfg.api_url, Some("https://api.example.com".to_string()));
         assert_eq!(cfg.token, None);
     }
@@ -756,16 +769,16 @@ mod tests {
     // resolve_api_url() — precedence tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_resolve_default_when_nothing_set() {
+    #[tokio::test]
+    async fn test_resolve_default_when_nothing_set() {
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url_with_env(None, None);
         assert_eq!(resolved.url, DEFAULT_API_URL);
         assert!(!resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_file_overrides_default() {
+    #[tokio::test]
+    async fn test_resolve_file_overrides_default() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -775,8 +788,8 @@ mod tests {
         assert!(!resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_env_overrides_file() {
+    #[tokio::test]
+    async fn test_resolve_env_overrides_file() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -786,8 +799,8 @@ mod tests {
         assert_eq!(resolved.url, "https://env.example.com");
     }
 
-    #[test]
-    fn test_resolve_cli_overrides_env() {
+    #[tokio::test]
+    async fn test_resolve_cli_overrides_env() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -799,8 +812,8 @@ mod tests {
         assert_eq!(resolved.url, "https://cli.example.com");
     }
 
-    #[test]
-    fn test_resolve_cli_overrides_all() {
+    #[tokio::test]
+    async fn test_resolve_cli_overrides_all() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -817,8 +830,8 @@ mod tests {
     // resolve_api_url() — empty/whitespace values fall through
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_resolve_empty_cli_override_falls_through() {
+    #[tokio::test]
+    async fn test_resolve_empty_cli_override_falls_through() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -827,8 +840,8 @@ mod tests {
         assert_eq!(resolved.url, "https://file.example.com");
     }
 
-    #[test]
-    fn test_resolve_whitespace_cli_override_falls_through() {
+    #[tokio::test]
+    async fn test_resolve_whitespace_cli_override_falls_through() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -837,8 +850,8 @@ mod tests {
         assert_eq!(resolved.url, "https://file.example.com");
     }
 
-    #[test]
-    fn test_resolve_empty_env_falls_through() {
+    #[tokio::test]
+    async fn test_resolve_empty_env_falls_through() {
         let cfg = CliConfig {
             api_url: Some("https://file.example.com".to_string()),
             ..Default::default()
@@ -847,15 +860,15 @@ mod tests {
         assert_eq!(resolved.url, "https://file.example.com");
     }
 
-    #[test]
-    fn test_resolve_whitespace_env_falls_through() {
+    #[tokio::test]
+    async fn test_resolve_whitespace_env_falls_through() {
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url_with_env(None, Some("  \t  ".to_string()));
         assert_eq!(resolved.url, DEFAULT_API_URL);
     }
 
-    #[test]
-    fn test_resolve_empty_file_value_falls_to_default() {
+    #[tokio::test]
+    async fn test_resolve_empty_file_value_falls_to_default() {
         let cfg = CliConfig {
             api_url: Some("".to_string()),
             ..Default::default()
@@ -868,16 +881,16 @@ mod tests {
     // resolve_api_url() — non-HTTPS warning
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_resolve_non_https_from_cli_warns() {
+    #[tokio::test]
+    async fn test_resolve_non_https_from_cli_warns() {
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url_with_env(Some("http://localhost:8080"), None);
         assert_eq!(resolved.url, "http://localhost:8080");
         assert!(resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_non_https_from_env_warns() {
+    #[tokio::test]
+    async fn test_resolve_non_https_from_env_warns() {
         let cfg = CliConfig::default();
         let resolved =
             cfg.resolve_api_url_with_env(None, Some("http://staging.example.com".to_string()));
@@ -885,8 +898,8 @@ mod tests {
         assert!(resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_non_https_from_file_warns() {
+    #[tokio::test]
+    async fn test_resolve_non_https_from_file_warns() {
         let cfg = CliConfig {
             api_url: Some("http://file.example.com".to_string()),
             ..Default::default()
@@ -896,8 +909,8 @@ mod tests {
         assert!(resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_https_no_warning() {
+    #[tokio::test]
+    async fn test_resolve_https_no_warning() {
         let cfg = CliConfig {
             api_url: Some("https://secure.example.com".to_string()),
             ..Default::default()
@@ -906,15 +919,15 @@ mod tests {
         assert!(!resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_ftp_scheme_warns() {
+    #[tokio::test]
+    async fn test_resolve_ftp_scheme_warns() {
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url_with_env(Some("ftp://files.example.com"), None);
         assert!(resolved.is_non_https);
     }
 
-    #[test]
-    fn test_resolve_file_scheme_warns() {
+    #[tokio::test]
+    async fn test_resolve_file_scheme_warns() {
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url_with_env(Some("file:///tmp/mock-api"), None);
         assert!(resolved.is_non_https);
@@ -924,15 +937,15 @@ mod tests {
     // resolve_api_url() — trimming behavior
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_resolve_trims_cli_override() {
+    #[tokio::test]
+    async fn test_resolve_trims_cli_override() {
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url_with_env(Some("  https://trimmed.example.com  "), None);
         assert_eq!(resolved.url, "https://trimmed.example.com");
     }
 
-    #[test]
-    fn test_resolve_trims_env_value() {
+    #[tokio::test]
+    async fn test_resolve_trims_env_value() {
         let cfg = CliConfig::default();
         let resolved =
             cfg.resolve_api_url_with_env(None, Some("  https://trimmed.example.com  ".to_string()));
@@ -943,23 +956,23 @@ mod tests {
     // non_empty_trimmed() helper
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_non_empty_trimmed_none() {
+    #[tokio::test]
+    async fn test_non_empty_trimmed_none() {
         assert_eq!(non_empty_trimmed(None), None);
     }
 
-    #[test]
-    fn test_non_empty_trimmed_empty() {
+    #[tokio::test]
+    async fn test_non_empty_trimmed_empty() {
         assert_eq!(non_empty_trimmed(Some("".to_string())), None);
     }
 
-    #[test]
-    fn test_non_empty_trimmed_whitespace() {
+    #[tokio::test]
+    async fn test_non_empty_trimmed_whitespace() {
         assert_eq!(non_empty_trimmed(Some("   ".to_string())), None);
     }
 
-    #[test]
-    fn test_non_empty_trimmed_value() {
+    #[tokio::test]
+    async fn test_non_empty_trimmed_value() {
         assert_eq!(
             non_empty_trimmed(Some(" hello ".to_string())),
             Some("hello".to_string())
@@ -970,9 +983,9 @@ mod tests {
     // Integration: resolve_api_url with real env var
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_api_url_reads_real_env_var() {
+    async fn test_resolve_api_url_reads_real_env_var() {
         let guard = EnvGuard::new(API_URL_ENV_VAR);
         guard.set("https://from-env.example.com");
 
@@ -983,9 +996,9 @@ mod tests {
         drop(guard);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_resolve_api_url_env_var_absent_uses_default() {
+    async fn test_resolve_api_url_env_var_absent_uses_default() {
         let guard = EnvGuard::new(API_URL_ENV_VAR);
         guard.remove();
 
@@ -1000,20 +1013,20 @@ mod tests {
     // auto_update defaults and resolver
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_auto_update_default_is_none() {
+    #[tokio::test]
+    async fn test_auto_update_default_is_none() {
         let cfg = CliConfig::default();
         assert_eq!(cfg.auto_update, None);
     }
 
-    #[test]
-    fn test_auto_update_enabled_defaults_false() {
+    #[tokio::test]
+    async fn test_auto_update_enabled_defaults_false() {
         let cfg = CliConfig::default();
         assert!(!cfg.auto_update_enabled());
     }
 
-    #[test]
-    fn test_auto_update_enabled_explicit_true() {
+    #[tokio::test]
+    async fn test_auto_update_enabled_explicit_true() {
         let cfg = CliConfig {
             auto_update: Some(true),
             ..Default::default()
@@ -1021,8 +1034,8 @@ mod tests {
         assert!(cfg.auto_update_enabled());
     }
 
-    #[test]
-    fn test_auto_update_enabled_explicit_false() {
+    #[tokio::test]
+    async fn test_auto_update_enabled_explicit_false() {
         let cfg = CliConfig {
             auto_update: Some(false),
             ..Default::default()
@@ -1030,8 +1043,8 @@ mod tests {
         assert!(!cfg.auto_update_enabled());
     }
 
-    #[test]
-    fn test_auto_update_roundtrip_toml() {
+    #[tokio::test]
+    async fn test_auto_update_roundtrip_toml() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
@@ -1040,21 +1053,25 @@ mod tests {
             update_check_interval: Some("24h".to_string()),
             ..Default::default()
         };
-        cfg.save_to(&path).unwrap();
+        cfg.save_to(&path).await.unwrap();
 
-        let loaded = CliConfig::load_from(&path).unwrap();
+        let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded.auto_update, Some(true));
         assert_eq!(loaded.update_check_interval, Some("24h".to_string()));
     }
 
-    #[test]
-    fn test_auto_update_absent_in_toml_loads_as_none() {
+    #[tokio::test]
+    async fn test_auto_update_absent_in_toml_loads_as_none() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "api_url = \"https://example.com\"\n").unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "api_url = \"https://example.com\"\n")
+            .await
+            .unwrap();
 
-        let loaded = CliConfig::load_from(&path).unwrap();
+        let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded.auto_update, None);
         assert_eq!(loaded.update_check_interval, None);
         assert!(!loaded.auto_update_enabled());
@@ -1064,15 +1081,15 @@ mod tests {
     // update_check_interval resolver
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_update_check_interval_default_8h() {
+    #[tokio::test]
+    async fn test_update_check_interval_default_8h() {
         let cfg = CliConfig::default();
         let interval = cfg.resolved_update_check_interval().unwrap();
         assert_eq!(interval, Duration::from_secs(8 * 3600));
     }
 
-    #[test]
-    fn test_update_check_interval_explicit_24h() {
+    #[tokio::test]
+    async fn test_update_check_interval_explicit_24h() {
         let cfg = CliConfig {
             update_check_interval: Some("24h".to_string()),
             ..Default::default()
@@ -1081,8 +1098,8 @@ mod tests {
         assert_eq!(interval, Duration::from_secs(24 * 3600));
     }
 
-    #[test]
-    fn test_update_check_interval_explicit_1d() {
+    #[tokio::test]
+    async fn test_update_check_interval_explicit_1d() {
         let cfg = CliConfig {
             update_check_interval: Some("1d".to_string()),
             ..Default::default()
@@ -1091,8 +1108,8 @@ mod tests {
         assert_eq!(interval, Duration::from_secs(86400));
     }
 
-    #[test]
-    fn test_update_check_interval_invalid_returns_error() {
+    #[tokio::test]
+    async fn test_update_check_interval_invalid_returns_error() {
         let cfg = CliConfig {
             update_check_interval: Some("invalid".to_string()),
             ..Default::default()
@@ -1104,48 +1121,48 @@ mod tests {
     // parse_duration_string
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_duration_8h() {
+    #[tokio::test]
+    async fn test_parse_duration_8h() {
         assert_eq!(
             parse_duration_string("8h").unwrap(),
             Duration::from_secs(28800)
         );
     }
 
-    #[test]
-    fn test_parse_duration_24h() {
+    #[tokio::test]
+    async fn test_parse_duration_24h() {
         assert_eq!(
             parse_duration_string("24h").unwrap(),
             Duration::from_secs(86400)
         );
     }
 
-    #[test]
-    fn test_parse_duration_1d() {
+    #[tokio::test]
+    async fn test_parse_duration_1d() {
         assert_eq!(
             parse_duration_string("1d").unwrap(),
             Duration::from_secs(86400)
         );
     }
 
-    #[test]
-    fn test_parse_duration_7d() {
+    #[tokio::test]
+    async fn test_parse_duration_7d() {
         assert_eq!(
             parse_duration_string("7d").unwrap(),
             Duration::from_secs(7 * 86400)
         );
     }
 
-    #[test]
-    fn test_parse_duration_trims_whitespace() {
+    #[tokio::test]
+    async fn test_parse_duration_trims_whitespace() {
         assert_eq!(
             parse_duration_string("  8h  ").unwrap(),
             Duration::from_secs(28800)
         );
     }
 
-    #[test]
-    fn test_parse_duration_zero_hours_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_zero_hours_rejected() {
         let result = parse_duration_string("0h");
         assert!(result.is_err());
         assert!(
@@ -1154,20 +1171,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duration_zero_days_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_zero_days_rejected() {
         let result = parse_duration_string("0d");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_parse_duration_negative_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_negative_rejected() {
         let result = parse_duration_string("-1h");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_parse_duration_empty_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_empty_rejected() {
         let result = parse_duration_string("");
         assert!(result.is_err());
         assert!(
@@ -1176,8 +1193,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duration_invalid_unit() {
+    #[tokio::test]
+    async fn test_parse_duration_invalid_unit() {
         let result = parse_duration_string("8m");
         assert!(result.is_err());
         assert!(
@@ -1189,8 +1206,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duration_uppercase_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_uppercase_rejected() {
         let result = parse_duration_string("8H");
         assert!(result.is_err());
         assert!(
@@ -1202,14 +1219,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duration_uppercase_d_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_uppercase_d_rejected() {
         let result = parse_duration_string("1D");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_parse_duration_no_number() {
+    #[tokio::test]
+    async fn test_parse_duration_no_number() {
         let result = parse_duration_string("h");
         assert!(result.is_err());
         assert!(
@@ -1218,20 +1235,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_duration_overflow() {
+    #[tokio::test]
+    async fn test_parse_duration_overflow() {
         let result = parse_duration_string("999999999999999999999999h");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_parse_duration_non_numeric() {
+    #[tokio::test]
+    async fn test_parse_duration_non_numeric() {
         let result = parse_duration_string("abch");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_parse_duration_float_rejected() {
+    #[tokio::test]
+    async fn test_parse_duration_float_rejected() {
         let result = parse_duration_string("1.5h");
         assert!(result.is_err());
     }
@@ -1240,59 +1257,69 @@ mod tests {
     // Latest version cache reader
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_read_cached_latest_version_missing_file() {
+    #[tokio::test]
+    async fn test_read_cached_latest_version_missing_file() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
-    #[test]
-    fn test_read_cached_latest_version_empty_file() {
+    #[tokio::test]
+    async fn test_read_cached_latest_version_empty_file() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "").unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "")
+            .await
+            .unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
-    #[test]
-    fn test_read_cached_latest_version_whitespace_only() {
+    #[tokio::test]
+    async fn test_read_cached_latest_version_whitespace_only() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "  \n  ").unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "  \n  ")
+            .await
+            .unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
-    #[test]
-    fn test_read_cached_latest_version_valid() {
+    #[tokio::test]
+    async fn test_read_cached_latest_version_valid() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "0.3.0\n").unwrap();
+        tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "0.3.0\n")
+            .await
+            .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.3.0".to_string())
         );
     }
 
-    #[test]
-    fn test_read_cached_latest_version_with_v_prefix() {
+    #[tokio::test]
+    async fn test_read_cached_latest_version_with_v_prefix() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v0.3.0\n").unwrap();
+        tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v0.3.0\n")
+            .await
+            .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.3.0".to_string())
         );
     }
 
-    #[test]
-    fn test_read_cached_latest_version_just_v() {
+    #[tokio::test]
+    async fn test_read_cached_latest_version_just_v() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v").unwrap();
-        assert_eq!(read_cached_latest_version_from_dir(tmp.path()), None);
+        tokio::fs::write(tmp.path().join(LATEST_VERSION_CACHE_FILE), "v")
+            .await
+            .unwrap();
+        assert_eq!(read_cached_latest_version_from_dir(tmp.path()).await, None);
     }
 
     // -----------------------------------------------------------------------
     // config_dir helpers
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_config_dir_with_home() {
+    #[tokio::test]
+    async fn test_config_dir_with_home() {
         let home = PathBuf::from("/home/tester");
         let dir = CliConfig::config_dir_with_home(&home).unwrap();
         assert_eq!(dir, PathBuf::from("/home/tester/.cadence/cli"));
@@ -1302,61 +1329,71 @@ mod tests {
     // write_cached_latest_version
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_write_cached_latest_version_roundtrip() {
+    #[tokio::test]
+    async fn test_write_cached_latest_version_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        write_cached_latest_version_to_dir("0.4.0", tmp.path()).unwrap();
+        write_cached_latest_version_to_dir("0.4.0", tmp.path())
+            .await
+            .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.4.0".to_string())
         );
     }
 
-    #[test]
-    fn test_write_cached_latest_version_with_v_prefix() {
+    #[tokio::test]
+    async fn test_write_cached_latest_version_with_v_prefix() {
         let tmp = TempDir::new().unwrap();
-        write_cached_latest_version_to_dir("v0.4.0", tmp.path()).unwrap();
+        write_cached_latest_version_to_dir("v0.4.0", tmp.path())
+            .await
+            .unwrap();
         // Reader strips the v prefix
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.4.0".to_string())
         );
     }
 
-    #[test]
-    fn test_write_cached_latest_version_creates_dir() {
+    #[tokio::test]
+    async fn test_write_cached_latest_version_creates_dir() {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("nested").join("dir");
-        write_cached_latest_version_to_dir("1.0.0", &sub).unwrap();
+        write_cached_latest_version_to_dir("1.0.0", &sub)
+            .await
+            .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(&sub),
+            read_cached_latest_version_from_dir(&sub).await,
             Some("1.0.0".to_string())
         );
     }
 
-    #[test]
-    fn test_write_cached_latest_version_empty_rejected() {
+    #[tokio::test]
+    async fn test_write_cached_latest_version_empty_rejected() {
         let tmp = TempDir::new().unwrap();
-        let result = write_cached_latest_version_to_dir("", tmp.path());
+        let result = write_cached_latest_version_to_dir("", tmp.path()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }
 
-    #[test]
-    fn test_write_cached_latest_version_whitespace_rejected() {
+    #[tokio::test]
+    async fn test_write_cached_latest_version_whitespace_rejected() {
         let tmp = TempDir::new().unwrap();
-        let result = write_cached_latest_version_to_dir("  \n  ", tmp.path());
+        let result = write_cached_latest_version_to_dir("  \n  ", tmp.path()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }
 
-    #[test]
-    fn test_write_cached_latest_version_overwrites() {
+    #[tokio::test]
+    async fn test_write_cached_latest_version_overwrites() {
         let tmp = TempDir::new().unwrap();
-        write_cached_latest_version_to_dir("0.3.0", tmp.path()).unwrap();
-        write_cached_latest_version_to_dir("0.4.0", tmp.path()).unwrap();
+        write_cached_latest_version_to_dir("0.3.0", tmp.path())
+            .await
+            .unwrap();
+        write_cached_latest_version_to_dir("0.4.0", tmp.path())
+            .await
+            .unwrap();
         assert_eq!(
-            read_cached_latest_version_from_dir(tmp.path()),
+            read_cached_latest_version_from_dir(tmp.path()).await,
             Some("0.4.0".to_string())
         );
     }
@@ -1365,8 +1402,8 @@ mod tests {
     // ConfigKey::from_str
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_config_key_from_str_snake_case() {
+    #[tokio::test]
+    async fn test_config_key_from_str_snake_case() {
         assert_eq!(
             "auto_update".parse::<ConfigKey>().unwrap(),
             ConfigKey::AutoUpdate
@@ -1378,8 +1415,8 @@ mod tests {
         assert_eq!("api_url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
     }
 
-    #[test]
-    fn test_config_key_from_str_kebab_case() {
+    #[tokio::test]
+    async fn test_config_key_from_str_kebab_case() {
         assert_eq!(
             "auto-update".parse::<ConfigKey>().unwrap(),
             ConfigKey::AutoUpdate
@@ -1391,8 +1428,8 @@ mod tests {
         assert_eq!("api-url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
     }
 
-    #[test]
-    fn test_config_key_from_str_case_insensitive() {
+    #[tokio::test]
+    async fn test_config_key_from_str_case_insensitive() {
         assert_eq!(
             "AUTO_UPDATE".parse::<ConfigKey>().unwrap(),
             ConfigKey::AutoUpdate
@@ -1400,16 +1437,16 @@ mod tests {
         assert_eq!("Api-Url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
     }
 
-    #[test]
-    fn test_config_key_from_str_with_whitespace() {
+    #[tokio::test]
+    async fn test_config_key_from_str_with_whitespace() {
         assert_eq!(
             "  auto_update  ".parse::<ConfigKey>().unwrap(),
             ConfigKey::AutoUpdate
         );
     }
 
-    #[test]
-    fn test_config_key_from_str_unknown() {
+    #[tokio::test]
+    async fn test_config_key_from_str_unknown() {
         let result = "nonexistent".parse::<ConfigKey>();
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1420,30 +1457,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_config_key_from_str_auth_managed_token() {
+    #[tokio::test]
+    async fn test_config_key_from_str_auth_managed_token() {
         let result = "token".parse::<ConfigKey>();
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("managed by the auth flow"), "got: {msg}");
     }
 
-    #[test]
-    fn test_config_key_from_str_auth_managed_github_login() {
+    #[tokio::test]
+    async fn test_config_key_from_str_auth_managed_github_login() {
         let result = "github_login".parse::<ConfigKey>();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("auth flow"));
     }
 
-    #[test]
-    fn test_config_key_from_str_auth_managed_kebab() {
+    #[tokio::test]
+    async fn test_config_key_from_str_auth_managed_kebab() {
         let result = "github-login".parse::<ConfigKey>();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("auth flow"));
     }
 
-    #[test]
-    fn test_config_key_from_str_auth_managed_expires_at() {
+    #[tokio::test]
+    async fn test_config_key_from_str_auth_managed_expires_at() {
         let result = "expires_at".parse::<ConfigKey>();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("auth flow"));
@@ -1453,8 +1490,8 @@ mod tests {
     // parse_bool_value
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_parse_bool_value_true_variants() {
+    #[tokio::test]
+    async fn test_parse_bool_value_true_variants() {
         assert!(parse_bool_value("true").unwrap());
         assert!(parse_bool_value("True").unwrap());
         assert!(parse_bool_value("TRUE").unwrap());
@@ -1463,8 +1500,8 @@ mod tests {
         assert!(parse_bool_value("1").unwrap());
     }
 
-    #[test]
-    fn test_parse_bool_value_false_variants() {
+    #[tokio::test]
+    async fn test_parse_bool_value_false_variants() {
         assert!(!parse_bool_value("false").unwrap());
         assert!(!parse_bool_value("False").unwrap());
         assert!(!parse_bool_value("FALSE").unwrap());
@@ -1473,14 +1510,14 @@ mod tests {
         assert!(!parse_bool_value("0").unwrap());
     }
 
-    #[test]
-    fn test_parse_bool_value_with_whitespace() {
+    #[tokio::test]
+    async fn test_parse_bool_value_with_whitespace() {
         assert!(parse_bool_value("  true  ").unwrap());
         assert!(!parse_bool_value("  false  ").unwrap());
     }
 
-    #[test]
-    fn test_parse_bool_value_invalid() {
+    #[tokio::test]
+    async fn test_parse_bool_value_invalid() {
         let result = parse_bool_value("maybe");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1491,8 +1528,8 @@ mod tests {
     // set_key / get_key roundtrips
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_set_get_auto_update() {
+    #[tokio::test]
+    async fn test_set_get_auto_update() {
         let mut cfg = CliConfig::default();
         cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
         assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "true");
@@ -1503,8 +1540,8 @@ mod tests {
         assert_eq!(cfg.auto_update, Some(false));
     }
 
-    #[test]
-    fn test_set_get_update_check_interval() {
+    #[tokio::test]
+    async fn test_set_get_update_check_interval() {
         let mut cfg = CliConfig::default();
         cfg.set_key(ConfigKey::UpdateCheckInterval, "24h").unwrap();
         assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "24h");
@@ -1513,23 +1550,23 @@ mod tests {
         assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "1d");
     }
 
-    #[test]
-    fn test_set_update_check_interval_invalid() {
+    #[tokio::test]
+    async fn test_set_update_check_interval_invalid() {
         let mut cfg = CliConfig::default();
         let result = cfg.set_key(ConfigKey::UpdateCheckInterval, "invalid");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_set_get_api_url() {
+    #[tokio::test]
+    async fn test_set_get_api_url() {
         let mut cfg = CliConfig::default();
         cfg.set_key(ConfigKey::ApiUrl, "https://custom.example.com")
             .unwrap();
         assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "https://custom.example.com");
     }
 
-    #[test]
-    fn test_set_api_url_empty_clears() {
+    #[tokio::test]
+    async fn test_set_api_url_empty_clears() {
         let mut cfg = CliConfig {
             api_url: Some("https://example.com".to_string()),
             ..Default::default()
@@ -1539,23 +1576,23 @@ mod tests {
         assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "(not set)");
     }
 
-    #[test]
-    fn test_get_key_unset_returns_not_set() {
+    #[tokio::test]
+    async fn test_get_key_unset_returns_not_set() {
         let cfg = CliConfig::default();
         assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "(not set)");
         assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "(not set)");
         assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "(not set)");
     }
 
-    #[test]
-    fn test_set_key_auto_update_invalid_value() {
+    #[tokio::test]
+    async fn test_set_key_auto_update_invalid_value() {
         let mut cfg = CliConfig::default();
         let result = cfg.set_key(ConfigKey::AutoUpdate, "maybe");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_set_key_roundtrip_to_disk() {
+    #[tokio::test]
+    async fn test_set_key_roundtrip_to_disk() {
         let tmp = TempDir::new().unwrap();
         let path = config_path_in(tmp.path());
 
@@ -1564,9 +1601,9 @@ mod tests {
         cfg.set_key(ConfigKey::UpdateCheckInterval, "12h").unwrap();
         cfg.set_key(ConfigKey::ApiUrl, "https://test.example.com")
             .unwrap();
-        cfg.save_to(&path).unwrap();
+        cfg.save_to(&path).await.unwrap();
 
-        let loaded = CliConfig::load_from(&path).unwrap();
+        let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded.auto_update, Some(true));
         assert_eq!(loaded.update_check_interval, Some("12h".to_string()));
         assert_eq!(loaded.api_url, Some("https://test.example.com".to_string()));
@@ -1576,8 +1613,8 @@ mod tests {
     // ConfigKey display + name
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_config_key_display() {
+    #[tokio::test]
+    async fn test_config_key_display() {
         assert_eq!(ConfigKey::AutoUpdate.to_string(), "auto_update");
         assert_eq!(
             ConfigKey::UpdateCheckInterval.to_string(),
@@ -1586,8 +1623,8 @@ mod tests {
         assert_eq!(ConfigKey::ApiUrl.to_string(), "api_url");
     }
 
-    #[test]
-    fn test_all_config_keys_count() {
+    #[tokio::test]
+    async fn test_all_config_keys_count() {
         assert_eq!(ALL_CONFIG_KEYS.len(), 3);
     }
 }

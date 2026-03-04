@@ -1,0 +1,4 @@
+"file","agent","repo_display","repo_root","cwd","session_id","commit_hashes","considered","added","added_count","attach_error_count","session_skipped_count","session_skipped_reasons","discovery_skipped","discovery_reason"
+"/Users/example/.claude/projects/-Users-example-repo/aaa111.jsonl","claude-code","git@github.com:example-org/example-repo.git","/Users/example/repo","/Users/example/repo","aaa111","0","true","false","0","0","1","no_ranked_commit_selected","false",""
+"/Users/example/.claude/projects/-Users-example-repo/bbb222.jsonl","claude-code","git@github.com:example-org/example-repo.git","/Users/example/repo","/Users/example/repo","bbb222","3","true","false","0","3","0","","false",""
+"/Users/example/.claude/projects/-Users-example-repo/ccc333.jsonl","","","","","","","false","false","0","0","0","","true","missing_session_metadata"

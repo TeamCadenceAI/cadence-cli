@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use pgp::ArmorOptions;
 use pgp::KeyType;
 use pgp::composed::key::{SecretKeyParamsBuilder, SubkeyParamsBuilder};
-use pgp::composed::{Deserializable, Message, SignedPublicKey};
+use pgp::composed::{Deserializable, Message, SignedPublicKey, SignedSecretKey};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::ser::Serialize;
 use pgp::types::PublicKeyTrait;
@@ -46,24 +46,26 @@ fn cache_dir() -> Option<PathBuf> {
     agents::home_dir().map(|home| home.join(".cadence").join("cli"))
 }
 
-fn read_optional_file(path: Option<PathBuf>) -> Result<Option<String>> {
+async fn read_optional_file(path: Option<PathBuf>) -> Result<Option<String>> {
     let Some(path) = path else {
         return Ok(None);
     };
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(contents) if contents.trim().is_empty() => Ok(None),
         Ok(contents) => Ok(Some(contents)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == tokio::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
 }
 
-fn write_cache_file(path: &Path, contents: &str) -> Result<()> {
+async fn write_cache_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("failed to create cache directory at {}", parent.display()))?;
     }
-    std::fs::write(path, contents)
+    tokio::fs::write(path, contents)
+        .await
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -76,8 +78,8 @@ fn fingerprint_to_string(fingerprint: &pgp::types::Fingerprint) -> String {
 ///
 /// Reads `ai.cadence.keys.userFingerprint`. Returns `Ok(None)` if the
 /// key is not set or is blank/whitespace-only. Propagates real git errors.
-pub fn get_user_fingerprint() -> Result<Option<String>> {
-    let value = git::config_get_global(USER_FINGERPRINT_KEY)?;
+pub async fn get_user_fingerprint() -> Result<Option<String>> {
+    let value = git::config_get_global(USER_FINGERPRINT_KEY).await?;
     match value {
         Some(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
         _ => Ok(None),
@@ -85,8 +87,8 @@ pub fn get_user_fingerprint() -> Result<Option<String>> {
 }
 
 /// Read the configured API fingerprint from **global** git config.
-pub fn get_api_fingerprint() -> Result<Option<String>> {
-    let value = git::config_get_global(API_FINGERPRINT_KEY)?;
+pub async fn get_api_fingerprint() -> Result<Option<String>> {
+    let value = git::config_get_global(API_FINGERPRINT_KEY).await?;
     match value {
         Some(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
         _ => Ok(None),
@@ -116,47 +118,47 @@ pub fn api_public_key_meta_path() -> Option<PathBuf> {
 }
 
 /// Load the cached armored public key for the local user.
-pub fn load_cached_user_public_key() -> Result<Option<String>> {
-    read_optional_file(user_public_key_cache_path())
+pub async fn load_cached_user_public_key() -> Result<Option<String>> {
+    read_optional_file(user_public_key_cache_path()).await
 }
 
 /// Load the cached armored private key for the local user.
-pub fn load_cached_user_private_key() -> Result<Option<String>> {
-    read_optional_file(user_private_key_cache_path())
+pub async fn load_cached_user_private_key() -> Result<Option<String>> {
+    read_optional_file(user_private_key_cache_path()).await
 }
 
 /// Load the cached armored public key for the API recipient.
-pub fn load_cached_api_public_key() -> Result<Option<String>> {
-    read_optional_file(api_public_key_cache_path())
+pub async fn load_cached_api_public_key() -> Result<Option<String>> {
+    read_optional_file(api_public_key_cache_path()).await
 }
 
 /// Save armored public + private keys to cache, enforcing private key permissions.
-pub fn save_user_keys(armored_public_key: &str, armored_private_key: &str) -> Result<()> {
+pub async fn save_user_keys(armored_public_key: &str, armored_private_key: &str) -> Result<()> {
     let public_path = user_public_key_cache_path()
         .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
     let private_path = user_private_key_cache_path()
         .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
 
-    write_cache_file(&public_path, armored_public_key)?;
-    write_cache_file(&private_path, armored_private_key)?;
+    write_cache_file(&public_path, armored_public_key).await?;
+    write_cache_file(&private_path, armored_private_key).await?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&private_path, perms);
+        let _ = tokio::fs::set_permissions(&private_path, perms).await;
     }
 
     Ok(())
 }
 
 /// Load cached API public key metadata.
-pub fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
+pub async fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
     let path = api_public_key_meta_path();
     let Some(path) = path else {
         return Ok(None);
     };
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(contents) if contents.trim().is_empty() => Ok(None),
         Ok(contents) => {
             let parsed: ApiPublicKeyMetadata =
@@ -165,7 +167,7 @@ pub fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
                 })?;
             Ok(Some(parsed))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == tokio::io::ErrorKind::NotFound => Ok(None),
         Err(e) => {
             Err(e).with_context(|| format!("failed to read api key metadata at {}", path.display()))
         }
@@ -173,7 +175,7 @@ pub fn load_api_public_key_metadata() -> Result<Option<ApiPublicKeyMetadata>> {
 }
 
 /// Save API public key and metadata to cache.
-pub fn save_api_public_key_cache(
+pub async fn save_api_public_key_cache(
     armored_public_key: &str,
     metadata: &ApiPublicKeyMetadata,
 ) -> Result<()> {
@@ -182,18 +184,21 @@ pub fn save_api_public_key_cache(
     let meta_path = api_public_key_meta_path()
         .ok_or_else(|| anyhow::anyhow!("cannot determine cache path: $HOME is not set"))?;
     if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("failed to create cache directory at {}", parent.display()))?;
     }
-    std::fs::write(&key_path, armored_public_key).with_context(|| {
-        format!(
-            "failed to write cached api public key at {}",
-            key_path.display()
-        )
-    })?;
+    tokio::fs::write(&key_path, armored_public_key)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to write cached api public key at {}",
+                key_path.display()
+            )
+        })?;
     let meta =
         serde_json::to_string_pretty(metadata).context("failed to serialize api key metadata")?;
-    std::fs::write(&meta_path, meta).with_context(|| {
+    tokio::fs::write(&meta_path, meta).await.with_context(|| {
         format!(
             "failed to write api key metadata at {}",
             meta_path.display()
@@ -317,4 +322,33 @@ pub fn encrypt_to_public_keys_binary(
     encrypted
         .to_bytes()
         .context("rpgp encrypt failed: binary serialization error")
+}
+
+/// Decrypt binary OpenPGP message bytes using an armored private key + passphrase.
+///
+/// Returns the decrypted literal payload bytes.
+pub fn decrypt_with_private_key_binary(
+    encrypted: &[u8],
+    armored_private_key: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>> {
+    let trimmed_key = armored_private_key.trim();
+    if trimmed_key.is_empty() {
+        bail!("rpgp decrypt: private key material must not be blank");
+    }
+    if passphrase.trim().is_empty() {
+        bail!("rpgp decrypt: passphrase must not be blank");
+    }
+
+    let (secret_key, _headers) = SignedSecretKey::from_string(trimmed_key)
+        .context("rpgp decrypt: private key parse error")?;
+    let message = Message::from_bytes(encrypted).context("rpgp decrypt: message parse error")?;
+    let (decrypted, _recipient_ids) = message
+        .decrypt(|| passphrase.to_string(), &[&secret_key])
+        .context("rpgp decrypt: message decryption failed")?;
+    let content = decrypted
+        .get_content()
+        .context("rpgp decrypt: failed to extract message content")?
+        .ok_or_else(|| anyhow::anyhow!("rpgp decrypt: decrypted message has no content"))?;
+    Ok(content)
 }
