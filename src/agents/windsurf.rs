@@ -408,10 +408,74 @@ async fn discover_lsp_process() -> Option<LspProcess> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 async fn discover_lsp_process() -> Option<LspProcess> {
-    // Local LSP probing currently shells out to Unix tooling (`ps`/`lsof`).
-    // Keep this a no-op on non-Unix targets rather than failing discovery.
+    let output = tokio::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let rows = match value {
+        serde_json::Value::Array(rows) => rows,
+        row @ serde_json::Value::Object(_) => vec![row],
+        _ => return None,
+    };
+
+    for row in rows {
+        let map = match row.as_object() {
+            Some(map) => map,
+            None => continue,
+        };
+        let pid = match map.get("ProcessId").and_then(|v| v.as_u64()) {
+            Some(pid) => pid as u32,
+            None => continue,
+        };
+        let cmd = map
+            .get("CommandLine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if cmd.is_empty() {
+            continue;
+        }
+        let cmd_lower = cmd.to_lowercase();
+        if !cmd_lower.contains("language_server_") {
+            continue;
+        }
+        if !cmd_lower.contains("--ide_name windsurf") {
+            continue;
+        }
+
+        let csrf_token = extract_flag_value(cmd, "--csrf_token")?;
+        let extension_port =
+            extract_flag_value(cmd, "--extension_server_port").and_then(|v| v.parse::<u16>().ok());
+        let ide_version = extract_flag_value(cmd, "--windsurf_version");
+        let workspace_id = extract_flag_value(cmd, "--workspace_id");
+        return Some(LspProcess {
+            pid,
+            csrf_token,
+            extension_port,
+            ide_version,
+            workspace_id,
+        });
+    }
+
+    None
+}
+
+#[cfg(all(not(unix), not(windows)))]
+async fn discover_lsp_process() -> Option<LspProcess> {
+    // Local LSP probing currently supports Unix (`ps`/`lsof`) and Windows
+    // (`powershell`/`netstat`) only.
     None
 }
 
@@ -451,7 +515,31 @@ async fn discover_listening_ports(pid: u32) -> Vec<u16> {
     ports.into_iter().collect()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn discover_listening_ports(pid: u32) -> Vec<u16> {
+    let output = tokio::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .await;
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut ports = BTreeSet::new();
+    for line in stdout.lines() {
+        if let Some(port) = parse_port_from_netstat_line(line, pid) {
+            ports.insert(port);
+        }
+    }
+    ports.into_iter().collect()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 async fn discover_listening_ports(_pid: u32) -> Vec<u16> {
     Vec::new()
 }
@@ -471,6 +559,27 @@ fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
         None => return None,
     };
     let port_str = port_str.trim_matches(|c: char| c == ')' || c == ']');
+    port_str.parse::<u16>().ok()
+}
+
+#[cfg(any(windows, test))]
+fn parse_port_from_netstat_line(line: &str, pid: u32) -> Option<u16> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    if !parts[0].eq_ignore_ascii_case("tcp") {
+        return None;
+    }
+    if !parts[3].eq_ignore_ascii_case("listening") {
+        return None;
+    }
+    let line_pid = parts[4].parse::<u32>().ok()?;
+    if line_pid != pid {
+        return None;
+    }
+    let local_addr = parts[1].trim_matches(|c| c == '[' || c == ']');
+    let port_str = local_addr.rsplit(':').next()?;
     port_str.parse::<u16>().ok()
 }
 
@@ -810,6 +919,13 @@ mod tests {
     fn test_parse_port_from_lsof_line_handles_listen_suffix() {
         let line = "language_ 20815 zack 6u IPv4 0x0 0t0 TCP 127.0.0.1:60482 (LISTEN)";
         assert_eq!(parse_port_from_lsof_line(line), Some(60482));
+    }
+
+    #[test]
+    fn test_parse_port_from_netstat_line_filters_pid_and_extracts_port() {
+        let line = "  TCP    127.0.0.1:60482    0.0.0.0:0    LISTENING    20815";
+        assert_eq!(parse_port_from_netstat_line(line, 20815), Some(60482));
+        assert_eq!(parse_port_from_netstat_line(line, 99999), None);
     }
 
     #[tokio::test]
