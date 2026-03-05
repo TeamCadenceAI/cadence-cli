@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use super::{AgentExplorer, SessionLog, SessionSource, home_dir};
 use crate::scanner::AgentType;
@@ -60,6 +61,7 @@ struct SessionRecord {
     source_file: String,
     created_at: Option<i64>,
     updated_at: Option<i64>,
+    file_mtime: Option<i64>,
     raw: Value,
 }
 
@@ -70,6 +72,7 @@ struct MessageRecord {
     role: Option<String>,
     source_file: String,
     created_at: Option<i64>,
+    file_mtime: Option<i64>,
     raw: Value,
 }
 
@@ -81,6 +84,7 @@ struct PartRecord {
     part_type: Option<String>,
     source_file: String,
     created_at: Option<i64>,
+    file_mtime: Option<i64>,
     raw: Value,
 }
 
@@ -130,6 +134,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 source_file: path.to_string_lossy().to_string(),
                 created_at,
                 updated_at,
+                file_mtime: file_mtime_epoch(&path).await,
                 raw: value,
             };
 
@@ -169,6 +174,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 created_at: value
                     .pointer("/time/created")
                     .and_then(parse_epoch_from_json_value),
+                file_mtime: file_mtime_epoch(&path).await,
                 raw: value,
             };
 
@@ -215,6 +221,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 created_at: value
                     .pointer("/time/created")
                     .and_then(parse_epoch_from_json_value),
+                file_mtime: file_mtime_epoch(&path).await,
                 raw: value,
             };
 
@@ -260,7 +267,10 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
         let title = session_record.and_then(|s| s.title.clone());
         let source_file = session_record.map(|s| s.source_file.clone());
 
-        if let Some(ts) = session_updated.or(session_created) {
+        if let Some(ts) = session_updated
+            .or(session_created)
+            .or_else(|| session_record.and_then(|s| s.file_mtime))
+        {
             max_updated = max_updated.max(ts);
         }
 
@@ -282,7 +292,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
         lines.push(session_meta.to_string());
 
         for message in messages {
-            if let Some(ts) = message.created_at {
+            if let Some(ts) = message.created_at.or(message.file_mtime) {
                 max_updated = max_updated.max(ts);
             }
             let event = json!({
@@ -301,7 +311,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
         }
 
         for part in parts {
-            if let Some(ts) = part.created_at {
+            if let Some(ts) = part.created_at.or(part.file_mtime) {
                 max_updated = max_updated.max(ts);
             }
             let event = json!({
@@ -321,7 +331,7 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
         }
 
         if max_updated == 0 {
-            max_updated = now;
+            continue;
         }
         if max_updated < cutoff {
             continue;
@@ -375,6 +385,13 @@ async fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str::<Value>(&content).ok()
 }
 
+async fn file_mtime_epoch(path: &Path) -> Option<i64> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_secs() as i64)
+}
+
 fn parse_epoch_from_json_value(value: &Value) -> Option<i64> {
     if let Some(v) = value.as_i64() {
         if v > 1_000_000_000_000 {
@@ -400,6 +417,7 @@ fn parse_epoch_from_json_value(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::set_file_mtime;
 
     async fn write_json(path: &Path, value: &str) {
         if let Some(parent) = path.parent() {
@@ -502,5 +520,26 @@ mod tests {
             }
             SessionSource::File(_) => panic!("expected inline session"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_opencode_untimestamped_session_uses_file_mtime_for_cutoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let session_file = root
+            .join("storage")
+            .join("session")
+            .join("global")
+            .join("ses_untimed.json");
+        write_json(&session_file, r#"{"id":"ses_untimed","directory":"/repo"}"#).await;
+        set_file_mtime(&session_file, 100);
+
+        let logs = discover_recent_in(&[root.to_path_buf()], 10_000, 100).await;
+        assert!(logs.is_empty());
+
+        set_file_mtime(&session_file, 9_950);
+        let logs = discover_recent_in(&[root.to_path_buf()], 10_000, 100).await;
+        assert_eq!(logs.len(), 1);
     }
 }
