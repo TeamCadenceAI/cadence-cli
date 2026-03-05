@@ -27,6 +27,7 @@ pub enum AgentType {
     Cursor,
     Copilot,
     Antigravity,
+    Windsurf,
     Warp,
 }
 
@@ -38,6 +39,7 @@ impl std::fmt::Display for AgentType {
             AgentType::Cursor => write!(f, "cursor"),
             AgentType::Copilot => write!(f, "copilot"),
             AgentType::Antigravity => write!(f, "antigravity"),
+            AgentType::Windsurf => write!(f, "windsurf"),
             AgentType::Warp => write!(f, "warp"),
         }
     }
@@ -261,6 +263,14 @@ fn infer_agent_type(path: &Path) -> AgentType {
         || path_lower.contains("/.cadence/cli/antigravity-api/")
     {
         AgentType::Antigravity
+    } else if path_lower.contains("/.codeium/windsurf/")
+        || path_lower.contains("/windsurf-api/")
+        || path_lower.contains("/library/application support/windsurf/")
+        || path_lower.contains("/.config/windsurf/")
+        || path_lower.contains("/appdata/roaming/windsurf/")
+        || path_lower.contains("/windsurf/user/workspacestorage/")
+    {
+        AgentType::Windsurf
     } else if path_lower.contains("warp.sqlite") || path_lower.contains("/warp/") {
         AgentType::Warp
     } else if path_lower.contains("/code/") {
@@ -595,6 +605,34 @@ mod tests {
         assert_eq!(infer_agent_type(path), AgentType::Antigravity);
     }
 
+    #[tokio::test]
+    async fn test_infer_agent_type_windsurf() {
+        let path = Path::new("/Users/foo/.codeium/windsurf/cascade/abc.pb");
+        assert_eq!(infer_agent_type(path), AgentType::Windsurf);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_windsurf_api_cache() {
+        let path = Path::new("/Users/foo/.cadence/cli/windsurf-api/abc.json");
+        assert_eq!(infer_agent_type(path), AgentType::Windsurf);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_windsurf_linux_workspace_storage() {
+        let path = Path::new(
+            "/home/foo/.config/Windsurf/User/workspaceStorage/x/chatSessions/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Windsurf);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_windsurf_windows_workspace_storage() {
+        let path = Path::new(
+            "C:\\Users\\foo\\AppData\\Roaming\\Windsurf\\User\\workspaceStorage\\x\\chatSessions\\session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Windsurf);
+    }
+
     #[test]
     fn test_infer_agent_type_warp() {
         let path = Path::new(
@@ -636,6 +674,11 @@ mod tests {
     #[tokio::test]
     async fn test_agent_type_display_antigravity() {
         assert_eq!(AgentType::Antigravity.to_string(), "antigravity");
+    }
+
+    #[tokio::test]
+    async fn test_agent_type_display_windsurf() {
+        assert_eq!(AgentType::Windsurf.to_string(), "windsurf");
     }
 
     #[test]

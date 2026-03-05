@@ -1,12 +1,12 @@
-//! Antigravity log discovery (VS Code style workspace storage + local API).
+//! Windsurf log discovery (VS Code style workspace storage + local API).
 //!
-//! Antigravity stores chat sessions under:
-//! - macOS: ~/Library/Application Support/Antigravity/User/workspaceStorage/*/chatSessions/*.json
-//! - Linux: ~/.config/Antigravity/User/workspaceStorage/*/chatSessions/*.json
-//! - Windows: %APPDATA%\\Antigravity\\User\\workspaceStorage\\*\\chatSessions\\*.json
+//! Windsurf stores chat sessions under:
+//! - macOS: ~/Library/Application Support/Windsurf/User/workspaceStorage/*/chatSessions/*.json
+//! - Linux: ~/.config/Windsurf/User/workspaceStorage/*/chatSessions/*.json
+//! - Windows: %APPDATA%\\Windsurf\\User\\workspaceStorage\\*\\chatSessions\\*.json
 //!
 //! If local API discovery succeeds, this module also writes API-fetched
-//! conversations into `~/.cadence/cli/antigravity-api/*.json`.
+//! conversations into `~/.cadence/cli/windsurf-api/*.json`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use crate::scanner::AgentType;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// Return all Antigravity log directories for use by the post-commit hook.
+/// Return all Windsurf log directories for use by the post-commit hook.
 pub async fn log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
@@ -29,22 +29,22 @@ pub async fn log_dirs() -> Vec<PathBuf> {
     log_dirs_in(&home).await
 }
 
-/// Return all Antigravity log directories for backfill (not repo-scoped).
+/// Return all Windsurf log directories for backfill (not repo-scoped).
 pub async fn all_log_dirs() -> Vec<PathBuf> {
     log_dirs().await
 }
 
-pub struct AntigravityExplorer;
+pub struct WindsurfExplorer;
 
 #[async_trait]
-impl AgentExplorer for AntigravityExplorer {
+impl AgentExplorer for WindsurfExplorer {
     async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
         let dirs = all_log_dirs().await;
         recent_files_with_exts(&dirs, now, since_secs, &["json"])
             .await
             .into_iter()
             .map(|file| SessionLog {
-                agent_type: AgentType::Antigravity,
+                agent_type: AgentType::Windsurf,
                 source: SessionSource::File(file.path),
                 updated_at: Some(file.mtime_epoch),
                 match_reasons: Vec::new(),
@@ -54,10 +54,10 @@ impl AgentExplorer for AntigravityExplorer {
 }
 
 async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
-    let ws_root = app_config_dir_in("Antigravity", home)
+    let ws_root = app_config_dir_in("Windsurf", home)
         .join("User")
         .join("workspaceStorage");
-    let user_root = app_config_dir_in("Antigravity", home).join("User");
+    let user_root = app_config_dir_in("Windsurf", home).join("User");
 
     let mut dirs = BTreeSet::new();
     for dir in find_chat_session_dirs(&ws_root).await {
@@ -84,6 +84,8 @@ struct LspProcess {
     pid: u32,
     csrf_token: String,
     extension_port: Option<u16>,
+    ide_version: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -94,10 +96,10 @@ struct ProbeCache {
 }
 
 async fn api_log_dir(home: &Path) -> Option<PathBuf> {
-    if std::env::var("CADENCE_DISABLE_ANTIGRAVITY_API").is_ok() {
+    if std::env::var("CADENCE_DISABLE_WINDSURF_API").is_ok() {
         return None;
     }
-    let debug = std::env::var("CADENCE_ANTIGRAVITY_DEBUG").is_ok();
+    let debug = std::env::var("CADENCE_WINDSURF_DEBUG").is_ok();
     let now = now_epoch();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -109,11 +111,11 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     let cache_dir = api_cache_dir(home);
     if ensure_dir(&cache_dir).await.is_err() {
         if debug {
-            eprintln!("[cadence] antigravity: failed to create cache dir");
+            eprintln!("[cadence] windsurf: failed to create cache dir");
         }
         return None;
     }
-    let probe_ttl_secs = std::env::var("CADENCE_ANTIGRAVITY_PROBE_TTL_SECS")
+    let probe_ttl_secs = std::env::var("CADENCE_WINDSURF_PROBE_TTL_SECS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|v| *v > 0)
@@ -144,47 +146,53 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
     };
     if debug {
         eprintln!(
-            "[cadence] antigravity: pid={}, extension_port={:?}",
+            "[cadence] windsurf: pid={}, extension_port={:?}",
             process.pid, process.extension_port
         );
     }
-    let ports = discover_listening_ports(process.pid).await;
+    let mut ports = discover_listening_ports(process.pid).await;
+    if ports.is_empty()
+        && let Some(extension_port) = process.extension_port
+    {
+        ports = extension_port_candidates(extension_port);
+    }
+    if debug {
+        eprintln!("[cadence] windsurf: listening ports={:?}", ports);
+    }
     let preferred_connect = override_connect_port();
-    let probed_connect = probe_connect_port(&client, &ports, &process.csrf_token).await;
+    let probed_connect = probe_connect_port(&client, &ports, &process).await;
     let (scheme, port) = match preferred_connect.or(probed_connect) {
         Some(p) => p,
         None => {
             if let Some(ext_port) = process.extension_port {
                 if debug {
                     eprintln!(
-                        "[cadence] antigravity: probe failed, using extension port {}",
+                        "[cadence] windsurf: probe failed, using extension port {}",
                         ext_port
                     );
                 }
                 ("http", ext_port)
             } else {
                 if debug {
-                    eprintln!("[cadence] antigravity: no connect port found");
+                    eprintln!("[cadence] windsurf: no connect port found");
                 }
-                probe_cache.cached_log_dir = None;
-                let _ = save_probe_cache(&cache_path, &probe_cache).await;
-                return None;
+                return fallback_cached_dir(&cache_dir).await;
             }
         }
     };
 
     if debug {
         eprintln!(
-            "[cadence] antigravity: connect {}://127.0.0.1:{}",
+            "[cadence] windsurf: connect {}://127.0.0.1:{}",
             scheme, port
         );
     }
 
-    let cascade_ids = match fetch_cascade_ids(&client, scheme, port, &process.csrf_token).await {
+    let cascade_ids = match fetch_cascade_ids(&client, scheme, port, &process).await {
         Ok(ids) => ids,
         Err(e) => {
             if debug {
-                eprintln!("[cadence] antigravity: list failed: {e}");
+                eprintln!("[cadence] windsurf: list failed: {e}");
             }
             return fallback_cached_dir(&cache_dir).await;
         }
@@ -192,20 +200,20 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
 
     if cascade_ids.is_empty() {
         if debug {
-            eprintln!("[cadence] antigravity: no cascade ids found");
+            eprintln!("[cadence] windsurf: no cascade ids found");
         }
         return fallback_cached_dir(&cache_dir).await;
     }
 
     let mut payloads: Vec<(String, String)> = Vec::new();
     for (idx, cascade_id) in cascade_ids.iter().enumerate() {
-        match fetch_cascade_steps(&client, scheme, port, &process.csrf_token, cascade_id).await {
+        match fetch_cascade_steps(&client, scheme, port, &process, cascade_id).await {
             Ok(steps) => {
                 let workspace_uri = extract_workspace_uri(&steps);
                 let payload = serde_json::json!({
                     "sessionId": cascade_id,
                     "cascadeId": cascade_id,
-                    "source": "antigravity_api",
+                    "source": "windsurf_api",
                     "baseUri": workspace_uri.as_ref().map(|uri| serde_json::json!({ "path": uri })),
                     "fetchedAt": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
                     "steps": steps,
@@ -215,10 +223,7 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
             }
             Err(e) => {
                 if debug {
-                    eprintln!(
-                        "[cadence] antigravity: steps failed for {}: {}",
-                        cascade_id, e
-                    );
+                    eprintln!("[cadence] windsurf: steps failed for {}: {}", cascade_id, e);
                 }
                 continue;
             }
@@ -236,7 +241,7 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
         if tokio::fs::write(&path, payload).await.is_ok() {
             wrote_any = true;
         } else if debug {
-            eprintln!("[cadence] antigravity: failed to write {}", path.display());
+            eprintln!("[cadence] windsurf: failed to write {}", path.display());
         }
     }
 
@@ -251,11 +256,11 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
 }
 
 fn api_cache_dir(home: &Path) -> PathBuf {
-    home.join(".cadence/cli").join("antigravity-api")
+    home.join(".cadence/cli").join("windsurf-api")
 }
 
 fn probe_cache_path(home: &Path) -> PathBuf {
-    home.join(".cadence/cli").join("antigravity-probe.json")
+    home.join(".cadence/cli").join("windsurf-probe.json")
 }
 
 async fn load_probe_cache(path: &Path) -> Option<ProbeCache> {
@@ -380,19 +385,21 @@ async fn discover_lsp_process() -> Option<LspProcess> {
         if !cmd_lower.contains("language_server_") {
             continue;
         }
-        if !(cmd_lower.contains("--app_data_dir antigravity")
-            || cmd_lower.contains("/antigravity/"))
-        {
+        if !cmd_lower.contains("--ide_name windsurf") {
             continue;
         }
 
         let csrf_token = extract_flag_value(cmd, "--csrf_token")?;
         let extension_port =
             extract_flag_value(cmd, "--extension_server_port").and_then(|v| v.parse::<u16>().ok());
+        let ide_version = extract_flag_value(cmd, "--windsurf_version");
+        let workspace_id = extract_flag_value(cmd, "--workspace_id");
         return Some(LspProcess {
             pid,
             csrf_token,
             extension_port,
+            ide_version,
+            workspace_id,
         });
     }
 
@@ -442,20 +449,21 @@ async fn discover_lsp_process() -> Option<LspProcess> {
         if !cmd_lower.contains("language_server_") {
             continue;
         }
-        if !(cmd_lower.contains("--app_data_dir antigravity")
-            || cmd_lower.contains("/antigravity/")
-            || cmd_lower.contains("\\antigravity\\"))
-        {
+        if !cmd_lower.contains("--ide_name windsurf") {
             continue;
         }
 
         let csrf_token = extract_flag_value(cmd, "--csrf_token")?;
         let extension_port =
             extract_flag_value(cmd, "--extension_server_port").and_then(|v| v.parse::<u16>().ok());
+        let ide_version = extract_flag_value(cmd, "--windsurf_version");
+        let workspace_id = extract_flag_value(cmd, "--workspace_id");
         return Some(LspProcess {
             pid,
             csrf_token,
             extension_port,
+            ide_version,
+            workspace_id,
         });
     }
 
@@ -576,46 +584,44 @@ fn parse_port_from_netstat_line(line: &str, pid: u32) -> Option<u16> {
 async fn probe_connect_port(
     client: &reqwest::Client,
     ports: &[u16],
-    csrf: &str,
+    process: &LspProcess,
 ) -> Option<(&'static str, u16)> {
+    let body = metadata_body(process);
+    let probe_bodies = [body.clone(), serde_json::json!({})];
+    let probe_methods = ["GetUnleashData", "GetAllCascadeTrajectories"];
+
     for port in ports {
-        if post_json(
-            client,
-            "https",
-            *port,
-            "GetUnleashData",
-            csrf,
-            &serde_json::json!({}),
-        )
-        .await
-        .is_ok()
-        {
-            return Some(("https", *port));
+        for method in &probe_methods {
+            for probe_body in &probe_bodies {
+                if post_json(client, "https", *port, method, process, probe_body)
+                    .await
+                    .is_ok()
+                {
+                    return Some(("https", *port));
+                }
+            }
         }
     }
     for port in ports {
-        if post_json(
-            client,
-            "http",
-            *port,
-            "GetUnleashData",
-            csrf,
-            &serde_json::json!({}),
-        )
-        .await
-        .is_ok()
-        {
-            return Some(("http", *port));
+        for method in &probe_methods {
+            for probe_body in &probe_bodies {
+                if post_json(client, "http", *port, method, process, probe_body)
+                    .await
+                    .is_ok()
+                {
+                    return Some(("http", *port));
+                }
+            }
         }
     }
     None
 }
 
 fn override_connect_port() -> Option<(&'static str, u16)> {
-    let port = std::env::var("ANTIGRAVITY_LSP_PORT")
+    let port = std::env::var("WINDSURF_LSP_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())?;
-    let scheme = std::env::var("ANTIGRAVITY_LSP_SCHEME")
+    let scheme = std::env::var("WINDSURF_LSP_SCHEME")
         .ok()
         .unwrap_or_else(|| "https".to_string());
     let scheme = if scheme.eq_ignore_ascii_case("http") {
@@ -626,15 +632,35 @@ fn override_connect_port() -> Option<(&'static str, u16)> {
     Some((scheme, port))
 }
 
+fn extension_port_candidates(extension_port: u16) -> Vec<u16> {
+    let mut ports = BTreeSet::new();
+    ports.insert(extension_port);
+    // Windsurf frequently binds the language-server RPC service on nearby
+    // random ports while the extension server stays on `--extension_server_port`.
+    for delta in 1u16..=8u16 {
+        ports.insert(extension_port.saturating_add(delta));
+        ports.insert(extension_port.saturating_sub(delta));
+    }
+    ports.into_iter().collect()
+}
+
 async fn fetch_cascade_ids(
     client: &reqwest::Client,
     scheme: &str,
     port: u16,
-    csrf: &str,
+    process: &LspProcess,
 ) -> anyhow::Result<Vec<String>> {
-    let method = std::env::var("ANTIGRAVITY_LSP_LIST_METHOD")
+    let method = std::env::var("WINDSURF_LSP_LIST_METHOD")
         .unwrap_or_else(|_| "GetAllCascadeTrajectories".to_string());
-    let response = post_json(client, scheme, port, &method, csrf, &serde_json::json!({})).await?;
+    let response = post_json(
+        client,
+        scheme,
+        port,
+        &method,
+        process,
+        &metadata_body(process),
+    )
+    .await?;
     Ok(extract_cascade_ids_from_value(&response))
 }
 
@@ -642,22 +668,26 @@ async fn fetch_cascade_steps(
     client: &reqwest::Client,
     scheme: &str,
     port: u16,
-    csrf: &str,
+    process: &LspProcess,
     cascade_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let method = std::env::var("ANTIGRAVITY_LSP_STEPS_METHOD")
+    let method = std::env::var("WINDSURF_LSP_STEPS_METHOD")
         .unwrap_or_else(|_| "GetCascadeTrajectorySteps".to_string());
-    let end_index = std::env::var("ANTIGRAVITY_LSP_STEPS_END")
+    let end_index = std::env::var("WINDSURF_LSP_STEPS_END")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(10_000);
 
-    let body = serde_json::json!({
-        "cascadeId": cascade_id,
-        "startIndex": 0,
-        "endIndex": end_index
-    });
-    post_json(client, scheme, port, &method, csrf, &body).await
+    let mut body = metadata_body(process);
+    merge_object(
+        &mut body,
+        &serde_json::json!({
+            "cascadeId": cascade_id,
+            "startIndex": 0,
+            "endIndex": end_index
+        }),
+    );
+    post_json(client, scheme, port, &method, process, &body).await
 }
 
 async fn post_json(
@@ -665,7 +695,7 @@ async fn post_json(
     scheme: &str,
     port: u16,
     method: &str,
-    csrf: &str,
+    process: &LspProcess,
     body: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!(
@@ -676,17 +706,64 @@ async fn post_json(
         .post(url)
         .header("Content-Type", "application/json")
         .header("Connect-Protocol-Version", "1")
-        .header("X-Codeium-Csrf-Token", csrf)
+        .header("X-Codeium-Csrf-Token", &process.csrf_token)
         .json(body)
         .send()
         .await?;
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
-            "antigravity API returned status {}",
+            "windsurf API returned status {}",
             response.status()
         ));
     }
     Ok(response.json().await?)
+}
+
+fn metadata_body(process: &LspProcess) -> serde_json::Value {
+    let version = process
+        .ide_version
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("x".to_string()),
+    );
+    metadata.insert(
+        "ide_name".to_string(),
+        serde_json::Value::String("windsurf".to_string()),
+    );
+    metadata.insert(
+        "ide_version".to_string(),
+        serde_json::Value::String(version.clone()),
+    );
+    metadata.insert(
+        "extension_version".to_string(),
+        serde_json::Value::String(version),
+    );
+
+    if let Some(workspace_id) = process
+        .workspace_id
+        .clone()
+        .filter(|v| !v.trim().is_empty())
+    {
+        metadata.insert(
+            "workspace_id".to_string(),
+            serde_json::Value::String(workspace_id),
+        );
+    }
+
+    serde_json::json!({ "metadata": metadata })
+}
+
+fn merge_object(target: &mut serde_json::Value, extra: &serde_json::Value) {
+    if let (Some(target_obj), Some(extra_obj)) = (target.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra_obj {
+            target_obj.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 fn extract_cascade_ids_from_value(value: &serde_json::Value) -> Vec<String> {
@@ -748,25 +825,34 @@ fn sanitize_filename(input: &str, fallback_index: usize) -> String {
 }
 
 fn extract_workspace_uri(value: &serde_json::Value) -> Option<String> {
-    if let Some(uri) = value
-        .pointer("/steps/0/userInput/activeUserState/activeDocument/workspaceUri")
-        .and_then(|v| v.as_str())
-    {
-        return Some(uri.to_string());
+    fn walk(node: &serde_json::Value) -> Option<String> {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(uri) = map.get("workspaceUri").and_then(|v| v.as_str())
+                    && !uri.trim().is_empty()
+                {
+                    return Some(uri.to_string());
+                }
+                for value in map.values() {
+                    if let Some(uri) = walk(value) {
+                        return Some(uri);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(uri) = walk(item) {
+                        return Some(uri);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
-    if let Some(uri) = value
-        .pointer("/steps/0/userInput/activeUserState/workspaceUri")
-        .and_then(|v| v.as_str())
-    {
-        return Some(uri.to_string());
-    }
-    if let Some(uri) = value
-        .pointer("/steps/0/userInput/activeUserState/openDocuments/0/workspaceUri")
-        .and_then(|v| v.as_str())
-    {
-        return Some(uri.to_string());
-    }
-    None
+
+    walk(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -782,15 +868,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_antigravity_log_dirs_collects_chat_sessions() {
+    async fn test_windsurf_log_dirs_collects_chat_sessions() {
         let home = TempDir::new().unwrap();
-        let ws_root = app_config_dir_in("Antigravity", home.path())
+        let ws_root = app_config_dir_in("Windsurf", home.path())
             .join("User")
             .join("workspaceStorage")
             .join("abc")
             .join("chatSessions");
         tokio::fs::create_dir_all(&ws_root).await.unwrap();
-        let other_root = app_config_dir_in("Antigravity", home.path())
+        let other_root = app_config_dir_in("Windsurf", home.path())
             .join("User")
             .join("other")
             .join("chatSessions");
@@ -869,5 +955,31 @@ mod tests {
         });
         let uri = extract_workspace_uri(&value);
         assert_eq!(uri.as_deref(), Some("file:///Users/zack/dev/fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_workspace_uri_from_nested_steps_shape() {
+        let value = json!({
+            "steps": {
+                "steps": [{
+                    "userInput": {
+                        "activeUserState": {
+                            "activeDocument": { "workspaceUri": "file:///Users/zack/dev/cadence-cli" }
+                        }
+                    }
+                }]
+            }
+        });
+        let uri = extract_workspace_uri(&value);
+        assert_eq!(uri.as_deref(), Some("file:///Users/zack/dev/cadence-cli"));
+    }
+
+    #[test]
+    fn test_extension_port_candidates_includes_neighbor_ports() {
+        let ports = extension_port_candidates(60480);
+        assert!(ports.contains(&60480));
+        assert!(ports.contains(&60479));
+        assert!(ports.contains(&60481));
+        assert!(ports.contains(&60488));
     }
 }

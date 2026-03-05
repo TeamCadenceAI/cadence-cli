@@ -9,6 +9,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod warp;
+pub mod windsurf;
 
 use crate::scanner::AgentType;
 use async_trait::async_trait;
@@ -179,12 +180,21 @@ pub async fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
 
 /// Collect recent session logs across all supported agents.
 pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionLog> {
-    let (claude_logs, codex_logs, cursor_logs, copilot_logs, antigravity_logs, warp_logs) = tokio::join!(
+    let (
+        claude_logs,
+        codex_logs,
+        cursor_logs,
+        copilot_logs,
+        antigravity_logs,
+        windsurf_logs,
+        warp_logs,
+    ) = tokio::join!(
         claude::ClaudeExplorer.discover_recent(now, since_secs),
         codex::CodexExplorer.discover_recent(now, since_secs),
         cursor::CursorExplorer.discover_recent(now, since_secs),
         copilot::CopilotExplorer.discover_recent(now, since_secs),
         antigravity::AntigravityExplorer.discover_recent(now, since_secs),
+        windsurf::WindsurfExplorer.discover_recent(now, since_secs),
         warp::WarpExplorer.discover_recent(now, since_secs),
     );
 
@@ -194,6 +204,7 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
     results.extend(cursor_logs);
     results.extend(copilot_logs);
     results.extend(antigravity_logs);
+    results.extend(windsurf_logs);
     results.extend(warp_logs);
     results
 }
