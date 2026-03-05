@@ -176,9 +176,7 @@ async fn api_log_dir(home: &Path) -> Option<PathBuf> {
                 if debug {
                     eprintln!("[cadence] windsurf: no connect port found");
                 }
-                probe_cache.cached_log_dir = None;
-                let _ = save_probe_cache(&cache_path, &probe_cache).await;
-                return None;
+                return fallback_cached_dir(&cache_dir).await;
             }
         }
     };

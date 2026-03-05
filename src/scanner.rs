@@ -266,6 +266,9 @@ fn infer_agent_type(path: &Path) -> AgentType {
     } else if path_lower.contains("/.codeium/windsurf/")
         || path_lower.contains("/windsurf-api/")
         || path_lower.contains("/library/application support/windsurf/")
+        || path_lower.contains("/.config/windsurf/")
+        || path_lower.contains("/appdata/roaming/windsurf/")
+        || path_lower.contains("/windsurf/user/workspacestorage/")
     {
         AgentType::Windsurf
     } else if path_lower.contains("warp.sqlite") || path_lower.contains("/warp/") {
@@ -611,6 +614,22 @@ mod tests {
     #[tokio::test]
     async fn test_infer_agent_type_windsurf_api_cache() {
         let path = Path::new("/Users/foo/.cadence/cli/windsurf-api/abc.json");
+        assert_eq!(infer_agent_type(path), AgentType::Windsurf);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_windsurf_linux_workspace_storage() {
+        let path = Path::new(
+            "/home/foo/.config/Windsurf/User/workspaceStorage/x/chatSessions/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Windsurf);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_windsurf_windows_workspace_storage() {
+        let path = Path::new(
+            "C:\\Users\\foo\\AppData\\Roaming\\Windsurf\\User\\workspaceStorage\\x\\chatSessions\\session.json",
+        );
         assert_eq!(infer_agent_type(path), AgentType::Windsurf);
     }
 
