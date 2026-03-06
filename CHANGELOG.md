@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.1.0...v1.1.1) (2026-03-06)
+
+
+### Bug Fixes
+
+* **backfill:** log repo_push_failed when session ref push errors ([3268234](https://github.com/TeamCadenceAI/cadence-cli/commit/3268234e1635eca85ba605fd10c7af38c539c4d3))
+* **backfill:** log repo_push_failed when session ref push errors ([89ad10a](https://github.com/TeamCadenceAI/cadence-cli/commit/89ad10a49c368962d9ac72ce77aa50cae86e0b21))
+
 ## [1.1.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.0.0...v1.1.0) (2026-03-06)
 
 
