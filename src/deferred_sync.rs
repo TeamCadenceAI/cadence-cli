@@ -23,7 +23,7 @@ use crate::{agents, git, push};
 
 const DEFAULT_LOCK_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_LOG_RETENTION_DAYS: i64 = 7;
-const DEFAULT_SYNC_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_SYNC_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_TIME_BUDGET_MS: u64 = 8_000;
 const REF_SYNC_JOB_CONCURRENCY: usize = 4;
 static SYNC_TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -194,6 +194,19 @@ pub async fn run_sync_command(opts: SyncRunOptions) -> Result<()> {
         "deferred sync invocation started"
     );
     execute_jobs_bounded(jobs, opts.time_budget_ms).await
+}
+
+/// List runnable pending jobs using the same filtering as the deferred worker.
+pub async fn list_runnable_pending_sync_jobs(max_items: usize) -> Result<Vec<PendingSyncRecord>> {
+    collect_runnable_jobs(&SyncRunOptions {
+        repo: None,
+        remote: None,
+        all_pending: true,
+        background: false,
+        max_items,
+        time_budget_ms: DEFAULT_TIME_BUDGET_MS,
+    })
+    .await
 }
 
 /// Run lock/log maintenance before processing jobs.
@@ -988,6 +1001,13 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(
             jobs[0].repo_root,
+            PathBuf::from("/tmp/a-repo").to_string_lossy()
+        );
+
+        let jobs_from_public = list_runnable_pending_sync_jobs(1).await.unwrap();
+        assert_eq!(jobs_from_public.len(), 1);
+        assert_eq!(
+            jobs_from_public[0].repo_root,
             PathBuf::from("/tmp/a-repo").to_string_lossy()
         );
 

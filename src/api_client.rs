@@ -127,8 +127,17 @@ impl ApiClient {
     /// double-slash issues when joining endpoint paths.
     pub fn new(base_url: &str) -> Self {
         let normalized = base_url.trim().trim_end_matches('/').to_string();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-cadence-cli-version"),
+            reqwest::header::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("build Cadence API HTTP client");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: normalized,
         }
     }

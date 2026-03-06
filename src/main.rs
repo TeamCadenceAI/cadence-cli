@@ -1174,6 +1174,27 @@ struct ParsedSessionLog {
     session_log: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum IncrementalLogDisposition {
+    Indexed,
+    SkippedPermanent,
+    ErrorRetriable,
+}
+
+fn advance_cursor_for_disposition(
+    current_cursor: i64,
+    mtime: Option<i64>,
+    disposition: IncrementalLogDisposition,
+) -> i64 {
+    match disposition {
+        IncrementalLogDisposition::Indexed | IncrementalLogDisposition::SkippedPermanent => {
+            mtime.map_or(current_cursor, |mtime| current_cursor.max(mtime))
+        }
+        IncrementalLogDisposition::ErrorRetriable => current_cursor,
+    }
+}
+
 async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSessionLog> {
     let session_log = match &log.source {
         agents::SessionSource::File(path) => tokio::fs::read_to_string(path).await.ok()?,
@@ -1599,7 +1620,7 @@ async fn ingest_incremental_sessions_for_repo(
     let files = agents::discover_recent_sessions(now, since_secs).await;
 
     let mut ingested = 0usize;
-    let mut max_mtime = min_cursor;
+    let mut cursor_advance_mtime = min_cursor;
     let mut candidates = Vec::new();
     for log in files {
         let Some(mtime) = log.updated_at else {
@@ -1607,9 +1628,6 @@ async fn ingest_incremental_sessions_for_repo(
         };
         if mtime <= min_cursor {
             continue;
-        }
-        if mtime > max_mtime {
-            max_mtime = mtime;
         }
         candidates.push(log);
     }
@@ -1625,7 +1643,14 @@ async fn ingest_incremental_sessions_for_repo(
         std::collections::HashMap::new();
 
     for parsed in parsed_logs {
+        let log_mtime = parsed.log.updated_at;
         let Some(cwd) = parsed.metadata.cwd.clone() else {
+            // Missing CWD can never be attributed to this repo; skip permanently.
+            cursor_advance_mtime = advance_cursor_for_disposition(
+                cursor_advance_mtime,
+                log_mtime,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
             continue;
         };
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -1636,9 +1661,21 @@ async fn ingest_incremental_sessions_for_repo(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
+            // Unresolvable CWD cannot be matched to this repo in this path; skip permanently.
+            cursor_advance_mtime = advance_cursor_for_disposition(
+                cursor_advance_mtime,
+                log_mtime,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
             continue;
         };
         if resolved_repo != repo_root {
+            // Logs for a different repo are permanently irrelevant for this repo.
+            cursor_advance_mtime = advance_cursor_for_disposition(
+                cursor_advance_mtime,
+                log_mtime,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
             continue;
         }
 
@@ -1668,7 +1705,7 @@ async fn ingest_incremental_sessions_for_repo(
             Some(parsed.log.match_reasons.as_slice())
         };
 
-        let info = ingest_session_from_log(
+        let info = match ingest_session_from_log(
             &agent,
             &session_id,
             repo_root_str,
@@ -1682,8 +1719,20 @@ async fn ingest_incremental_sessions_for_repo(
             Some(repo_root),
             Some(&explicit_branch_keys),
         )
-        .await?;
+        .await
+        {
+            Ok(info) => info,
+            Err(err) => {
+                // Ingest failure is retriable; keep cursor unchanged.
+                return Err(err);
+            }
+        };
         ingested += 1;
+        cursor_advance_mtime = advance_cursor_for_disposition(
+            cursor_advance_mtime,
+            log_mtime,
+            IncrementalLogDisposition::Indexed,
+        );
         if output::is_verbose() {
             output::detail(&format!(
                 "pre-push incremental: session uid {} stored as {} ({})",
@@ -1692,21 +1741,23 @@ async fn ingest_incremental_sessions_for_repo(
         }
     }
 
-    sync_pending::upsert_cursor(
-        repo_root_str,
-        sync_pending::ScopeType::Committer,
-        &committer_hash,
-        max_mtime,
-    )
-    .await?;
-    for key_hash in &branch_key_hashes {
+    if cursor_advance_mtime > min_cursor {
         sync_pending::upsert_cursor(
             repo_root_str,
-            sync_pending::ScopeType::Branch,
-            key_hash,
-            max_mtime,
+            sync_pending::ScopeType::Committer,
+            &committer_hash,
+            cursor_advance_mtime,
         )
         .await?;
+        for key_hash in &branch_key_hashes {
+            sync_pending::upsert_cursor(
+                repo_root_str,
+                sync_pending::ScopeType::Branch,
+                key_hash,
+                cursor_advance_mtime,
+            )
+            .await?;
+        }
     }
 
     Ok(ingested)
@@ -4347,6 +4398,20 @@ async fn run_sync(
     max_items: usize,
     time_budget_ms: u64,
 ) -> Result<()> {
+    let repo_roots = repo_roots_for_sync_ingest(repo.as_deref(), all_pending, max_items).await?;
+    let encryption_method = resolve_encryption_method()
+        .await
+        .unwrap_or_else(|e| EncryptionMethod::Unavailable(format!("{e}")));
+    for repo_root in &repo_roots {
+        let repo_root_str = repo_root.to_string_lossy().to_string();
+        if let Err(e) =
+            ingest_incremental_sessions_for_repo(repo_root, &repo_root_str, &encryption_method)
+                .await
+        {
+            output::note(&format!("Deferred sync ingest issue: {}", e));
+        }
+    }
+
     deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
         repo,
         remote,
@@ -4358,6 +4423,35 @@ async fn run_sync(
     .await
 }
 
+async fn repo_roots_for_sync_ingest(
+    repo: Option<&Path>,
+    all_pending: bool,
+    max_items: usize,
+) -> Result<Vec<PathBuf>> {
+    if all_pending {
+        let jobs = deferred_sync::list_runnable_pending_sync_jobs(max_items).await?;
+        return Ok(pending_repo_roots_sorted_deduped(jobs));
+    }
+
+    let root = match repo {
+        Some(path) => git::repo_root_at(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf()),
+        None => git::repo_root().await?,
+    };
+    Ok(vec![root])
+}
+
+fn pending_repo_roots_sorted_deduped(jobs: Vec<deferred_sync::PendingSyncRecord>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = jobs
+        .into_iter()
+        .map(|job| PathBuf::from(job.repo_root))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4365,6 +4459,7 @@ async fn run_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deferred_sync::PendingSyncRecord;
     use tempfile::TempDir;
 
     async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
@@ -4755,6 +4850,71 @@ mod tests {
             }
         }
         assert_eq!(missing_meta, 1);
+    }
+
+    #[test]
+    fn repo_roots_for_sync_ingest_dedupes_and_sorts_pending_records() {
+        let jobs = vec![
+            PendingSyncRecord {
+                repo_root: "/tmp/z-repo".to_string(),
+                remote: "origin".to_string(),
+                enqueued_at: note::now_rfc3339(),
+                updated_at: note::now_rfc3339(),
+                attempt_count: 0,
+                next_attempt_at_epoch: 0,
+                last_error: None,
+            },
+            PendingSyncRecord {
+                repo_root: "/tmp/a-repo".to_string(),
+                remote: "origin".to_string(),
+                enqueued_at: note::now_rfc3339(),
+                updated_at: note::now_rfc3339(),
+                attempt_count: 0,
+                next_attempt_at_epoch: 0,
+                last_error: None,
+            },
+            PendingSyncRecord {
+                repo_root: "/tmp/z-repo".to_string(),
+                remote: "upstream".to_string(),
+                enqueued_at: note::now_rfc3339(),
+                updated_at: note::now_rfc3339(),
+                attempt_count: 0,
+                next_attempt_at_epoch: 0,
+                last_error: None,
+            },
+        ];
+        let roots = pending_repo_roots_sorted_deduped(jobs);
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/tmp/a-repo"), PathBuf::from("/tmp/z-repo")]
+        );
+    }
+
+    #[test]
+    fn cursor_advances_for_indexed_logs() {
+        let updated =
+            advance_cursor_for_disposition(100, Some(150), IncrementalLogDisposition::Indexed);
+        assert_eq!(updated, 150);
+    }
+
+    #[test]
+    fn cursor_advances_for_permanent_skips() {
+        let updated = advance_cursor_for_disposition(
+            100,
+            Some(140),
+            IncrementalLogDisposition::SkippedPermanent,
+        );
+        assert_eq!(updated, 140);
+    }
+
+    #[test]
+    fn cursor_does_not_advance_for_retriable_errors() {
+        let updated = advance_cursor_for_disposition(
+            100,
+            Some(180),
+            IncrementalLogDisposition::ErrorRetriable,
+        );
+        assert_eq!(updated, 100);
     }
 
     #[tokio::test(flavor = "multi_thread")]
