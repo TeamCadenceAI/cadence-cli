@@ -1,13 +1,18 @@
 //! Agent log discovery module.
 //!
-//! Discovers AI coding agent session logs (Claude Code, Codex) on disk
+//! Discovers AI coding agent session logs on disk
 //! and filters candidate files by modification time relative to a commit.
 
+pub mod amp_code;
 pub mod antigravity;
 pub mod claude;
+pub mod cline;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod kiro;
+pub mod opencode;
+pub mod roo_code;
 pub mod warp;
 pub mod windsurf;
 
@@ -111,6 +116,40 @@ pub async fn recent_files_with_exts(
     results
 }
 
+/// Recursively collect directories that contain at least one file with
+/// an extension listed in `exts` (case-insensitive).
+pub async fn collect_dirs_with_exts(root: &Path, results: &mut Vec<PathBuf>, exts: &[&str]) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        let mut has_match = false;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && !has_match
+                && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext))
+            {
+                has_match = true;
+            }
+        }
+
+        if has_match {
+            results.push(dir);
+        }
+    }
+}
+
 /// Resolve the user's home directory.
 ///
 /// Returns `None` if the home directory cannot be determined.
@@ -131,19 +170,25 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
+    let is_real_home = home_dir().as_deref() == Some(home);
+
     if cfg!(target_os = "macos") {
         home.join("Library").join("Application Support").join(app)
     } else if cfg!(target_os = "windows") {
-        if let Ok(appdata) = std::env::var("APPDATA") {
+        if is_real_home && let Ok(appdata) = std::env::var("APPDATA") {
             PathBuf::from(appdata).join(app)
         } else {
             home.join("AppData").join("Roaming").join(app)
         }
     } else {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
+        let base = if is_real_home {
+            std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"))
+        } else {
+            home.join(".config")
+        };
         base.join(app)
     }
 }
@@ -185,6 +230,11 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
         codex_logs,
         cursor_logs,
         copilot_logs,
+        cline_logs,
+        roo_logs,
+        opencode_logs,
+        kiro_logs,
+        amp_logs,
         antigravity_logs,
         windsurf_logs,
         warp_logs,
@@ -193,6 +243,11 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
         codex::CodexExplorer.discover_recent(now, since_secs),
         cursor::CursorExplorer.discover_recent(now, since_secs),
         copilot::CopilotExplorer.discover_recent(now, since_secs),
+        cline::ClineExplorer.discover_recent(now, since_secs),
+        roo_code::RooCodeExplorer.discover_recent(now, since_secs),
+        opencode::OpenCodeExplorer.discover_recent(now, since_secs),
+        kiro::KiroExplorer.discover_recent(now, since_secs),
+        amp_code::AmpCodeExplorer.discover_recent(now, since_secs),
         antigravity::AntigravityExplorer.discover_recent(now, since_secs),
         windsurf::WindsurfExplorer.discover_recent(now, since_secs),
         warp::WarpExplorer.discover_recent(now, since_secs),
@@ -203,6 +258,11 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
     results.extend(codex_logs);
     results.extend(cursor_logs);
     results.extend(copilot_logs);
+    results.extend(cline_logs);
+    results.extend(roo_logs);
+    results.extend(opencode_logs);
+    results.extend(kiro_logs);
+    results.extend(amp_logs);
     results.extend(antigravity_logs);
     results.extend(windsurf_logs);
     results.extend(warp_logs);
@@ -366,10 +426,6 @@ mod tests {
     #[test]
     fn test_app_config_dir_in_platform() {
         let home = PathBuf::from("/home/tester");
-        let xdg_backup = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/home/tester/.config");
-        }
         let dir = app_config_dir_in("Code", &home);
         if cfg!(target_os = "macos") {
             assert_eq!(
@@ -377,14 +433,9 @@ mod tests {
                 PathBuf::from("/home/tester/Library/Application Support/Code")
             );
         } else if cfg!(target_os = "windows") {
-            assert!(dir.ends_with(PathBuf::from("Code")));
+            assert_eq!(dir, home.join("AppData").join("Roaming").join("Code"));
         } else {
-            assert!(dir.starts_with(PathBuf::from("/home/tester")));
-            assert!(dir.ends_with(PathBuf::from("Code")));
-        }
-        match xdg_backup {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            assert_eq!(dir, home.join(".config").join("Code"));
         }
     }
 }

@@ -26,6 +26,11 @@ pub enum AgentType {
     Codex,
     Cursor,
     Copilot,
+    Cline,
+    RooCode,
+    OpenCode,
+    Kiro,
+    AmpCode,
     Antigravity,
     Windsurf,
     Warp,
@@ -38,6 +43,11 @@ impl std::fmt::Display for AgentType {
             AgentType::Codex => write!(f, "codex"),
             AgentType::Cursor => write!(f, "cursor"),
             AgentType::Copilot => write!(f, "copilot"),
+            AgentType::Cline => write!(f, "cline"),
+            AgentType::RooCode => write!(f, "roo-code"),
+            AgentType::OpenCode => write!(f, "opencode"),
+            AgentType::Kiro => write!(f, "kiro"),
+            AgentType::AmpCode => write!(f, "amp-code"),
             AgentType::Antigravity => write!(f, "antigravity"),
             AgentType::Windsurf => write!(f, "windsurf"),
             AgentType::Warp => write!(f, "warp"),
@@ -246,16 +256,52 @@ fn extract_hashes_from_line(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Infer the agent type from a file path.
+/// Infer the agent type from a file path using ordered substring matches.
 ///
-/// - If path contains `.claude` -> Claude
-/// - If path contains `.codex` -> Codex
-/// - Otherwise -> Claude (conservative default)
+/// Match precedence is significant for overlapping paths:
+/// 1. Codex (`.codex`)
+/// 2. OpenCode data roots
+/// 3. Cline extension/storage paths
+/// 4. Roo Code extension/storage paths
+/// 5. Kiro storage paths
+/// 6. Amp Code paths
+/// 7. Cursor paths
+/// 8. Antigravity paths
+/// 9. Windsurf paths
+/// 10. Warp paths
+/// 11. VS Code / Copilot workspace storage
+/// 12. Fallback to Claude
 fn infer_agent_type(path: &Path) -> AgentType {
     let path_str = path.to_string_lossy().replace('\\', "/");
     let path_lower = path_str.to_ascii_lowercase();
     if path_lower.contains(".codex") {
         AgentType::Codex
+    } else if path_lower.contains("/.local/share/opencode/")
+        || path_lower.contains("/library/application support/opencode/")
+        || path_lower.contains("/appdata/roaming/opencode/")
+    {
+        AgentType::OpenCode
+    } else if path_lower.contains("/.cline/")
+        || path_lower.contains("/saoudrizwan.claude-dev/")
+        || path_lower.contains("/cline.cline/")
+    {
+        AgentType::Cline
+    } else if path_lower.contains("/.roo/")
+        || path_lower.contains("/rooveterinaryinc.roo-cline/")
+        || path_lower.contains("/roocode.roo-code/")
+    {
+        AgentType::RooCode
+    } else if path_lower
+        .contains("/library/application support/kiro/user/globalstorage/kiro.kiroagent/")
+        || path_lower.contains("/.config/kiro/user/globalstorage/kiro.kiroagent/")
+        || path_lower.contains("/appdata/roaming/kiro/user/globalstorage/kiro.kiroagent/")
+    {
+        AgentType::Kiro
+    } else if path_lower.contains("/.local/share/amp/threads/")
+        || path_lower.contains("/.amp/file-changes/")
+        || path_lower.contains("/appdata/roaming/amp/threads/")
+    {
+        AgentType::AmpCode
     } else if path_lower.contains(".cursor") || path_lower.contains("/cursor/") {
         AgentType::Cursor
     } else if path_lower.contains("/antigravity/")
@@ -338,6 +384,8 @@ fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json:
         && let Some(id) = value
             .get("session_id")
             .or_else(|| value.get("sessionId"))
+            .or_else(|| value.get("sessionID"))
+            .or_else(|| value.get("taskId"))
             .or_else(|| value.pointer("/payload/id"))
             .and_then(|v| v.as_str())
     {
@@ -350,6 +398,9 @@ fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json:
             .get("cwd")
             .or_else(|| value.get("workdir"))
             .or_else(|| value.get("working_directory"))
+            .or_else(|| value.get("directory"))
+            .or_else(|| value.get("workspaceDirectory"))
+            .or_else(|| value.get("workspacePath"))
             .or_else(|| value.pointer("/payload/cwd"))
             .and_then(|v| v.as_str())
     {
@@ -358,6 +409,13 @@ fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json:
 
     if metadata.session_id.is_none()
         && let Some(id) = value.get("sessionId").and_then(|v| v.as_str())
+    {
+        metadata.session_id = Some(id.to_string());
+    }
+    if metadata.session_id.is_none()
+        && let Some(id) = value.get("id").and_then(|v| v.as_str())
+        && (id.starts_with("ses_")
+            || (id.starts_with("T-") && value.get("messages").and_then(|v| v.as_array()).is_some()))
     {
         metadata.session_id = Some(id.to_string());
     }
@@ -487,11 +545,22 @@ fn extract_cwd_from_value(value: &serde_json::Value) -> Option<String> {
         }
     }
 
+    if let Some(trees) = value
+        .pointer("/env/initial/trees")
+        .and_then(|v| v.as_array())
+    {
+        for tree in trees {
+            if let Some(uri) = tree.get("uri").and_then(|v| v.as_str()) {
+                return Some(normalize_cwd_path(uri));
+            }
+        }
+    }
+
     None
 }
 
 fn normalize_cwd_path(path: &str) -> String {
-    let trimmed = path.strip_prefix("file://").unwrap_or(path);
+    let trimmed = strip_file_uri_prefix(path);
     let candidate = Path::new(trimmed);
     if looks_like_file(candidate) {
         candidate
@@ -502,6 +571,32 @@ fn normalize_cwd_path(path: &str) -> String {
     } else {
         candidate.to_string_lossy().to_string()
     }
+}
+
+fn strip_file_uri_prefix(path: &str) -> &str {
+    let Some(mut trimmed) = path.strip_prefix("file://") else {
+        return path;
+    };
+
+    if let Some(local_path) = trimmed.strip_prefix("localhost/") {
+        trimmed = local_path;
+    }
+
+    if let Some(without_leading_slash) = trimmed.strip_prefix('/')
+        && is_windows_drive_path(without_leading_slash)
+    {
+        return without_leading_slash;
+    }
+
+    trimmed
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
 fn looks_like_file(path: &Path) -> bool {
@@ -576,11 +671,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_infer_agent_type_cline() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/x/task.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Cline);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_roo_code() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/x/task.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::RooCode);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_opencode() {
+        let path =
+            Path::new("/Users/foo/.local/share/opencode/storage/session/global/ses_abc.json");
+        assert_eq!(infer_agent_type(path), AgentType::OpenCode);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_kiro() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/x/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Kiro);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_amp_code() {
+        let path = Path::new("/Users/foo/.local/share/amp/threads/T-abc.json");
+        assert_eq!(infer_agent_type(path), AgentType::AmpCode);
+    }
+
+    #[tokio::test]
     async fn test_infer_agent_type_cursor() {
         let path = Path::new(
             "/Users/foo/Library/Application Support/Cursor/User/workspaceStorage/x/chatSessions/session.json",
         );
         assert_eq!(infer_agent_type(path), AgentType::Cursor);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_cline_wins_over_cursor_for_ambiguous_path() {
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/tasks/x/task.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Cline);
     }
 
     #[tokio::test]
@@ -672,6 +812,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_type_display_cline() {
+        assert_eq!(AgentType::Cline.to_string(), "cline");
+    }
+
+    #[tokio::test]
+    async fn test_agent_type_display_roo_code() {
+        assert_eq!(AgentType::RooCode.to_string(), "roo-code");
+    }
+
+    #[tokio::test]
+    async fn test_agent_type_display_opencode() {
+        assert_eq!(AgentType::OpenCode.to_string(), "opencode");
+    }
+
+    #[tokio::test]
+    async fn test_agent_type_display_kiro() {
+        assert_eq!(AgentType::Kiro.to_string(), "kiro");
+    }
+
+    #[tokio::test]
+    async fn test_agent_type_display_amp_code() {
+        assert_eq!(AgentType::AmpCode.to_string(), "amp-code");
+    }
+
+    #[tokio::test]
     async fn test_agent_type_display_antigravity() {
         assert_eq!(AgentType::Antigravity.to_string(), "antigravity");
     }
@@ -735,6 +900,69 @@ mod tests {
         let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.cwd, Some("/opt/app".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_opencode_fields() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"id":"ses_123","sessionID":"ses_123","directory":"/Users/foo/dev/repo"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("ses_123".to_string()));
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_kiro_fields() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"sessionId":"kiro-1","workspaceDirectory":"/Users/foo/dev/kiro-repo"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("kiro-1".to_string()));
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/kiro-repo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_amp_fields() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"id":"T-123","messages":[],"env":{"initial":{"trees":[{"uri":"file:///Users/foo/dev/cadence-cli"}]}}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("T-123".to_string()));
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/cadence-cli".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_amp_fields_windows_file_uri() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"id":"T-456","messages":[],"env":{"initial":{"trees":[{"uri":"file:///C:/Users/foo/dev/cadence-cli"}]}}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("T-456".to_string()));
+        assert_eq!(
+            metadata.cwd,
+            Some("C:/Users/foo/dev/cadence-cli".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_cline_task_id() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"taskId":"task-123","workspacePath":"/Users/foo/dev/repo"}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("task-123".to_string()));
+        assert_eq!(metadata.cwd, Some("/Users/foo/dev/repo".to_string()));
     }
 
     #[tokio::test]
@@ -857,6 +1085,18 @@ also not json {{{{
     }
 
     #[tokio::test]
+    async fn test_parse_metadata_agent_type_from_opencode_path() {
+        let dir = TempDir::new().unwrap();
+        let opencode_dir = dir.path().join(".local").join("share").join("opencode");
+        tokio::fs::create_dir_all(&opencode_dir).await.unwrap();
+        let file = write_temp_file(&opencode_dir, "session.json", "{}").await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.agent_type, Some(AgentType::OpenCode));
+    }
+
+    #[tokio::test]
     async fn test_parse_metadata_first_value_wins() {
         let dir = TempDir::new().unwrap();
         // Two lines with session_id -- first should win
@@ -888,6 +1128,12 @@ also not json {{{{
         let metadata = parse_session_metadata_str(content);
         assert_eq!(metadata.session_id, Some("chat-999".to_string()));
         assert_eq!(metadata.cwd, Some("/Users/foo/dev/repo".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_cwd_path_handles_localhost_windows_file_uri() {
+        let normalized = normalize_cwd_path("file://localhost/C:/Users/foo/dev/repo");
+        assert_eq!(normalized, "C:/Users/foo/dev/repo".to_string());
     }
 
     // -----------------------------------------------------------------------

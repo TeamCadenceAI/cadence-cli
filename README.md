@@ -63,6 +63,11 @@ If a repository still has the legacy ref `refs/notes/ai-sessions`, Cadence will 
 
 - Claude Code
 - Codex
+- Cline
+- Roo Code
+- OpenCode
+- Kiro
+- Amp Code
 - Cursor
 - GitHub Copilot
 - Antigravity
@@ -70,6 +75,8 @@ If a repository still has the legacy ref `refs/notes/ai-sessions`, Cadence will 
 
 Note: Warp stores sessions in a local SQLite database. In some local-only cases the
 assistant output may be missing, so Cadence stores prompts/context without responses.
+OpenCode sessions are normalized from fragmented storage (`session`, `message`, `part`)
+into one synthetic session log per session ID before ingestion.
 
 ## Optional: Encryption
 
