@@ -170,19 +170,25 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn app_config_dir_in(app: &str, home: &Path) -> PathBuf {
+    let is_real_home = home_dir().as_deref() == Some(home);
+
     if cfg!(target_os = "macos") {
         home.join("Library").join("Application Support").join(app)
     } else if cfg!(target_os = "windows") {
-        if let Ok(appdata) = std::env::var("APPDATA") {
+        if is_real_home && let Ok(appdata) = std::env::var("APPDATA") {
             PathBuf::from(appdata).join(app)
         } else {
             home.join("AppData").join("Roaming").join(app)
         }
     } else {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
+        let base = if is_real_home {
+            std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"))
+        } else {
+            home.join(".config")
+        };
         base.join(app)
     }
 }
@@ -420,10 +426,6 @@ mod tests {
     #[test]
     fn test_app_config_dir_in_platform() {
         let home = PathBuf::from("/home/tester");
-        let xdg_backup = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/home/tester/.config");
-        }
         let dir = app_config_dir_in("Code", &home);
         if cfg!(target_os = "macos") {
             assert_eq!(
@@ -431,14 +433,9 @@ mod tests {
                 PathBuf::from("/home/tester/Library/Application Support/Code")
             );
         } else if cfg!(target_os = "windows") {
-            assert!(dir.ends_with(PathBuf::from("Code")));
+            assert_eq!(dir, home.join("AppData").join("Roaming").join("Code"));
         } else {
-            assert!(dir.starts_with(PathBuf::from("/home/tester")));
-            assert!(dir.ends_with(PathBuf::from("Code")));
-        }
-        match xdg_backup {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            assert_eq!(dir, home.join(".config").join("Code"));
         }
     }
 }
