@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.1.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.0.0...v1.1.0) (2026-03-06)
+
+
+### Features
+
+* **agents:** add Cline, Roo Code, OpenCode, Kiro, and Amp Code session discovery ([ee310a4](https://github.com/TeamCadenceAI/cadence-cli/commit/ee310a4bf2ff196dd93e4190d697b37d53993f9a))
+* **agents:** add Windows API discovery for windsurf and antigravity ([f56f315](https://github.com/TeamCadenceAI/cadence-cli/commit/f56f315ff4662687c2e9e8b8408ff67e623d7912))
+* **agents:** add windsurf API session ingestion and backfill attachment support ([79e8282](https://github.com/TeamCadenceAI/cadence-cli/commit/79e8282d600e6853f2ba97f0ab4361d568f3d595))
+* **api:** send CLI version header on Cadence requests ([0b1cc24](https://github.com/TeamCadenceAI/cadence-cli/commit/0b1cc24a26f4cddb5aad48b3bee2ff2f0342ba3a))
+* Cline, RooCode, OpenCode, Kiro and Amp Code ([9902d5d](https://github.com/TeamCadenceAI/cadence-cli/commit/9902d5d1856f4aca53eeb287b572f90cf5ca89ce))
+* Windsurf support ([df4b338](https://github.com/TeamCadenceAI/cadence-cli/commit/df4b3383079305fa32bb4c2b3e5f6d41c5b9310c))
+
+
+### Bug Fixes
+
+* Add CLI version header + defer sync improvements ([0e5d1ad](https://github.com/TeamCadenceAI/cadence-cli/commit/0e5d1adab2d1fce722c2257d221ed6673da7b7b5))
+* **agents:** harden windsurf and antigravity API discovery ([f1900c7](https://github.com/TeamCadenceAI/cadence-cli/commit/f1900c754de561e0fc0ae1f8d75321d2693a30df))
+* **agents:** isolate app config paths from host env in rooted discovery ([45cce55](https://github.com/TeamCadenceAI/cadence-cli/commit/45cce558166508e70c1445845f97c3c8b9fb9542))
+* **opencode:** use file mtime fallback for untimestamped sessions ([e367c9b](https://github.com/TeamCadenceAI/cadence-cli/commit/e367c9bf508216d053383d00da0ed1e638f0f4db))
+* **scanner:** harden agent/cwd discovery and dedupe dir scans ([4048d23](https://github.com/TeamCadenceAI/cadence-cli/commit/4048d2331dfd2c646a575e1a3594949b82d48eb0))
+* **sync:** bound deferred ingest to runnable pending jobs ([956b670](https://github.com/TeamCadenceAI/cadence-cli/commit/956b670a8a18e8dcf30fc626126f66bfe9432569))
+* **sync:** set deferred sync timeout to 120 seconds ([22b98b3](https://github.com/TeamCadenceAI/cadence-cli/commit/22b98b33aea57dd153915e5f0aa1e8f0c22195ab))
+* **windsurf:** preserve cached API logs and classify non-macOS paths ([a5d544a](https://github.com/TeamCadenceAI/cadence-cli/commit/a5d544a5ab5d58e5e132ed19138bd645c40ebca0))
+
 ## [1.0.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v0.10.0...v1.0.0) (2026-03-04)
 
 
