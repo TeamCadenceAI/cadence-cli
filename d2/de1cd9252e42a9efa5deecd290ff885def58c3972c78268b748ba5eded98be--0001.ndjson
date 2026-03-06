@@ -156,3 +156,4 @@
 {"session_uid":"493d28d4271f0e50146143833820792bbc7ccc71e3bacf155e1823b410b01da6","session_blob_sha":"64d22d2488179b373fe5e5478743aa794dad47f5","session_start":1771021675,"agent":"claude-code","ingested_at":"2026-02-13T22:27:55Z"}
 {"session_uid":"4079a7e51e428eff9dd32e5340d5badc77c94148df1533cb36cd5db37570540f","session_blob_sha":"6af36b6e1d3969c6a85242e983622b9fe835baa8","session_start":1771379629,"agent":"claude-code","ingested_at":"2026-02-18T01:53:49Z"}
 {"session_uid":"120771042fe03ed984dc3c1ab1072793889ca636bd6ec831f1df2638a48d5560","session_blob_sha":"4567bbbde0f2acd4827a8162633d70b213ae3ae8","session_start":1771026821,"agent":"claude-code","ingested_at":"2026-02-13T23:53:41Z"}
+{"session_uid":"bd8d92fd55830c1ed6c125956fa277e8362ec0979ae64f44aeca2f0e2245d6f2","session_blob_sha":"cbf98c183969de8481dffd4548408f6c8f6d97ca","session_start":1771003410,"agent":"claude-code","ingested_at":"2026-02-13T17:23:30Z"}
