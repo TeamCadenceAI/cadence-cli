@@ -1,6 +1,6 @@
 //! Push decision and sync logic for canonical session refs.
 
-use crate::{git, output};
+use crate::git;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -26,37 +26,8 @@ pub async fn should_push_remote(remote: &str) -> bool {
     check_org_filter_remote(remote).await
 }
 
-#[allow(dead_code)]
-pub async fn attempt_push_remote_at(repo: &Path, remote: &str) {
-    attempt_push_remote_at_with_options(repo, remote, true).await;
-}
-
-pub async fn attempt_push_remote_at_quiet(repo: &Path, remote: &str) {
-    attempt_push_remote_at_with_options(repo, remote, false).await;
-}
-
 pub async fn try_push_remote_at_quiet(repo: &Path, remote: &str) -> Result<()> {
     sync_session_refs_for_remote_at(repo, remote).await
-}
-
-async fn attempt_push_remote_at_with_options(repo: &Path, remote: &str, show_progress: bool) {
-    let result = sync_session_refs_for_remote_at(repo, remote).await;
-
-    if let Err(e) = result {
-        if show_progress {
-            output::note(&format!(
-                "Could not sync session refs with {}: {}",
-                remote, e
-            ));
-        } else if output::is_verbose() {
-            output::detail(&format!(
-                "Could not sync session refs with {}: {}",
-                remote, e
-            ));
-        }
-    } else if show_progress && output::is_verbose() {
-        output::detail(&format!("Synced session refs with {}", remote));
-    }
 }
 
 pub async fn sync_session_refs_for_remote_at(repo: &Path, remote: &str) -> Result<()> {
