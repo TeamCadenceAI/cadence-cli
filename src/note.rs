@@ -75,6 +75,10 @@ pub struct SessionRecord {
     pub branch_key: String,
     pub committer_key_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_user_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_user_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_start: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_end: Option<i64>,
@@ -85,8 +89,6 @@ pub struct SessionRecord {
     pub time_window: Option<TimeWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub touched_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_signals: Option<MatchSignals>,
     pub ingested_at: String,
@@ -176,6 +178,8 @@ mod tests {
             repo_remote_url: None,
             branch_key: "main".to_string(),
             committer_key_hash: "committer-hash".to_string(),
+            git_user_email: Some("dev@example.com".to_string()),
+            git_user_name: Some("Dev Name".to_string()),
             session_start: Some(1_700_000_000),
             session_end: Some(1_700_000_100),
             content_sha256: "content-sha".to_string(),
@@ -185,7 +189,6 @@ mod tests {
                 end: 1_700_000_100,
             }),
             cwd: Some("/tmp/repo".to_string()),
-            touched_paths: vec!["src/main.rs".to_string()],
             match_signals: Some(MatchSignals {
                 confidence: "scored_match".to_string(),
                 score: Some(0.9),

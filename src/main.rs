@@ -1337,7 +1337,6 @@ async fn ingest_session_from_log(
     let ingested_at = session_start
         .and_then(format_unix_rfc3339)
         .unwrap_or_else(note::now_rfc3339);
-    let touched_paths = Vec::new();
     let mut branch_keys: Vec<String> = explicit_branch_keys
         .map(|keys| keys.to_vec())
         .unwrap_or_default();
@@ -1351,6 +1350,14 @@ async fn ingest_session_from_log(
         .cloned()
         .unwrap_or_else(|| "detached/unknown".to_string());
     let committer_key_hash = committer_key_hash_for_repo(&repo_path).await;
+    let git_user_email = git::config_get_at(&repo_path, "user.email")
+        .await
+        .ok()
+        .flatten();
+    let git_user_name = git::config_get_at(&repo_path, "user.name")
+        .await
+        .ok()
+        .flatten();
     let repo_remote_url = match git::resolve_push_remote_at(&repo_path).await {
         Ok(Some(remote)) => git::remote_url_at(&repo_path, &remote).await.ok().flatten(),
         _ => None,
@@ -1364,13 +1371,14 @@ async fn ingest_session_from_log(
         repo_remote_url,
         branch_key: branch_key.clone(),
         committer_key_hash: committer_key_hash.clone(),
+        git_user_email,
+        git_user_name,
         session_start,
         session_end: session_start,
         content_sha256,
         observed_commits,
         time_window: session_start.map(|start| note::TimeWindow { start, end: start }),
         cwd: Some(repo_str.to_string()),
-        touched_paths,
         match_signals: Some(note::MatchSignals {
             confidence: confidence.to_string(),
             score: match_score,
