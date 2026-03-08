@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.2.0...v1.3.0) (2026-03-08)
+
+
+### Features
+
+* **sync:** notify Cadence API after deferred session-ref push ([1e0e74f](https://github.com/TeamCadenceAI/cadence-cli/commit/1e0e74f4d7f71aef5c4accf4bd82bc17af4a4adc))
+* **sync:** notify session-ref pushes and require auth for server hook ([b035681](https://github.com/TeamCadenceAI/cadence-cli/commit/b035681359b47bdacdae3018a876574e2a7218a3))
+
+
+### Bug Fixes
+
+* **sync:** require auth token for session-ref push notification ([cc2250c](https://github.com/TeamCadenceAI/cadence-cli/commit/cc2250cdbb29f29ebc36b920dc1a887c98259591))
+
 ## [1.2.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.1.1...v1.2.0) (2026-03-07)
 
 
