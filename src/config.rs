@@ -15,8 +15,11 @@ use std::time::Duration;
 /// Hardcoded default API URL for the AI Barometer service.
 pub const DEFAULT_API_URL: &str = "https://dash.teamcadence.ai";
 
-/// Environment variable name for overriding the API URL.
-const API_URL_ENV_VAR: &str = "AI_BAROMETER_API_URL";
+/// Primary environment variable name for overriding the API URL.
+const API_URL_ENV_VAR: &str = "CADENCE_API_URL";
+
+/// Legacy environment variable name kept for backward compatibility.
+const LEGACY_API_URL_ENV_VAR: &str = "AI_BAROMETER_API_URL";
 
 /// Primary config root directory under `$HOME/`.
 const CONFIG_ROOT_DIR_NAME: &str = ".cadence";
@@ -171,7 +174,8 @@ impl CliConfig {
     ///
     /// Priority (highest wins):
     /// 1. `cli_override` — the `--api-url` CLI flag value for this invocation
-    /// 2. `AI_BAROMETER_API_URL` environment variable
+    /// 2. `CADENCE_API_URL` environment variable
+    ///    (falls back to legacy `AI_BAROMETER_API_URL`)
     /// 3. `api_url` field from the persisted config file
     /// 4. Hardcoded default: `https://dash.teamcadence.ai`
     ///
@@ -181,7 +185,10 @@ impl CliConfig {
     /// Returns a [`ResolvedApiUrl`] containing the resolved URL and a flag
     /// indicating whether the URL is non-HTTPS (callers should print a warning).
     pub fn resolve_api_url(&self, cli_override: Option<&str>) -> ResolvedApiUrl {
-        self.resolve_api_url_with_env(cli_override, std::env::var(API_URL_ENV_VAR).ok())
+        let env_value = std::env::var(API_URL_ENV_VAR)
+            .ok()
+            .or_else(|| std::env::var(LEGACY_API_URL_ENV_VAR).ok());
+        self.resolve_api_url_with_env(cli_override, env_value)
     }
 
     /// Internal resolver that accepts the env var value as a parameter for testability.
@@ -987,12 +994,15 @@ mod tests {
     #[serial]
     async fn test_resolve_api_url_reads_real_env_var() {
         let guard = EnvGuard::new(API_URL_ENV_VAR);
+        let legacy_guard = EnvGuard::new(LEGACY_API_URL_ENV_VAR);
+        legacy_guard.remove();
         guard.set("https://from-env.example.com");
 
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url(None);
         assert_eq!(resolved.url, "https://from-env.example.com");
 
+        drop(legacy_guard);
         drop(guard);
     }
 
@@ -1000,12 +1010,47 @@ mod tests {
     #[serial]
     async fn test_resolve_api_url_env_var_absent_uses_default() {
         let guard = EnvGuard::new(API_URL_ENV_VAR);
+        let legacy_guard = EnvGuard::new(LEGACY_API_URL_ENV_VAR);
         guard.remove();
+        legacy_guard.remove();
 
         let cfg = CliConfig::default();
         let resolved = cfg.resolve_api_url(None);
         assert_eq!(resolved.url, DEFAULT_API_URL);
 
+        drop(legacy_guard);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_api_url_uses_legacy_env_var_when_primary_absent() {
+        let guard = EnvGuard::new(API_URL_ENV_VAR);
+        let legacy_guard = EnvGuard::new(LEGACY_API_URL_ENV_VAR);
+        guard.remove();
+        legacy_guard.set("https://legacy-env.example.com");
+
+        let cfg = CliConfig::default();
+        let resolved = cfg.resolve_api_url(None);
+        assert_eq!(resolved.url, "https://legacy-env.example.com");
+
+        drop(legacy_guard);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_api_url_primary_env_var_overrides_legacy_env_var() {
+        let guard = EnvGuard::new(API_URL_ENV_VAR);
+        let legacy_guard = EnvGuard::new(LEGACY_API_URL_ENV_VAR);
+        guard.set("https://primary-env.example.com");
+        legacy_guard.set("https://legacy-env.example.com");
+
+        let cfg = CliConfig::default();
+        let resolved = cfg.resolve_api_url(None);
+        assert_eq!(resolved.url, "https://primary-env.example.com");
+
+        drop(legacy_guard);
         drop(guard);
     }
 

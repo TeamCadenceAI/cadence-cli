@@ -19,12 +19,20 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::{agents, git, push};
+use crate::{agents, config, git, push};
 
 const DEFAULT_LOCK_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_LOG_RETENTION_DAYS: i64 = 7;
 const DEFAULT_SYNC_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_TIME_BUDGET_MS: u64 = 8_000;
+const SESSION_REF_PUSH_NOTIFY_PATH: &str = "/api/hooks/session-ref-push";
+const SESSION_REF_PUSH_NOTIFY_TIMEOUT_SECS: u64 = 5;
+const CADENCE_CLI_TOKEN_ENV_VAR: &str = "CADENCE_CLI_TOKEN";
+const SESSION_REFS_PUSHED: [&str; 3] = [
+    git::SESSION_DATA_REF,
+    git::SESSION_INDEX_BRANCH_REF,
+    git::SESSION_INDEX_COMMITTER_REF,
+];
 const REF_SYNC_JOB_CONCURRENCY: usize = 4;
 static SYNC_TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
@@ -75,6 +83,12 @@ struct SyncLockRecord {
 #[derive(Debug)]
 struct SyncLockGuard {
     path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionRefPushNotification<'a> {
+    repo_full_name: &'a str,
+    refs_pushed: &'a [&'a str],
 }
 
 impl Drop for SyncLockGuard {
@@ -326,6 +340,7 @@ async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
                 "sync worker finished successfully"
             );
             clear_pending_record(&job.repo_root, &job.remote).await?;
+            notify_session_ref_push_after_sync(&repo_path, &job.remote).await;
         }
         Ok(Err(e)) => {
             warn!(
@@ -347,6 +362,127 @@ async fn run_one_pending_job(job: PendingSyncRecord) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn notify_session_ref_push_after_sync(repo_path: &Path, remote: &str) {
+    if let Err(err) = notify_session_ref_push(repo_path, remote).await {
+        warn!(
+            repo = %repo_path.display(),
+            remote = %remote,
+            error = %err,
+            "session ref push notification failed; relying on catchup scheduler"
+        );
+    }
+}
+
+async fn notify_session_ref_push(repo_path: &Path, remote: &str) -> Result<()> {
+    let remote_url = git::remote_url_at(repo_path, remote)
+        .await
+        .with_context(|| format!("resolve remote URL for '{}'", remote))?
+        .ok_or_else(|| anyhow::anyhow!("remote '{}' has no URL", remote))?;
+
+    let repo_full_name = parse_repo_full_name_from_remote_url(&remote_url)
+        .ok_or_else(|| anyhow::anyhow!("derive repo_full_name from remote URL '{}'", remote_url))?;
+
+    let cfg = match config::CliConfig::load().await {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to load CLI config for session ref push notification; using defaults"
+            );
+            config::CliConfig::default()
+        }
+    };
+    let api_url = cfg.resolve_api_url(None).url;
+    let endpoint = format!(
+        "{}{}",
+        api_url.trim_end_matches('/'),
+        SESSION_REF_PUSH_NOTIFY_PATH
+    );
+
+    let payload = SessionRefPushNotification {
+        repo_full_name: &repo_full_name,
+        refs_pushed: &SESSION_REFS_PUSHED,
+    };
+
+    let mut req = reqwest::Client::new()
+        .post(&endpoint)
+        .timeout(Duration::from_secs(SESSION_REF_PUSH_NOTIFY_TIMEOUT_SECS))
+        .json(&payload);
+    if let Some(token) = resolve_cli_notification_token() {
+        req = req.bearer_auth(token);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("post session ref push notification to {}", endpoint))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "session ref push notification endpoint returned {}: {}",
+            status,
+            body.trim()
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_cli_notification_token() -> Option<String> {
+    non_empty_trimmed(std::env::var(CADENCE_CLI_TOKEN_ENV_VAR).ok())
+}
+
+fn parse_repo_full_name_from_remote_url(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(url) = reqwest::Url::parse(trimmed)
+        && let Some(full_name) = repo_full_name_from_path(url.path())
+    {
+        return Some(full_name);
+    }
+
+    if let Some((_, path)) = trimmed.split_once(':')
+        && let Some(full_name) = repo_full_name_from_path(path)
+    {
+        return Some(full_name);
+    }
+
+    repo_full_name_from_path(trimmed)
+}
+
+fn repo_full_name_from_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let owner = parts[parts.len() - 2];
+    let repo_raw = parts[parts.len() - 1];
+    let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
 fn pending_key(repo_root: &str, remote: &str) -> String {
@@ -827,8 +963,11 @@ async fn log_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     #[test]
     fn pending_key_is_stable() {
@@ -883,6 +1022,9 @@ mod tests {
         userprofile: Option<String>,
         homedrive: Option<String>,
         homepath: Option<String>,
+        cadence_api_url: Option<String>,
+        legacy_api_url: Option<String>,
+        cadence_cli_token: Option<String>,
     }
 
     impl EnvBackup {
@@ -892,6 +1034,9 @@ mod tests {
                 userprofile: std::env::var("USERPROFILE").ok(),
                 homedrive: std::env::var("HOMEDRIVE").ok(),
                 homepath: std::env::var("HOMEPATH").ok(),
+                cadence_api_url: std::env::var("CADENCE_API_URL").ok(),
+                legacy_api_url: std::env::var("AI_BAROMETER_API_URL").ok(),
+                cadence_cli_token: std::env::var("CADENCE_CLI_TOKEN").ok(),
             }
         }
 
@@ -912,6 +1057,218 @@ mod tests {
                 Some(v) => unsafe { std::env::set_var("HOMEPATH", v) },
                 None => unsafe { std::env::remove_var("HOMEPATH") },
             }
+            match self.cadence_api_url {
+                Some(v) => unsafe { std::env::set_var("CADENCE_API_URL", v) },
+                None => unsafe { std::env::remove_var("CADENCE_API_URL") },
+            }
+            match self.legacy_api_url {
+                Some(v) => unsafe { std::env::set_var("AI_BAROMETER_API_URL", v) },
+                None => unsafe { std::env::remove_var("AI_BAROMETER_API_URL") },
+            }
+            match self.cadence_cli_token {
+                Some(v) => unsafe { std::env::set_var("CADENCE_CLI_TOKEN", v) },
+                None => unsafe { std::env::remove_var("CADENCE_CLI_TOKEN") },
+            }
+        }
+    }
+
+    async fn run_git(repo: &Path, args: &[&str]) -> String {
+        let out = crate::git::run_git_output_at(Some(repo), args, &[])
+            .await
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
+    }
+
+    async fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        run_git(dir.path(), &["init", "-q"]).await;
+        run_git(dir.path(), &["config", "user.name", "Test User"]).await;
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]).await;
+        tokio::fs::write(dir.path().join("README.md"), "hello")
+            .await
+            .expect("write");
+        run_git(dir.path(), &["add", "README.md"]).await;
+        run_git(dir.path(), &["commit", "-m", "init"]).await;
+        dir
+    }
+
+    async fn init_repo_with_file_remote(
+        owner: &str,
+        repo_name: &str,
+    ) -> (TempDir, TempDir, PathBuf) {
+        let local = init_repo().await;
+        let remote_root = TempDir::new().expect("remote tempdir");
+        let bare_repo = remote_root
+            .path()
+            .join(owner)
+            .join(format!("{repo_name}.git"));
+        tokio::fs::create_dir_all(
+            bare_repo
+                .parent()
+                .expect("bare repo path should have parent directory"),
+        )
+        .await
+        .expect("create bare remote parent");
+        run_git(
+            remote_root.path(),
+            &["init", "--bare", "-q", &bare_repo.to_string_lossy()],
+        )
+        .await;
+        let remote_url = reqwest::Url::from_file_path(&bare_repo)
+            .expect("file URL")
+            .to_string();
+        run_git(local.path(), &["remote", "add", "origin", &remote_url]).await;
+        (local, remote_root, bare_repo)
+    }
+
+    async fn write_session_data_ref(repo: &Path) {
+        let blob = git::store_blob_at(Some(repo), br#"{"session_uid":"sync-test"}"#)
+            .await
+            .expect("store blob");
+        let tree = git::mktree_at(Some(repo), &[format!("100644 blob {blob}\tsession.json")])
+            .await
+            .expect("build tree");
+        let commit = git::commit_tree_at(Some(repo), &tree, "sync test ref", None)
+            .await
+            .expect("commit tree");
+        git::update_ref_at(Some(repo), git::SESSION_DATA_REF, &commit)
+            .await
+            .expect("update data ref");
+    }
+
+    fn make_pending_job(repo: &Path, remote: &str) -> PendingSyncRecord {
+        PendingSyncRecord {
+            repo_root: repo.to_string_lossy().to_string(),
+            remote: remote.to_string(),
+            enqueued_at: crate::note::now_rfc3339(),
+            updated_at: crate::note::now_rfc3339(),
+            attempt_count: 0,
+            next_attempt_at_epoch: now_epoch(),
+            last_error: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturedHttpRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body: String,
+    }
+
+    async fn spawn_single_request_server(
+        status_code: u16,
+    ) -> (String, oneshot::Receiver<CapturedHttpRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = oneshot::channel::<CapturedHttpRequest>();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept connection");
+            let raw_request = read_http_request_bytes(&mut stream).await;
+            let captured = parse_http_request(&raw_request);
+            let _ = tx.send(captured);
+
+            let status_text = if status_code == 200 {
+                "OK"
+            } else {
+                "Internal Server Error"
+            };
+            let body = if status_code == 200 {
+                r#"{"status":"accepted"}"#
+            } else {
+                r#"{"error":"test-failure"}"#
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        (format!("http://{}", addr), rx)
+    }
+
+    async fn read_http_request_bytes(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let mut expected_len: Option<usize> = None;
+
+        loop {
+            let n = stream.read(&mut chunk).await.expect("read request");
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+
+            if expected_len.is_none()
+                && let Some(header_end) = find_header_end(&bytes)
+            {
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(header_end + content_length);
+            }
+
+            if let Some(target_len) = expected_len
+                && bytes.len() >= target_len
+            {
+                break;
+            }
+        }
+
+        bytes
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|idx| idx + 4)
+    }
+
+    fn parse_http_request(raw: &[u8]) -> CapturedHttpRequest {
+        let text = String::from_utf8_lossy(raw);
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or_default().to_string();
+        let path = request_parts.next().unwrap_or_default().to_string();
+        let mut authorization = None;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("authorization")
+            {
+                authorization = Some(value.trim().to_string());
+            }
+        }
+        CapturedHttpRequest {
+            method,
+            path,
+            authorization,
+            body: body.to_string(),
         }
     }
 
@@ -1010,6 +1367,103 @@ mod tests {
             jobs_from_public[0].repo_root,
             PathBuf::from("/tmp/a-repo").to_string_lossy()
         );
+
+        backup.restore();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_one_pending_job_success_notifies_session_ref_push_endpoint() {
+        let env_tmp = TempDir::new().unwrap();
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::set_var("HOME", env_tmp.path());
+            std::env::remove_var("AI_BAROMETER_API_URL");
+            std::env::set_var("CADENCE_CLI_TOKEN", "notify-token");
+        }
+
+        let (local, _remote_root, remote_bare) =
+            init_repo_with_file_remote("example-org", "example-repo").await;
+        write_session_data_ref(local.path()).await;
+        enqueue_pending_sync(local.path(), "origin")
+            .await
+            .expect("enqueue pending sync");
+
+        let (api_url, req_rx) = spawn_single_request_server(200).await;
+        unsafe {
+            std::env::set_var("CADENCE_API_URL", api_url);
+        }
+
+        let job = make_pending_job(local.path(), "origin");
+        run_one_pending_job(job)
+            .await
+            .expect("sync worker should succeed");
+
+        let captured = tokio::time::timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("notification request timeout")
+            .expect("notification request capture");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/hooks/session-ref-push");
+        assert_eq!(
+            captured.authorization.as_deref(),
+            Some("Bearer notify-token")
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&captured.body).expect("parse request body");
+        assert_eq!(payload["repo_full_name"], "example-org/example-repo");
+        assert_eq!(
+            payload["refs_pushed"],
+            serde_json::json!([
+                git::SESSION_DATA_REF,
+                git::SESSION_INDEX_BRANCH_REF,
+                git::SESSION_INDEX_COMMITTER_REF
+            ])
+        );
+
+        let remote_tip = git::rev_parse_at(Some(&remote_bare), git::SESSION_DATA_REF)
+            .await
+            .expect("remote ref should be pushed");
+        assert!(!remote_tip.is_empty());
+
+        backup.restore();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_one_pending_job_notification_failure_does_not_fail_sync() {
+        let env_tmp = TempDir::new().unwrap();
+        let backup = EnvBackup::capture();
+        unsafe {
+            std::env::set_var("HOME", env_tmp.path());
+            std::env::remove_var("AI_BAROMETER_API_URL");
+            std::env::remove_var("CADENCE_CLI_TOKEN");
+        }
+
+        let (local, _remote_root, remote_bare) =
+            init_repo_with_file_remote("example-org", "notify-failure").await;
+        write_session_data_ref(local.path()).await;
+
+        let (api_url, req_rx) = spawn_single_request_server(500).await;
+        unsafe {
+            std::env::set_var("CADENCE_API_URL", api_url);
+        }
+
+        let job = make_pending_job(local.path(), "origin");
+        run_one_pending_job(job)
+            .await
+            .expect("sync should succeed even if notification endpoint fails");
+
+        let _captured = tokio::time::timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("notification request timeout")
+            .expect("notification request capture");
+
+        let remote_tip = git::rev_parse_at(Some(&remote_bare), git::SESSION_DATA_REF)
+            .await
+            .expect("remote ref should still be pushed");
+        assert!(!remote_tip.is_empty());
 
         backup.restore();
     }
