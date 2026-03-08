@@ -183,7 +183,7 @@ mod tests {
             session_start: Some(1_700_000_000),
             session_end: Some(1_700_000_100),
             content_sha256: "content-sha".to_string(),
-            observed_commits: vec!["abc123".to_string()],
+            observed_commits: Vec::new(),
             time_window: Some(TimeWindow {
                 start: 1_700_000_000,
                 end: 1_700_000_100,

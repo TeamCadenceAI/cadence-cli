@@ -921,38 +921,6 @@ pub(crate) async fn local_branches_at(repo: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Return local branches that contain the given commit.
-pub(crate) async fn branches_containing_commit_at(
-    repo: &Path,
-    commit: &str,
-) -> Result<Vec<String>> {
-    let output = run_git_output_at(
-        Some(repo),
-        &[
-            "for-each-ref",
-            "--contains",
-            commit,
-            "--format=%(refname:short)",
-            "refs/heads",
-        ],
-        &[],
-    )
-    .await
-    .context("failed to execute git for-each-ref --contains")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git for-each-ref --contains failed: {}", stderr.trim());
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .context("git for-each-ref --contains output was not valid UTF-8")?;
-    Ok(stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
 /// Push the AI-session notes ref to the provided remote.
 ///
 /// Note: Production push paths now use inline force-with-lease pushes

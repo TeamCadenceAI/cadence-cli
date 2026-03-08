@@ -1117,43 +1117,6 @@ async fn branch_key_for_repo(repo: &std::path::Path) -> String {
     format!("{remote}/{branch}")
 }
 
-async fn branch_keys_for_repo_and_commits(
-    repo: &std::path::Path,
-    commits: &[String],
-) -> Vec<String> {
-    let remote = git::resolve_push_remote_at(repo)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "origin".to_string());
-    let mut branch_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    for commit in commits {
-        if let Ok(branches) = git::branches_containing_commit_at(repo, commit).await {
-            for branch in branches {
-                if !branch.is_empty() {
-                    branch_names.insert(branch);
-                }
-            }
-        }
-    }
-
-    if branch_names.is_empty()
-        && let Ok(Some(current)) = git::current_branch_at(repo).await
-    {
-        branch_names.insert(current);
-    }
-
-    if branch_names.is_empty() {
-        branch_names.insert("detached/unknown".to_string());
-    }
-
-    branch_names
-        .into_iter()
-        .map(|branch| format!("{remote}/{branch}"))
-        .collect()
-}
-
 fn hook_discovery_concurrency() -> usize {
     std::env::var("CADENCE_HOOK_DISCOVERY_CONCURRENCY")
         .ok()
@@ -1170,7 +1133,6 @@ struct ParsedSessionLog {
     log: agents::SessionLog,
     metadata: scanner::SessionMetadata,
     session_start: Option<i64>,
-    observed_commits: Vec<String>,
     session_log: String,
 }
 
@@ -1203,12 +1165,10 @@ async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSession
     let mut metadata = scanner::parse_session_metadata_str(&session_log);
     metadata.agent_type = Some(log.agent_type.clone());
     let session_start = scanner::session_time_range_str(&session_log).map(|(start, _)| start);
-    let observed_commits = scanner::extract_commit_hashes_str(&session_log);
     Some(ParsedSessionLog {
         log,
         metadata,
         session_start,
-        observed_commits,
         session_log,
     })
 }
@@ -1236,55 +1196,6 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     out
 }
 
-async fn branch_keys_for_repo_and_commits_cached(
-    repo: &std::path::Path,
-    commits: &[String],
-    branches_cache: &mut std::collections::HashMap<String, Vec<String>>,
-    remote_hint: Option<&str>,
-    current_branch_hint: Option<&str>,
-) -> Vec<String> {
-    let remote = remote_hint
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "origin".to_string());
-    let mut branch_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    for commit in commits {
-        if let Some(cached) = branches_cache.get(commit) {
-            for branch in cached {
-                if !branch.is_empty() {
-                    branch_names.insert(branch.clone());
-                }
-            }
-            continue;
-        }
-
-        let branches = git::branches_containing_commit_at(repo, commit)
-            .await
-            .unwrap_or_default();
-        branches_cache.insert(commit.clone(), branches.clone());
-        for branch in branches {
-            if !branch.is_empty() {
-                branch_names.insert(branch);
-            }
-        }
-    }
-
-    if branch_names.is_empty()
-        && let Some(current) = current_branch_hint
-    {
-        branch_names.insert(current.to_string());
-    }
-
-    if branch_names.is_empty() {
-        branch_names.insert("detached/unknown".to_string());
-    }
-
-    branch_names
-        .into_iter()
-        .map(|branch| format!("{remote}/{branch}"))
-        .collect()
-}
-
 async fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
     let email = git::config_get_at(repo, "user.email")
         .await
@@ -1294,24 +1205,11 @@ async fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
     note::hash_key(email.trim().to_ascii_lowercase().as_str())
 }
 
-fn normalize_observed_commits(commits: Option<&[String]>) -> Vec<String> {
-    let mut out: Vec<String> = commits
-        .unwrap_or_default()
-        .iter()
-        .map(|c| c.trim().to_ascii_lowercase())
-        .filter(|c| c.len() >= 7 && c.len() <= 40 && c.bytes().all(|b| b.is_ascii_hexdigit()))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn ingest_session_from_log(
     agent_type: &scanner::AgentType,
     session_id: &str,
     repo_str: &str,
-    observed_commits: Option<&[String]>,
     session_log: &str,
     confidence: note::Confidence,
     method: &EncryptionMethod,
@@ -1333,7 +1231,6 @@ async fn ingest_session_from_log(
         session_start,
         &content_sha256,
     );
-    let observed_commits = normalize_observed_commits(observed_commits);
     let ingested_at = session_start
         .and_then(format_unix_rfc3339)
         .unwrap_or_else(note::now_rfc3339);
@@ -1376,7 +1273,7 @@ async fn ingest_session_from_log(
         session_start,
         session_end: session_start,
         content_sha256,
-        observed_commits,
+        observed_commits: Vec::new(),
         time_window: session_start.map(|start| note::TimeWindow { start, end: start }),
         cwd: Some(repo_str.to_string()),
         match_signals: Some(note::MatchSignals {
@@ -1452,19 +1349,7 @@ async fn ingest_recent_sessions_for_repo(
         .as_secs() as i64;
     let files = agents::discover_recent_sessions(now, since_secs).await;
     let parsed_logs = parse_session_logs_bounded(files).await;
-    let remote_hint = git::resolve_push_remote_at(repo_root)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "origin".to_string());
-    let current_branch_hint = git::current_branch_at(repo_root)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "detached/unknown".to_string());
     let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
-        std::collections::HashMap::new();
-    let mut branches_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut ingested = 0usize;
 
@@ -1497,15 +1382,6 @@ async fn ingest_recent_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let observed_commits = parsed.observed_commits.clone();
-        let explicit_branch_keys = branch_keys_for_repo_and_commits_cached(
-            repo_root,
-            &observed_commits,
-            &mut branches_cache,
-            Some(remote_hint.as_str()),
-            Some(current_branch_hint.as_str()),
-        )
-        .await;
         let match_reasons = if parsed.log.match_reasons.is_empty() {
             None
         } else {
@@ -1516,7 +1392,6 @@ async fn ingest_recent_sessions_for_repo(
             &agent,
             &session_id,
             repo_root_str,
-            Some(&observed_commits),
             &parsed.session_log,
             note::Confidence::ScoredMatch,
             method,
@@ -1524,7 +1399,7 @@ async fn ingest_recent_sessions_for_repo(
             None,
             match_reasons,
             Some(repo_root),
-            Some(&explicit_branch_keys),
+            None,
         )
         .await?;
         ingested += 1;
@@ -1554,15 +1429,6 @@ async fn session_log_time_range(log: &agents::SessionLog) -> Option<(i64, i64)> 
     match &log.source {
         agents::SessionSource::File(path) => scanner::session_time_range(path).await,
         agents::SessionSource::Inline { content, .. } => scanner::session_time_range_str(content),
-    }
-}
-
-async fn session_log_commit_hashes(log: &agents::SessionLog) -> Vec<String> {
-    match &log.source {
-        agents::SessionSource::File(path) => scanner::extract_commit_hashes(path).await,
-        agents::SessionSource::Inline { content, .. } => {
-            scanner::extract_commit_hashes_str(content)
-        }
     }
 }
 
@@ -1640,14 +1506,7 @@ async fn ingest_incremental_sessions_for_repo(
         candidates.push(log);
     }
     let parsed_logs = parse_session_logs_bounded(candidates).await;
-    let current_branch_hint = git::current_branch_at(repo_root)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "detached/unknown".to_string());
     let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
-        std::collections::HashMap::new();
-    let mut branches_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
     for parsed in parsed_logs {
@@ -1698,15 +1557,6 @@ async fn ingest_incremental_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let observed_commits = parsed.observed_commits.clone();
-        let explicit_branch_keys = branch_keys_for_repo_and_commits_cached(
-            repo_root,
-            &observed_commits,
-            &mut branches_cache,
-            Some(remote.as_str()),
-            Some(current_branch_hint.as_str()),
-        )
-        .await;
         let match_reasons = if parsed.log.match_reasons.is_empty() {
             None
         } else {
@@ -1717,7 +1567,6 @@ async fn ingest_incremental_sessions_for_repo(
             &agent,
             &session_id,
             repo_root_str,
-            Some(&observed_commits),
             &parsed.session_log,
             note::Confidence::ScoredMatch,
             method,
@@ -1725,7 +1574,7 @@ async fn ingest_incremental_sessions_for_repo(
             None,
             match_reasons,
             Some(repo_root),
-            Some(&explicit_branch_keys),
+            None,
         )
         .await
         {
@@ -1819,7 +1668,6 @@ struct SessionInfo {
     session_id: String,
     repo_root: std::path::PathBuf,
     metadata: scanner::SessionMetadata,
-    commit_hashes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -1829,7 +1677,6 @@ struct RepoBackfillStats {
     skipped: usize,
     errors: usize,
     fallback_attached: usize,
-    commits_found: usize,
 }
 
 fn repo_label_from_display(display: &str) -> String {
@@ -1890,17 +1737,7 @@ async fn process_repo_backfill(
     backfill_logger: backfill_log::BackfillLogger,
 ) -> RepoBackfillStats {
     let mut stats = RepoBackfillStats::default();
-    let planned_units: u64 = sessions
-        .iter()
-        .map(|s| {
-            if s.commit_hashes.is_empty() {
-                1_u64
-            } else {
-                s.commit_hashes.len() as u64
-            }
-        })
-        .sum::<u64>()
-        .max(1);
+    let planned_units: u64 = (sessions.len() as u64).max(1);
     if let Some(pb) = &repo_progress {
         pb.set_length(planned_units);
         pb.set_message("starting");
@@ -2028,8 +1865,6 @@ async fn process_repo_backfill(
 
     for session in sessions {
         stats.sessions_seen += 1;
-        let commit_hashes = session.commit_hashes.clone();
-        stats.commits_found += commit_hashes.len();
         let session_file = session.log.source_label();
         let agent_type = session
             .metadata
@@ -2044,7 +1879,6 @@ async fn process_repo_backfill(
                 "session_id": session.session_id.as_str(),
                 "file": session_file,
                 "agent": agent_type.to_string(),
-                "observed_commits": commit_hashes.len(),
             }),
         );
 
@@ -2074,13 +1908,10 @@ async fn process_repo_backfill(
             .await
             .map(|(start, _)| start);
 
-        let branch_keys =
-            branch_keys_for_repo_and_commits(&session.repo_root, &commit_hashes).await;
         match ingest_session_from_log(
             &agent_type,
             &session.session_id,
             &repo_str,
-            Some(&commit_hashes),
             &session_log,
             note::Confidence::ScoredMatch,
             &encryption_method,
@@ -2092,7 +1923,7 @@ async fn process_repo_backfill(
                 Some(session.log.match_reasons.as_slice())
             },
             Some(&session.repo_root),
-            Some(&branch_keys),
+            None,
         )
         .await
         {
@@ -2167,8 +1998,8 @@ async fn process_repo_backfill(
 
     if let Some(pb) = &repo_progress {
         pb.finish_with_message(format!(
-            "done: sessions={}, commits={}, uploaded={}, skipped={}, issues={}",
-            stats.sessions_seen, stats.commits_found, stats.attached, stats.skipped, stats.errors
+            "done: sessions={}, uploaded={}, skipped={}, issues={}",
+            stats.sessions_seen, stats.attached, stats.skipped, stats.errors
         ));
     }
 
@@ -2178,7 +2009,6 @@ async fn process_repo_backfill(
             "repo_display": repo_display.as_str(),
             "repo_root": repo_root_str.as_str(),
             "sessions_seen": stats.sessions_seen,
-            "commits_found": stats.commits_found,
             "attached": stats.attached,
             "fallback_attached": stats.fallback_attached,
             "skipped": stats.skipped,
@@ -2429,7 +2259,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             resolved
         };
 
-        let commit_hashes = session_log_commit_hashes(log).await;
         let agent_label = metadata
             .agent_type
             .clone()
@@ -2444,7 +2273,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 "repo_root": repo_root.to_string_lossy(),
                 "repo_display": repo_display.as_str(),
                 "agent": agent_label,
-                "commit_hashes": commit_hashes.len(),
             }),
         );
 
@@ -2456,7 +2284,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 session_id,
                 repo_root,
                 metadata,
-                commit_hashes,
             });
 
         if let Some(ref pb) = progress {
@@ -2497,17 +2324,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             }),
         );
         let per_repo_bar = if let Some(mp) = &multi {
-            let total_units: u64 = sessions
-                .iter()
-                .map(|s| {
-                    if s.commit_hashes.is_empty() {
-                        1_u64
-                    } else {
-                        s.commit_hashes.len() as u64
-                    }
-                })
-                .sum::<u64>()
-                .max(1);
+            let total_units: u64 = (sessions.len() as u64).max(1);
             let pb = mp.add(ProgressBar::new(total_units));
             pb.set_style(
                 ProgressStyle::with_template(
@@ -2558,7 +2375,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                         "sessions_seen": repo_stats.sessions_seen,
                         "skipped": repo_stats.skipped,
                         "errors": repo_stats.errors,
-                        "commits_found": repo_stats.commits_found,
                     }),
                 );
             }
@@ -3080,8 +2896,6 @@ async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()
         .unwrap_or_else(|| "origin".to_string());
     let branches = repo_local_branches(repo).await;
     let local_labels = build_local_session_labels_for_repo(repo).await;
-    let mut contains_cache: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
 
     output::action("Audit", &repo_label);
     output::detail(&format!(
@@ -3091,10 +2905,6 @@ async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()
     ));
 
     let mut total_sessions = 0usize;
-    let mut related = 0usize;
-    let mut commitless = 0usize;
-    let mut unresolved = 0usize;
-    let mut overindexed = 0usize;
 
     for branch in branches {
         let branch_key = format!("{remote}/{branch}");
@@ -3114,71 +2924,10 @@ async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()
         ));
         for entry in entries {
             total_sessions += 1;
-            let label = session_display_label(repo, &entry, &local_labels).await;
-            let observed_commits = load_session_envelope_for_entry(repo, &entry)
-                .await
-                .map(|env| env.record.observed_commits)
-                .unwrap_or_default();
-
-            if observed_commits.is_empty() {
-                commitless += 1;
-                if show_ok {
-                    output::detail(&format!(
-                        "  OK commitless-fallback uid={} {}",
-                        short_session_uid(&entry.session_uid),
-                        label
-                    ));
-                }
-                continue;
-            }
-
-            let mut branch_match = false;
-            let mut any_resolution = false;
-            let mut resolved_branches: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
-            for commit in &observed_commits {
-                let containing = if let Some(cached) = contains_cache.get(commit) {
-                    cached.clone()
-                } else {
-                    let resolved = git::branches_containing_commit_at(repo, commit)
-                        .await
-                        .unwrap_or_default();
-                    contains_cache.insert(commit.clone(), resolved.clone());
-                    resolved
-                };
-                if !containing.is_empty() {
-                    any_resolution = true;
-                    for b in &containing {
-                        resolved_branches.insert(b.clone());
-                    }
-                }
-                if containing.iter().any(|b| b == &branch) {
-                    branch_match = true;
-                }
-            }
-
-            if branch_match {
-                related += 1;
-                if show_ok {
-                    output::detail(&format!(
-                        "  OK related uid={} {}",
-                        short_session_uid(&entry.session_uid),
-                        label
-                    ));
-                }
-            } else if any_resolution {
-                overindexed += 1;
+            if show_ok {
+                let label = session_display_label(repo, &entry, &local_labels).await;
                 output::detail(&format!(
-                    "  WARN overindexed uid={} branch={} related_to={:?} {}",
-                    short_session_uid(&entry.session_uid),
-                    branch,
-                    resolved_branches.into_iter().collect::<Vec<_>>(),
-                    label
-                ));
-            } else {
-                unresolved += 1;
-                output::detail(&format!(
-                    "  WARN unresolved-commits uid={} {}",
+                    "  OK uid={} {}",
                     short_session_uid(&entry.session_uid),
                     label
                 ));
@@ -3186,15 +2935,7 @@ async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()
         }
     }
 
-    output::detail(&format!(
-        "summary: total={}, related={}, commitless={}, unresolved={}, overindexed={}",
-        total_sessions, related, commitless, unresolved, overindexed
-    ));
-    if commitless > 0 {
-        output::detail(
-            "note: commitless sessions are indexed by ingest-time branch fallback; overindex checks are strongest when observed_commits are present.",
-        );
-    }
+    output::detail(&format!("summary: total={}", total_sessions));
     Ok(())
 }
 
@@ -3287,11 +3028,7 @@ async fn run_sessions_inspect(query: &str, all: bool, raw: bool) -> Result<()> {
             }
             output::detail(&format!("branches={:?}", branch_hits));
             if let Some(env) = envelope {
-                output::detail(&format!(
-                    "observed_commits={} session_id={}",
-                    env.record.observed_commits.len(),
-                    env.record.session_id
-                ));
+                output::detail(&format!("session_id={}", env.record.session_id));
                 if raw {
                     output::detail("raw_record:");
                     let raw_record = serde_json::to_string_pretty(&env.record)?;
@@ -4958,7 +4695,6 @@ mod tests {
             &scanner::AgentType::Claude,
             "aaa111",
             &repo.path().to_string_lossy(),
-            None,
             session_log,
             note::Confidence::TimeWindowMatch,
             &EncryptionMethod::None,
@@ -5009,7 +4745,6 @@ mod tests {
             &scanner::AgentType::Claude,
             "multi-branch",
             &repo.path().to_string_lossy(),
-            None,
             session_log,
             note::Confidence::TimeWindowMatch,
             &EncryptionMethod::None,
@@ -5036,34 +4771,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_session_is_stable_across_commit_hints_when_observed_commits_match() {
+    async fn ingest_session_is_stable_across_repeated_calls() {
         let repo = init_repo().await;
-        run_git(
-            repo.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:example-org/example-repo.git",
-            ],
-        )
-        .await;
-        tokio::fs::write(repo.path().join("file2.txt"), "x")
-            .await
-            .expect("write file2");
-        run_git(repo.path(), &["add", "file2.txt"]).await;
-        run_git(repo.path(), &["commit", "-m", "second"]).await;
-
-        let first = run_git(repo.path(), &["rev-list", "--max-count=1", "HEAD~1"]).await;
-        let second = run_git(repo.path(), &["rev-parse", "HEAD"]).await;
-        let observed = vec![first.clone(), second.clone()];
         let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
 
         let first_info = ingest_session_from_log(
             &scanner::AgentType::Claude,
             "stable-1",
             &repo.path().to_string_lossy(),
-            Some(&observed),
             session_log,
             note::Confidence::ExactHashMatch,
             &EncryptionMethod::None,
@@ -5080,7 +4795,6 @@ mod tests {
             &scanner::AgentType::Claude,
             "stable-1",
             &repo.path().to_string_lossy(),
-            Some(&observed),
             session_log,
             note::Confidence::ExactHashMatch,
             &EncryptionMethod::None,
@@ -5124,7 +4838,6 @@ mod tests {
                 session_id: "no-candidate".to_string(),
                 repo_root: repo.path().to_path_buf(),
                 metadata,
-                commit_hashes: Vec::new(),
             }],
             EncryptionMethod::None,
             None,
@@ -5167,7 +4880,6 @@ mod tests {
                 session_id: "missing-commit".to_string(),
                 repo_root: repo.path().to_path_buf(),
                 metadata,
-                commit_hashes: vec!["deadbeef".to_string()],
             }],
             EncryptionMethod::None,
             None,
