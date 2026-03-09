@@ -97,7 +97,11 @@ enum Command {
     Status,
 
     /// Diagnose hook and session-ref configuration issues.
-    Doctor,
+    Doctor {
+        /// Attempt to repair auto-update scheduler artifacts based on config intent.
+        #[arg(long)]
+        repair: bool,
+    },
 
     /// Check for and install updates.
     Update {
@@ -108,6 +112,12 @@ enum Command {
         /// Skip confirmation prompt when installing an update.
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+
+    /// Manage unattended auto-update controls and scheduler artifacts.
+    AutoUpdate {
+        #[command(subcommand)]
+        command: Option<AutoUpdateCommand>,
     },
 
     /// View or modify CLI configuration.
@@ -152,6 +162,18 @@ enum ConfigCommand {
     },
     /// List all configuration keys and their current values.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum AutoUpdateCommand {
+    /// Show auto-update status and scheduler health.
+    Status,
+    /// Enable unattended background auto-update and reconcile scheduler artifacts.
+    Enable,
+    /// Disable unattended background auto-update (scheduler runs become no-op).
+    Disable,
+    /// Remove scheduler artifacts (idempotent and safe to rerun).
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -718,24 +740,7 @@ async fn run_install_inner(
         }
     }
 
-    // Step 4c: Provision unattended auto-update scheduler (idempotent).
-    match update::provision_auto_update_scheduler().await {
-        Ok(result) if result.configured => {
-            output::success(
-                "Updated",
-                &format!("auto-update scheduler ({})", result.description),
-            );
-        }
-        Ok(result) => {
-            output::note(&format!(
-                "Auto-update scheduler not configured: {}",
-                result.description
-            ));
-        }
-        Err(e) => {
-            output::note(&format!("Could not provision auto-update scheduler ({e})"));
-        }
-    }
+    // Step 4c: Scheduler reconciliation is performed after auto-update consent is resolved.
 
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
@@ -759,6 +764,26 @@ async fn run_install_inner(
 
     // Step 5.6: Optional auto-update preference prompt
     run_install_auto_update_prompt().await;
+
+    // Step 5.7: Reconcile scheduler with persisted user intent.
+    let auto_update_enabled = config::CliConfig::load()
+        .await
+        .unwrap_or_default()
+        .auto_update_enabled();
+    match update::reconcile_scheduler_for_auto_update_enabled(auto_update_enabled).await {
+        Ok(result) if result.configured => {
+            output::success(
+                "Updated",
+                &format!("auto-update scheduler ({})", result.description),
+            );
+        }
+        Ok(result) => {
+            output::detail(&format!("Auto-update scheduler: {}", result.description));
+        }
+        Err(e) => {
+            output::note(&format!("Could not reconcile auto-update scheduler ({e})"));
+        }
+    }
 
     println!();
     if had_errors {
@@ -3257,21 +3282,61 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         ),
         false,
     );
+    if let Some(last_attempt) = updater_health.last_attempt_at {
+        output::detail_to_with_tty(
+            w,
+            &format!("Auto-update last attempt: {last_attempt}"),
+            false,
+        );
+    }
     if let Some(next_retry) = updater_health.next_retry_after {
         output::detail_to_with_tty(w, &format!("Auto-update next retry: {next_retry}"), false);
     }
     if let Some(last_error) = updater_health.last_error {
         output::detail_to_with_tty(w, &format!("Auto-update last error: {last_error}"), false);
     }
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Auto-update policy: {}",
+            update::auto_update_policy_summary()
+        ),
+        false,
+    );
+    let scheduler_health = update::scheduler_health().await;
+    let scheduler_state = match scheduler_health.state {
+        update::SchedulerHealthState::Installed => "installed",
+        update::SchedulerHealthState::Missing => "missing",
+        update::SchedulerHealthState::Broken => "broken",
+        update::SchedulerHealthState::Unsupported => "unsupported",
+    };
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Auto-update scheduler: {scheduler_state} ({})",
+            scheduler_health.details
+        ),
+        false,
+    );
+    output::detail_to_with_tty(
+        w,
+        &format!("Auto-update remediation: {}", scheduler_health.remediation),
+        false,
+    );
+    output::detail_to_with_tty(
+        w,
+        "Controls: `cadence auto-update status|enable|disable|uninstall`",
+        false,
+    );
 
     Ok(())
 }
 
-async fn run_doctor() -> Result<()> {
-    run_doctor_inner(&mut std::io::stderr()).await
+async fn run_doctor(repair: bool) -> Result<()> {
+    run_doctor_inner(&mut std::io::stderr(), repair).await
 }
 
-async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
+async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()> {
     output::action_to_with_tty(w, "Doctor", "", false);
 
     let mut issues = 0usize;
@@ -3459,6 +3524,62 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write) -> Result<()> {
     if let Some(last_error) = updater_health.last_error {
         output::detail_to_with_tty(w, &format!("Auto-update last error: {last_error}"), false);
     }
+    if let Some(last_attempt) = updater_health.last_attempt_at {
+        output::detail_to_with_tty(
+            w,
+            &format!("Auto-update last attempt: {last_attempt}"),
+            false,
+        );
+    }
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Auto-update policy: {}",
+            update::auto_update_policy_summary()
+        ),
+        false,
+    );
+
+    if repair {
+        let cfg = config::CliConfig::load().await.unwrap_or_default();
+        let reconcile =
+            update::reconcile_scheduler_for_auto_update_enabled(cfg.auto_update_enabled()).await?;
+        output::detail_to_with_tty(
+            w,
+            &format!("Repair applied: {}", reconcile.description),
+            false,
+        );
+    }
+
+    let scheduler_health = update::scheduler_health().await;
+    match scheduler_health.state {
+        update::SchedulerHealthState::Installed | update::SchedulerHealthState::Unsupported => {
+            output::detail_to_with_tty(
+                w,
+                &format!("Auto-update scheduler: {}", scheduler_health.details),
+                false,
+            );
+        }
+        update::SchedulerHealthState::Missing | update::SchedulerHealthState::Broken => {
+            output::fail_to_with_tty(
+                w,
+                "Fail",
+                &format!("Auto-update scheduler: {}", scheduler_health.details),
+                false,
+            );
+            issues += 1;
+        }
+    }
+    output::detail_to_with_tty(
+        w,
+        &format!("Auto-update remediation: {}", scheduler_health.remediation),
+        false,
+    );
+    output::detail_to_with_tty(
+        w,
+        "Remediation commands: `cadence auto-update disable`, `cadence auto-update enable`, `cadence auto-update uninstall`, `cadence install`, `cadence doctor --repair`",
+        false,
+    );
 
     if issues == 0 {
         output::success_to_with_tty(w, "Doctor", "all checks passed", false);
@@ -3784,6 +3905,32 @@ async fn run_install_auto_update_prompt_inner(
 
     // Skip if auto_update is already set (user already made a choice)
     if cfg.auto_update.is_some() {
+        let mut stdout = std::io::stdout();
+        let is_tty = Term::stdout().is_term();
+        println!();
+        output::action_to_with_tty(&mut stdout, "Auto-update", "disclosure", is_tty);
+        output::detail_to_with_tty(
+            &mut stdout,
+            "Cadence background updater runs unattended and installs stable releases only.",
+            is_tty,
+        );
+        output::detail_to_with_tty(
+            &mut stdout,
+            "Controls: `cadence auto-update disable` or `cadence auto-update uninstall`.",
+            is_tty,
+        );
+        output::detail_to_with_tty(
+            &mut stdout,
+            &format!(
+                "Current setting: {}",
+                if cfg.auto_update_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            is_tty,
+        );
         return;
     }
 
@@ -3794,7 +3941,17 @@ async fn run_install_auto_update_prompt_inner(
     output::action_to_with_tty(&mut stdout, "Auto-update", "setup", is_tty);
     output::detail_to_with_tty(
         &mut stdout,
-        "Cadence can install stable updates in the background without prompts.",
+        "Cadence can run unattended background updates (stable channel only, no prompts).",
+        is_tty,
+    );
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Disable anytime: `cadence auto-update disable`",
+        is_tty,
+    );
+    output::detail_to_with_tty(
+        &mut stdout,
+        "Remove scheduler artifacts: `cadence auto-update uninstall`",
         is_tty,
     );
 
@@ -3821,13 +3978,13 @@ async fn run_install_auto_update_prompt_inner(
                 output::success_to_with_tty(
                     &mut stdout,
                     "Auto-update",
-                    "enabled for unattended background updates. Change anytime with `cadence config set auto_update false`.",
+                    "enabled. Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.",
                     is_tty,
                 );
             } else {
                 output::detail_to_with_tty(
                     &mut stdout,
-                    "Auto-update disabled. Run `cadence update` to check manually.",
+                    "Auto-update disabled. Scheduled runs will no-op. Run `cadence update` to check manually.",
                     is_tty,
                 );
             }
@@ -4041,6 +4198,113 @@ async fn run_config_list() -> Result<()> {
     Ok(())
 }
 
+async fn set_auto_update_enabled(enabled: bool) -> Result<()> {
+    let mut cfg = config::CliConfig::load().await?;
+    cfg.auto_update = Some(enabled);
+    cfg.save().await?;
+    Ok(())
+}
+
+async fn run_auto_update_status() -> Result<()> {
+    let mut stderr = std::io::stderr();
+    let updater = update::updater_health().await;
+    let scheduler = update::scheduler_health().await;
+    output::action_to_with_tty(&mut stderr, "Auto-update", "status", false);
+    output::detail_to_with_tty(
+        &mut stderr,
+        &format!("Enabled: {}", if updater.enabled { "yes" } else { "no" }),
+        false,
+    );
+    output::detail_to_with_tty(
+        &mut stderr,
+        &format!("Policy: {}", update::auto_update_policy_summary()),
+        false,
+    );
+    let updater_state = match updater.state {
+        update::UpdaterHealthState::Disabled => "disabled",
+        update::UpdaterHealthState::NeverRun => "never-run",
+        update::UpdaterHealthState::Healthy => "healthy",
+        update::UpdaterHealthState::Retrying => "retrying",
+        update::UpdaterHealthState::Failing => "failing",
+    };
+    output::detail_to_with_tty(
+        &mut stderr,
+        &format!("Updater state: {updater_state}"),
+        false,
+    );
+    if let Some(last_attempt) = updater.last_attempt_at {
+        output::detail_to_with_tty(
+            &mut stderr,
+            &format!("Last updater attempt: {last_attempt}"),
+            false,
+        );
+    }
+    let scheduler_state = match scheduler.state {
+        update::SchedulerHealthState::Installed => "installed",
+        update::SchedulerHealthState::Missing => "missing",
+        update::SchedulerHealthState::Broken => "broken",
+        update::SchedulerHealthState::Unsupported => "unsupported",
+    };
+    output::detail_to_with_tty(
+        &mut stderr,
+        &format!("Scheduler: {scheduler_state} ({})", scheduler.details),
+        false,
+    );
+    output::detail_to_with_tty(
+        &mut stderr,
+        &format!("Remediation: {}", scheduler.remediation),
+        false,
+    );
+    Ok(())
+}
+
+async fn run_auto_update_enable() -> Result<()> {
+    set_auto_update_enabled(true).await?;
+    let reconcile = update::reconcile_scheduler_for_auto_update_enabled(true).await?;
+    output::success(
+        "Auto-update",
+        "enabled. Background stable-channel updates are now active.",
+    );
+    output::detail(&format!("Scheduler reconciled: {}", reconcile.description));
+    output::detail("Disable with `cadence auto-update disable`.");
+    output::detail("Remove scheduler artifacts with `cadence auto-update uninstall`.");
+    Ok(())
+}
+
+async fn run_auto_update_disable() -> Result<()> {
+    set_auto_update_enabled(false).await?;
+    output::success(
+        "Auto-update",
+        "disabled. Scheduled updater runs will no-op immediately.",
+    );
+    output::detail("Re-enable with `cadence auto-update enable`.");
+    Ok(())
+}
+
+async fn run_auto_update_uninstall() -> Result<()> {
+    set_auto_update_enabled(false).await?;
+    let removed = update::uninstall_auto_update_scheduler().await?;
+    if removed.removed {
+        output::success("Auto-update", "scheduler artifacts removed.");
+    } else {
+        output::detail("Auto-update scheduler artifacts were already absent.");
+    }
+    output::detail(&format!("Cleanup target: {}", removed.description));
+    output::detail(
+        "Background updates remain disabled until you run `cadence auto-update enable`.",
+    );
+    Ok(())
+}
+
+async fn run_auto_update(command: Option<AutoUpdateCommand>) -> Result<()> {
+    match command.unwrap_or(AutoUpdateCommand::Status) {
+        AutoUpdateCommand::Status => run_auto_update_status().await,
+        AutoUpdateCommand::Enable => run_auto_update_enable().await,
+        AutoUpdateCommand::Disable => run_auto_update_disable().await,
+        AutoUpdateCommand::Uninstall => run_auto_update_uninstall().await,
+    }
+}
+
 /// Check for or install updates.
 ///
 /// With `--check`: queries GitHub for the latest release and reports whether
@@ -4206,8 +4470,9 @@ async fn main() {
             ConfigCommand::Get { key } => run_config_get(&key).await,
             ConfigCommand::List => run_config_list().await,
         },
-        Command::Doctor => run_doctor().await,
+        Command::Doctor { repair } => run_doctor(repair).await,
         Command::Update { check, yes } => run_update(check, yes).await,
+        Command::AutoUpdate { command } => run_auto_update(command).await,
         Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
             KeysCommands::Setup => run_keys_setup().await,
             KeysCommands::Status => run_keys_status().await,
@@ -4496,8 +4761,54 @@ mod tests {
     fn cli_parses_doctor() {
         let cli = Cli::parse_from(["cadence", "doctor"]);
         match cli.command {
-            Command::Doctor => {}
+            Command::Doctor { repair } => {
+                assert!(!repair);
+            }
             _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_repair() {
+        let cli = Cli::parse_from(["cadence", "doctor", "--repair"]);
+        match cli.command {
+            Command::Doctor { repair } => {
+                assert!(repair);
+            }
+            _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auto_update_default_status() {
+        let cli = Cli::parse_from(["cadence", "auto-update"]);
+        match cli.command {
+            Command::AutoUpdate { command } => {
+                assert!(command.is_none());
+            }
+            _ => panic!("expected AutoUpdate command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auto_update_disable() {
+        let cli = Cli::parse_from(["cadence", "auto-update", "disable"]);
+        match cli.command {
+            Command::AutoUpdate { command } => {
+                assert!(matches!(command, Some(AutoUpdateCommand::Disable)));
+            }
+            _ => panic!("expected AutoUpdate command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_auto_update_uninstall() {
+        let cli = Cli::parse_from(["cadence", "auto-update", "uninstall"]);
+        match cli.command {
+            Command::AutoUpdate { command } => {
+                assert!(matches!(command, Some(AutoUpdateCommand::Uninstall)));
+            }
+            _ => panic!("expected AutoUpdate command"),
         }
     }
 

@@ -98,6 +98,7 @@ pub struct UpdaterHealth {
     pub enabled: bool,
     pub state: UpdaterHealthState,
     pub last_result: String,
+    pub last_attempt_at: Option<String>,
     pub next_retry_after: Option<String>,
     pub last_error: Option<String>,
 }
@@ -1170,6 +1171,32 @@ pub struct SchedulerProvisionResult {
     pub description: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SchedulerUninstallResult {
+    pub removed: bool,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerHealthState {
+    Installed,
+    Missing,
+    Broken,
+    Unsupported,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulerHealth {
+    pub state: SchedulerHealthState,
+    pub details: String,
+    pub remediation: String,
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_LAUNCH_AGENT_LABEL: &str = "ai.teamcadence.cadence.autoupdate";
+#[cfg(target_os = "windows")]
+const WINDOWS_TASK_NAME: &str = "Cadence CLI Auto Update";
+
 #[cfg(target_os = "windows")]
 fn scheduler_command_line(exe_path: &Path) -> String {
     format!("\"{}\" hook auto-update", exe_path.display())
@@ -1203,6 +1230,15 @@ fn launch_agent_plist(label: &str, exe_path: &Path) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is required for LaunchAgent provisioning")?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{MACOS_LAUNCH_AGENT_LABEL}.plist")))
+}
+
 #[cfg(target_os = "linux")]
 fn systemd_service_contents(exe_path: &Path) -> String {
     format!(
@@ -1219,6 +1255,19 @@ fn systemd_timer_contents() -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn linux_systemd_paths() -> Result<(PathBuf, PathBuf)> {
+    let home = std::env::var("HOME").context("HOME is required for systemd user provisioning")?;
+    let user_dir = PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user");
+    Ok((
+        user_dir.join("cadence-autoupdate.service"),
+        user_dir.join("cadence-autoupdate.timer"),
+    ))
+}
+
 pub async fn provision_auto_update_scheduler() -> Result<SchedulerProvisionResult> {
     let exe =
         std::env::current_exe().context("failed to resolve current cadence executable path")?;
@@ -1230,19 +1279,18 @@ pub async fn provision_auto_update_scheduler_for_exe(
 ) -> Result<SchedulerProvisionResult> {
     #[cfg(target_os = "macos")]
     {
-        let home =
-            std::env::var("HOME").context("HOME is required for LaunchAgent provisioning")?;
-        let agents_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
+        let plist_path = macos_launch_agent_path()?;
+        let agents_dir = plist_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid launch agent path"))?;
         tokio::fs::create_dir_all(&agents_dir).await?;
-        let label = "ai.teamcadence.cadence.autoupdate";
-        let plist_path = agents_dir.join(format!("{label}.plist"));
-        let plist = launch_agent_plist(label, exe);
+        let plist = launch_agent_plist(MACOS_LAUNCH_AGENT_LABEL, exe);
         tokio::fs::write(&plist_path, plist).await?;
 
         let uid = std::env::var("UID").unwrap_or_default();
         if !uid.is_empty() {
             let domain = format!("gui/{uid}");
-            let service_target = format!("{domain}/{label}");
+            let service_target = format!("{domain}/{MACOS_LAUNCH_AGENT_LABEL}");
             let _ = Command::new("launchctl")
                 .args(["bootout", &service_target])
                 .stdout(std::process::Stdio::null())
@@ -1271,15 +1319,11 @@ pub async fn provision_auto_update_scheduler_for_exe(
 
     #[cfg(target_os = "linux")]
     {
-        let home =
-            std::env::var("HOME").context("HOME is required for systemd user provisioning")?;
-        let user_dir = PathBuf::from(home)
-            .join(".config")
-            .join("systemd")
-            .join("user");
+        let (service_path, timer_path) = linux_systemd_paths()?;
+        let user_dir = service_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid systemd user service path"))?;
         tokio::fs::create_dir_all(&user_dir).await?;
-        let service_path = user_dir.join("cadence-autoupdate.service");
-        let timer_path = user_dir.join("cadence-autoupdate.timer");
         tokio::fs::write(&service_path, systemd_service_contents(exe)).await?;
         tokio::fs::write(&timer_path, systemd_timer_contents()).await?;
 
@@ -1302,17 +1346,25 @@ pub async fn provision_auto_update_scheduler_for_exe(
 
     #[cfg(target_os = "windows")]
     {
-        let task_name = "Cadence CLI Auto Update";
         let command = scheduler_command_line(exe);
         let _ = Command::new("schtasks")
             .args([
-                "/Create", "/F", "/SC", "HOURLY", "/MO", "8", "/TN", task_name, "/TR", &command,
+                "/Create",
+                "/F",
+                "/SC",
+                "HOURLY",
+                "/MO",
+                "8",
+                "/TN",
+                WINDOWS_TASK_NAME,
+                "/TR",
+                &command,
             ])
             .status()
             .await;
         return Ok(SchedulerProvisionResult {
             configured: true,
-            description: task_name.to_string(),
+            description: WINDOWS_TASK_NAME.to_string(),
         });
     }
 
@@ -1321,6 +1373,231 @@ pub async fn provision_auto_update_scheduler_for_exe(
         configured: false,
         description: "scheduler unsupported on this platform".to_string(),
     })
+}
+
+pub async fn uninstall_auto_update_scheduler() -> Result<SchedulerUninstallResult> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = macos_launch_agent_path()?;
+        let uid = std::env::var("UID").unwrap_or_default();
+        if !uid.is_empty() {
+            let service_target = format!("gui/{uid}/{MACOS_LAUNCH_AGENT_LABEL}");
+            let _ = Command::new("launchctl")
+                .args(["bootout", &service_target])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
+        let existed = tokio::fs::try_exists(&plist_path).await.unwrap_or(false);
+        if existed {
+            let _ = tokio::fs::remove_file(&plist_path).await;
+        }
+        return Ok(SchedulerUninstallResult {
+            removed: existed,
+            description: format!("LaunchAgent {}", plist_path.display()),
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let (service_path, timer_path) = linux_systemd_paths()?;
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "cadence-autoupdate.timer"])
+            .status()
+            .await;
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .await;
+
+        let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
+        let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
+        if service_exists {
+            let _ = tokio::fs::remove_file(&service_path).await;
+        }
+        if timer_exists {
+            let _ = tokio::fs::remove_file(&timer_path).await;
+        }
+        return Ok(SchedulerUninstallResult {
+            removed: service_exists || timer_exists,
+            description: format!(
+                "systemd user files ({}, {})",
+                service_path.display(),
+                timer_path.display()
+            ),
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let out = Command::new("schtasks")
+            .args(["/Delete", "/F", "/TN", WINDOWS_TASK_NAME])
+            .status()
+            .await;
+        return Ok(SchedulerUninstallResult {
+            removed: out.as_ref().is_ok_and(|s| s.success()),
+            description: WINDOWS_TASK_NAME.to_string(),
+        });
+    }
+
+    #[allow(unreachable_code)]
+    Ok(SchedulerUninstallResult {
+        removed: false,
+        description: "scheduler unsupported on this platform".to_string(),
+    })
+}
+
+pub async fn reconcile_scheduler_for_auto_update_enabled(
+    enabled: bool,
+) -> Result<SchedulerProvisionResult> {
+    if enabled {
+        return provision_auto_update_scheduler().await;
+    }
+    let removed = uninstall_auto_update_scheduler().await?;
+    Ok(SchedulerProvisionResult {
+        configured: false,
+        description: format!(
+            "disabled; cleaned scheduler artifacts ({})",
+            removed.description
+        ),
+    })
+}
+
+pub async fn scheduler_health() -> SchedulerHealth {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = match macos_launch_agent_path() {
+            Ok(v) => v,
+            Err(e) => {
+                return SchedulerHealth {
+                    state: SchedulerHealthState::Broken,
+                    details: format!("LaunchAgent path unavailable: {e}"),
+                    remediation: "Run `cadence install` to repair scheduler setup.".to_string(),
+                };
+            }
+        };
+        if !tokio::fs::try_exists(&plist_path).await.unwrap_or(false) {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Missing,
+                details: format!("missing LaunchAgent {}", plist_path.display()),
+                remediation: "Run `cadence auto-update enable` or `cadence install` to create it."
+                    .to_string(),
+            };
+        }
+        let contents = tokio::fs::read_to_string(&plist_path)
+            .await
+            .unwrap_or_default();
+        if !contents.contains("<string>auto-update</string>") {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Broken,
+                details: format!(
+                    "LaunchAgent exists but contents look invalid: {}",
+                    plist_path.display()
+                ),
+                remediation: "Run `cadence install` to rewrite scheduler artifacts.".to_string(),
+            };
+        }
+        return SchedulerHealth {
+            state: SchedulerHealthState::Installed,
+            details: format!("LaunchAgent installed: {}", plist_path.display()),
+            remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let (service_path, timer_path) = match linux_systemd_paths() {
+            Ok(v) => v,
+            Err(e) => {
+                return SchedulerHealth {
+                    state: SchedulerHealthState::Broken,
+                    details: format!("systemd user path unavailable: {e}"),
+                    remediation: "Run `cadence install` to repair scheduler setup.".to_string(),
+                };
+            }
+        };
+        let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
+        let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
+        if !service_exists && !timer_exists {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Missing,
+                details: format!(
+                    "missing systemd user timer/service ({}, {})",
+                    service_path.display(),
+                    timer_path.display()
+                ),
+                remediation:
+                    "Run `cadence auto-update enable` or `cadence install` to create them."
+                        .to_string(),
+            };
+        }
+        if !service_exists || !timer_exists {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Broken,
+                details: format!(
+                    "partial systemd artifacts present ({}, {})",
+                    service_path.display(),
+                    timer_path.display()
+                ),
+                remediation: "Run `cadence install` to reconcile scheduler artifacts.".to_string(),
+            };
+        }
+        let service_contents = tokio::fs::read_to_string(&service_path)
+            .await
+            .unwrap_or_default();
+        if !service_contents.contains("hook auto-update") {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Broken,
+                details: format!(
+                    "systemd service exists but command is invalid: {}",
+                    service_path.display()
+                ),
+                remediation: "Run `cadence install` to rewrite scheduler artifacts.".to_string(),
+            };
+        }
+        return SchedulerHealth {
+            state: SchedulerHealthState::Installed,
+            details: format!(
+                "systemd user timer/service installed ({}, {})",
+                service_path.display(),
+                timer_path.display()
+            ),
+            remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let queried = Command::new("schtasks")
+            .args(["/Query", "/TN", WINDOWS_TASK_NAME])
+            .status()
+            .await;
+        if queried.as_ref().is_ok_and(|s| s.success()) {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Installed,
+                details: format!("Task Scheduler task installed: {}", WINDOWS_TASK_NAME),
+                remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
+            };
+        }
+        return SchedulerHealth {
+            state: SchedulerHealthState::Missing,
+            details: format!("Task Scheduler task missing: {}", WINDOWS_TASK_NAME),
+            remediation: "Run `cadence auto-update enable` or `cadence install` to create it."
+                .to_string(),
+        };
+    }
+
+    #[allow(unreachable_code)]
+    SchedulerHealth {
+        state: SchedulerHealthState::Unsupported,
+        details: "scheduler unsupported on this platform".to_string(),
+        remediation: "No scheduler action required.".to_string(),
+    }
+}
+
+pub fn auto_update_policy_summary() -> &'static str {
+    "stable channel only; prereleases are excluded by default"
 }
 
 pub async fn updater_health() -> UpdaterHealth {
@@ -1336,6 +1613,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
             enabled,
             state: UpdaterHealthState::Disabled,
             last_result: "disabled".to_string(),
+            last_attempt_at: state.last_attempt_at.clone(),
             next_retry_after: None,
             last_error: None,
         };
@@ -1346,6 +1624,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
             enabled,
             state: UpdaterHealthState::NeverRun,
             last_result: "never run".to_string(),
+            last_attempt_at: None,
             next_retry_after: None,
             last_error: None,
         };
@@ -1361,6 +1640,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
             enabled,
             state: health_state,
             last_result: "retry scheduled".to_string(),
+            last_attempt_at: state.last_attempt_at.clone(),
             next_retry_after: state.next_retry_after.clone(),
             last_error: state.last_error.clone(),
         };
@@ -1370,6 +1650,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
         enabled,
         state: UpdaterHealthState::Healthy,
         last_result: "healthy".to_string(),
+        last_attempt_at: state.last_attempt_at.clone(),
         next_retry_after: state.next_retry_after.clone(),
         last_error: state.last_error.clone(),
     }
@@ -2667,6 +2948,60 @@ mod tests {
             .await
             .expect("reacquire");
         assert!(reacquired.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn uninstall_scheduler_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let first = uninstall_auto_update_scheduler()
+            .await
+            .expect("first uninstall");
+        let second = uninstall_auto_update_scheduler()
+            .await
+            .expect("second uninstall");
+        assert!(!first.removed);
+        assert!(!second.removed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn scheduler_health_reports_missing_without_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let health = scheduler_health().await;
+        assert_eq!(health.state, SchedulerHealthState::Missing);
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn reconcile_enabled_then_disabled_is_consistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let exe = PathBuf::from("/usr/local/bin/cadence");
+        let enabled = provision_auto_update_scheduler_for_exe(&exe)
+            .await
+            .expect("provision scheduler");
+        assert!(enabled.configured);
+
+        let health_after_enable = scheduler_health().await;
+        assert_eq!(health_after_enable.state, SchedulerHealthState::Installed);
+
+        let _ = reconcile_scheduler_for_auto_update_enabled(false)
+            .await
+            .expect("disable reconcile");
+        let health_after_disable = scheduler_health().await;
+        assert_eq!(health_after_disable.state, SchedulerHealthState::Missing);
     }
 
     #[test]
