@@ -24,7 +24,7 @@ use crate::config::CliConfig;
 use sysinfo::{Pid, System};
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, SYNCHRONIZE, WAIT_TIMEOUT},
+    Foundation::{CloseHandle, WAIT_TIMEOUT},
     System::Threading::{OpenProcess, WaitForSingleObject},
 };
 
@@ -54,6 +54,8 @@ const ACTIVITY_LOCK_FILE: &str = "global-activity.lock";
 const ACTIVITY_LOCK_STALE_SECS: i64 = 15 * 60;
 const ACTIVITY_LOCK_POLL_INTERVAL_MS: u64 = 20;
 const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 /// Scheduler cadence and jitter defaults.
 const AUTO_UPDATE_INTERVAL_SECS: u64 = 8 * 60 * 60;
@@ -267,7 +269,7 @@ fn is_pid_alive(pid: u32) -> bool {
         if pid == 0 {
             return false;
         }
-        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        let handle = unsafe { OpenProcess(WINDOWS_SYNCHRONIZE_ACCESS, 0, pid) };
         if handle.is_null() {
             return false;
         }
