@@ -53,7 +53,6 @@ cadence doctor
 ## How It Works
 
 Cadence installs global Git hooks that scan for recent AI session logs, then stores canonical session objects and indexes after each commit.
-It also configures Git note rewrite settings so notes follow rewritten commits during rebase/amend.
 Notes can be synced alongside commits without modifying commit history.
 
 If a repository still has the legacy ref `refs/notes/ai-sessions`, Cadence will migrate it to
@@ -80,7 +79,7 @@ into one synthetic session log per session ID before ingestion.
 
 ## Optional: Encryption
 
-To encrypt session logs before attaching (local + API recipients):
+To encrypt stored session logs (local + API recipients):
 ```sh
 cadence keys setup
 ```

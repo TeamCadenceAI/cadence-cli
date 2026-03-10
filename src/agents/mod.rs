@@ -1,7 +1,7 @@
 //! Agent log discovery module.
 //!
 //! Discovers AI coding agent session logs on disk
-//! and filters candidate files by modification time relative to a commit.
+//! and filters candidate files by modification time relative to a cutoff window.
 
 pub mod amp_code;
 pub mod antigravity;
@@ -37,7 +37,6 @@ pub struct SessionLog {
     pub agent_type: AgentType,
     pub source: SessionSource,
     pub updated_at: Option<i64>,
-    pub match_reasons: Vec<String>,
 }
 
 impl SessionLog {

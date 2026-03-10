@@ -156,7 +156,7 @@ enum ConfigCommand {
 
 #[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Post-commit hook: attempt to attach AI session note to HEAD.
+    /// Post-commit hook: ingest recent AI sessions for the current repository.
     PostCommit,
     /// Pre-push hook: sync session refs with the push remote.
     PrePush {
@@ -973,7 +973,7 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     let repo_root = git::repo_root().await?;
     let repo_root_str = repo_root.to_string_lossy().to_string();
 
-    // Step 1.25: Org filter gating — skip all attachment if mismatched
+    // Step 1.25: Org filter gating — skip session storage if mismatched
     match git::repo_matches_org_filter(&repo_root).await {
         Ok(true) => {}
         Ok(false) => return Ok(()),
@@ -1211,11 +1211,8 @@ async fn ingest_session_from_log(
     session_id: &str,
     repo_str: &str,
     session_log: &str,
-    confidence: note::Confidence,
     method: &EncryptionMethod,
     session_start: Option<i64>,
-    match_score: Option<f64>,
-    match_reasons: Option<&[String]>,
     repo: Option<&std::path::Path>,
     explicit_branch_keys: Option<&[String]>,
 ) -> Result<SessionIngestInfo> {
@@ -1271,16 +1268,8 @@ async fn ingest_session_from_log(
         git_user_email,
         git_user_name,
         session_start,
-        session_end: session_start,
         content_sha256,
-        observed_commits: Vec::new(),
-        time_window: session_start.map(|start| note::TimeWindow { start, end: start }),
         cwd: Some(repo_str.to_string()),
-        match_signals: Some(note::MatchSignals {
-            confidence: confidence.to_string(),
-            score: match_score,
-            reasons: match_reasons.unwrap_or_default().to_vec(),
-        }),
         ingested_at: ingested_at.clone(),
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -1382,22 +1371,14 @@ async fn ingest_recent_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let match_reasons = if parsed.log.match_reasons.is_empty() {
-            None
-        } else {
-            Some(parsed.log.match_reasons.as_slice())
-        };
 
         let info = ingest_session_from_log(
             &agent,
             &session_id,
             repo_root_str,
             &parsed.session_log,
-            note::Confidence::ScoredMatch,
             method,
             parsed.session_start,
-            None,
-            match_reasons,
             Some(repo_root),
             None,
         )
@@ -1557,22 +1538,14 @@ async fn ingest_incremental_sessions_for_repo(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        let match_reasons = if parsed.log.match_reasons.is_empty() {
-            None
-        } else {
-            Some(parsed.log.match_reasons.as_slice())
-        };
 
         let info = match ingest_session_from_log(
             &agent,
             &session_id,
             repo_root_str,
             &parsed.session_log,
-            note::Confidence::ScoredMatch,
             method,
             parsed.session_start,
-            None,
-            match_reasons,
             Some(repo_root),
             None,
         )
@@ -1642,11 +1615,11 @@ fn parse_since_duration(since: &str) -> Result<i64> {
     }
 }
 
-/// The backfill subcommand: backfill AI session notes for recent commits.
+/// The backfill subcommand: ingest recent AI session logs into session refs.
 ///
-/// This scans ALL Claude and Codex log directories (not scoped to any
-/// single repo), finds commit hashes in session logs, resolves repos
-/// from session metadata, and attaches notes where missing.
+/// This scans ALL supported agent log directories (not scoped to any
+/// single repo), resolves repos from session metadata, and stores
+/// session records where missing.
 ///
 /// Properties:
 /// - Can take minutes for large log directories
@@ -1676,7 +1649,6 @@ struct RepoBackfillStats {
     attached: usize,
     skipped: usize,
     errors: usize,
-    fallback_attached: usize,
 }
 
 fn repo_label_from_display(display: &str) -> String {
@@ -1913,15 +1885,8 @@ async fn process_repo_backfill(
             &session.session_id,
             &repo_str,
             &session_log,
-            note::Confidence::ScoredMatch,
             &encryption_method,
             session_start,
-            None,
-            if session.log.match_reasons.is_empty() {
-                None
-            } else {
-                Some(session.log.match_reasons.as_slice())
-            },
             Some(&session.repo_root),
             None,
         )
@@ -2010,7 +1975,6 @@ async fn process_repo_backfill(
             "repo_root": repo_root_str.as_str(),
             "sessions_seen": stats.sessions_seen,
             "attached": stats.attached,
-            "fallback_attached": stats.fallback_attached,
             "skipped": stats.skipped,
             "errors": stats.errors,
         }),
@@ -2116,7 +2080,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     let mut attached = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
-    let mut fallback_attached = 0usize;
     let mut sessions_by_repo: std::collections::BTreeMap<String, Vec<SessionInfo>> =
         std::collections::BTreeMap::new();
     let mut repo_root_cache: std::collections::HashMap<String, std::path::PathBuf> =
@@ -2366,12 +2329,10 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 attached += repo_stats.attached;
                 skipped += repo_stats.skipped;
                 errors += repo_stats.errors;
-                fallback_attached += repo_stats.fallback_attached;
                 backfill_logger.event(
                     "repo_worker_result",
                     serde_json::json!({
                         "attached": repo_stats.attached,
-                        "fallback_attached": repo_stats.fallback_attached,
                         "sessions_seen": repo_stats.sessions_seen,
                         "skipped": repo_stats.skipped,
                         "errors": repo_stats.errors,
@@ -2404,10 +2365,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     // Final summary
     output::success(
         "Backfill",
-        &format!(
-            "{} uploaded, {} fallback uploaded, {} skipped, {} issues",
-            attached, fallback_attached, skipped, errors
-        ),
+        &format!("{attached} uploaded, {skipped} skipped, {errors} issues"),
     );
     let issues = if errors > 0 {
         vec![format!("{errors} issue(s) encountered during backfill")]
@@ -2428,7 +2386,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         "backfill_completed",
         serde_json::json!({
             "attached": attached,
-            "fallback_attached": fallback_attached,
             "skipped": skipped,
             "errors": errors,
             "repos_scanned": total_repos,
@@ -3622,12 +3579,12 @@ async fn run_install_encryption_setup() -> Result<()> {
     output::action_to_with_tty(&mut stdout, "Encryption", "setup", is_tty);
     output::detail_to_with_tty(
         &mut stdout,
-        "Protect attached session notes so only you and the Cadence API can read them.",
+        "Protect stored session logs so only you and the Cadence API can read them.",
         is_tty,
     );
 
     let Some(enable) = prompter
-        .confirm("Encrypt attached session notes? (Recommended)", &mut stdout)
+        .confirm("Encrypt stored session logs? (Recommended)", &mut stdout)
         .await?
     else {
         output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
@@ -3852,7 +3809,7 @@ async fn run_keys_setup_inner(
         output::action_to_with_tty(writer, "Encryption", "setup", is_tty);
         output::detail_to_with_tty(
             writer,
-            "Encrypt attached session notes so only you and the Cadence API can read them.",
+            "Encrypt stored session logs so only you and the Cadence API can read them.",
             is_tty,
         );
         writeln!(writer)?;
@@ -4677,7 +4634,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_session_without_commit_writes_data_and_indexes() {
+    async fn ingest_session_writes_data_and_indexes() {
         let repo = init_repo().await;
         run_git(
             repo.path(),
@@ -4696,11 +4653,8 @@ mod tests {
             "aaa111",
             &repo.path().to_string_lossy(),
             session_log,
-            note::Confidence::TimeWindowMatch,
             &EncryptionMethod::None,
             Some(1_707_526_800),
-            None,
-            None,
             Some(repo.path()),
             None,
         )
@@ -4746,11 +4700,8 @@ mod tests {
             "multi-branch",
             &repo.path().to_string_lossy(),
             session_log,
-            note::Confidence::TimeWindowMatch,
             &EncryptionMethod::None,
             Some(1_707_526_800),
-            None,
-            None,
             Some(repo.path()),
             Some(&branch_keys),
         )
@@ -4780,11 +4731,8 @@ mod tests {
             "stable-1",
             &repo.path().to_string_lossy(),
             session_log,
-            note::Confidence::ExactHashMatch,
             &EncryptionMethod::None,
             Some(1_707_526_800),
-            None,
-            None,
             Some(repo.path()),
             None,
         )
@@ -4796,11 +4744,8 @@ mod tests {
             "stable-1",
             &repo.path().to_string_lossy(),
             session_log,
-            note::Confidence::ExactHashMatch,
             &EncryptionMethod::None,
             Some(1_707_526_800),
-            None,
-            None,
             Some(repo.path()),
             None,
         )
@@ -4812,7 +4757,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn backfill_uploads_session_when_no_candidate_commits() {
+    async fn backfill_uploads_session_without_commit_candidates() {
         let repo = init_repo().await;
         let session_file = repo.path().join("session-no-candidate.jsonl");
         tokio::fs::write(
@@ -4833,7 +4778,6 @@ mod tests {
                     agent_type: scanner::AgentType::Claude,
                     source: agents::SessionSource::File(session_file),
                     updated_at: Some(0),
-                    match_reasons: Vec::new(),
                 },
                 session_id: "no-candidate".to_string(),
                 repo_root: repo.path().to_path_buf(),
@@ -4854,7 +4798,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn backfill_uploads_session_when_explicit_commits_are_unavailable() {
+    async fn backfill_uploads_session_without_explicit_commit_matches() {
         let repo = init_repo().await;
         let session_file = repo.path().join("session-missing-commit.jsonl");
         tokio::fs::write(
@@ -4875,7 +4819,6 @@ mod tests {
                     agent_type: scanner::AgentType::Claude,
                     source: agents::SessionSource::File(session_file),
                     updated_at: Some(0),
-                    match_reasons: Vec::new(),
                 },
                 session_id: "missing-commit".to_string(),
                 repo_root: repo.path().to_path_buf(),

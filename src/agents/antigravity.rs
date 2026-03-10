@@ -47,7 +47,6 @@ impl AgentExplorer for AntigravityExplorer {
                 agent_type: AgentType::Antigravity,
                 source: SessionSource::File(file.path),
                 updated_at: Some(file.mtime_epoch),
-                match_reasons: Vec::new(),
             })
             .collect()
     }

@@ -351,7 +351,6 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
                 content: lines.join("\n"),
             },
             updated_at: Some(max_updated),
-            match_reasons: Vec::new(),
         });
     }
 
