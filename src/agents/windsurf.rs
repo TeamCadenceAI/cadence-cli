@@ -47,7 +47,6 @@ impl AgentExplorer for WindsurfExplorer {
                 agent_type: AgentType::Windsurf,
                 source: SessionSource::File(file.path),
                 updated_at: Some(file.mtime_epoch),
-                match_reasons: Vec::new(),
             })
             .collect()
     }

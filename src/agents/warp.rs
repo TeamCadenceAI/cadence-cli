@@ -132,7 +132,6 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
 
     for (conversation_id, rows) in by_conversation {
         let mut max_start = 0i64;
-        let mut has_non_success_status = false;
         let mut conversation_cwd: Option<String> = None;
         let mut events = Vec::new();
         let mut ord = 0usize;
@@ -140,14 +139,6 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
 
         for row in &rows {
             max_start = max_start.max(row.start_ts);
-            if row
-                .output_status
-                .as_deref()
-                .map(|s| !is_success_output_status(s))
-                .unwrap_or(true)
-            {
-                has_non_success_status = true;
-            }
             if conversation_cwd.is_none()
                 && let Some(cwd) = row.working_directory.as_deref().map(str::trim)
                 && !cwd.is_empty()
@@ -220,7 +211,6 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
         });
 
         let mut lines = Vec::new();
-        let mut has_output_signal = false;
         let mut deduped = dedupe_adjacent(events.into_iter().map(|e| e.value).collect());
 
         if deduped.is_empty() {
@@ -278,22 +268,10 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
         }
 
         for value in deduped {
-            if matches!(
-                value.get("type").and_then(Value::as_str),
-                Some("assistant") | Some("tool_result")
-            ) {
-                has_output_signal = true;
-            }
             if let Ok(line) = serde_json::to_string(&value) {
                 lines.push(line);
             }
         }
-
-        let match_reasons = if has_non_success_status && !has_output_signal {
-            vec!["warp_missing_output".to_string()]
-        } else {
-            Vec::new()
-        };
 
         out.push(SessionLog {
             agent_type: AgentType::Warp,
@@ -302,7 +280,6 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
                 content: lines.join("\n"),
             },
             updated_at: Some(max_start),
-            match_reasons,
         });
     }
 
@@ -796,11 +773,6 @@ fn normalized_start_ts_sql(column: &str) -> String {
             ELSE CAST(unixepoch({column}) AS INTEGER)
         END"
     )
-}
-
-fn is_success_output_status(status: &str) -> bool {
-    let normalized = status.trim().trim_matches('"').trim();
-    normalized.eq_ignore_ascii_case("Succeeded") || normalized.eq_ignore_ascii_case("Completed")
 }
 
 fn fetch_agent_tasks_by_conversation(

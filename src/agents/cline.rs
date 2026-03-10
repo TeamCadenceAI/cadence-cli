@@ -36,7 +36,6 @@ impl AgentExplorer for ClineExplorer {
                 agent_type: AgentType::Cline,
                 source: SessionSource::File(file.path),
                 updated_at: Some(file.mtime_epoch),
-                match_reasons: Vec::new(),
             })
             .collect()
     }

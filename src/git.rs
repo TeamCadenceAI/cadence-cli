@@ -128,7 +128,7 @@ fn emit_stream_chunk(chunk: &[u8]) {
 ///
 /// Reads `git config ai.cadence.enabled`. If the value is exactly
 /// `"false"`, returns `false` -- the caller should skip ALL processing
-/// (session scanning, note attachment, pending records, push, retry).
+/// (session scanning, session-ref updates, pending records, push, retry).
 /// Any other value (including unset) returns `true`.
 ///
 /// This is placed in the `git` module (not `push`) because it gates

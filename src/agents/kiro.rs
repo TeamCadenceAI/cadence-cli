@@ -126,7 +126,6 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
             agent_type: AgentType::Kiro,
             source: SessionSource::File(candidate.path),
             updated_at: Some(candidate.mtime_epoch),
-            match_reasons: Vec::new(),
         })
         .collect()
 }

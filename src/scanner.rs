@@ -1,14 +1,7 @@
-//! Session scanning and correlation.
+//! Session scanning and metadata extraction.
 //!
-//! Scans candidate session log files (JSONL) to find commit hashes,
-//! then parses minimal metadata and verifies the match against the
-//! git repository.
-//!
-//! The core invariant: "If an AI agent created a commit, the commit hash
-//! appears verbatim in the session log." This module implements that
-//! search by streaming files line-by-line (never loading entire files
-//! into memory) and doing substring matching for the full hash and
-//! the short hash (first 7 characters).
+//! Parses session logs to extract lightweight metadata and timestamps
+//! without loading unnecessary structure into the ingest pipeline.
 
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;

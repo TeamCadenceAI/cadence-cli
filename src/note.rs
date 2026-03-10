@@ -10,25 +10,6 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Confidence level of the match between session and commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(clippy::enum_variant_names)]
-pub enum Confidence {
-    ExactHashMatch,
-    TimeWindowMatch,
-    ScoredMatch,
-}
-
-impl std::fmt::Display for Confidence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Confidence::ExactHashMatch => write!(f, "exact_hash_match"),
-            Confidence::TimeWindowMatch => write!(f, "time_window_match"),
-            Confidence::ScoredMatch => write!(f, "scored_match"),
-        }
-    }
-}
-
 /// Encryption/compression encoding for stored canonical session objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentEncoding {
@@ -50,21 +31,6 @@ impl std::fmt::Display for ContentEncoding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimeWindow {
-    pub start: i64,
-    pub end: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchSignals {
-    pub confidence: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reasons: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_uid: String,
     pub agent: String,
@@ -82,11 +48,7 @@ pub struct SessionRecord {
     pub session_start: Option<i64>,
     pub content_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_window: Option<TimeWindow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub match_signals: Option<MatchSignals>,
     pub ingested_at: String,
     pub cli_version: String,
 }
@@ -178,16 +140,7 @@ mod tests {
             git_user_name: Some("Dev Name".to_string()),
             session_start: Some(1_700_000_000),
             content_sha256: "content-sha".to_string(),
-            time_window: Some(TimeWindow {
-                start: 1_700_000_000,
-                end: 1_700_000_100,
-            }),
             cwd: Some("/tmp/repo".to_string()),
-            match_signals: Some(MatchSignals {
-                confidence: "scored_match".to_string(),
-                score: Some(0.9),
-                reasons: vec!["contains_commit_hash".to_string()],
-            }),
             ingested_at: "2026-03-02T00:00:00Z".to_string(),
             cli_version: "1.0.0".to_string(),
         }
@@ -248,6 +201,8 @@ mod tests {
 
         assert!(record.get("session_end").is_none());
         assert!(record.get("observed_commits").is_none());
+        assert!(record.get("time_window").is_none());
+        assert!(record.get("match_signals").is_none());
     }
 
     #[test]
