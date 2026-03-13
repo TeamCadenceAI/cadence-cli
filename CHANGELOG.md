@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.4.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.3.0...v1.4.0) (2026-03-13)
+
+
+### Features
+
+* **auto-update:** add phase 2 trust and control UX ([b63a1ed](https://github.com/TeamCadenceAI/cadence-cli/commit/b63a1ed8c192e937b52a7de31f99909824367ec6))
+* unattended auto-update with trust/control UX (Phase 1 + 2) ([f3cb63e](https://github.com/TeamCadenceAI/cadence-cli/commit/f3cb63e34770137c94b7ba1c3b582c859ad0c6d2))
+* **update:** implement unattended hook-safe background auto-update v1 ([815fc22](https://github.com/TeamCadenceAI/cadence-cli/commit/815fc225f77ec39fc9350c668476eeee93c8acd7))
+
+
+### Bug Fixes
+
+* **install:** default auto-update on during FTUE ([e79e877](https://github.com/TeamCadenceAI/cadence-cli/commit/e79e877b2c4a37728303a94120afc610b1649931))
+* **install:** default auto-update on during FTUE ([d348d43](https://github.com/TeamCadenceAI/cadence-cli/commit/d348d4306d48943b3dc2cc5e00bcfdc4f3884449))
+* **note:** remove misleading session envelope metadata ([62eda71](https://github.com/TeamCadenceAI/cadence-cli/commit/62eda713eff43a20868aa96dce87d66ae487fc9d))
+* **note:** remove unused session matching metadata ([0b84901](https://github.com/TeamCadenceAI/cadence-cli/commit/0b849017b67260677730c12872bd6641b104bd71))
+* **note:** stop writing misleading session fields ([567dcc6](https://github.com/TeamCadenceAI/cadence-cli/commit/567dcc639c20a6d95e51d82deed4115882ead80e))
+* **update:** address PR review feedback ([f39f41a](https://github.com/TeamCadenceAI/cadence-cli/commit/f39f41a70a7493289565c5237456f2a65cdd27aa))
+* **update:** repair windows activity-lock build ([9ac6c2c](https://github.com/TeamCadenceAI/cadence-cli/commit/9ac6c2c0937d967cf7e769b6f268f6a63419bdfa))
+* **update:** use portable windows sync access mask ([062f87b](https://github.com/TeamCadenceAI/cadence-cli/commit/062f87bab4e3d34d5afc8805a231efc3c6d18186))
+
 ## [1.3.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.2.0...v1.3.0) (2026-03-08)
 
 
