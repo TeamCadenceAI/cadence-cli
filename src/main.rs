@@ -3830,11 +3830,10 @@ async fn run_install_encryption_setup() -> Result<()> {
 // Install: auto-update preference prompt
 // ---------------------------------------------------------------------------
 
-/// Prompt the user to enable automatic updates during install.
+/// Configure automatic updates during install.
 ///
 /// This is non-critical: failures are logged but never abort install.
-/// Skipped silently if output is not interactive, and only shows disclosure when
-/// auto-update is already enabled.
+/// Skipped silently if output is not interactive.
 async fn run_install_auto_update_prompt() {
     let cfg = match config::CliConfig::load().await {
         Ok(c) => c,
@@ -3844,9 +3843,7 @@ async fn run_install_auto_update_prompt() {
         Some(p) => p,
         None => return,
     };
-    let mut prompter = DialoguerPrompter::new();
     run_install_auto_update_prompt_inner(
-        &mut prompter,
         &cfg,
         &config_path,
         output::is_stderr_tty() && Term::stdout().is_term(),
@@ -3854,11 +3851,23 @@ async fn run_install_auto_update_prompt() {
     .await;
 }
 
-/// Testable inner implementation of the auto-update prompt.
-///
-/// Accepts injectable prompter and config path for testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallAutoUpdateFtueState {
+    Skip,
+    Disclosure,
+    EnableByDefault,
+}
+
+fn install_auto_update_ftue_state(cfg: &config::CliConfig) -> InstallAutoUpdateFtueState {
+    match cfg.auto_update {
+        Some(true) => InstallAutoUpdateFtueState::Disclosure,
+        Some(false) => InstallAutoUpdateFtueState::Skip,
+        None => InstallAutoUpdateFtueState::EnableByDefault,
+    }
+}
+
+/// Testable inner implementation of the install-time auto-update behavior.
 async fn run_install_auto_update_prompt_inner(
-    prompter: &mut dyn Prompter,
     cfg: &config::CliConfig,
     config_path: &std::path::Path,
     is_tty: bool,
@@ -3867,42 +3876,33 @@ async fn run_install_auto_update_prompt_inner(
         return;
     }
 
-    if should_show_auto_update_disclosure(cfg) {
-        let mut stdout = std::io::stdout();
-        println!();
-        output::action_to_with_tty(&mut stdout, "Auto-update", "disclosure", is_tty);
-        output::detail_to_with_tty(
-            &mut stdout,
-            "Cadence background updater runs unattended and installs stable releases only.",
-            is_tty,
-        );
-        output::detail_to_with_tty(
-            &mut stdout,
-            "Controls: `cadence auto-update disable` or `cadence auto-update uninstall`.",
-            is_tty,
-        );
-        output::detail_to_with_tty(
-            &mut stdout,
-            &format!(
-                "Current setting: {}",
-                if cfg.auto_update_enabled() {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ),
-            is_tty,
-        );
-        return;
+    let mut stdout = std::io::stdout();
+    match install_auto_update_ftue_state(cfg) {
+        InstallAutoUpdateFtueState::Skip => return,
+        InstallAutoUpdateFtueState::Disclosure => {
+            println!();
+            output::action_to_with_tty(&mut stdout, "Auto-update", "disclosure", is_tty);
+            output::detail_to_with_tty(
+                &mut stdout,
+                "Cadence background updater runs unattended and installs stable releases only.",
+                is_tty,
+            );
+            output::detail_to_with_tty(
+                &mut stdout,
+                "Controls: `cadence auto-update disable` or `cadence auto-update uninstall`.",
+                is_tty,
+            );
+            output::detail_to_with_tty(&mut stdout, "Current setting: enabled", is_tty);
+            return;
+        }
+        InstallAutoUpdateFtueState::EnableByDefault => {}
     }
 
-    let mut stdout = std::io::stdout();
-
     println!();
-    output::action_to_with_tty(&mut stdout, "Auto-update", "setup", is_tty);
+    output::action_to_with_tty(&mut stdout, "Auto-update", "enabled", is_tty);
     output::detail_to_with_tty(
         &mut stdout,
-        "Cadence can run unattended background updates (stable channel only, no prompts).",
+        "Cadence enables unattended background updates by default (stable channel only, no prompts).",
         is_tty,
     );
     output::detail_to_with_tty(
@@ -3916,48 +3916,22 @@ async fn run_install_auto_update_prompt_inner(
         is_tty,
     );
 
-    let response = prompter
-        .confirm("Enable automatic updates?", &mut stdout)
-        .await;
-    match response {
-        Ok(Some(enabled)) => {
-            let value = if enabled { "true" } else { "false" };
-            let mut cfg = cfg.clone();
-            if let Err(e) = cfg.set_key(config::ConfigKey::AutoUpdate, value) {
-                output::note_to_with_tty(
-                    &mut stdout,
-                    &format!("Could not save auto-update preference: {e}"),
-                    is_tty,
-                );
-            } else if let Err(e) = cfg.save_to(config_path).await {
-                output::note_to_with_tty(
-                    &mut stdout,
-                    &format!("Could not save auto-update preference: {e}"),
-                    is_tty,
-                );
-            } else if enabled {
-                output::success_to_with_tty(
-                    &mut stdout,
-                    "Auto-update",
-                    "enabled. Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.",
-                    is_tty,
-                );
-            } else {
-                output::detail_to_with_tty(
-                    &mut stdout,
-                    "Auto-update disabled. Scheduled runs will no-op. Run `cadence update` to check manually.",
-                    is_tty,
-                );
-            }
-        }
-        Ok(None) | Err(_) => {
-            // User cancelled or error — skip silently
-        }
+    let mut updated_cfg = cfg.clone();
+    if let Err(e) = updated_cfg.set_key(config::ConfigKey::AutoUpdate, "true") {
+        output::note_to_with_tty(
+            &mut stdout,
+            &format!("Could not save auto-update preference: {e}"),
+            is_tty,
+        );
+        return;
     }
-}
-
-fn should_show_auto_update_disclosure(cfg: &config::CliConfig) -> bool {
-    cfg.auto_update == Some(true)
+    if let Err(e) = updated_cfg.save_to(config_path).await {
+        output::note_to_with_tty(
+            &mut stdout,
+            &format!("Could not save auto-update preference: {e}"),
+            is_tty,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4532,23 +4506,6 @@ mod tests {
     use deferred_sync::PendingSyncRecord;
     use tempfile::TempDir;
 
-    struct MockPrompter {
-        response: Option<bool>,
-        prompts: Vec<String>,
-    }
-
-    #[async_trait]
-    impl Prompter for MockPrompter {
-        async fn confirm(
-            &mut self,
-            prompt: &str,
-            _writer: &mut dyn std::io::Write,
-        ) -> Result<Option<bool>> {
-            self.prompts.push(prompt.to_string());
-            Ok(self.response)
-        }
-    }
-
     async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
         let out = crate::git::run_git_output_at(Some(repo), args, &[])
             .await
@@ -4844,39 +4801,38 @@ mod tests {
     }
 
     #[test]
-    fn auto_update_disclosure_only_shows_for_enabled_setting() {
+    fn install_auto_update_ftue_state_matches_config() {
         let mut enabled = config::CliConfig::default();
         enabled.auto_update = Some(true);
-        assert!(should_show_auto_update_disclosure(&enabled));
+        assert_eq!(
+            install_auto_update_ftue_state(&enabled),
+            InstallAutoUpdateFtueState::Disclosure
+        );
 
         let mut disabled = config::CliConfig::default();
         disabled.auto_update = Some(false);
-        assert!(!should_show_auto_update_disclosure(&disabled));
+        assert_eq!(
+            install_auto_update_ftue_state(&disabled),
+            InstallAutoUpdateFtueState::Skip
+        );
 
-        assert!(!should_show_auto_update_disclosure(
-            &config::CliConfig::default()
-        ));
+        assert_eq!(
+            install_auto_update_ftue_state(&config::CliConfig::default()),
+            InstallAutoUpdateFtueState::EnableByDefault
+        );
     }
 
     #[tokio::test]
-    async fn install_auto_update_prompt_reprompts_when_auto_update_disabled() {
+    async fn install_auto_update_defaults_to_enabled_when_unset() {
         let dir = TempDir::new().expect("tempdir");
         let config_path = dir.path().join("config.toml");
-        let mut cfg = config::CliConfig::default();
-        cfg.auto_update = Some(false);
+        let cfg = config::CliConfig::default();
 
-        let mut prompter = MockPrompter {
-            response: Some(false),
-            prompts: Vec::new(),
-        };
-
-        run_install_auto_update_prompt_inner(&mut prompter, &cfg, &config_path, true).await;
-
-        assert_eq!(prompter.prompts, vec!["Enable automatic updates?"]);
+        run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
         let saved = config::CliConfig::load_from(&config_path)
             .await
             .expect("load config");
-        assert_eq!(saved.auto_update, Some(false));
+        assert_eq!(saved.auto_update, Some(true));
     }
 
     #[tokio::test]
@@ -4886,14 +4842,20 @@ mod tests {
         let mut cfg = config::CliConfig::default();
         cfg.auto_update = Some(true);
 
-        let mut prompter = MockPrompter {
-            response: Some(false),
-            prompts: Vec::new(),
-        };
+        run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
 
-        run_install_auto_update_prompt_inner(&mut prompter, &cfg, &config_path, true).await;
+        assert!(!config_path.exists());
+    }
 
-        assert!(prompter.prompts.is_empty());
+    #[tokio::test]
+    async fn install_auto_update_respects_explicit_disable() {
+        let dir = TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut cfg = config::CliConfig::default();
+        cfg.auto_update = Some(false);
+
+        run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
+
         assert!(!config_path.exists());
     }
 
