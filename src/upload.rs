@@ -14,7 +14,7 @@ use std::time::Duration;
 
 const KEYCHAIN_SERVICE: &str = "cadence-cli";
 const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
-const API_TIMEOUT_SECS: u64 = 5;
+const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 60;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
 pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
@@ -58,7 +58,10 @@ pub struct PendingUploadSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingUploadRecord {
     pub session_uid: String,
-    pub request: SessionUploadUrlRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<SessionUploadUrlRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<note::SessionEnvelope>,
     pub enqueued_at: String,
     pub updated_at: String,
     pub attempt_count: u32,
@@ -127,7 +130,7 @@ pub async fn upload_or_queue_prepared_session(
     prepared: &PreparedSessionUpload,
 ) -> Result<LiveUploadOutcome> {
     let Some(token) = context.token.as_deref() else {
-        enqueue_pending_upload(prepared, "missing Cadence CLI auth token").await?;
+        enqueue_prepared_upload(prepared, "missing Cadence CLI auth token").await?;
         return Ok(LiveUploadOutcome::Queued);
     };
 
@@ -145,14 +148,26 @@ pub async fn upload_or_queue_prepared_session(
             Ok(LiveUploadOutcome::SkippedRepoNotAssociated)
         }
         Err(UploadAttemptError::Unauthorized) => {
-            enqueue_pending_upload(prepared, "Cadence CLI auth token was rejected").await?;
+            enqueue_prepared_upload(prepared, "Cadence CLI auth token was rejected").await?;
             Ok(LiveUploadOutcome::Queued)
         }
         Err(UploadAttemptError::Retryable(message)) => {
-            enqueue_pending_upload(prepared, &message).await?;
+            enqueue_prepared_upload(prepared, &message).await?;
             Ok(LiveUploadOutcome::Queued)
         }
     }
+}
+
+pub async fn queue_session_for_remote_resolution(
+    record: note::SessionRecord,
+    session_content: String,
+    error: &str,
+) -> Result<()> {
+    let envelope = note::SessionEnvelope {
+        record,
+        session_content,
+    };
+    enqueue_pending_envelope(&envelope, error).await
 }
 
 pub async fn process_pending_uploads(
@@ -170,19 +185,22 @@ pub async fn process_pending_uploads(
     let mut summary = PendingUploadSummary::default();
     for record in records {
         summary.attempted += 1;
-        let payload = match load_pending_payload(&record.session_uid).await {
-            Ok(payload) => payload,
+        let prepared = match prepare_pending_upload(&record).await {
+            Ok(prepared) => prepared,
             Err(err) => {
-                record_pending_failure(
-                    &record,
-                    &format!("failed to read pending payload: {err:#}"),
-                )
-                .await?;
+                record_pending_failure(&record, &err.to_string()).await?;
                 continue;
             }
         };
 
-        match attempt_upload(&context.client, token, &record.request, &payload).await {
+        match attempt_upload(
+            &context.client,
+            token,
+            &prepared.request,
+            &prepared.compressed_payload,
+        )
+        .await
+        {
             Ok(UploadAttemptOutcome::Uploaded) => {
                 remove_pending_upload(&record.session_uid).await?;
                 summary.uploaded += 1;
@@ -261,19 +279,17 @@ async fn attempt_upload(
     }
 }
 
-async fn enqueue_pending_upload(prepared: &PreparedSessionUpload, error: &str) -> Result<()> {
+async fn enqueue_prepared_upload(prepared: &PreparedSessionUpload, error: &str) -> Result<()> {
     let dir = pending_dir().await?;
     let now = now_epoch();
     let now_rfc3339 = note::now_rfc3339();
     let path = record_path(&dir, &prepared.session_uid);
-    let existing = match tokio::fs::read_to_string(&path).await {
-        Ok(content) => serde_json::from_str::<PendingUploadRecord>(&content).ok(),
-        Err(_) => None,
-    };
+    let existing = load_pending_record(&path).await;
 
     let record = PendingUploadRecord {
         session_uid: prepared.session_uid.clone(),
-        request: prepared.request.clone(),
+        request: Some(prepared.request.clone()),
+        envelope: None,
         enqueued_at: existing
             .as_ref()
             .map(|record| record.enqueued_at.clone())
@@ -287,17 +303,51 @@ async fn enqueue_pending_upload(prepared: &PreparedSessionUpload, error: &str) -
         last_error: Some(error.to_string()),
     };
 
-    write_pending_files(&dir, &record, &prepared.compressed_payload).await
+    write_pending_record(dir.as_path(), &record).await?;
+    write_pending_payload(
+        dir.as_path(),
+        &record.session_uid,
+        &prepared.compressed_payload,
+    )
+    .await
+}
+
+async fn enqueue_pending_envelope(envelope: &note::SessionEnvelope, error: &str) -> Result<()> {
+    let dir = pending_dir().await?;
+    let now = now_epoch();
+    let now_rfc3339 = note::now_rfc3339();
+    let path = record_path(&dir, &envelope.record.session_uid);
+    let existing = load_pending_record(&path).await;
+
+    let record = PendingUploadRecord {
+        session_uid: envelope.record.session_uid.clone(),
+        request: None,
+        envelope: Some(envelope.clone()),
+        enqueued_at: existing
+            .as_ref()
+            .map(|record| record.enqueued_at.clone())
+            .unwrap_or_else(|| now_rfc3339.clone()),
+        updated_at: now_rfc3339,
+        attempt_count: existing
+            .as_ref()
+            .map(|record| record.attempt_count)
+            .unwrap_or(0),
+        next_attempt_at_epoch: now,
+        last_error: Some(error.to_string()),
+    };
+
+    write_pending_record(dir.as_path(), &record).await?;
+    remove_pending_payload(dir.as_path(), &record.session_uid).await
 }
 
 async fn record_pending_failure(record: &PendingUploadRecord, error: &str) -> Result<()> {
-    let dir = pending_dir().await?;
     let now = now_epoch();
     let attempts = record.attempt_count.saturating_add(1);
     let retry_delay = retry_delay_secs(attempts);
     let updated = PendingUploadRecord {
         session_uid: record.session_uid.clone(),
         request: record.request.clone(),
+        envelope: record.envelope.clone(),
         enqueued_at: record.enqueued_at.clone(),
         updated_at: note::now_rfc3339(),
         attempt_count: attempts,
@@ -305,8 +355,7 @@ async fn record_pending_failure(record: &PendingUploadRecord, error: &str) -> Re
         last_error: Some(error.to_string()),
     };
 
-    let payload = load_pending_payload(&record.session_uid).await?;
-    write_pending_files(&dir, &updated, &payload).await
+    write_pending_record(pending_dir().await?.as_path(), &updated).await
 }
 
 async fn remove_pending_upload(session_uid: &str) -> Result<()> {
@@ -375,19 +424,32 @@ async fn load_pending_payload(session_uid: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("failed to read pending upload payload {}", path.display()))
 }
 
-async fn write_pending_files(
-    dir: &Path,
-    record: &PendingUploadRecord,
-    payload: &[u8],
-) -> Result<()> {
+async fn write_pending_record(dir: &Path, record: &PendingUploadRecord) -> Result<()> {
     let record_path = record_path(dir, &record.session_uid);
-    let payload_path = payload_path(dir, &record.session_uid);
     write_atomic(
         &record_path,
         serde_json::to_vec_pretty(record).context("failed to serialize pending upload")?,
     )
-    .await?;
-    write_atomic(&payload_path, payload.to_vec()).await
+    .await
+}
+
+async fn write_pending_payload(dir: &Path, session_uid: &str, payload: &[u8]) -> Result<()> {
+    write_atomic(&payload_path(dir, session_uid), payload.to_vec()).await
+}
+
+async fn remove_pending_payload(dir: &Path, session_uid: &str) -> Result<()> {
+    let payload_path = payload_path(dir, session_uid);
+    if tokio::fs::try_exists(&payload_path).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(&payload_path).await;
+    }
+    Ok(())
+}
+
+async fn load_pending_record(path: &Path) -> Option<PendingUploadRecord> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => serde_json::from_str::<PendingUploadRecord>(&content).ok(),
+        Err(_) => None,
+    }
 }
 
 async fn write_atomic(path: &Path, bytes: Vec<u8>) -> Result<()> {
@@ -444,6 +506,49 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+async fn prepare_pending_upload(record: &PendingUploadRecord) -> Result<PreparedSessionUpload> {
+    if let Some(request) = record.request.clone() {
+        let payload = load_pending_payload(&record.session_uid).await?;
+        return Ok(PreparedSessionUpload {
+            session_uid: record.session_uid.clone(),
+            request,
+            compressed_payload: payload,
+        });
+    }
+
+    let envelope = record.envelope.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pending upload {} is missing request data",
+            record.session_uid
+        )
+    })?;
+    let repo_remote_url = resolve_repo_remote_url(Path::new(&envelope.record.repo_root))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo has no push remote URL"))?;
+    rebuild_prepared_upload(&envelope, repo_remote_url)
+}
+
+fn rebuild_prepared_upload(
+    envelope: &note::SessionEnvelope,
+    repo_remote_url: String,
+) -> Result<PreparedSessionUpload> {
+    let mut record = envelope.record.clone();
+    record.repo_remote_url = Some(repo_remote_url);
+    prepare_session_upload(record, envelope.session_content.clone())
+}
+
+async fn resolve_repo_remote_url(repo_root: &Path) -> Result<Option<String>> {
+    let remote = match crate::git::resolve_push_remote_at(repo_root).await {
+        Ok(Some(remote)) => remote,
+        _ => return Ok(None),
+    };
+    Ok(crate::git::remote_url_at(repo_root, &remote)
+        .await
+        .ok()
+        .flatten()
+        .filter(|url| !url.trim().is_empty()))
+}
+
 async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
     let keychain = KeyringStore::new(KEYCHAIN_SERVICE);
     match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
@@ -455,6 +560,35 @@ async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var(key).ok(),
+            }
+        }
+
+        fn set_path(&self, path: &Path) {
+            unsafe { std::env::set_var(self.key, path) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn sample_record() -> note::SessionRecord {
         note::SessionRecord {
@@ -483,5 +617,77 @@ mod tests {
         let envelope = note::serialize_session_object(record, "hello".to_string())
             .expect("serialize session object");
         assert_eq!(prepared.request.content_sha256, sha256_hex(&envelope));
+    }
+
+    #[test]
+    fn prepare_session_upload_requires_repo_remote_url() {
+        let mut record = sample_record();
+        record.repo_remote_url = None;
+        let err = prepare_session_upload(record, "hello".to_string()).expect_err("missing remote");
+        assert!(err.to_string().contains("missing repo remote URL"));
+    }
+
+    #[test]
+    fn rebuild_prepared_upload_refreshes_remote_url_and_hash() {
+        let mut record = sample_record();
+        record.repo_remote_url = Some("cadence://missing-repo-remote-url".to_string());
+        let envelope = note::SessionEnvelope {
+            record,
+            session_content: "hello".to_string(),
+        };
+
+        let prepared =
+            rebuild_prepared_upload(&envelope, "git@github.com:team/example.git".to_string())
+                .expect("rebuild prepared upload");
+
+        assert_eq!(
+            prepared.request.repo_remote_url,
+            "git@github.com:team/example.git"
+        );
+        let envelope = note::serialize_session_object(
+            note::SessionRecord {
+                repo_remote_url: Some("git@github.com:team/example.git".to_string()),
+                ..envelope.record
+            },
+            "hello".to_string(),
+        )
+        .expect("serialize rebuilt envelope");
+        assert_eq!(prepared.request.content_sha256, sha256_hex(&envelope));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enqueue_pending_envelope_removes_stale_payload() {
+        let dir = TempDir::new().expect("tempdir");
+        let pending_dir = dir.path().join(".cadence/cli/pending-uploads");
+        tokio::fs::create_dir_all(&pending_dir)
+            .await
+            .expect("create pending dir");
+
+        let path = payload_path(&pending_dir, "uid-1");
+        tokio::fs::write(&path, b"stale")
+            .await
+            .expect("write stale payload");
+
+        let record = sample_record();
+        let envelope = note::SessionEnvelope {
+            record: note::SessionRecord {
+                repo_remote_url: None,
+                ..record
+            },
+            session_content: "hello".to_string(),
+        };
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        enqueue_pending_envelope(&envelope, "missing remote")
+            .await
+            .expect("enqueue pending envelope");
+
+        assert!(
+            !tokio::fs::try_exists(&path)
+                .await
+                .expect("check stale payload removal")
+        );
     }
 }

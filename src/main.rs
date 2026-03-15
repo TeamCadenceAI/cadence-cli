@@ -36,6 +36,7 @@ const KEYCHAIN_SERVICE: &str = "cadence-cli";
 const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
+const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
 static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
 /// Cadence CLI: upload AI coding agent sessions directly to Cadence.
@@ -1058,6 +1059,30 @@ struct ParsedSessionLog {
     session_log: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncrementalCursor {
+    last_scanned_mtime_epoch: i64,
+    last_scanned_source_label: Option<String>,
+}
+
+impl IncrementalCursor {
+    fn from_persisted(
+        record: Option<upload_cursor::UploadCursorRecord>,
+        default_mtime_epoch: i64,
+    ) -> Self {
+        match record {
+            Some(record) => Self {
+                last_scanned_mtime_epoch: record.last_scanned_mtime_epoch,
+                last_scanned_source_label: record.last_scanned_source_label,
+            },
+            None => Self {
+                last_scanned_mtime_epoch: default_mtime_epoch,
+                last_scanned_source_label: None,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum IncrementalLogDisposition {
@@ -1066,17 +1091,74 @@ enum IncrementalLogDisposition {
     ErrorRetriable,
 }
 
+fn source_label_is_scanned(cursor: &IncrementalCursor, mtime: i64, source_label: &str) -> bool {
+    if mtime < cursor.last_scanned_mtime_epoch {
+        return true;
+    }
+    if mtime > cursor.last_scanned_mtime_epoch {
+        return false;
+    }
+    match cursor.last_scanned_source_label.as_deref() {
+        Some(scanned_label) => source_label <= scanned_label,
+        None => true,
+    }
+}
+
 fn advance_cursor_for_disposition(
-    current_cursor: i64,
+    current_cursor: &IncrementalCursor,
     mtime: Option<i64>,
+    source_label: &str,
     disposition: IncrementalLogDisposition,
-) -> i64 {
+) -> IncrementalCursor {
     match disposition {
         IncrementalLogDisposition::Indexed | IncrementalLogDisposition::SkippedPermanent => {
-            mtime.map_or(current_cursor, |mtime| current_cursor.max(mtime))
+            let Some(mtime) = mtime else {
+                return current_cursor.clone();
+            };
+            if mtime > current_cursor.last_scanned_mtime_epoch {
+                return IncrementalCursor {
+                    last_scanned_mtime_epoch: mtime,
+                    last_scanned_source_label: Some(source_label.to_string()),
+                };
+            }
+            if mtime == current_cursor.last_scanned_mtime_epoch {
+                let next_label = match current_cursor.last_scanned_source_label.as_deref() {
+                    Some(existing) if existing >= source_label => existing.to_string(),
+                    _ => source_label.to_string(),
+                };
+                return IncrementalCursor {
+                    last_scanned_mtime_epoch: mtime,
+                    last_scanned_source_label: Some(next_label),
+                };
+            }
+            current_cursor.clone()
         }
-        IncrementalLogDisposition::ErrorRetriable => current_cursor,
+        IncrementalLogDisposition::ErrorRetriable => current_cursor.clone(),
     }
+}
+
+fn select_incremental_candidates(
+    logs: Vec<agents::SessionLog>,
+    cursor: &IncrementalCursor,
+    max_items: usize,
+) -> Vec<agents::SessionLog> {
+    let mut candidates: Vec<_> = logs
+        .into_iter()
+        .filter(|log| {
+            let Some(mtime) = log.updated_at else {
+                return false;
+            };
+            !source_label_is_scanned(cursor, mtime, &log.source_label())
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.updated_at
+            .unwrap_or_default()
+            .cmp(&b.updated_at.unwrap_or_default())
+            .then_with(|| a.source_label().cmp(&b.source_label()))
+    });
+    candidates.truncate(max_items);
+    candidates
 }
 
 async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSessionLog> {
@@ -1101,11 +1183,13 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     }
     let semaphore = Arc::new(Semaphore::new(hook_discovery_concurrency()));
     let mut set = JoinSet::new();
-    for log in logs {
+    for (idx, log) in logs.into_iter().enumerate() {
         let semaphore = Arc::clone(&semaphore);
         set.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok()?;
-            parse_session_log_once(log).await
+            parse_session_log_once(log)
+                .await
+                .map(|parsed| (idx, parsed))
         });
     }
 
@@ -1115,7 +1199,8 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
             out.push(parsed);
         }
     }
-    out
+    out.sort_by_key(|(idx, _)| *idx);
+    out.into_iter().map(|(_, parsed)| parsed).collect()
 }
 
 async fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
@@ -1185,10 +1270,10 @@ async fn upload_session_from_log(
         .flatten();
     let repo_remote_url = match git::resolve_push_remote_at(repo_root).await {
         Ok(Some(remote)) => match git::remote_url_at(repo_root, &remote).await.ok().flatten() {
-            Some(url) if !url.trim().is_empty() => url,
-            _ => return UploadFromLogOutcome::Retryable("repo has no push remote URL".to_string()),
+            Some(url) if !url.trim().is_empty() => Some(url),
+            _ => None,
         },
-        _ => return UploadFromLogOutcome::Retryable("repo has no push remote URL".to_string()),
+        _ => None,
     };
 
     let record = note::SessionRecord {
@@ -1196,7 +1281,7 @@ async fn upload_session_from_log(
         agent: agent.to_string(),
         session_id,
         repo_root: repo_root_str.to_string(),
-        repo_remote_url: Some(repo_remote_url),
+        repo_remote_url,
         branch_key,
         committer_key_hash,
         git_user_email,
@@ -1211,6 +1296,19 @@ async fn upload_session_from_log(
         ingested_at,
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
+
+    if record.repo_remote_url.is_none() {
+        return match upload::queue_session_for_remote_resolution(
+            record,
+            parsed.session_log.clone(),
+            "repo has no push remote URL",
+        )
+        .await
+        {
+            Ok(()) => UploadFromLogOutcome::Queued,
+            Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
+        };
+    }
 
     let prepared = match upload::prepare_session_upload(record, parsed.session_log.clone()) {
         Ok(prepared) => prepared,
@@ -1237,36 +1335,28 @@ async fn upload_incremental_sessions_for_repo(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let min_cursor = upload_cursor::load_cursor(repo_root_str)
-        .await?
-        .map(|record| record.last_scanned_mtime_epoch)
-        .unwrap_or(now - POST_COMMIT_FALLBACK_WINDOW_SECS);
-    let since_secs = (now - min_cursor).max(0);
+    let persisted_cursor = upload_cursor::load_cursor(repo_root_str).await?;
+    let initial_cursor =
+        IncrementalCursor::from_persisted(persisted_cursor, now - POST_COMMIT_FALLBACK_WINDOW_SECS);
+    let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
     let files = agents::discover_recent_sessions(now, since_secs).await;
-
-    let mut candidates = Vec::new();
-    for log in files {
-        let Some(mtime) = log.updated_at else {
-            continue;
-        };
-        if mtime <= min_cursor {
-            continue;
-        }
-        candidates.push(log);
-    }
+    let candidates =
+        select_incremental_candidates(files, &initial_cursor, POST_COMMIT_MAX_UPLOADS_PER_RUN);
 
     let parsed_logs = parse_session_logs_bounded(candidates).await;
     let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
         std::collections::HashMap::new();
     let mut stats = UploadRunStats::default();
-    let mut cursor_advance_mtime = min_cursor;
+    let mut cursor_advance = initial_cursor.clone();
 
     for parsed in parsed_logs {
         let log_mtime = parsed.log.updated_at;
+        let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance_mtime = advance_cursor_for_disposition(
-                cursor_advance_mtime,
+            cursor_advance = advance_cursor_for_disposition(
+                &cursor_advance,
                 log_mtime,
+                &log_source_label,
                 IncrementalLogDisposition::SkippedPermanent,
             );
             continue;
@@ -1279,17 +1369,19 @@ async fn upload_incremental_sessions_for_repo(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
-            cursor_advance_mtime = advance_cursor_for_disposition(
-                cursor_advance_mtime,
+            cursor_advance = advance_cursor_for_disposition(
+                &cursor_advance,
                 log_mtime,
+                &log_source_label,
                 IncrementalLogDisposition::SkippedPermanent,
             );
             continue;
         };
         if resolved_repo != repo_root {
-            cursor_advance_mtime = advance_cursor_for_disposition(
-                cursor_advance_mtime,
+            cursor_advance = advance_cursor_for_disposition(
+                &cursor_advance,
                 log_mtime,
+                &log_source_label,
                 IncrementalLogDisposition::SkippedPermanent,
             );
             continue;
@@ -1298,26 +1390,29 @@ async fn upload_incremental_sessions_for_repo(
         match upload_session_from_log(context, &parsed, repo_root, repo_root_str).await {
             UploadFromLogOutcome::Uploaded => {
                 stats.uploaded += 1;
-                cursor_advance_mtime = advance_cursor_for_disposition(
-                    cursor_advance_mtime,
+                cursor_advance = advance_cursor_for_disposition(
+                    &cursor_advance,
                     log_mtime,
+                    &log_source_label,
                     IncrementalLogDisposition::Indexed,
                 );
             }
             UploadFromLogOutcome::AlreadyExists
             | UploadFromLogOutcome::SkippedRepoNotAssociated => {
                 stats.skipped += 1;
-                cursor_advance_mtime = advance_cursor_for_disposition(
-                    cursor_advance_mtime,
+                cursor_advance = advance_cursor_for_disposition(
+                    &cursor_advance,
                     log_mtime,
+                    &log_source_label,
                     IncrementalLogDisposition::SkippedPermanent,
                 );
             }
             UploadFromLogOutcome::Queued => {
                 stats.queued += 1;
-                cursor_advance_mtime = advance_cursor_for_disposition(
-                    cursor_advance_mtime,
+                cursor_advance = advance_cursor_for_disposition(
+                    &cursor_advance,
                     log_mtime,
+                    &log_source_label,
                     IncrementalLogDisposition::Indexed,
                 );
             }
@@ -1330,8 +1425,13 @@ async fn upload_incremental_sessions_for_repo(
         }
     }
 
-    if cursor_advance_mtime > min_cursor {
-        upload_cursor::upsert_cursor(repo_root_str, cursor_advance_mtime).await?;
+    if cursor_advance != initial_cursor {
+        upload_cursor::upsert_cursor(
+            repo_root_str,
+            cursor_advance.last_scanned_mtime_epoch,
+            cursor_advance.last_scanned_source_label.as_deref(),
+        )
+        .await?;
     }
 
     Ok(stats)
@@ -1607,28 +1707,26 @@ async fn ingest_incremental_sessions_for_repo(
     let files = agents::discover_recent_sessions(now, since_secs).await;
 
     let mut ingested = 0usize;
-    let mut cursor_advance_mtime = min_cursor;
-    let mut candidates = Vec::new();
-    for log in files {
-        let Some(mtime) = log.updated_at else {
-            continue;
-        };
-        if mtime <= min_cursor {
-            continue;
-        }
-        candidates.push(log);
-    }
+    let initial_cursor = IncrementalCursor {
+        last_scanned_mtime_epoch: min_cursor,
+        last_scanned_source_label: None,
+    };
+    let mut cursor_advance = initial_cursor.clone();
+    let candidates =
+        select_incremental_candidates(files, &initial_cursor, POST_COMMIT_MAX_UPLOADS_PER_RUN);
     let parsed_logs = parse_session_logs_bounded(candidates).await;
     let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
         std::collections::HashMap::new();
 
     for parsed in parsed_logs {
         let log_mtime = parsed.log.updated_at;
+        let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
             // Missing CWD can never be attributed to this repo; skip permanently.
-            cursor_advance_mtime = advance_cursor_for_disposition(
-                cursor_advance_mtime,
+            cursor_advance = advance_cursor_for_disposition(
+                &cursor_advance,
                 log_mtime,
+                &log_source_label,
                 IncrementalLogDisposition::SkippedPermanent,
             );
             continue;
@@ -1642,18 +1740,20 @@ async fn ingest_incremental_sessions_for_repo(
         };
         let Some(resolved_repo) = resolved_repo else {
             // Unresolvable CWD cannot be matched to this repo in this path; skip permanently.
-            cursor_advance_mtime = advance_cursor_for_disposition(
-                cursor_advance_mtime,
+            cursor_advance = advance_cursor_for_disposition(
+                &cursor_advance,
                 log_mtime,
+                &log_source_label,
                 IncrementalLogDisposition::SkippedPermanent,
             );
             continue;
         };
         if resolved_repo != repo_root {
             // Logs for a different repo are permanently irrelevant for this repo.
-            cursor_advance_mtime = advance_cursor_for_disposition(
-                cursor_advance_mtime,
+            cursor_advance = advance_cursor_for_disposition(
+                &cursor_advance,
                 log_mtime,
+                &log_source_label,
                 IncrementalLogDisposition::SkippedPermanent,
             );
             continue;
@@ -1690,9 +1790,10 @@ async fn ingest_incremental_sessions_for_repo(
             }
         };
         ingested += 1;
-        cursor_advance_mtime = advance_cursor_for_disposition(
-            cursor_advance_mtime,
+        cursor_advance = advance_cursor_for_disposition(
+            &cursor_advance,
             log_mtime,
+            &log_source_label,
             IncrementalLogDisposition::Indexed,
         );
         if output::is_verbose() {
@@ -1703,12 +1804,12 @@ async fn ingest_incremental_sessions_for_repo(
         }
     }
 
-    if cursor_advance_mtime > min_cursor {
+    if cursor_advance.last_scanned_mtime_epoch > min_cursor {
         sync_pending::upsert_cursor(
             repo_root_str,
             sync_pending::ScopeType::Committer,
             &committer_hash,
-            cursor_advance_mtime,
+            cursor_advance.last_scanned_mtime_epoch,
         )
         .await?;
         for key_hash in &branch_key_hashes {
@@ -1716,7 +1817,7 @@ async fn ingest_incremental_sessions_for_repo(
                 repo_root_str,
                 sync_pending::ScopeType::Branch,
                 key_hash,
-                cursor_advance_mtime,
+                cursor_advance.last_scanned_mtime_epoch,
             )
             .await?;
         }
@@ -4815,6 +4916,11 @@ mod tests {
     }
 
     #[test]
+    fn post_commit_max_uploads_per_run_defaults_are_stable() {
+        assert_eq!(POST_COMMIT_MAX_UPLOADS_PER_RUN, 20);
+    }
+
+    #[test]
     fn anonymized_backfill_fixture_contains_expected_failure_modes() {
         let csv = include_str!("../tests/fixtures/backfill/anonymized_report.csv");
         let mut missing_meta = 0usize;
@@ -4866,29 +4972,110 @@ mod tests {
 
     #[test]
     fn cursor_advances_for_indexed_logs() {
-        let updated =
-            advance_cursor_for_disposition(100, Some(150), IncrementalLogDisposition::Indexed);
-        assert_eq!(updated, 150);
+        let updated = advance_cursor_for_disposition(
+            &IncrementalCursor {
+                last_scanned_mtime_epoch: 100,
+                last_scanned_source_label: Some("a".to_string()),
+            },
+            Some(150),
+            "b",
+            IncrementalLogDisposition::Indexed,
+        );
+        assert_eq!(updated.last_scanned_mtime_epoch, 150);
+        assert_eq!(updated.last_scanned_source_label.as_deref(), Some("b"));
     }
 
     #[test]
     fn cursor_advances_for_permanent_skips() {
         let updated = advance_cursor_for_disposition(
-            100,
+            &IncrementalCursor {
+                last_scanned_mtime_epoch: 100,
+                last_scanned_source_label: Some("a".to_string()),
+            },
             Some(140),
+            "c",
             IncrementalLogDisposition::SkippedPermanent,
         );
-        assert_eq!(updated, 140);
+        assert_eq!(updated.last_scanned_mtime_epoch, 140);
+        assert_eq!(updated.last_scanned_source_label.as_deref(), Some("c"));
     }
 
     #[test]
     fn cursor_does_not_advance_for_retriable_errors() {
         let updated = advance_cursor_for_disposition(
-            100,
+            &IncrementalCursor {
+                last_scanned_mtime_epoch: 100,
+                last_scanned_source_label: Some("a".to_string()),
+            },
             Some(180),
+            "z",
             IncrementalLogDisposition::ErrorRetriable,
         );
-        assert_eq!(updated, 100);
+        assert_eq!(
+            updated,
+            IncrementalCursor {
+                last_scanned_mtime_epoch: 100,
+                last_scanned_source_label: Some("a".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_uses_source_label_to_track_same_mtime_progress() {
+        let updated = advance_cursor_for_disposition(
+            &IncrementalCursor {
+                last_scanned_mtime_epoch: 100,
+                last_scanned_source_label: Some("a".to_string()),
+            },
+            Some(100),
+            "c",
+            IncrementalLogDisposition::Indexed,
+        );
+        assert_eq!(updated.last_scanned_mtime_epoch, 100);
+        assert_eq!(updated.last_scanned_source_label.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn select_incremental_candidates_orders_and_caps() {
+        let cursor = IncrementalCursor {
+            last_scanned_mtime_epoch: 100,
+            last_scanned_source_label: Some("a".to_string()),
+        };
+        let candidates = select_incremental_candidates(
+            vec![
+                agents::SessionLog {
+                    agent_type: scanner::AgentType::Codex,
+                    source: agents::SessionSource::Inline {
+                        label: "c".to_string(),
+                        content: "{}".to_string(),
+                    },
+                    updated_at: Some(110),
+                },
+                agents::SessionLog {
+                    agent_type: scanner::AgentType::Codex,
+                    source: agents::SessionSource::Inline {
+                        label: "b".to_string(),
+                        content: "{}".to_string(),
+                    },
+                    updated_at: Some(100),
+                },
+                agents::SessionLog {
+                    agent_type: scanner::AgentType::Codex,
+                    source: agents::SessionSource::Inline {
+                        label: "d".to_string(),
+                        content: "{}".to_string(),
+                    },
+                    updated_at: Some(110),
+                },
+            ],
+            &cursor,
+            2,
+        );
+        let labels: Vec<_> = candidates
+            .into_iter()
+            .map(|log| log.source_label())
+            .collect();
+        assert_eq!(labels, vec!["b".to_string(), "c".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

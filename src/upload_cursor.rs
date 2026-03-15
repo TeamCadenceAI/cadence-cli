@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub struct UploadCursorRecord {
     pub repo_root: String,
     pub last_scanned_mtime_epoch: i64,
+    #[serde(default)]
+    pub last_scanned_source_label: Option<String>,
     pub updated_at: String,
 }
 
@@ -28,13 +30,18 @@ pub async fn load_cursor(repo_root: &str) -> Result<Option<UploadCursorRecord>> 
     }
 }
 
-pub async fn upsert_cursor(repo_root: &str, last_scanned_mtime_epoch: i64) -> Result<()> {
+pub async fn upsert_cursor(
+    repo_root: &str,
+    last_scanned_mtime_epoch: i64,
+    last_scanned_source_label: Option<&str>,
+) -> Result<()> {
     let dir = cursor_dir().await?;
     let path = record_path(&dir, repo_root);
     let tmp = path.with_extension("json.tmp");
     let record = UploadCursorRecord {
         repo_root: repo_root.to_string(),
         last_scanned_mtime_epoch,
+        last_scanned_source_label: last_scanned_source_label.map(str::to_string),
         updated_at: crate::note::now_rfc3339(),
     };
     let bytes = serde_json::to_vec_pretty(&record).context("failed to serialize upload cursor")?;

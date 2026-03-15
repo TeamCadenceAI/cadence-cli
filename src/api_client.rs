@@ -155,6 +155,7 @@ impl std::error::Error for AuthenticatedRequestError {}
 #[derive(Debug)]
 pub struct ApiClient {
     client: reqwest::Client,
+    raw_client: reqwest::Client,
     base_url: String,
 }
 
@@ -174,8 +175,12 @@ impl ApiClient {
             .default_headers(headers)
             .build()
             .expect("build Cadence API HTTP client");
+        let raw_client = reqwest::Client::builder()
+            .build()
+            .expect("build raw HTTP client");
         Self {
             client,
+            raw_client,
             base_url: normalized,
         }
     }
@@ -320,10 +325,8 @@ impl ApiClient {
         payload: &[u8],
         timeout: Duration,
     ) -> std::result::Result<(), AuthenticatedRequestError> {
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| AuthenticatedRequestError::Unexpected(e.to_string()))?;
-        let resp = client
+        let resp = self
+            .raw_client
             .put(upload_url)
             .header(reqwest::header::CONTENT_TYPE, "application/zstd")
             .timeout(timeout)
