@@ -2,27 +2,20 @@ mod agents;
 mod api_client;
 mod backfill_log;
 mod config;
-mod deferred_sync;
 mod git;
 mod keychain;
 mod login;
 mod note;
 mod output;
-mod pgp_keys;
-mod push;
 mod scanner;
-mod sync_pending;
 mod update;
 mod upload;
 mod upload_cursor;
 
-use anyhow::{Context, Result};
-use async_trait::async_trait;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use console::Term;
-use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -159,48 +152,6 @@ enum HookCommand {
     AutoUpdate,
 }
 
-#[derive(Subcommand, Debug)]
-enum SessionsCommand {
-    /// List sessions for branch + current committer.
-    List {
-        /// List sessions for all discovered repos instead of only current repo.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Audit branch indexing and flag likely overindexed sessions.
-    Audit {
-        /// Audit all discovered repos instead of only current repo.
-        #[arg(long)]
-        all: bool,
-        /// Include non-problematic sessions in output.
-        #[arg(long)]
-        show_ok: bool,
-    },
-    /// Inspect a session by UID prefix / session_id / label text.
-    Inspect {
-        /// Query string (session UID prefix, session_id, or label substring).
-        query: String,
-        /// Search all discovered repos instead of only current repo.
-        #[arg(long)]
-        all: bool,
-        /// Print the full stored record + session_content for each match.
-        #[arg(long)]
-        raw: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum KeysCommands {
-    /// Set up encryption with local + API recipients.
-    Setup,
-    /// Show encryption status for local + API recipients.
-    Status,
-    /// Disable encryption and clear cached keys.
-    Disable,
-    /// Refresh the cached API public key.
-    Refresh,
-}
-
 // ---------------------------------------------------------------------------
 // Hook error taxonomy
 // ---------------------------------------------------------------------------
@@ -219,161 +170,8 @@ impl From<anyhow::Error> for HookError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared encryption helper
-// ---------------------------------------------------------------------------
-
-/// How note content should be encrypted before storage.
-#[derive(Clone)]
-enum EncryptionMethod {
-    /// Pure-Rust rpgp encryption using user + API public keys.
-    RpgpMulti { user_key: String, api_key: String },
-    /// Encryption configured but keys are unavailable.
-    Unavailable(String),
-    /// No encryption configured — notes are stored as plaintext.
-    None,
-}
-
-impl EncryptionMethod {
-    /// Returns `true` when encryption is configured.
-    fn is_configured(&self) -> bool {
-        !matches!(self, EncryptionMethod::None)
-    }
-}
-
-/// Resolve how note encryption should be performed.
-///
-/// If `ai.cadence.keys.userFingerprint` is unset, returns `None`.
-/// If set but keys are unavailable, returns `Unavailable` with a reason.
-async fn resolve_encryption_method() -> Result<EncryptionMethod> {
-    let Some(user_fingerprint) = pgp_keys::get_user_fingerprint().await? else {
-        return Ok(EncryptionMethod::None);
-    };
-
-    let user_key = match pgp_keys::load_cached_user_public_key().await {
-        Ok(Some(key)) => Some(key),
-        Ok(None) => None,
-        Err(e) => {
-            return Ok(EncryptionMethod::Unavailable(format!(
-                "failed to read cached local key: {e}"
-            )));
-        }
-    };
-
-    let api_key = match resolve_api_public_key_cache(false).await {
-        Ok(Some(key)) => Some(key),
-        Ok(None) => None,
-        Err(e) => {
-            return Ok(EncryptionMethod::Unavailable(format!(
-                "failed to fetch API public key: {e}"
-            )));
-        }
-    };
-
-    match (user_key, api_key) {
-        (Some(user_key), Some(api_key)) => Ok(EncryptionMethod::RpgpMulti { user_key, api_key }),
-        _ => Ok(EncryptionMethod::Unavailable(format!(
-            "encryption configured for key {user_fingerprint}, but keys are missing"
-        ))),
-    }
-}
-
-/// Encode canonical session object bytes: compress with zstd, optionally encrypt
-/// (binary, not armored), then store as a git blob.
-///
-/// Returns `(blob_sha, encoding)`.
-async fn encode_and_store_session_object_at(
-    repo: Option<&std::path::Path>,
-    session_object_bytes: &[u8],
-    method: &EncryptionMethod,
-) -> Result<(String, note::ContentEncoding)> {
-    let compressed = tokio::task::spawn_blocking({
-        let data = session_object_bytes.to_vec();
-        move || note::compress_bytes(&data)
-    })
-    .await
-    .context("session object compression task failed")?
-    .context("session object compression failed")?;
-
-    // Step 2: Optionally encrypt (binary, not armored)
-    let (encoded, encoding) = match method {
-        EncryptionMethod::RpgpMulti { user_key, api_key } => {
-            let encrypted = pgp_keys::encrypt_to_public_keys_binary(
-                &compressed,
-                &[user_key.clone(), api_key.clone()],
-            )
-            .context("session object encryption failed")?;
-            (encrypted, note::ContentEncoding::ZstdPgp)
-        }
-        EncryptionMethod::Unavailable(reason) => {
-            anyhow::bail!("encryption unavailable: {}", reason);
-        }
-        EncryptionMethod::None => (compressed, note::ContentEncoding::Zstd),
-    };
-
-    let blob_sha = git::store_blob_at(repo, &encoded)
-        .await
-        .context("failed to store canonical session blob")?;
-
-    Ok((blob_sha, encoding))
-}
-
-const API_PUBLIC_KEY_MAX_AGE_DAYS: i64 = 7;
-
-fn now_rfc3339() -> String {
-    use time::format_description::well_known::Rfc3339;
-    time::OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
 fn api_url_override() -> Option<&'static str> {
     API_URL_OVERRIDE.get().map(String::as_str)
-}
-
-/// Resolve the cached API public key, refreshing if needed.
-async fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<String>> {
-    let cached_key = pgp_keys::load_cached_api_public_key().await.unwrap_or(None);
-    let metadata = pgp_keys::load_api_public_key_metadata()
-        .await
-        .unwrap_or(None);
-
-    let stale = metadata
-        .as_ref()
-        .map(|m| pgp_keys::api_public_key_cache_stale(m, API_PUBLIC_KEY_MAX_AGE_DAYS))
-        .unwrap_or(true);
-
-    if !force_refresh && !stale && cached_key.is_some() {
-        return Ok(cached_key);
-    }
-
-    let cfg = config::CliConfig::load().await?;
-    let resolved = cfg.resolve_api_url(api_url_override());
-    let client = api_client::ApiClient::new(&resolved.url);
-    let keys_url = format!("{}/api/keys/public", resolved.url.trim_end_matches('/'));
-    let api_key = client
-        .get_api_public_key()
-        .await
-        .with_context(|| format!("failed to fetch API public key from {keys_url}"))?;
-
-    let meta = pgp_keys::ApiPublicKeyMetadata {
-        fingerprint: api_key.fingerprint.clone(),
-        fetched_at: now_rfc3339(),
-        created_at: api_key.created_at.clone(),
-        rotated_at: api_key.rotated_at.clone(),
-        version: api_key.version.clone(),
-    };
-    pgp_keys::save_api_public_key_cache(&api_key.armored_public_key, &meta).await?;
-
-    if let Err(e) =
-        git::config_set_global(pgp_keys::API_FINGERPRINT_KEY, &api_key.fingerprint).await
-    {
-        output::note(&format!(
-            "Could not save API fingerprint to git config: {e}"
-        ));
-    }
-
-    Ok(Some(api_key.armored_public_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -429,13 +227,6 @@ fn debug_hook_exe_path() -> Option<String> {
 
 fn post_commit_hook_content() -> String {
     format!("#!/bin/sh\nexec {} hook post-commit\n", hook_command_exe())
-}
-
-fn pre_push_hook_content() -> String {
-    format!(
-        "#!/bin/sh\nexec {} hook pre-push \"$1\" \"$2\"\n",
-        hook_command_exe()
-    )
 }
 
 fn resolve_hooks_path(repo_root: Option<&Path>, configured_path: &str) -> PathBuf {
@@ -853,29 +644,6 @@ async fn run_hook_post_commit() -> Result<()> {
     final_result
 }
 
-/// The pre-push hook handler. Must never block the push.
-async fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
-    let remote = remote.to_string();
-    let url = url.to_string();
-    let result = tokio::spawn(async move { hook_pre_push_inner(&remote, &url).await }).await;
-
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            output::note(&format!("Hook issue: {}", e));
-        }
-        Err(e) => {
-            if !e.is_panic() {
-                output::note(&format!("Hook task failed: {}", e));
-            }
-            output::note("Hook panicked (please report this issue)");
-        }
-    }
-
-    eprintln!();
-    Ok(())
-}
-
 /// Inner implementation of the post-commit hook.
 async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
@@ -937,45 +705,7 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     Ok(())
 }
 
-/// Inner implementation of the pre-push hook.
-async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
-    if !git::check_enabled().await {
-        return Ok(());
-    }
-    let _activity_lock = update::acquire_activity_lock_blocking("hook-pre-push").await?;
-
-    if push::should_push_remote(remote).await {
-        let repo_root = git::repo_root().await?;
-        let repo_root_str = repo_root.to_string_lossy().to_string();
-        let encryption_method = resolve_encryption_method()
-            .await
-            .unwrap_or_else(|e| EncryptionMethod::Unavailable(format!("{e}")));
-        if let Err(e) =
-            ingest_incremental_sessions_for_repo(&repo_root, &repo_root_str, &encryption_method)
-                .await
-        {
-            output::note(&format!("Pre-push ingest issue: {}", e));
-        }
-        let queue_progress = hook_status_spinner_start("Queueing AI session sync");
-        deferred_sync::enqueue_pending_sync(&repo_root, remote).await?;
-        let _ = deferred_sync::spawn_background_sync(&repo_root, remote).await;
-        hook_status_spinner_finish_ok(queue_progress, "Queueing AI session sync");
-    }
-
-    Ok(())
-}
-
 const POST_COMMIT_FALLBACK_WINDOW_SECS: i64 = 30 * 86_400;
-
-/// Stored canonical session object info.
-struct SessionIngestInfo {
-    session_uid: String,
-    blob_sha: String,
-    encoding: note::ContentEncoding,
-}
-
-const INDEX_TARGET_SIZE_BYTES: usize = 128 * 1024;
-const INDEX_HARD_SIZE_BYTES: usize = 256 * 1024;
 
 fn cadence_hook_label(is_tty: bool) -> String {
     if is_tty {
@@ -1437,196 +1167,6 @@ async fn upload_incremental_sessions_for_repo(
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn ingest_session_from_log(
-    agent_type: &scanner::AgentType,
-    session_id: &str,
-    repo_str: &str,
-    session_log: &str,
-    method: &EncryptionMethod,
-    session_start: Option<i64>,
-    repo: Option<&std::path::Path>,
-    explicit_branch_keys: Option<&[String]>,
-) -> Result<SessionIngestInfo> {
-    let repo_path = match repo {
-        Some(r) => r.to_path_buf(),
-        None => git::repo_root().await?,
-    };
-    let content_sha256 = note::content_sha256(session_log);
-    let session_uid = note::compute_session_uid(
-        agent_type,
-        session_id,
-        repo_str,
-        session_start,
-        &content_sha256,
-    );
-    let ingested_at = session_start
-        .and_then(format_unix_rfc3339)
-        .unwrap_or_else(note::now_rfc3339);
-    let mut branch_keys: Vec<String> = explicit_branch_keys
-        .map(|keys| keys.to_vec())
-        .unwrap_or_default();
-    if branch_keys.is_empty() {
-        branch_keys.push(branch_key_for_repo(&repo_path).await);
-    }
-    branch_keys.sort();
-    branch_keys.dedup();
-    let branch_key = branch_keys
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "detached/unknown".to_string());
-    let committer_key_hash = committer_key_hash_for_repo(&repo_path).await;
-    let git_user_email = git::config_get_at(&repo_path, "user.email")
-        .await
-        .ok()
-        .flatten();
-    let git_user_name = git::config_get_at(&repo_path, "user.name")
-        .await
-        .ok()
-        .flatten();
-    let repo_remote_url = match git::resolve_push_remote_at(&repo_path).await {
-        Ok(Some(remote)) => git::remote_url_at(&repo_path, &remote).await.ok().flatten(),
-        _ => None,
-    };
-
-    let record = note::SessionRecord {
-        session_uid: session_uid.clone(),
-        agent: agent_type.to_string(),
-        session_id: session_id.to_string(),
-        repo_root: repo_str.to_string(),
-        repo_remote_url,
-        branch_key: branch_key.clone(),
-        committer_key_hash: committer_key_hash.clone(),
-        git_user_email,
-        git_user_name,
-        session_start,
-        content_sha256,
-        cwd: Some(repo_str.to_string()),
-        ingested_at: ingested_at.clone(),
-        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-
-    let session_bytes = note::serialize_session_object(record, session_log.to_string())?;
-    let _ = git::migrate_legacy_session_ref_at(Some(&repo_path)).await?;
-    let (blob_sha, encoding) =
-        encode_and_store_session_object_at(Some(&repo_path), &session_bytes, method).await?;
-    let fanout_path = git::fanout_path_for_key_hash(&session_uid)?;
-    git::ensure_blob_referenced_in_ref_at(
-        &repo_path,
-        git::SESSION_DATA_REF,
-        &fanout_path,
-        &blob_sha,
-        "cadence session data",
-    )
-    .await?;
-
-    let index_entry = note::IndexEntry {
-        session_uid: session_uid.clone(),
-        session_blob_sha: blob_sha.clone(),
-        session_start,
-        agent: agent_type.to_string(),
-        ingested_at,
-    };
-    let line = note::serialize_index_entry_line(&index_entry)?;
-    for key in &branch_keys {
-        git::append_index_entry_at(
-            &repo_path,
-            git::SESSION_INDEX_BRANCH_REF,
-            &note::hash_key(key),
-            &line,
-            INDEX_TARGET_SIZE_BYTES,
-            INDEX_HARD_SIZE_BYTES,
-            "cadence branch index",
-        )
-        .await?;
-    }
-    git::append_index_entry_at(
-        &repo_path,
-        git::SESSION_INDEX_COMMITTER_REF,
-        &committer_key_hash,
-        &line,
-        INDEX_TARGET_SIZE_BYTES,
-        INDEX_HARD_SIZE_BYTES,
-        "cadence committer index",
-    )
-    .await?;
-
-    Ok(SessionIngestInfo {
-        session_uid,
-        blob_sha,
-        encoding,
-    })
-}
-
-async fn ingest_recent_sessions_for_repo(
-    repo_root: &std::path::Path,
-    repo_root_str: &str,
-    since_secs: i64,
-    method: &EncryptionMethod,
-) -> Result<usize> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let files = agents::discover_recent_sessions(now, since_secs).await;
-    let parsed_logs = parse_session_logs_bounded(files).await;
-    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
-        std::collections::HashMap::new();
-    let mut ingested = 0usize;
-
-    for parsed in parsed_logs {
-        let Some(cwd) = parsed.metadata.cwd.clone() else {
-            continue;
-        };
-        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
-            cached.clone()
-        } else {
-            let resolved = git::repo_root_at(std::path::Path::new(&cwd)).await.ok();
-            repo_root_cache.insert(cwd.clone(), resolved.clone());
-            resolved
-        };
-        let Some(resolved_repo) = resolved_repo else {
-            continue;
-        };
-        if resolved_repo != repo_root {
-            continue;
-        }
-
-        let session_id = parsed
-            .metadata
-            .session_id
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
-        let agent = parsed
-            .metadata
-            .agent_type
-            .clone()
-            .unwrap_or(scanner::AgentType::Claude);
-
-        let info = ingest_session_from_log(
-            &agent,
-            &session_id,
-            repo_root_str,
-            &parsed.session_log,
-            method,
-            parsed.session_start,
-            Some(repo_root),
-            None,
-        )
-        .await?;
-        ingested += 1;
-        if output::is_verbose() {
-            output::detail(&format!(
-                "session uid {} stored as {} ({})",
-                info.session_uid, info.blob_sha, info.encoding
-            ));
-        }
-    }
-
-    Ok(ingested)
-}
-
 async fn session_log_metadata(log: &agents::SessionLog) -> scanner::SessionMetadata {
     let mut metadata = match &log.source {
         agents::SessionSource::File(path) => scanner::parse_session_metadata(path).await,
@@ -1650,180 +1190,6 @@ async fn session_log_content_async(log: &agents::SessionLog) -> Option<String> {
         agents::SessionSource::File(path) => tokio::fs::read_to_string(path).await.ok(),
         agents::SessionSource::Inline { content, .. } => Some(content.clone()),
     }
-}
-
-async fn ingest_incremental_sessions_for_repo(
-    repo_root: &std::path::Path,
-    repo_root_str: &str,
-    method: &EncryptionMethod,
-) -> Result<usize> {
-    let remote = git::resolve_push_remote_at(repo_root)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "origin".to_string());
-    let committer_hash = committer_key_hash_for_repo(repo_root).await;
-    let mut local_branches = git::local_branches_at(repo_root).await.unwrap_or_default();
-    if local_branches.is_empty()
-        && let Ok(Some(current)) = git::current_branch_at(repo_root).await
-    {
-        local_branches.push(current);
-    }
-    local_branches.sort();
-    local_branches.dedup();
-
-    let branch_keys: Vec<String> = local_branches
-        .iter()
-        .map(|branch| format!("{remote}/{branch}"))
-        .collect();
-    let branch_key_hashes: Vec<String> = branch_keys.iter().map(|k| note::hash_key(k)).collect();
-
-    let mut cursor_values = Vec::new();
-    if let Some(rec) = sync_pending::load_cursor(
-        repo_root_str,
-        sync_pending::ScopeType::Committer,
-        &committer_hash,
-    )
-    .await?
-    {
-        cursor_values.push(rec.last_scanned_mtime_epoch);
-    }
-    for key_hash in &branch_key_hashes {
-        if let Some(rec) =
-            sync_pending::load_cursor(repo_root_str, sync_pending::ScopeType::Branch, key_hash)
-                .await?
-        {
-            cursor_values.push(rec.last_scanned_mtime_epoch);
-        }
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let fallback_since = now - 30 * 86_400;
-    let min_cursor = cursor_values.into_iter().min().unwrap_or(fallback_since);
-    let since_secs = (now - min_cursor).max(0);
-    let files = agents::discover_recent_sessions(now, since_secs).await;
-
-    let mut ingested = 0usize;
-    let initial_cursor = IncrementalCursor {
-        last_scanned_mtime_epoch: min_cursor,
-        last_scanned_source_label: None,
-    };
-    let mut cursor_advance = initial_cursor.clone();
-    let candidates =
-        select_incremental_candidates(files, &initial_cursor, POST_COMMIT_MAX_UPLOADS_PER_RUN);
-    let parsed_logs = parse_session_logs_bounded(candidates).await;
-    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
-        std::collections::HashMap::new();
-
-    for parsed in parsed_logs {
-        let log_mtime = parsed.log.updated_at;
-        let log_source_label = parsed.log.source_label();
-        let Some(cwd) = parsed.metadata.cwd.clone() else {
-            // Missing CWD can never be attributed to this repo; skip permanently.
-            cursor_advance = advance_cursor_for_disposition(
-                &cursor_advance,
-                log_mtime,
-                &log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
-            continue;
-        };
-        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
-            cached.clone()
-        } else {
-            let resolved = git::repo_root_at(std::path::Path::new(&cwd)).await.ok();
-            repo_root_cache.insert(cwd.clone(), resolved.clone());
-            resolved
-        };
-        let Some(resolved_repo) = resolved_repo else {
-            // Unresolvable CWD cannot be matched to this repo in this path; skip permanently.
-            cursor_advance = advance_cursor_for_disposition(
-                &cursor_advance,
-                log_mtime,
-                &log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
-            continue;
-        };
-        if resolved_repo != repo_root {
-            // Logs for a different repo are permanently irrelevant for this repo.
-            cursor_advance = advance_cursor_for_disposition(
-                &cursor_advance,
-                log_mtime,
-                &log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
-            continue;
-        }
-
-        let session_id = parsed
-            .metadata
-            .session_id
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
-        let agent = parsed
-            .metadata
-            .agent_type
-            .clone()
-            .unwrap_or(scanner::AgentType::Claude);
-
-        let info = match ingest_session_from_log(
-            &agent,
-            &session_id,
-            repo_root_str,
-            &parsed.session_log,
-            method,
-            parsed.session_start,
-            Some(repo_root),
-            None,
-        )
-        .await
-        {
-            Ok(info) => info,
-            Err(err) => {
-                // Ingest failure is retriable; keep cursor unchanged.
-                return Err(err);
-            }
-        };
-        ingested += 1;
-        cursor_advance = advance_cursor_for_disposition(
-            &cursor_advance,
-            log_mtime,
-            &log_source_label,
-            IncrementalLogDisposition::Indexed,
-        );
-        if output::is_verbose() {
-            output::detail(&format!(
-                "pre-push incremental: session uid {} stored as {} ({})",
-                info.session_uid, info.blob_sha, info.encoding
-            ));
-        }
-    }
-
-    if cursor_advance.last_scanned_mtime_epoch > min_cursor {
-        sync_pending::upsert_cursor(
-            repo_root_str,
-            sync_pending::ScopeType::Committer,
-            &committer_hash,
-            cursor_advance.last_scanned_mtime_epoch,
-        )
-        .await?;
-        for key_hash in &branch_key_hashes {
-            sync_pending::upsert_cursor(
-                repo_root_str,
-                sync_pending::ScopeType::Branch,
-                key_hash,
-                cursor_advance.last_scanned_mtime_epoch,
-            )
-            .await?;
-        }
-    }
-
-    Ok(ingested)
 }
 
 /// Parse a duration string like "7d", "30d", "1d" into seconds.
@@ -2573,630 +1939,6 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     Ok(())
 }
 
-fn parse_ls_tree_line(line: &str) -> Option<(String, String, String)> {
-    let (meta, name) = line.split_once('\t')?;
-    let mut parts = meta.split_whitespace();
-    let _mode = parts.next()?;
-    let kind = parts.next()?.to_string();
-    let sha = parts.next()?.to_string();
-    Some((kind, sha, name.to_string()))
-}
-
-async fn list_index_entries_for_key(
-    repo: &std::path::Path,
-    ref_name: &str,
-    key_hash: &str,
-) -> Result<Vec<note::IndexEntry>> {
-    if !git::ref_exists_at(Some(repo), ref_name).await? {
-        return Ok(Vec::new());
-    }
-    let fanout = git::fanout_path_for_key_hash(key_hash)?;
-    let mut split = fanout.splitn(2, '/');
-    let dir = split.next().unwrap_or("");
-    let file_prefix = split.next().unwrap_or("");
-    if dir.is_empty() || file_prefix.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let root_tree = format!("{ref_name}^{{tree}}");
-    let mut dir_tree_sha: Option<String> = None;
-    for line in git::list_tree_entries_at(Some(repo), &root_tree).await? {
-        if let Some((kind, sha, name)) = parse_ls_tree_line(&line)
-            && kind == "tree"
-            && name == dir
-        {
-            dir_tree_sha = Some(sha);
-            break;
-        }
-    }
-    let Some(tree_sha) = dir_tree_sha else {
-        return Ok(Vec::new());
-    };
-
-    let mut shard_blobs: Vec<(String, String)> = Vec::new();
-    for line in git::list_tree_entries_at(Some(repo), &tree_sha).await? {
-        if let Some((kind, sha, name)) = parse_ls_tree_line(&line)
-            && kind == "blob"
-            && name.starts_with(&format!("{file_prefix}--"))
-            && name.ends_with(".ndjson")
-        {
-            shard_blobs.push((name, sha));
-        }
-    }
-    shard_blobs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut entries = Vec::new();
-    for (_name, sha) in shard_blobs {
-        let data = git::read_blob_at(Some(repo), &sha).await?;
-        let text = String::from_utf8_lossy(&data);
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<note::IndexEntry>(trimmed) {
-                entries.push(entry);
-            }
-        }
-    }
-    Ok(entries)
-}
-
-fn short_session_uid(uid: &str) -> String {
-    uid.chars().take(12).collect()
-}
-
-fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut out = trimmed.chars().take(max_chars).collect::<String>();
-    if trimmed.chars().count() > max_chars {
-        out.push('…');
-    }
-    out
-}
-
-fn one_line_excerpt(text: &str, max_chars: usize) -> Option<String> {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('{') && !line.starts_with('['))?;
-    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    let mut out = normalized.chars().take(max_chars).collect::<String>();
-    if normalized.chars().count() > max_chars {
-        out.push('…');
-    }
-    Some(out)
-}
-
-fn jsonl_prompt_excerpt(text: &str, max_chars: usize) -> Option<String> {
-    fn codex_user_prompt_title(prompt: &str, max_chars: usize) -> Option<String> {
-        let trimmed = prompt.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        if let Some((_, tail)) = trimmed.rsplit_once("My request for Codex:") {
-            let line = tail
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with("```"))?;
-            let out = truncate_with_ellipsis(line, max_chars);
-            if !out.is_empty() {
-                return Some(out);
-            }
-        }
-
-        for line in trimmed.lines().map(str::trim) {
-            if line.is_empty()
-                || line.starts_with("```")
-                || line.starts_with("# AGENTS.md instructions")
-                || line.starts_with("# Context from my IDE setup:")
-                || line.starts_with("## Active file:")
-                || line.starts_with("## Open tabs:")
-                || line.starts_with("<INSTRUCTIONS>")
-                || line.starts_with("</INSTRUCTIONS>")
-            {
-                continue;
-            }
-            let out = truncate_with_ellipsis(line, max_chars);
-            if !out.is_empty() {
-                return Some(out);
-            }
-        }
-
-        let out = truncate_with_ellipsis(trimmed, max_chars);
-        if out.is_empty() { None } else { Some(out) }
-    }
-
-    let mut latest_prompt: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-
-        if value.get("type").and_then(|v| v.as_str()) == Some("user")
-            && let Some(content) = value.get("content").and_then(|v| v.as_str())
-        {
-            let out = codex_user_prompt_title(content, max_chars);
-            if out.is_some() {
-                return out;
-            }
-        }
-
-        if let Some(title) = value.pointer("/payload/title").and_then(|v| v.as_str()) {
-            let out = truncate_with_ellipsis(title, max_chars);
-            if !out.is_empty() {
-                latest_prompt = Some(out);
-            }
-        }
-
-        if let Some(input) = value.get("input") {
-            if let Some(text) = input.as_str() {
-                let out = codex_user_prompt_title(text, max_chars);
-                if out.is_some() {
-                    latest_prompt = out;
-                }
-            } else if let Some(map) = input.as_object() {
-                let keys = [
-                    "prompt",
-                    "query",
-                    "user_query",
-                    "userQuery",
-                    "request",
-                    "text",
-                ];
-                for key in keys {
-                    if let Some(text) = map.get(key).and_then(|v| v.as_str()) {
-                        let out = codex_user_prompt_title(text, max_chars);
-                        if out.is_some() {
-                            latest_prompt = out;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let is_user_message = value.pointer("/payload/type").and_then(|v| v.as_str())
-            == Some("message")
-            && value.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user");
-        if is_user_message
-            && let Some(items) = value.pointer("/payload/content").and_then(|v| v.as_array())
-        {
-            for item in items {
-                if item.get("type").and_then(|v| v.as_str()) == Some("input_text")
-                    && let Some(prompt) = item.get("text").and_then(|v| v.as_str())
-                {
-                    let out = codex_user_prompt_title(prompt, max_chars);
-                    if out.is_some() {
-                        latest_prompt = out;
-                    }
-                }
-            }
-        }
-
-        if value.pointer("/payload/type").and_then(|v| v.as_str()) == Some("message")
-            && value.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user")
-            && let Some(prompt) = value.pointer("/payload/text").and_then(|v| v.as_str())
-        {
-            let out = codex_user_prompt_title(prompt, max_chars);
-            if out.is_some() {
-                latest_prompt = out;
-            }
-        }
-    }
-    latest_prompt
-}
-
-async fn load_decrypted_session_blob(blob: &[u8]) -> Option<Vec<u8>> {
-    if serde_json::from_slice::<note::SessionEnvelope>(blob).is_ok() {
-        return Some(blob.to_vec());
-    }
-
-    if let Ok(decoded) = zstd_decode_all_async(blob.to_vec()).await
-        && serde_json::from_slice::<note::SessionEnvelope>(&decoded).is_ok()
-    {
-        return Some(decoded);
-    }
-
-    let private_key = pgp_keys::load_cached_user_private_key()
-        .await
-        .ok()
-        .flatten()?;
-    let fingerprint = pgp_keys::get_user_fingerprint().await.ok().flatten()?;
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    let passphrase = keychain.get(&fingerprint).await.ok().flatten()?;
-    let decrypted =
-        pgp_keys::decrypt_with_private_key_binary(blob, &private_key, &passphrase).ok()?;
-
-    if let Ok(decoded) = zstd_decode_all_async(decrypted.clone()).await
-        && serde_json::from_slice::<note::SessionEnvelope>(&decoded).is_ok()
-    {
-        return Some(decoded);
-    }
-    if serde_json::from_slice::<note::SessionEnvelope>(&decrypted).is_ok() {
-        return Some(decrypted);
-    }
-    None
-}
-
-async fn zstd_decode_all_async(data: Vec<u8>) -> Result<Vec<u8>> {
-    tokio::task::spawn_blocking(move || zstd::decode_all(std::io::Cursor::new(data)))
-        .await
-        .context("zstd decode task failed")?
-        .context("zstd decode failed")
-}
-
-async fn build_local_session_labels_for_repo(
-    repo: &std::path::Path,
-) -> std::collections::HashMap<String, String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let mut labels = std::collections::HashMap::new();
-    for log in agents::discover_recent_sessions(now, 90 * 86_400).await {
-        let metadata = session_log_metadata(&log).await;
-        let Some(cwd) = metadata.cwd else {
-            continue;
-        };
-        let Ok(file_repo_root) = git::repo_root_at(std::path::Path::new(&cwd)).await else {
-            continue;
-        };
-        if file_repo_root != repo {
-            continue;
-        }
-        let session_log = match session_log_content_async(&log).await {
-            Some(content) => content,
-            None => continue,
-        };
-        let session_id = metadata.session_id.as_deref().unwrap_or("unknown");
-        let agent = metadata.agent_type.unwrap_or(scanner::AgentType::Claude);
-        let session_start = session_log_time_range(&log).await.map(|(start, _)| start);
-        let content_sha256 = note::content_sha256(&session_log);
-        let session_uid = note::compute_session_uid(
-            &agent,
-            session_id,
-            &file_repo_root.to_string_lossy(),
-            session_start,
-            &content_sha256,
-        );
-
-        let label = one_line_excerpt(&session_log, 72)
-            .or_else(|| jsonl_prompt_excerpt(&session_log, 72))
-            .unwrap_or_else(|| format!("session {}", truncate_with_ellipsis(session_id, 24)));
-        labels.entry(session_uid).or_insert(label);
-    }
-    labels
-}
-
-async fn session_display_label(
-    repo: &std::path::Path,
-    entry: &note::IndexEntry,
-    local_labels: &std::collections::HashMap<String, String>,
-) -> String {
-    if let Some(local) = local_labels.get(&entry.session_uid) {
-        return local.clone();
-    }
-    let fallback = format!("session {}", short_session_uid(&entry.session_uid));
-    let blob = match git::read_blob_at(Some(repo), &entry.session_blob_sha).await {
-        Ok(data) => data,
-        Err(_) => return fallback,
-    };
-    let decoded_blob = match load_decrypted_session_blob(&blob).await {
-        Some(data) => data,
-        None => return fallback,
-    };
-    let envelope = match serde_json::from_slice::<note::SessionEnvelope>(&decoded_blob) {
-        Ok(parsed) => parsed,
-        Err(_) => return fallback,
-    };
-
-    if let Some(excerpt) = one_line_excerpt(&envelope.session_content, 72) {
-        return excerpt;
-    }
-    if let Some(excerpt) = jsonl_prompt_excerpt(&envelope.session_content, 72) {
-        return excerpt;
-    }
-    if !envelope.record.session_id.trim().is_empty() {
-        return format!(
-            "session {}",
-            truncate_with_ellipsis(&envelope.record.session_id, 24)
-        );
-    }
-    fallback
-}
-
-async fn discovered_repos_for_sessions() -> Vec<std::path::PathBuf> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let mut repos = std::collections::BTreeSet::new();
-    for log in agents::discover_recent_sessions(now, 90 * 86_400).await {
-        let metadata = session_log_metadata(&log).await;
-        let Some(cwd) = metadata.cwd else {
-            continue;
-        };
-        let cwd_path = std::path::Path::new(&cwd);
-        if let Ok(repo_root) = git::repo_root_at(cwd_path).await {
-            repos.insert(repo_root);
-        }
-    }
-    repos.into_iter().collect()
-}
-
-async fn print_sessions_for_repo(repo: &std::path::Path) -> Result<()> {
-    let repo_str = repo.to_string_lossy();
-    let branch_key_hash = note::hash_key(&branch_key_for_repo(repo).await);
-    let committer_hash = committer_key_hash_for_repo(repo).await;
-
-    let mut branch_entries =
-        list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &branch_key_hash).await?;
-    branch_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
-    branch_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-
-    let mut user_entries =
-        list_index_entries_for_key(repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash).await?;
-    user_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
-    user_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-    let local_labels = build_local_session_labels_for_repo(repo).await;
-
-    output::action("Repo", &repo_str);
-    output::detail("Branch sessions:");
-    for entry in branch_entries.iter().take(10) {
-        let label = session_display_label(repo, entry, &local_labels).await;
-        output::detail(&format!(
-            "  {} {} {}",
-            entry.session_start.unwrap_or_default(),
-            entry.agent,
-            label
-        ));
-    }
-    let shown = user_entries.len().min(10);
-    output::detail(&format!(
-        "User sessions (last {} of {}):",
-        shown,
-        user_entries.len()
-    ));
-    for entry in user_entries.iter().take(shown) {
-        let label = session_display_label(repo, entry, &local_labels).await;
-        output::detail(&format!(
-            "  {} {} {}",
-            entry.session_start.unwrap_or_default(),
-            entry.agent,
-            label
-        ));
-    }
-    Ok(())
-}
-
-async fn run_sessions_list(all: bool) -> Result<()> {
-    if all {
-        let repos = discovered_repos_for_sessions().await;
-        if repos.is_empty() {
-            output::note("No repositories discovered from recent sessions.");
-            return Ok(());
-        }
-        for repo in repos {
-            let _ = print_sessions_for_repo(&repo).await;
-        }
-        return Ok(());
-    }
-
-    let repo = git::repo_root()
-        .await
-        .map_err(|_| anyhow::anyhow!("not in a git repository. Use `cadence sessions --all`."))?;
-    print_sessions_for_repo(&repo).await
-}
-
-async fn load_session_envelope_for_entry(
-    repo: &std::path::Path,
-    entry: &note::IndexEntry,
-) -> Option<note::SessionEnvelope> {
-    let blob = git::read_blob_at(Some(repo), &entry.session_blob_sha)
-        .await
-        .ok()?;
-    let decoded = load_decrypted_session_blob(&blob).await?;
-    serde_json::from_slice::<note::SessionEnvelope>(&decoded).ok()
-}
-
-async fn repo_local_branches(repo: &std::path::Path) -> Vec<String> {
-    let mut branches = git::local_branches_at(repo).await.unwrap_or_default();
-    if branches.is_empty()
-        && let Ok(Some(current)) = git::current_branch_at(repo).await
-    {
-        branches.push(current);
-    }
-    branches.sort();
-    branches.dedup();
-    branches
-}
-
-async fn sessions_audit_repo(repo: &std::path::Path, show_ok: bool) -> Result<()> {
-    let repo_label = repo.to_string_lossy().to_string();
-    let remote = git::resolve_push_remote_at(repo)
-        .await?
-        .unwrap_or_else(|| "origin".to_string());
-    let branches = repo_local_branches(repo).await;
-    let local_labels = build_local_session_labels_for_repo(repo).await;
-
-    output::action("Audit", &repo_label);
-    output::detail(&format!(
-        "remote={}, local_branches={}",
-        remote,
-        branches.len()
-    ));
-
-    let mut total_sessions = 0usize;
-
-    for branch in branches {
-        let branch_key = format!("{remote}/{branch}");
-        let key_hash = note::hash_key(&branch_key);
-        let mut entries =
-            list_index_entries_for_key(repo, git::SESSION_INDEX_BRANCH_REF, &key_hash).await?;
-        entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
-        entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-        if entries.is_empty() {
-            continue;
-        }
-
-        output::detail(&format!(
-            "branch={} indexed_sessions={}",
-            branch,
-            entries.len()
-        ));
-        for entry in entries {
-            total_sessions += 1;
-            if show_ok {
-                let label = session_display_label(repo, &entry, &local_labels).await;
-                output::detail(&format!(
-                    "  OK uid={} {}",
-                    short_session_uid(&entry.session_uid),
-                    label
-                ));
-            }
-        }
-    }
-
-    output::detail(&format!("summary: total={}", total_sessions));
-    Ok(())
-}
-
-async fn run_sessions_audit(all: bool, show_ok: bool) -> Result<()> {
-    if all {
-        let repos = discovered_repos_for_sessions().await;
-        if repos.is_empty() {
-            output::note("No repositories discovered from recent sessions.");
-            return Ok(());
-        }
-        for repo in repos {
-            let _ = sessions_audit_repo(&repo, show_ok).await;
-        }
-        return Ok(());
-    }
-    let repo = git::repo_root().await.map_err(|_| {
-        anyhow::anyhow!("not in a git repository. Use `cadence sessions audit --all`.")
-    })?;
-    sessions_audit_repo(&repo, show_ok).await
-}
-
-async fn run_sessions_inspect(query: &str, all: bool, raw: bool) -> Result<()> {
-    let repos = if all {
-        discovered_repos_for_sessions().await
-    } else {
-        vec![git::repo_root().await.map_err(|_| {
-            anyhow::anyhow!(
-                "not in a git repository. Use `cadence sessions inspect --all <query>`."
-            )
-        })?]
-    };
-    if repos.is_empty() {
-        output::note("No repositories discovered from recent sessions.");
-        return Ok(());
-    }
-
-    let query_lc = query.to_ascii_lowercase();
-    let mut matches = 0usize;
-    for repo in repos {
-        let local_labels = build_local_session_labels_for_repo(&repo).await;
-        let committer_hash = committer_key_hash_for_repo(&repo).await;
-        let mut user_entries =
-            list_index_entries_for_key(&repo, git::SESSION_INDEX_COMMITTER_REF, &committer_hash)
-                .await?;
-        user_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
-        user_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-
-        let remote = git::resolve_push_remote_at(&repo)
-            .await?
-            .unwrap_or_else(|| "origin".to_string());
-        let branches = repo_local_branches(&repo).await;
-
-        for entry in user_entries {
-            let envelope = load_session_envelope_for_entry(&repo, &entry).await;
-            let session_id = envelope
-                .as_ref()
-                .map(|e| e.record.session_id.as_str())
-                .unwrap_or("");
-            let label = session_display_label(&repo, &entry, &local_labels).await;
-            let matches_query = entry.session_uid.starts_with(query)
-                || session_id.to_ascii_lowercase().contains(&query_lc)
-                || label.to_ascii_lowercase().contains(&query_lc);
-            if !matches_query {
-                continue;
-            }
-            matches += 1;
-            output::action("Match", &repo.to_string_lossy());
-            output::detail(&format!(
-                "uid={} start={} agent={} label={}",
-                entry.session_uid,
-                entry.session_start.unwrap_or_default(),
-                entry.agent,
-                label
-            ));
-
-            let mut branch_hits = Vec::new();
-            for branch in &branches {
-                let key_hash = note::hash_key(&format!("{remote}/{branch}"));
-                let mut branch_entries =
-                    list_index_entries_for_key(&repo, git::SESSION_INDEX_BRANCH_REF, &key_hash)
-                        .await?;
-                branch_entries.sort_by(|a, b| b.session_start.cmp(&a.session_start));
-                branch_entries.dedup_by(|a, b| a.session_uid == b.session_uid);
-                if branch_entries
-                    .iter()
-                    .any(|e| e.session_uid == entry.session_uid)
-                {
-                    branch_hits.push(branch.clone());
-                }
-            }
-            output::detail(&format!("branches={:?}", branch_hits));
-            if let Some(env) = envelope {
-                output::detail(&format!("session_id={}", env.record.session_id));
-                if raw {
-                    output::detail("raw_record:");
-                    let raw_record = serde_json::to_string_pretty(&env.record)?;
-                    for line in raw_record.lines() {
-                        output::detail(line);
-                    }
-                    output::detail("raw_session_content:");
-                    for line in env.session_content.lines() {
-                        output::detail(line);
-                    }
-                }
-            } else if raw {
-                output::detail("raw unavailable: unable to decrypt/parse session envelope");
-            }
-        }
-    }
-
-    if matches == 0 {
-        output::note("No matching sessions found.");
-    }
-    Ok(())
-}
-
-async fn run_sessions(command: Option<SessionsCommand>, all: bool) -> Result<()> {
-    match command {
-        None => run_sessions_list(all).await,
-        Some(SessionsCommand::List { all }) => run_sessions_list(all).await,
-        Some(SessionsCommand::Audit { all, show_ok }) => run_sessions_audit(all, show_ok).await,
-        Some(SessionsCommand::Inspect { query, all, raw }) => {
-            run_sessions_inspect(&query, all, raw).await
-        }
-    }
-}
-
 /// The status subcommand: show Cadence CLI configuration and state.
 ///
 /// Displays:
@@ -3626,285 +2368,6 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
-// Keys status command
-// ---------------------------------------------------------------------------
-
-struct KeysStatusReport {
-    user_fingerprint: Option<String>,
-    user_fingerprint_error: Option<String>,
-    user_public_key_cached: bool,
-    user_private_key_cached: bool,
-    api_public_key_cached: bool,
-    api_metadata: Option<pgp_keys::ApiPublicKeyMetadata>,
-}
-
-impl KeysStatusReport {
-    async fn collect() -> Self {
-        let (user_fingerprint, user_fingerprint_error) =
-            match pgp_keys::get_user_fingerprint().await {
-                Ok(v) => (v, None),
-                Err(e) => (None, Some(format!("{}", e))),
-            };
-        let user_public_key_cached = pgp_keys::load_cached_user_public_key()
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        let user_private_key_cached = pgp_keys::load_cached_user_private_key()
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        let api_public_key_cached = pgp_keys::load_cached_api_public_key()
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        let api_metadata = pgp_keys::load_api_public_key_metadata()
-            .await
-            .ok()
-            .flatten();
-
-        KeysStatusReport {
-            user_fingerprint,
-            user_fingerprint_error,
-            user_public_key_cached,
-            user_private_key_cached,
-            api_public_key_cached,
-            api_metadata,
-        }
-    }
-
-    fn summary(&self) -> &'static str {
-        if self.user_fingerprint.is_none() {
-            return "disabled (plaintext mode)";
-        }
-        if !self.user_public_key_cached || !self.api_public_key_cached {
-            return "configured but keys unavailable";
-        }
-        "enabled (dual recipient)"
-    }
-}
-
-fn render_keys_status(
-    w: &mut dyn std::io::Write,
-    report: &KeysStatusReport,
-) -> std::io::Result<()> {
-    let is_tty = Term::stdout().is_term();
-    let label = |text: &str| {
-        if is_tty {
-            console::style(text).bold().to_string()
-        } else {
-            text.to_string()
-        }
-    };
-    let value = |text: &str, color: console::Color| {
-        if is_tty {
-            console::style(text).fg(color).to_string()
-        } else {
-            text.to_string()
-        }
-    };
-
-    match (&report.user_fingerprint, &report.user_fingerprint_error) {
-        (Some(f), _) => writeln!(
-            w,
-            "{} {}",
-            label("Local key fingerprint:"),
-            value(f, console::Color::Cyan)
-        )?,
-        (None, Some(err)) => writeln!(
-            w,
-            "{} {}",
-            label("Local key fingerprint:"),
-            value(&format!("unavailable ({})", err), console::Color::Red)
-        )?,
-        (None, None) => writeln!(
-            w,
-            "{} {}",
-            label("Local key fingerprint:"),
-            value("not set", console::Color::Yellow)
-        )?,
-    }
-
-    writeln!(
-        w,
-        "{} {}",
-        label("Local public key cached:"),
-        value(
-            if report.user_public_key_cached {
-                "yes"
-            } else {
-                "no"
-            },
-            if report.user_public_key_cached {
-                console::Color::Green
-            } else {
-                console::Color::Yellow
-            }
-        )
-    )?;
-
-    writeln!(
-        w,
-        "{} {}",
-        label("Local private key cached:"),
-        value(
-            if report.user_private_key_cached {
-                "yes"
-            } else {
-                "no"
-            },
-            if report.user_private_key_cached {
-                console::Color::Green
-            } else {
-                console::Color::Yellow
-            }
-        )
-    )?;
-
-    let api_cache_detail = if let Some(meta) = &report.api_metadata {
-        format!("yes (fetched {})", meta.fetched_at)
-    } else if report.api_public_key_cached {
-        "yes".to_string()
-    } else {
-        "no".to_string()
-    };
-
-    writeln!(
-        w,
-        "{} {}",
-        label("API public key cached:"),
-        value(
-            &api_cache_detail,
-            if report.api_public_key_cached {
-                console::Color::Green
-            } else {
-                console::Color::Yellow
-            }
-        )
-    )?;
-
-    let summary = report.summary();
-    let summary_color = if summary.contains("enabled") {
-        console::Color::Green
-    } else {
-        console::Color::Yellow
-    };
-    writeln!(
-        w,
-        "{} {}",
-        label("Encryption:"),
-        value(summary, summary_color)
-    )?;
-
-    Ok(())
-}
-
-async fn run_keys_status() -> Result<()> {
-    let report = KeysStatusReport::collect().await;
-    let _ = render_keys_status(&mut std::io::stdout(), &report);
-    Ok(())
-}
-
-async fn run_keys_setup() -> Result<()> {
-    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        anyhow::bail!("cadence keys setup requires an interactive TTY. Run from a terminal.");
-    }
-    let mut prompter = DialoguerPrompter::new();
-    run_keys_setup_inner(&mut prompter, &mut std::io::stdout(), true).await
-}
-
-async fn run_keys_refresh() -> Result<()> {
-    let _ = resolve_api_public_key_cache(true).await?;
-    output::success("API", "public key refreshed.");
-    Ok(())
-}
-
-async fn run_keys_disable() -> Result<()> {
-    let _ = git::config_unset_global(pgp_keys::USER_FINGERPRINT_KEY).await;
-    let _ = git::config_unset_global(pgp_keys::API_FINGERPRINT_KEY).await;
-
-    if let Some(path) = pgp_keys::user_public_key_cache_path() {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    if let Some(path) = pgp_keys::user_private_key_cache_path() {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    if let Some(path) = pgp_keys::api_public_key_cache_path() {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    if let Some(path) = pgp_keys::api_public_key_meta_path() {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-
-    output::success("Encryption", "disabled.");
-    Ok(())
-}
-
-/// Optional encryption setup during install. Returns `Ok(())` if setup was
-/// skipped or completed, and `Err` if install should abort before backfill.
-async fn run_install_encryption_setup() -> Result<()> {
-    if !output::is_stderr_tty() || !Term::stdout().is_term() {
-        return Ok(());
-    }
-
-    let mut stdout = std::io::stdout();
-    let is_tty = Term::stdout().is_term();
-    let mut prompter = DialoguerPrompter::new();
-
-    output::action_to_with_tty(&mut stdout, "Encryption", "setup", is_tty);
-    output::detail_to_with_tty(
-        &mut stdout,
-        "Protect stored session logs so only you and the Cadence API can read them.",
-        is_tty,
-    );
-
-    let Some(enable) = prompter
-        .confirm("Encrypt stored session logs? (Recommended)", &mut stdout)
-        .await?
-    else {
-        output::note_to_with_tty(&mut stdout, "Skipping encryption setup.", is_tty);
-        return Ok(());
-    };
-
-    if !enable {
-        output::note_to_with_tty(
-            &mut stdout,
-            "Notes will be stored in plaintext. You can enable encryption later with `cadence keys setup`.",
-            is_tty,
-        );
-        return Ok(());
-    }
-
-    if let Err(e) = run_keys_setup_inner(&mut prompter, &mut stdout, false).await {
-        output::note_to_with_tty(
-            &mut stdout,
-            &format!("Encryption setup incomplete: {e:#}"),
-            is_tty,
-        );
-        anyhow::bail!("encryption setup failed");
-    }
-
-    let recipient = git::config_get_global(pgp_keys::USER_FINGERPRINT_KEY)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    if recipient.trim().is_empty() {
-        output::fail_to_with_tty(
-            &mut stdout,
-            "Encryption",
-            "setup did not complete. Install will stop before backfill.",
-            is_tty,
-        );
-        anyhow::bail!("encryption setup incomplete");
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Install: auto-update preference prompt
 // ---------------------------------------------------------------------------
 
@@ -4010,177 +2473,6 @@ async fn run_install_auto_update_prompt_inner(
             is_tty,
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Keys setup: prompter abstraction
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-trait Prompter {
-    async fn confirm(
-        &mut self,
-        prompt: &str,
-        writer: &mut dyn std::io::Write,
-    ) -> Result<Option<bool>>;
-}
-
-struct DialoguerPrompter {}
-
-impl DialoguerPrompter {
-    fn new() -> Self {
-        Self {}
-    }
-}
-
-#[async_trait]
-impl Prompter for DialoguerPrompter {
-    async fn confirm(
-        &mut self,
-        prompt: &str,
-        _writer: &mut dyn std::io::Write,
-    ) -> Result<Option<bool>> {
-        let prompt = prompt.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt(prompt)
-                .interact()
-        })
-        .await
-        .context("prompt task failed")?;
-        match result {
-            Ok(value) => Ok(Some(value)),
-            Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Ok(None)
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
-}
-
-async fn required_git_value(key: &str, label: &str) -> Result<String> {
-    let value = git::config_get_global(key).await?.unwrap_or_default();
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("Missing git {}. Run `git config --global {}`", label, key);
-    }
-    Ok(trimmed.to_string())
-}
-
-fn cadence_email(email: &str) -> Result<String> {
-    let trimmed = email.trim();
-    let (local, domain) = trimmed
-        .split_once('@')
-        .ok_or_else(|| anyhow::anyhow!("Invalid git email: {trimmed}"))?;
-    let local = if local.contains("+cadence") {
-        local.to_string()
-    } else {
-        format!("{local}+cadence")
-    };
-    Ok(format!("{local}@{domain}"))
-}
-
-fn generate_passphrase() -> String {
-    use rand::TryRngCore;
-    let mut bytes = [0u8; 32];
-    let mut rng = rand::rngs::OsRng;
-    rng.try_fill_bytes(&mut bytes)
-        .expect("OS RNG unavailable while generating passphrase");
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Keys setup: inner testable runner
-// ---------------------------------------------------------------------------
-
-/// Inner implementation of `keys setup` that accepts injectable I/O.
-async fn run_keys_setup_inner(
-    prompter: &mut dyn Prompter,
-    writer: &mut dyn std::io::Write,
-    show_intro: bool,
-) -> Result<()> {
-    let is_tty = Term::stdout().is_term();
-    if show_intro {
-        output::action_to_with_tty(writer, "Encryption", "setup", is_tty);
-        output::detail_to_with_tty(
-            writer,
-            "Encrypt stored session logs so only you and the Cadence API can read them.",
-            is_tty,
-        );
-        writeln!(writer)?;
-    }
-
-    let name = required_git_value("user.name", "user.name").await?;
-    let email = required_git_value("user.email", "user.email").await?;
-    let cadence_email = cadence_email(&email)?;
-    let identity = format!("{} <{}>", name.trim(), cadence_email.trim());
-    output::detail_to_with_tty(writer, &format!("Using Git identity: {identity}"), is_tty);
-
-    let cached_public = pgp_keys::load_cached_user_public_key()
-        .await
-        .context("failed to read cached local public key")?;
-    let cached_private = pgp_keys::load_cached_user_private_key()
-        .await
-        .context("failed to read cached local private key")?;
-
-    if resolve_api_public_key_cache(true).await?.is_none() {
-        anyhow::bail!("failed to fetch API public key");
-    }
-
-    let fingerprint = if let (Some(public), Some(_private)) =
-        (cached_public.as_ref(), cached_private.as_ref())
-    {
-        output::detail_to_with_tty(writer, "Reusing cached local keypair.", is_tty);
-        pgp_keys::fingerprint_from_public_key(public)?
-    } else {
-        let Some(store_in_keychain) = prompter
-            .confirm(
-                "Store encryption passphrase in OS keychain? (Recommended)",
-                writer,
-            )
-            .await?
-        else {
-            anyhow::bail!("setup cancelled");
-        };
-        if !store_in_keychain {
-            anyhow::bail!("encryption setup requires storing the passphrase in the OS keychain");
-        }
-
-        output::detail_to_with_tty(
-            writer,
-            "Generating a new encryption keypair (this may take a moment)...",
-            is_tty,
-        );
-
-        let passphrase = generate_passphrase();
-        let (armored_public_key, armored_private_key, fingerprint) =
-            pgp_keys::generate_user_keypair(&identity, &passphrase)
-                .context("failed to generate new keypair")?;
-
-        let keychain = keychain::KeyringStore::new("cadence-cli");
-        keychain
-            .set(&fingerprint, &passphrase)
-            .await
-            .context("failed to store passphrase in OS keychain")?;
-
-        pgp_keys::save_user_keys(&armored_public_key, &armored_private_key)
-            .await
-            .context("failed to cache local keys")?;
-
-        fingerprint
-    };
-
-    git::config_set_global(pgp_keys::USER_FINGERPRINT_KEY, &fingerprint)
-        .await
-        .context("failed to save user fingerprint to git config")?;
-
-    writeln!(writer, "Local key fingerprint: {}", fingerprint)?;
-    if let Ok(Some(api_fpr)) = pgp_keys::get_api_fingerprint().await {
-        writeln!(writer, "API key fingerprint: {}", api_fpr)?;
-    }
-    output::success_to_with_tty(writer, "Encryption", "ready.", is_tty);
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4334,86 +2626,6 @@ async fn run_update(check: bool, yes: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// GC: clear bloated notes and re-backfill
-// ---------------------------------------------------------------------------
-
-async fn run_gc(since: &str, confirm: bool) -> Result<()> {
-    let session_refs = [
-        git::SESSION_DATA_REF,
-        git::SESSION_INDEX_BRANCH_REF,
-        git::SESSION_INDEX_COMMITTER_REF,
-    ];
-
-    // Validate the --since value early so we fail before any destructive work.
-    let since_secs = parse_since_duration(since)?;
-    let since_days = since_secs / 86_400;
-
-    let repo_root = git::repo_root().await?;
-
-    if !confirm {
-        output::note("This will DELETE all local and remote AI session refs for this repo,");
-        output::note("then re-backfill them in the optimized v2 format.");
-        output::detail(&format!("Re-backfill window: last {} days", since_days));
-        for ref_name in &session_refs {
-            output::detail(&format!("Local ref:  {}  → deleted", ref_name));
-            output::detail(&format!("Remote ref: {}  → deleted", ref_name));
-        }
-        output::detail("Then: cadence backfill --since <window>");
-        eprintln!();
-        output::fail("Aborted", "pass --confirm to proceed.");
-        anyhow::bail!("gc requires --confirm to proceed");
-    }
-
-    // Resolve push remote (e.g. "origin").
-    let remote = git::resolve_push_remote_at(&repo_root).await?;
-
-    // Step 1: Delete remote session refs.
-    if let Some(ref remote_name) = remote {
-        output::action(
-            "GC",
-            &format!("Deleting remote session refs on '{}'", remote_name),
-        );
-        for ref_name in &session_refs {
-            match git::delete_remote_ref_at(Some(&repo_root), remote_name, ref_name).await {
-                Ok(()) => output::detail(&format!(
-                    "Remote session ref deleted (or did not exist): {ref_name}"
-                )),
-                Err(e) => output::detail(&format!(
-                    "Could not delete remote ref (continuing): {} ({})",
-                    ref_name, e
-                )),
-            }
-        }
-    } else {
-        output::detail("No push remote found; skipping remote ref deletion.");
-    }
-
-    // Step 2: Delete local session refs.
-    output::action("GC", "Deleting local session refs");
-    for ref_name in &session_refs {
-        match git::delete_local_ref_at(Some(&repo_root), ref_name).await {
-            Ok(()) => output::detail(&format!(
-                "Local session ref deleted (or did not exist): {ref_name}"
-            )),
-            Err(e) => output::detail(&format!(
-                "Could not delete local ref (continuing): {} ({})",
-                ref_name, e
-            )),
-        }
-    }
-
-    // Step 3: Re-backfill in v2 format with push enabled (scoped to this repo).
-    output::action(
-        "GC",
-        &format!("Re-backfilling (last {} days) with push", since_days),
-    );
-    run_backfill_inner(since, Some(&repo_root)).await?;
-
-    output::success("GC", "Complete. Session refs were regenerated.");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -4427,30 +2639,6 @@ async fn main() {
 
     let is_update_command = matches!(&cli.command, Command::Update { .. });
     let is_hook_command = matches!(&cli.command, Command::Hook { .. });
-
-    // Opportunistic sweep of pending sync jobs for normal CLI flows.
-    if !matches!(&cli.command, Command::Hook { .. }) && deferred_sync::has_pending_sync_jobs().await
-    {
-        let _ = deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
-            repo: None,
-            remote: None,
-            all_pending: true,
-            background: false,
-            max_items: 2,
-            time_budget_ms: std::env::var("CADENCE_SYNC_SWEEP_TIME_BUDGET_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                // Deprecated compatibility path: legacy var was in seconds.
-                .or_else(|| {
-                    std::env::var("CADENCE_SYNC_LOCK_SWEEP_INTERVAL_SECS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(|secs| secs * 1000)
-                })
-                .unwrap_or(1500),
-        })
-        .await;
-    }
 
     let result = match cli.command {
         Command::Install { org } => run_install(org).await,
@@ -4484,69 +2672,6 @@ async fn main() {
     }
 }
 
-async fn run_sync(
-    repo: Option<PathBuf>,
-    remote: Option<String>,
-    all_pending: bool,
-    background: bool,
-    max_items: usize,
-    time_budget_ms: u64,
-) -> Result<()> {
-    let _activity_lock = update::acquire_activity_lock_blocking("deferred-sync").await?;
-    let repo_roots = repo_roots_for_sync_ingest(repo.as_deref(), all_pending, max_items).await?;
-    let encryption_method = resolve_encryption_method()
-        .await
-        .unwrap_or_else(|e| EncryptionMethod::Unavailable(format!("{e}")));
-    for repo_root in &repo_roots {
-        let repo_root_str = repo_root.to_string_lossy().to_string();
-        if let Err(e) =
-            ingest_incremental_sessions_for_repo(repo_root, &repo_root_str, &encryption_method)
-                .await
-        {
-            output::note(&format!("Deferred sync ingest issue: {}", e));
-        }
-    }
-
-    deferred_sync::run_sync_command(deferred_sync::SyncRunOptions {
-        repo,
-        remote,
-        all_pending,
-        background,
-        max_items,
-        time_budget_ms,
-    })
-    .await
-}
-
-async fn repo_roots_for_sync_ingest(
-    repo: Option<&Path>,
-    all_pending: bool,
-    max_items: usize,
-) -> Result<Vec<PathBuf>> {
-    if all_pending {
-        let jobs = deferred_sync::list_runnable_pending_sync_jobs(max_items).await?;
-        return Ok(pending_repo_roots_sorted_deduped(jobs));
-    }
-
-    let root = match repo {
-        Some(path) => git::repo_root_at(path)
-            .await
-            .unwrap_or_else(|_| path.to_path_buf()),
-        None => git::repo_root().await?,
-    };
-    Ok(vec![root])
-}
-
-fn pending_repo_roots_sorted_deduped(jobs: Vec<deferred_sync::PendingSyncRecord>) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = jobs
-        .into_iter()
-        .map(|job| PathBuf::from(job.repo_root))
-        .collect();
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4554,7 +2679,7 @@ fn pending_repo_roots_sorted_deduped(jobs: Vec<deferred_sync::PendingSyncRecord>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deferred_sync::PendingSyncRecord;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
@@ -4583,6 +2708,37 @@ mod tests {
         run_git(dir.path(), &["add", "README.md"]).await;
         run_git(dir.path(), &["commit", "-m", "init"]).await;
         dir
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var(key).ok(),
+            }
+        }
+
+        fn set_str(&self, value: &str) {
+            unsafe { std::env::set_var(self.key, value) };
+        }
+
+        fn set_path(&self, value: &std::path::Path) {
+            self.set_str(&value.to_string_lossy());
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 
     #[test]
@@ -4933,44 +3089,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_roots_for_sync_ingest_dedupes_and_sorts_pending_records() {
-        let jobs = vec![
-            PendingSyncRecord {
-                repo_root: "/tmp/z-repo".to_string(),
-                remote: "origin".to_string(),
-                enqueued_at: note::now_rfc3339(),
-                updated_at: note::now_rfc3339(),
-                attempt_count: 0,
-                next_attempt_at_epoch: 0,
-                last_error: None,
-            },
-            PendingSyncRecord {
-                repo_root: "/tmp/a-repo".to_string(),
-                remote: "origin".to_string(),
-                enqueued_at: note::now_rfc3339(),
-                updated_at: note::now_rfc3339(),
-                attempt_count: 0,
-                next_attempt_at_epoch: 0,
-                last_error: None,
-            },
-            PendingSyncRecord {
-                repo_root: "/tmp/z-repo".to_string(),
-                remote: "upstream".to_string(),
-                enqueued_at: note::now_rfc3339(),
-                updated_at: note::now_rfc3339(),
-                attempt_count: 0,
-                next_attempt_at_epoch: 0,
-                last_error: None,
-            },
-        ];
-        let roots = pending_repo_roots_sorted_deduped(jobs);
-        assert_eq!(
-            roots,
-            vec![PathBuf::from("/tmp/a-repo"), PathBuf::from("/tmp/z-repo")]
-        );
-    }
-
-    #[test]
     fn cursor_advances_for_indexed_logs() {
         let updated = advance_cursor_for_disposition(
             &IncrementalCursor {
@@ -5078,157 +3196,86 @@ mod tests {
         assert_eq!(labels, vec!["b".to_string(), "c".to_string()]);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_session_writes_data_and_indexes() {
-        let repo = init_repo().await;
-        run_git(
-            repo.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:example-org/example-repo.git",
-            ],
-        )
-        .await;
+    #[tokio::test]
+    #[serial]
+    async fn process_repo_backfill_uses_direct_upload_pipeline() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
 
-        let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
-        let info = ingest_session_from_log(
-            &scanner::AgentType::Claude,
-            "aaa111",
-            &repo.path().to_string_lossy(),
-            session_log,
-            &EncryptionMethod::None,
-            Some(1_707_526_800),
-            Some(repo.path()),
-            None,
-        )
-        .await
-        .expect("ingest");
-
-        assert_eq!(info.blob_sha.len(), 40);
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF)
-                .await
-                .expect("data ref exists")
-        );
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_BRANCH_REF)
-                .await
-                .expect("branch index ref exists")
-        );
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_COMMITTER_REF)
-                .await
-                .expect("committer index ref exists")
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_session_with_explicit_branch_keys_indexes_each_branch() {
-        let repo = init_repo().await;
-        run_git(
-            repo.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:example-org/example-repo.git",
-            ],
-        )
-        .await;
-
-        let branch_keys = vec!["origin/main".to_string(), "origin/feature/test".to_string()];
-        let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
-        let info = ingest_session_from_log(
-            &scanner::AgentType::Claude,
-            "multi-branch",
-            &repo.path().to_string_lossy(),
-            session_log,
-            &EncryptionMethod::None,
-            Some(1_707_526_800),
-            Some(repo.path()),
-            Some(&branch_keys),
-        )
-        .await
-        .expect("ingest");
-
-        for key in branch_keys {
-            let mut entries = list_index_entries_for_key(
-                repo.path(),
-                git::SESSION_INDEX_BRANCH_REF,
-                &note::hash_key(&key),
-            )
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
             .await
-            .expect("list branch entries");
-            entries.sort_by(|a, b| b.ingested_at.cmp(&a.ingested_at));
-            assert!(entries.iter().any(|e| e.session_uid == info.session_uid));
-        }
-    }
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_session_is_stable_across_repeated_calls() {
         let repo = init_repo().await;
-        let session_log = include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl");
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
 
-        let first_info = ingest_session_from_log(
-            &scanner::AgentType::Claude,
-            "stable-1",
-            &repo.path().to_string_lossy(),
-            session_log,
-            &EncryptionMethod::None,
-            Some(1_707_526_800),
-            Some(repo.path()),
-            None,
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
         )
         .await
-        .expect("first ingest");
+        .expect("spawn upload test server");
 
-        let second_info = ingest_session_from_log(
-            &scanner::AgentType::Claude,
-            "stable-1",
-            &repo.path().to_string_lossy(),
-            session_log,
-            &EncryptionMethod::None,
-            Some(1_707_526_800),
-            Some(repo.path()),
-            None,
-        )
-        .await
-        .expect("second ingest");
+        let mut cfg = config::CliConfig::default();
+        cfg.token = Some("test-token".to_string());
+        cfg.save().await.expect("save config");
 
-        assert_eq!(first_info.blob_sha, second_info.blob_sha);
-        assert_eq!(first_info.session_uid, second_info.session_uid);
-    }
+        let upload_context = Arc::new(
+            upload::resolve_upload_context(Some(server.base_url.as_str()))
+                .await
+                .expect("resolve upload context"),
+        );
 
-    #[test]
-    fn jsonl_prompt_excerpt_extracts_codex_user_prompt() {
-        let content = r#"{"type":"session_meta","payload":{"id":"abc"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Show a short excerpt or a title instead of the long ID on the sessions list"}]}}"#;
-        let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
-        assert!(excerpt.starts_with("Show a short excerpt or a title"));
-    }
-
-    #[test]
-    fn jsonl_prompt_excerpt_extracts_payload_title() {
         let content =
-            r#"{"type":"event","payload":{"title":"Fix session list labels for codex logs"}}"#;
-        let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract title");
-        assert_eq!(excerpt, "Fix session list labels for codex logs");
-    }
+            include_str!("../tests/fixtures/backfill/session_no_ranked.jsonl").to_string();
+        let mut metadata = scanner::parse_session_metadata_str(&content);
+        metadata.cwd = Some(repo.path().to_string_lossy().to_string());
+        metadata.agent_type = Some(scanner::AgentType::Claude);
+        let session_id = metadata
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "backfill-session".to_string());
 
-    #[test]
-    fn jsonl_prompt_excerpt_extracts_warp_input_prompt() {
-        let content = r#"{"type":"warp_ai_query","input":{"prompt":"Summarize the warp query format for Cadence"}}"#;
-        let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
-        assert!(excerpt.starts_with("Summarize the warp query format"));
-    }
+        let stats = process_repo_backfill(
+            "git@github.com:team/example.git".to_string(),
+            vec![SessionInfo {
+                log: agents::SessionLog {
+                    agent_type: scanner::AgentType::Claude,
+                    source: agents::SessionSource::Inline {
+                        label: "fixture.jsonl".to_string(),
+                        content,
+                    },
+                    updated_at: Some(1_707_526_800),
+                },
+                session_id,
+                repo_root: repo.path().to_path_buf(),
+                metadata,
+            }],
+            upload_context,
+            None,
+            backfill_log::BackfillLogger::disabled(),
+        )
+        .await;
 
-    #[test]
-    fn jsonl_prompt_excerpt_prefers_normalized_user_turn() {
-        let content = r#"{"type":"user","content":"Review the Warp output and summarize tool calls"}
-{"type":"warp_ai_query","input":{"prompt":"fallback prompt"}}"#;
-        let excerpt = jsonl_prompt_excerpt(content, 72).expect("extract prompt");
-        assert!(excerpt.starts_with("Review the Warp output"));
+        assert_eq!(stats.sessions_seen, 1);
+        assert_eq!(stats.uploaded, 1);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 1,
+                uploads: 1,
+                confirms: 1,
+            }
+        );
     }
 }

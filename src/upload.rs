@@ -275,6 +275,8 @@ async fn attempt_upload(
         Ok(SessionUploadConfirmResponse { .. }) => Ok(UploadAttemptOutcome::Uploaded),
         Err(AuthenticatedRequestError::Conflict(_)) => Ok(UploadAttemptOutcome::Uploaded),
         Err(AuthenticatedRequestError::Unauthorized) => Err(UploadAttemptError::Unauthorized),
+        // Pending retries restart from request-url -> PUT -> confirm, so any
+        // confirm mismatch is recovered with a fresh presigned upload cycle.
         Err(err) => Err(UploadAttemptError::Retryable(err.to_string())),
     }
 }
@@ -462,12 +464,31 @@ async fn write_atomic(path: &Path, bytes: Vec<u8>) -> Result<()> {
     tokio::fs::write(&tmp, bytes)
         .await
         .with_context(|| format!("failed to write {}", tmp.display()))?;
-    if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    tokio::fs::rename(&tmp, path)
+    replace_path(&tmp, path)
         .await
         .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))
+}
+
+#[cfg(not(windows))]
+async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(tmp, path).await
+}
+
+#[cfg(windows)]
+async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+            ) && tokio::fs::try_exists(path).await.unwrap_or(false) =>
+        {
+            tokio::fs::remove_file(path).await?;
+            tokio::fs::rename(tmp, path).await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn pending_dir() -> Result<PathBuf> {
@@ -558,8 +579,294 @@ async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use crate::api_client::SessionUploadUrlRequest;
+    use anyhow::{Context, Result};
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct TestUploadServerConfig {
+        pub upload_url_statuses: Vec<u16>,
+        pub upload_statuses: Vec<u16>,
+        pub confirm_statuses: Vec<u16>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct TestUploadServerCounts {
+        pub upload_url_requests: usize,
+        pub uploads: usize,
+        pub confirms: usize,
+    }
+
+    struct TestUploadServerState {
+        counts: TestUploadServerCounts,
+        upload_url_statuses: VecDeque<u16>,
+        upload_statuses: VecDeque<u16>,
+        confirm_statuses: VecDeque<u16>,
+    }
+
+    impl TestUploadServerState {
+        fn new(config: TestUploadServerConfig) -> Self {
+            Self {
+                counts: TestUploadServerCounts::default(),
+                upload_url_statuses: config.upload_url_statuses.into(),
+                upload_statuses: config.upload_statuses.into(),
+                confirm_statuses: config.confirm_statuses.into(),
+            }
+        }
+
+        fn next_upload_url_status(&mut self) -> u16 {
+            self.counts.upload_url_requests += 1;
+            self.upload_url_statuses.pop_front().unwrap_or(200)
+        }
+
+        fn next_upload_status(&mut self) -> u16 {
+            self.counts.uploads += 1;
+            self.upload_statuses.pop_front().unwrap_or(200)
+        }
+
+        fn next_confirm_status(&mut self) -> u16 {
+            self.counts.confirms += 1;
+            self.confirm_statuses.pop_front().unwrap_or(200)
+        }
+    }
+
+    pub(crate) struct TestUploadServer {
+        pub base_url: String,
+        state: Arc<Mutex<TestUploadServerState>>,
+        handle: JoinHandle<()>,
+    }
+
+    impl TestUploadServer {
+        pub fn counts(&self) -> TestUploadServerCounts {
+            self.state.lock().expect("server state").counts
+        }
+    }
+
+    impl Drop for TestUploadServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    pub(crate) async fn spawn_test_upload_server(
+        config: TestUploadServerConfig,
+    ) -> Result<TestUploadServer> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind test upload server")?;
+        let addr = listener
+            .local_addr()
+            .context("read test upload server addr")?;
+        let base_url = format!("http://{addr}");
+        let state = Arc::new(Mutex::new(TestUploadServerState::new(config)));
+        let server_state = Arc::clone(&state);
+        let server_base_url = base_url.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let server_state = Arc::clone(&server_state);
+                let server_base_url = server_base_url.clone();
+                tokio::spawn(async move {
+                    if let Ok(request) = read_http_request(&mut stream).await {
+                        let response = build_response(&server_base_url, &server_state, request);
+                        let _ = write_http_response(&mut stream, response).await;
+                    }
+                });
+            }
+        });
+
+        Ok(TestUploadServer {
+            base_url,
+            state,
+            handle,
+        })
+    }
+
+    struct TestRequest {
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    struct TestResponse {
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> Result<TestRequest> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).await.context("read test request")?;
+            if read == 0 {
+                anyhow::bail!("unexpected EOF while reading request");
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(pos) = find_bytes(&buffer, b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let mut lines = headers.lines();
+        let request_line = lines.next().context("missing request line")?;
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or_default().to_string();
+        let path = request_parts.next().unwrap_or_default().to_string();
+        let header_map = parse_headers(lines);
+        let content_length = header_map
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        while buffer.len().saturating_sub(header_end) < content_length {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .context("read test request body")?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        Ok(TestRequest {
+            method,
+            path,
+            body: buffer[header_end..header_end + content_length].to_vec(),
+        })
+    }
+
+    fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once(':') {
+                headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        headers
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn build_response(
+        base_url: &str,
+        state: &Arc<Mutex<TestUploadServerState>>,
+        request: TestRequest,
+    ) -> TestResponse {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/api/sessions/upload-url") => {
+                let status = state.lock().expect("server state").next_upload_url_status();
+                if status == 200 {
+                    let session_uid =
+                        serde_json::from_slice::<SessionUploadUrlRequest>(&request.body)
+                            .map(|request| request.session_uid)
+                            .unwrap_or_else(|_| "session-uid".to_string());
+                    let body = format!(
+                        r#"{{"upload_url":"{base_url}/uploads/{session_uid}","session_uid":"{session_uid}","org_id":"org-test"}}"#
+                    )
+                    .into_bytes();
+                    TestResponse {
+                        status,
+                        content_type: "application/json",
+                        body,
+                    }
+                } else {
+                    TestResponse {
+                        status,
+                        content_type: "text/plain",
+                        body: format!("upload-url failed with {status}").into_bytes(),
+                    }
+                }
+            }
+            ("PUT", path) if path.starts_with("/uploads/") => {
+                let status = state.lock().expect("server state").next_upload_status();
+                TestResponse {
+                    status,
+                    content_type: "text/plain",
+                    body: if status == 200 {
+                        Vec::new()
+                    } else {
+                        format!("upload failed with {status}").into_bytes()
+                    },
+                }
+            }
+            ("POST", path) if path.starts_with("/api/sessions/") && path.ends_with("/confirm") => {
+                let status = state.lock().expect("server state").next_confirm_status();
+                if status == 200 {
+                    TestResponse {
+                        status,
+                        content_type: "application/json",
+                        body: br#"{"status":"accepted"}"#.to_vec(),
+                    }
+                } else {
+                    TestResponse {
+                        status,
+                        content_type: "text/plain",
+                        body: format!("confirm failed with {status}").into_bytes(),
+                    }
+                }
+            }
+            _ => TestResponse {
+                status: 404,
+                content_type: "text/plain",
+                body: b"not found".to_vec(),
+            },
+        }
+    }
+
+    async fn write_http_response(stream: &mut TcpStream, response: TestResponse) -> Result<()> {
+        let status_text = match response.status {
+            200 => "OK",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            409 => "Conflict",
+            422 => "Unprocessable Entity",
+            503 => "Service Unavailable",
+            _ => "Test Error",
+        };
+        let headers = format!(
+            "HTTP/1.1 {} {}\r\ncontent-length: {}\r\ncontent-type: {}\r\nconnection: close\r\n\r\n",
+            response.status,
+            status_text,
+            response.body.len(),
+            response.content_type
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .context("write test response headers")?;
+        if !response.body.is_empty() {
+            stream
+                .write_all(&response.body)
+                .await
+                .context("write test response body")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upload::test_support::{TestUploadServerConfig, spawn_test_upload_server};
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -588,6 +895,34 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    async fn run_git(repo: &Path, args: &[&str]) -> String {
+        let out = crate::git::run_git_output_at(Some(repo), args, &[])
+            .await
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
+    }
+
+    async fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        run_git(dir.path(), &["init", "-q"]).await;
+        run_git(dir.path(), &["config", "user.name", "Test User"]).await;
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]).await;
+        tokio::fs::write(dir.path().join("README.md"), "hello")
+            .await
+            .expect("write");
+        run_git(dir.path(), &["add", "README.md"]).await;
+        run_git(dir.path(), &["commit", "-m", "init"]).await;
+        dir
     }
 
     fn sample_record() -> note::SessionRecord {
@@ -688,6 +1023,161 @@ mod tests {
             !tokio::fs::try_exists(&path)
                 .await
                 .expect("check stale payload removal")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_retries_with_backoff_and_keeps_payload() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let prepared = prepare_session_upload(sample_record(), "hello".to_string())
+            .expect("prepare session upload");
+        enqueue_prepared_upload(&prepared, "initial failure")
+            .await
+            .expect("enqueue prepared upload");
+
+        let server = spawn_test_upload_server(TestUploadServerConfig {
+            upload_url_statuses: vec![503],
+            ..TestUploadServerConfig::default()
+        })
+        .await
+        .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+        let before = now_epoch();
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(server.counts().upload_url_requests, 1);
+
+        let pending_dir = pending_dir().await.expect("pending dir");
+        let record = load_pending_record(&record_path(&pending_dir, &prepared.session_uid))
+            .await
+            .expect("pending record");
+        assert_eq!(record.attempt_count, 1);
+        assert!(record.next_attempt_at_epoch >= before + 1);
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("server_error")
+                || record
+                    .last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("503")
+        );
+        assert!(
+            tokio::fs::try_exists(&payload_path(&pending_dir, &prepared.session_uid))
+                .await
+                .expect("check queued payload")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_rebuilds_remote_after_repo_remote_is_added() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let repo = init_repo().await;
+        let repo_root = repo.path().to_string_lossy().to_string();
+        let record = note::SessionRecord {
+            session_uid: "queued-remote-resolution".to_string(),
+            repo_root: repo_root,
+            repo_remote_url: None,
+            ..sample_record()
+        };
+        let envelope = note::SessionEnvelope {
+            record,
+            session_content: "hello".to_string(),
+        };
+        enqueue_pending_envelope(&envelope, "repo has no push remote URL")
+            .await
+            .expect("enqueue pending envelope");
+
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
+
+        let server = spawn_test_upload_server(TestUploadServerConfig::default())
+            .await
+            .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 1,
+                uploads: 1,
+                confirms: 1,
+            }
+        );
+        assert_eq!(
+            pending_upload_count().await.expect("pending upload count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_upload_retries_confirm_failures_with_fresh_upload_cycles() {
+        let server = spawn_test_upload_server(TestUploadServerConfig {
+            confirm_statuses: vec![422, 200],
+            ..TestUploadServerConfig::default()
+        })
+        .await
+        .expect("spawn test server");
+        let prepared = prepare_session_upload(sample_record(), "hello".to_string())
+            .expect("prepare session upload");
+        let client = ApiClient::new(&server.base_url);
+
+        let first = attempt_upload(
+            &client,
+            "test-token",
+            &prepared.request,
+            &prepared.compressed_payload,
+        )
+        .await;
+        assert!(matches!(first, Err(UploadAttemptError::Retryable(_))));
+
+        let second = attempt_upload(
+            &client,
+            "test-token",
+            &prepared.request,
+            &prepared.compressed_payload,
+        )
+        .await
+        .expect("retry fresh upload cycle");
+        assert_eq!(second, UploadAttemptOutcome::Uploaded);
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 2,
+                uploads: 2,
+                confirms: 2,
+            }
         );
     }
 }

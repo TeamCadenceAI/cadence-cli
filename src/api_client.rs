@@ -1,7 +1,6 @@
 //! HTTP client for Cadence API endpoints used by the CLI.
 //!
 //! Includes:
-//! - Public key retrieval for encryption setup
 //! - CLI auth exchange + revoke
 //! - Backfill-complete reporting
 //! - Direct session upload URL + confirmation
@@ -14,7 +13,6 @@ use std::time::Duration;
 // Endpoint path constants
 // ---------------------------------------------------------------------------
 
-const KEYS_PUBLIC_PATH: &str = "/api/keys/public";
 const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
 const AUTH_REVOKE_PATH: &str = "/api/auth";
 const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
@@ -23,19 +21,6 @@ const SESSION_UPLOAD_URL_PATH: &str = "/api/sessions/upload-url";
 // ---------------------------------------------------------------------------
 // Response DTOs
 // ---------------------------------------------------------------------------
-
-/// Response from `GET /api/keys/public`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ApiPublicKey {
-    pub fingerprint: String,
-    pub armored_public_key: String,
-    #[serde(default)]
-    pub created_at: Option<String>,
-    #[serde(default)]
-    pub rotated_at: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    pub version: Option<String>,
-}
 
 /// Request body for `POST /api/auth/exchange`.
 #[derive(Debug, Serialize)]
@@ -183,26 +168,6 @@ impl ApiClient {
             raw_client,
             base_url: normalized,
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Public endpoint methods
-    // -----------------------------------------------------------------------
-
-    /// Fetch the current API public key.
-    pub async fn get_api_public_key(&self) -> Result<ApiPublicKey> {
-        let url = self.url(KEYS_PUBLIC_PATH);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("failed to connect to API at {url}"))?;
-
-        let body = map_http_error(resp).await?;
-        let envelope: ApiResponseEnvelope<ApiPublicKey> =
-            serde_json::from_str(&body).context("failed to parse api public key response")?;
-        Ok(envelope.data)
     }
 
     /// Exchange a short-lived CLI exchange code for a long-lived CLI JWT.
@@ -385,20 +350,6 @@ impl ApiClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
-}
-
-fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::String(s)) => Some(s),
-        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-        Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
-        Some(serde_json::Value::Null) | None => None,
-        Some(other) => Some(other.to_string()),
-    })
 }
 
 // ---------------------------------------------------------------------------

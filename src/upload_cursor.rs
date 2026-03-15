@@ -48,13 +48,32 @@ pub async fn upsert_cursor(
     tokio::fs::write(&tmp, bytes)
         .await
         .with_context(|| format!("failed to write {}", tmp.display()))?;
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-    tokio::fs::rename(&tmp, &path)
+    replace_path(&tmp, &path)
         .await
         .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(tmp, path).await
+}
+
+#[cfg(windows)]
+async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+            ) && tokio::fs::try_exists(path).await.unwrap_or(false) =>
+        {
+            tokio::fs::remove_file(path).await?;
+            tokio::fs::rename(tmp, path).await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn cursor_dir() -> Result<PathBuf> {
@@ -81,9 +100,60 @@ fn short_hash(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var(key).ok(),
+            }
+        }
+
+        fn set_path(&self, path: &Path) {
+            unsafe { std::env::set_var(self.key, path) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn short_hash_is_stable() {
         assert_eq!(short_hash("/tmp/repo"), short_hash("/tmp/repo"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upsert_cursor_round_trips_latest_position() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        upsert_cursor("/tmp/repo", 123, Some("alpha"))
+            .await
+            .expect("write initial cursor");
+        upsert_cursor("/tmp/repo", 456, Some("beta"))
+            .await
+            .expect("overwrite cursor");
+
+        let record = load_cursor("/tmp/repo")
+            .await
+            .expect("load cursor")
+            .expect("persisted cursor");
+        assert_eq!(record.last_scanned_mtime_epoch, 456);
+        assert_eq!(record.last_scanned_source_label.as_deref(), Some("beta"));
     }
 }

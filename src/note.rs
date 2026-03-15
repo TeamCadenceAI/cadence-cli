@@ -10,26 +10,6 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Encryption/compression encoding for stored canonical session objects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContentEncoding {
-    Plain,
-    Zstd,
-    Pgp,
-    ZstdPgp,
-}
-
-impl std::fmt::Display for ContentEncoding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ContentEncoding::Plain => write!(f, "plain"),
-            ContentEncoding::Zstd => write!(f, "zstd"),
-            ContentEncoding::Pgp => write!(f, "pgp"),
-            ContentEncoding::ZstdPgp => write!(f, "zstd+pgp"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_uid: String,
@@ -57,16 +37,6 @@ pub struct SessionRecord {
 pub struct SessionEnvelope {
     pub record: SessionRecord,
     pub session_content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexEntry {
-    pub session_uid: String,
-    pub session_blob_sha: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_start: Option<i64>,
-    pub agent: String,
-    pub ingested_at: String,
 }
 
 pub fn now_rfc3339() -> String {
@@ -113,10 +83,6 @@ pub fn serialize_session_object(record: SessionRecord, session_content: String) 
         session_content,
     };
     Ok(serde_json::to_vec(&envelope)?)
-}
-
-pub fn serialize_index_entry_line(entry: &IndexEntry) -> Result<String> {
-    Ok(serde_json::to_string(entry)?)
 }
 
 pub fn compress_bytes(data: &[u8]) -> Result<Vec<u8>> {
@@ -242,25 +208,5 @@ mod tests {
         assert_eq!(envelope.record.session_id, "session-abc");
         assert_eq!(envelope.record.session_start, Some(1_700_000_000));
         assert_eq!(envelope.session_content, "line1\nline2");
-    }
-
-    #[test]
-    fn serialize_index_entry_line_is_stable_and_omits_none() {
-        let entry = IndexEntry {
-            session_uid: "uid-1".to_string(),
-            session_blob_sha: "blob-sha".to_string(),
-            session_start: None,
-            agent: "codex".to_string(),
-            ingested_at: "2026-03-02T00:00:00Z".to_string(),
-        };
-
-        let line = serialize_index_entry_line(&entry).expect("serialize index entry");
-        assert_eq!(
-            line,
-            r#"{"session_uid":"uid-1","session_blob_sha":"blob-sha","agent":"codex","ingested_at":"2026-03-02T00:00:00Z"}"#
-        );
-
-        let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse line");
-        assert!(parsed.get("session_start").is_none());
     }
 }
