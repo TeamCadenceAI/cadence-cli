@@ -13,6 +13,8 @@ mod push;
 mod scanner;
 mod sync_pending;
 mod update;
+mod upload;
+mod upload_cursor;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -36,7 +38,7 @@ const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
 static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
-/// Cadence CLI: store AI coding agent sessions in Git refs.
+/// Cadence CLI: upload AI coding agent sessions directly to Cadence.
 ///
 /// Provides provenance and measurement of AI-assisted development
 /// without polluting commit history.
@@ -83,20 +85,10 @@ enum Command {
     /// Revoke and clear local CLI authentication token.
     Logout,
 
-    /// List sessions indexed for branch/user.
-    Sessions {
-        #[command(subcommand)]
-        command: Option<SessionsCommand>,
-
-        /// List sessions for all discovered repos instead of only current repo.
-        #[arg(long)]
-        all: bool,
-    },
-
     /// Show Cadence CLI status for the current repository.
     Status,
 
-    /// Diagnose hook and session-ref configuration issues.
+    /// Diagnose hook and upload configuration issues.
     Doctor {
         /// Attempt to repair auto-update scheduler artifacts based on config intent.
         #[arg(long)]
@@ -124,25 +116,6 @@ enum Command {
     Config {
         #[command(subcommand)]
         config_command: Option<ConfigCommand>,
-    },
-
-    /// Manage encryption for local + API recipients.
-    Keys {
-        #[command(subcommand)]
-        keys_command: Option<KeysCommands>,
-    },
-
-    /// Clear session refs and re-backfill.
-    ///
-    /// Deletes local and remote session refs, then re-runs backfill.
-    Gc {
-        /// How far back to re-backfill, e.g. "30d" for 30 days.
-        #[arg(long, default_value = "30d")]
-        since: String,
-
-        /// Confirm destructive operation (required).
-        #[arg(long)]
-        confirm: bool,
     },
 }
 
@@ -178,36 +151,8 @@ enum AutoUpdateCommand {
 
 #[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Post-commit hook: ingest recent AI sessions for the current repository.
+    /// Post-commit hook: upload recent AI sessions for the current repository.
     PostCommit,
-    /// Pre-push hook: sync session refs with the push remote.
-    PrePush {
-        /// Remote name provided by git.
-        remote: String,
-        /// Remote URL provided by git.
-        url: String,
-    },
-    /// Deferred sync worker: process queued session-ref sync jobs.
-    DeferredSync {
-        /// Repository path to sync (defaults to current repository).
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// Remote name to sync (defaults to push remote or origin).
-        #[arg(long)]
-        remote: Option<String>,
-        /// Process queued pending sync jobs.
-        #[arg(long)]
-        all_pending: bool,
-        /// Internal: background worker mode.
-        #[arg(long)]
-        background: bool,
-        /// Max pending jobs to process in this invocation.
-        #[arg(long, default_value_t = 4)]
-        max_items: usize,
-        /// Max time budget for this invocation in milliseconds.
-        #[arg(long, default_value_t = 8000)]
-        time_budget_ms: u64,
-    },
     /// Internal unattended background updater entrypoint (scheduler-only).
     #[command(hide = true)]
     AutoUpdate,
@@ -261,15 +206,9 @@ enum KeysCommands {
 
 /// Error classification for the post-commit hook.
 ///
-/// The hook must normally never block a commit (all errors are swallowed).
-/// The single exception is when encryption is configured but fails —
-/// in that case the hook MUST exit non-zero to prevent unencrypted notes.
+/// Direct uploads must never block a commit, so all hook failures are soft.
 enum HookError {
-    /// Encryption was configured but failed. The hook must propagate
-    /// this as a non-zero exit to block the commit.
-    EncryptionFailed(String),
-    /// Any other error (session not found, git error, etc.). These are
-    /// logged as notes and the commit proceeds.
+    /// Any hook failure is logged as a note and the commit proceeds.
     Soft(anyhow::Error),
 }
 
@@ -446,9 +385,8 @@ async fn resolve_api_public_key_cache(force_refresh: bool) -> Result<Option<Stri
 /// 1. Set `git config --global core.hooksPath ~/.git-hooks`
 /// 2. Create `~/.git-hooks/` directory if missing
 /// 3. Write `~/.git-hooks/post-commit` shim script
-/// 4. Write `~/.git-hooks/pre-push` shim script
-/// 5. Make shims executable (chmod +x)
-/// 6. If `--org` provided, persist org filter to global git config
+/// 4. Make shim executable (chmod +x)
+/// 5. If `--org` provided, persist org filter to global git config
 ///
 /// Errors at each step are reported but do not prevent subsequent steps
 /// from being attempted.
@@ -516,20 +454,12 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     left_norm == right_norm
 }
 
-async fn cadence_hooks_installed(hooks_dir: &Path) -> (bool, bool) {
+async fn cadence_hooks_installed(hooks_dir: &Path) -> bool {
     let post_path = hooks_dir.join("post-commit");
-    let post_installed = match tokio::fs::read_to_string(&post_path).await {
+    match tokio::fs::read_to_string(&post_path).await {
         Ok(content) => is_cadence_hook(&content),
         Err(_) => false,
-    };
-
-    let pre_path = hooks_dir.join("pre-push");
-    let pre_installed = match tokio::fs::read_to_string(&pre_path).await {
-        Ok(content) => is_cadence_hook(&content),
-        Err(_) => false,
-    };
-
-    (post_installed, pre_installed)
+    }
 }
 
 /// Inner implementation of install, accepting an optional home directory override
@@ -583,7 +513,7 @@ async fn run_install_inner(
         ));
     }
 
-    // Step 3 & 4: Write post-commit shim and make it executable
+    // Step 3: Write post-commit shim and make it executable
     let shim_path = hooks_dir.join("post-commit");
     let shim_content = post_commit_hook_content();
 
@@ -663,84 +593,41 @@ async fn run_install_inner(
         }
     }
 
-    // Step 4b: Write pre-push shim and make it executable
     let pre_push_path = hooks_dir.join("pre-push");
-    let pre_push_content = pre_push_hook_content();
-
-    let should_write_pre_push = if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
+    if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
         match tokio::fs::read_to_string(&pre_push_path).await {
-            Ok(existing) => {
-                if is_cadence_hook(&existing) {
-                    output::detail("Pre-push hook already installed; updating");
-                    true
-                } else {
-                    let backup_path = hooks_dir.join("pre-push.pre-cadence");
-                    match tokio::fs::copy(&pre_push_path, &backup_path).await {
-                        Ok(_) => {
-                            output::note(&format!(
-                                "Existing pre-push hook saved to {}",
-                                backup_path.display()
-                            ));
-                        }
-                        Err(e) => {
-                            output::note(&format!(
-                                "Could not back up existing pre-push hook ({})",
-                                e
-                            ));
-                        }
+            Ok(existing) if is_cadence_hook(&existing) => {
+                match tokio::fs::remove_file(&pre_push_path).await {
+                    Ok(()) => output::success(
+                        "Removed",
+                        &format!("legacy pre-push hook ({})", pre_push_path.display()),
+                    ),
+                    Err(e) => {
+                        output::fail(
+                            "Failed",
+                            &format!("to remove {} ({})", pre_push_path.display(), e),
+                        );
+                        had_errors = true;
                     }
-                    true
                 }
             }
-            Err(_) => {
-                output::note(&format!(
-                    "Could not read existing {}; overwriting",
+            Ok(_) => {
+                output::detail(&format!(
+                    "Leaving non-Cadence pre-push hook untouched: {}",
                     pre_push_path.display()
                 ));
-                true
-            }
-        }
-    } else {
-        true
-    };
-
-    if should_write_pre_push {
-        match tokio::fs::write(&pre_push_path, pre_push_content).await {
-            Ok(()) => {
-                output::success(
-                    "Wrote",
-                    &format!("pre-push hook ({})", pre_push_path.display()),
-                );
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o755);
-                    match tokio::fs::set_permissions(&pre_push_path, perms).await {
-                        Ok(()) => {
-                            output::detail(&format!("Made {} executable", pre_push_path.display()));
-                        }
-                        Err(e) => {
-                            output::fail(
-                                "Failed",
-                                &format!("to make {} executable ({})", pre_push_path.display(), e),
-                            );
-                            had_errors = true;
-                        }
-                    }
-                }
             }
             Err(e) => {
-                output::fail(
-                    "Failed",
-                    &format!("to write {} ({})", pre_push_path.display(), e),
-                );
-                had_errors = true;
+                output::note(&format!(
+                    "Could not inspect legacy pre-push hook {} ({})",
+                    pre_push_path.display(),
+                    e
+                ));
             }
         }
     }
 
-    // Step 4c: Scheduler reconciliation is performed after auto-update consent is resolved.
+    // Step 4: Scheduler reconciliation is performed after auto-update consent is resolved.
 
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
@@ -755,17 +642,10 @@ async fn run_install_inner(
         }
     }
 
-    // Step 5.5: Optional encryption setup
-    println!();
-    if let Err(e) = run_install_encryption_setup().await {
-        output::fail("Install", &format!("stopped ({})", e));
-        return Err(e);
-    }
-
-    // Step 5.6: Optional auto-update preference prompt
+    // Step 5.5: Optional auto-update preference prompt
     run_install_auto_update_prompt().await;
 
-    // Step 5.7: Reconcile scheduler with persisted user intent.
+    // Step 5.6: Reconcile scheduler with persisted user intent.
     let auto_update_enabled = config::CliConfig::load()
         .await
         .unwrap_or_default()
@@ -946,24 +826,14 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
 
 /// The post-commit hook handler. This is the critical hot path.
 ///
-/// This function swallows all errors and returns `Ok(())` EXCEPT when
-/// encryption is configured and fails — in that case it returns `Err` to
-/// block the commit (non-zero exit). This is the only case where the hook
-/// intentionally fails.
-///
-/// The outer wrapper uses `std::panic::catch_unwind` to catch panics, and
-/// pattern-matches on `HookError` to distinguish commit-blocking
-/// failures from soft failures that should be swallowed.
+/// Direct uploads must never block a commit, so all failures are swallowed
+/// after being surfaced as a note.
 async fn run_hook_post_commit() -> Result<()> {
     // Catch-all: catch panics
     let result = tokio::spawn(async { hook_post_commit_inner().await }).await;
 
     let final_result = match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(HookError::EncryptionFailed(msg))) => {
-            output::fail("Encryption", &format!("failed ({})", msg));
-            anyhow::bail!("Encryption configured but failed: {}", msg);
-        }
         Ok(Err(HookError::Soft(e))) => {
             output::note(&format!("Hook issue: {}", e));
             Ok(())
@@ -1006,10 +876,6 @@ async fn run_hook_pre_push(remote: &str, url: &str) -> Result<()> {
 }
 
 /// Inner implementation of the post-commit hook.
-///
-/// Returns `HookError::EncryptionFailed` if encryption is configured but
-/// fails — this is the only case where the hook blocks the commit. All other
-/// errors are wrapped in `HookError::Soft` and swallowed by the caller.
 async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
     if !git::check_enabled().await {
@@ -1030,36 +896,41 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
         Err(e) => return Err(HookError::Soft(e)),
     }
 
-    // Step 1.5: Resolve encryption method once for this invocation
-    let encryption_method = resolve_encryption_method().await.map_err(|e| {
-        // Config read failure is a soft error — don't block commit
-        HookError::Soft(e)
-    })?;
+    let upload_context = upload::resolve_upload_context(api_url_override())
+        .await
+        .map_err(HookError::Soft)?;
+    let pending_summary =
+        upload::process_pending_uploads(&upload_context, upload::DEFAULT_PENDING_UPLOADS_PER_RUN)
+            .await
+            .map_err(HookError::Soft)?;
 
-    let storing_progress = hook_status_spinner_start("Storing AI sessions");
-    let scanned = match ingest_recent_sessions_for_repo(
-        &repo_root,
-        &repo_root_str,
-        POST_COMMIT_MATCH_WINDOW_SECS,
-        &encryption_method,
-    )
-    .await
-    {
-        Ok(scanned) => {
-            hook_status_spinner_finish_ok(storing_progress, "Storing AI sessions");
-            scanned
-        }
-        Err(e) => {
-            hook_status_spinner_finish_err(storing_progress, "Storing AI sessions");
-            return Err(if encryption_method.is_configured() {
-                HookError::EncryptionFailed(format!("{:#}", e))
-            } else {
-                HookError::Soft(e)
-            });
-        }
-    };
+    let uploading_progress = hook_status_spinner_start("Uploading AI sessions");
+    let stats =
+        match upload_incremental_sessions_for_repo(&upload_context, &repo_root, &repo_root_str)
+            .await
+        {
+            Ok(stats) => {
+                hook_status_spinner_finish_ok(uploading_progress, "Uploading AI sessions");
+                stats
+            }
+            Err(e) => {
+                hook_status_spinner_finish_err(uploading_progress, "Uploading AI sessions");
+                return Err(HookError::Soft(e));
+            }
+        };
+
+    if (!upload_context.has_token() && stats.queued > 0) || pending_summary.auth_required {
+        output::note("Run `cadence login` to upload queued AI sessions.");
+    }
     if output::is_verbose() {
-        output::detail(&format!("ingested {} recent sessions", scanned));
+        output::detail(&format!(
+            "uploaded={} queued={} skipped={} issues={} retried_pending={}",
+            stats.uploaded,
+            stats.queued,
+            stats.skipped,
+            stats.issues,
+            pending_summary.uploaded + pending_summary.already_existed
+        ));
     }
 
     Ok(())
@@ -1093,7 +964,7 @@ async fn hook_pre_push_inner(remote: &str, _url: &str) -> Result<()> {
     Ok(())
 }
 
-const POST_COMMIT_MATCH_WINDOW_SECS: i64 = 1_800;
+const POST_COMMIT_FALLBACK_WINDOW_SECS: i64 = 30 * 86_400;
 
 /// Stored canonical session object info.
 struct SessionIngestInfo {
@@ -1254,6 +1125,216 @@ async fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
     note::hash_key(email.trim().to_ascii_lowercase().as_str())
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct UploadRunStats {
+    uploaded: usize,
+    queued: usize,
+    skipped: usize,
+    issues: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UploadFromLogOutcome {
+    Uploaded,
+    AlreadyExists,
+    SkippedRepoNotAssociated,
+    Queued,
+    Retryable(String),
+}
+
+async fn upload_session_from_log(
+    context: &upload::UploadContext,
+    parsed: &ParsedSessionLog,
+    repo_root: &std::path::Path,
+    repo_root_str: &str,
+) -> UploadFromLogOutcome {
+    let session_id = parsed
+        .metadata
+        .session_id
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+    let agent = parsed
+        .metadata
+        .agent_type
+        .clone()
+        .unwrap_or(scanner::AgentType::Claude);
+    let content_sha256 = note::content_sha256(&parsed.session_log);
+    let session_uid = note::compute_session_uid(
+        &agent,
+        &session_id,
+        repo_root_str,
+        parsed.session_start,
+        &content_sha256,
+    );
+    let ingested_at = parsed
+        .session_start
+        .and_then(format_unix_rfc3339)
+        .unwrap_or_else(note::now_rfc3339);
+    let branch_key = branch_key_for_repo(repo_root).await;
+    let committer_key_hash = committer_key_hash_for_repo(repo_root).await;
+    let git_user_email = git::config_get_at(repo_root, "user.email")
+        .await
+        .ok()
+        .flatten();
+    let git_user_name = git::config_get_at(repo_root, "user.name")
+        .await
+        .ok()
+        .flatten();
+    let repo_remote_url = match git::resolve_push_remote_at(repo_root).await {
+        Ok(Some(remote)) => match git::remote_url_at(repo_root, &remote).await.ok().flatten() {
+            Some(url) if !url.trim().is_empty() => url,
+            _ => return UploadFromLogOutcome::Retryable("repo has no push remote URL".to_string()),
+        },
+        _ => return UploadFromLogOutcome::Retryable("repo has no push remote URL".to_string()),
+    };
+
+    let record = note::SessionRecord {
+        session_uid,
+        agent: agent.to_string(),
+        session_id,
+        repo_root: repo_root_str.to_string(),
+        repo_remote_url: Some(repo_remote_url),
+        branch_key,
+        committer_key_hash,
+        git_user_email,
+        git_user_name,
+        session_start: parsed.session_start,
+        content_sha256,
+        cwd: parsed
+            .metadata
+            .cwd
+            .clone()
+            .or_else(|| Some(repo_root_str.to_string())),
+        ingested_at,
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    let prepared = match upload::prepare_session_upload(record, parsed.session_log.clone()) {
+        Ok(prepared) => prepared,
+        Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
+    };
+
+    match upload::upload_or_queue_prepared_session(context, &prepared).await {
+        Ok(upload::LiveUploadOutcome::Uploaded) => UploadFromLogOutcome::Uploaded,
+        Ok(upload::LiveUploadOutcome::AlreadyExists) => UploadFromLogOutcome::AlreadyExists,
+        Ok(upload::LiveUploadOutcome::SkippedRepoNotAssociated) => {
+            UploadFromLogOutcome::SkippedRepoNotAssociated
+        }
+        Ok(upload::LiveUploadOutcome::Queued) => UploadFromLogOutcome::Queued,
+        Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
+    }
+}
+
+async fn upload_incremental_sessions_for_repo(
+    context: &upload::UploadContext,
+    repo_root: &std::path::Path,
+    repo_root_str: &str,
+) -> Result<UploadRunStats> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let min_cursor = upload_cursor::load_cursor(repo_root_str)
+        .await?
+        .map(|record| record.last_scanned_mtime_epoch)
+        .unwrap_or(now - POST_COMMIT_FALLBACK_WINDOW_SECS);
+    let since_secs = (now - min_cursor).max(0);
+    let files = agents::discover_recent_sessions(now, since_secs).await;
+
+    let mut candidates = Vec::new();
+    for log in files {
+        let Some(mtime) = log.updated_at else {
+            continue;
+        };
+        if mtime <= min_cursor {
+            continue;
+        }
+        candidates.push(log);
+    }
+
+    let parsed_logs = parse_session_logs_bounded(candidates).await;
+    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    let mut stats = UploadRunStats::default();
+    let mut cursor_advance_mtime = min_cursor;
+
+    for parsed in parsed_logs {
+        let log_mtime = parsed.log.updated_at;
+        let Some(cwd) = parsed.metadata.cwd.clone() else {
+            cursor_advance_mtime = advance_cursor_for_disposition(
+                cursor_advance_mtime,
+                log_mtime,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
+            continue;
+        };
+        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
+            cached.clone()
+        } else {
+            let resolved = git::repo_root_at(std::path::Path::new(&cwd)).await.ok();
+            repo_root_cache.insert(cwd.clone(), resolved.clone());
+            resolved
+        };
+        let Some(resolved_repo) = resolved_repo else {
+            cursor_advance_mtime = advance_cursor_for_disposition(
+                cursor_advance_mtime,
+                log_mtime,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
+            continue;
+        };
+        if resolved_repo != repo_root {
+            cursor_advance_mtime = advance_cursor_for_disposition(
+                cursor_advance_mtime,
+                log_mtime,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
+            continue;
+        }
+
+        match upload_session_from_log(context, &parsed, repo_root, repo_root_str).await {
+            UploadFromLogOutcome::Uploaded => {
+                stats.uploaded += 1;
+                cursor_advance_mtime = advance_cursor_for_disposition(
+                    cursor_advance_mtime,
+                    log_mtime,
+                    IncrementalLogDisposition::Indexed,
+                );
+            }
+            UploadFromLogOutcome::AlreadyExists
+            | UploadFromLogOutcome::SkippedRepoNotAssociated => {
+                stats.skipped += 1;
+                cursor_advance_mtime = advance_cursor_for_disposition(
+                    cursor_advance_mtime,
+                    log_mtime,
+                    IncrementalLogDisposition::SkippedPermanent,
+                );
+            }
+            UploadFromLogOutcome::Queued => {
+                stats.queued += 1;
+                cursor_advance_mtime = advance_cursor_for_disposition(
+                    cursor_advance_mtime,
+                    log_mtime,
+                    IncrementalLogDisposition::Indexed,
+                );
+            }
+            UploadFromLogOutcome::Retryable(message) => {
+                stats.issues += 1;
+                if output::is_verbose() {
+                    output::detail(&format!("post-commit upload retryable error: {message}"));
+                }
+            }
+        }
+    }
+
+    if cursor_advance_mtime > min_cursor {
+        upload_cursor::upsert_cursor(repo_root_str, cursor_advance_mtime).await?;
+    }
+
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1666,7 +1747,7 @@ fn parse_since_duration(since: &str) -> Result<i64> {
     }
 }
 
-/// The backfill subcommand: ingest recent AI session logs into session refs.
+/// The backfill subcommand: upload recent AI session logs to Cadence.
 ///
 /// This scans ALL supported agent log directories (not scoped to any
 /// single repo), resolves repos from session metadata, and stores
@@ -1676,7 +1757,7 @@ fn parse_since_duration(since: &str) -> Result<i64> {
 /// - Can take minutes for large log directories
 /// - Prints verbose progress throughout
 /// - All errors are non-fatal (logged and continued)
-/// - Always syncs and pushes canonical session refs per repository
+/// - Uploads session blobs directly to the Cadence API
 async fn run_backfill(since: &str) -> Result<()> {
     run_backfill_inner(since, None).await
 }
@@ -1697,7 +1778,8 @@ struct SessionInfo {
 #[derive(Default)]
 struct RepoBackfillStats {
     sessions_seen: usize,
-    attached: usize,
+    uploaded: usize,
+    queued: usize,
     skipped: usize,
     errors: usize,
 }
@@ -1755,7 +1837,7 @@ fn backfill_repo_concurrency() -> usize {
 async fn process_repo_backfill(
     repo_display: String,
     sessions: Vec<SessionInfo>,
-    encryption_method: EncryptionMethod,
+    upload_context: Arc<upload::UploadContext>,
     repo_progress: Option<ProgressBar>,
     backfill_logger: backfill_log::BackfillLogger,
 ) -> RepoBackfillStats {
@@ -1791,8 +1873,7 @@ async fn process_repo_backfill(
             "repo_root": repo_root_str.as_str(),
             "sessions": sessions.len(),
             "planned_units": planned_units,
-            "sync_remote_before_attach": true,
-            "do_push": true,
+            "upload_mode": "direct",
         }),
     );
 
@@ -1847,45 +1928,6 @@ async fn process_repo_backfill(
         return stats;
     }
 
-    let repo_remote = {
-        let remote = match git::resolve_push_remote_at(&repo_root).await {
-            Ok(Some(remote)) => remote,
-            _ => "origin".to_string(),
-        };
-        backfill_logger.event(
-            "repo_remote_sync_started",
-            serde_json::json!({
-                "repo_display": repo_display.as_str(),
-                "repo_root": repo_root_str.as_str(),
-                "remote": remote.as_str(),
-            }),
-        );
-        match push::fetch_merge_notes_for_remote_at(&repo_root, &remote).await {
-            Ok(()) => {
-                backfill_logger.event(
-                    "repo_remote_sync_completed",
-                    serde_json::json!({
-                        "repo_display": repo_display.as_str(),
-                        "repo_root": repo_root_str.as_str(),
-                        "remote": remote.as_str(),
-                    }),
-                );
-            }
-            Err(e) => {
-                backfill_logger.event(
-                    "repo_remote_sync_error",
-                    serde_json::json!({
-                        "repo_display": repo_display.as_str(),
-                        "repo_root": repo_root_str.as_str(),
-                        "remote": remote.as_str(),
-                        "error": e.to_string(),
-                    }),
-                );
-            }
-        }
-        remote
-    };
-
     for session in sessions {
         stats.sessions_seen += 1;
         let session_file = session.log.source_label();
@@ -1931,20 +1973,17 @@ async fn process_repo_backfill(
             .await
             .map(|(start, _)| start);
 
-        match ingest_session_from_log(
-            &agent_type,
-            &session.session_id,
-            &repo_str,
-            &session_log,
-            &encryption_method,
+        let parsed = ParsedSessionLog {
+            log: session.log.clone(),
+            metadata: session.metadata.clone(),
             session_start,
-            Some(&session.repo_root),
-            None,
-        )
-        .await
+            session_log,
+        };
+
+        match upload_session_from_log(&upload_context, &parsed, &session.repo_root, &repo_str).await
         {
-            Ok(info) => {
-                stats.attached += 1;
+            UploadFromLogOutcome::Uploaded => {
+                stats.uploaded += 1;
                 backfill_logger.event(
                     "session_uploaded",
                     serde_json::json!({
@@ -1952,12 +1991,26 @@ async fn process_repo_backfill(
                         "repo_root": repo_root_str.as_str(),
                         "session_id": session.session_id.as_str(),
                         "file": session.log.source_label(),
-                        "session_uid": info.session_uid,
-                        "session_blob": info.blob_sha,
                     }),
                 );
             }
-            Err(e) => {
+            UploadFromLogOutcome::Queued => {
+                stats.queued += 1;
+                backfill_logger.event(
+                    "session_queued",
+                    serde_json::json!({
+                        "repo_display": repo_display.as_str(),
+                        "repo_root": repo_root_str.as_str(),
+                        "session_id": session.session_id.as_str(),
+                        "file": session.log.source_label(),
+                    }),
+                );
+            }
+            UploadFromLogOutcome::AlreadyExists
+            | UploadFromLogOutcome::SkippedRepoNotAssociated => {
+                stats.skipped += 1;
+            }
+            UploadFromLogOutcome::Retryable(error) => {
                 stats.errors += 1;
                 backfill_logger.event(
                     "session_upload_error",
@@ -1966,7 +2019,7 @@ async fn process_repo_backfill(
                         "repo_root": repo_root_str.as_str(),
                         "session_id": session.session_id.as_str(),
                         "file": session.log.source_label(),
-                        "error": e.to_string(),
+                        "error": error,
                     }),
                 );
             }
@@ -1974,48 +2027,16 @@ async fn process_repo_backfill(
         if let Some(pb) = &repo_progress {
             pb.inc(1);
             pb.set_message(format!(
-                "sessions={}, uploaded={}, issues={}",
-                stats.sessions_seen, stats.attached, stats.errors
+                "sessions={}, uploaded={}, queued={}, issues={}",
+                stats.sessions_seen, stats.uploaded, stats.queued, stats.errors
             ));
-        }
-    }
-
-    backfill_logger.event(
-        "repo_push_started",
-        serde_json::json!({
-            "repo_display": repo_display.as_str(),
-            "repo_root": repo_root_str.as_str(),
-            "remote": repo_remote.as_str(),
-        }),
-    );
-    match push::try_push_remote_at_quiet(&repo_root, &repo_remote).await {
-        Ok(()) => {
-            backfill_logger.event(
-                "repo_push_completed",
-                serde_json::json!({
-                    "repo_display": repo_display.as_str(),
-                    "repo_root": repo_root_str.as_str(),
-                    "remote": repo_remote.as_str(),
-                }),
-            );
-        }
-        Err(e) => {
-            backfill_logger.event(
-                "repo_push_failed",
-                serde_json::json!({
-                    "repo_display": repo_display.as_str(),
-                    "repo_root": repo_root_str.as_str(),
-                    "remote": repo_remote.as_str(),
-                    "error": format!("{e:#}"),
-                }),
-            );
         }
     }
 
     if let Some(pb) = &repo_progress {
         pb.finish_with_message(format!(
-            "done: sessions={}, uploaded={}, skipped={}, issues={}",
-            stats.sessions_seen, stats.attached, stats.skipped, stats.errors
+            "done: sessions={}, uploaded={}, queued={}, skipped={}, issues={}",
+            stats.sessions_seen, stats.uploaded, stats.queued, stats.skipped, stats.errors
         ));
     }
 
@@ -2025,7 +2046,8 @@ async fn process_repo_backfill(
             "repo_display": repo_display.as_str(),
             "repo_root": repo_root_str.as_str(),
             "sessions_seen": stats.sessions_seen,
-            "attached": stats.attached,
+            "uploaded": stats.uploaded,
+            "queued": stats.queued,
             "skipped": stats.skipped,
             "errors": stats.errors,
         }),
@@ -2056,11 +2078,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         }
     };
 
-    // Resolve encryption method once for this backfill run
-    let encryption_method = match resolve_encryption_method().await {
-        Ok(method) => method,
-        Err(e) => EncryptionMethod::Unavailable(format!("{e}")),
-    };
+    let upload_context = Arc::new(upload::resolve_upload_context(api_url_override()).await?);
 
     let use_progress = output::is_stderr_tty();
     let spinner = if use_progress {
@@ -2084,8 +2102,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             "since": since,
             "since_secs": since_secs,
             "since_days": since_days,
-            "do_push": true,
-            "sync_remote_before_attach": true,
+            "upload_mode": "direct",
             "repo_filter": repo_filter.map(|p| p.to_string_lossy().to_string()),
             "use_progress": use_progress,
         }),
@@ -2128,7 +2145,8 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     }
 
     // Counters for final summary
-    let mut attached = 0usize;
+    let mut uploaded = 0usize;
+    let mut queued = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut sessions_by_repo: std::collections::BTreeMap<String, Vec<SessionInfo>> =
@@ -2329,7 +2347,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
 
     for (repo_display, sessions) in sessions_by_repo {
         let permit = semaphore.clone().acquire_owned().await?;
-        let method = encryption_method.clone();
+        let upload_context = Arc::clone(&upload_context);
         backfill_logger.event(
             "repo_worker_queued",
             serde_json::json!({
@@ -2365,7 +2383,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 process_repo_backfill(
                     repo_display,
                     sessions,
-                    method,
+                    upload_context,
                     per_repo_bar,
                     backfill_logger,
                 )
@@ -2377,13 +2395,15 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok(Ok(repo_stats)) => {
-                attached += repo_stats.attached;
+                uploaded += repo_stats.uploaded;
+                queued += repo_stats.queued;
                 skipped += repo_stats.skipped;
                 errors += repo_stats.errors;
                 backfill_logger.event(
                     "repo_worker_result",
                     serde_json::json!({
-                        "attached": repo_stats.attached,
+                        "uploaded": repo_stats.uploaded,
+                        "queued": repo_stats.queued,
                         "sessions_seen": repo_stats.sessions_seen,
                         "skipped": repo_stats.skipped,
                         "errors": repo_stats.errors,
@@ -2416,17 +2436,19 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     // Final summary
     output::success(
         "Backfill",
-        &format!("{attached} uploaded, {skipped} skipped, {errors} issues"),
+        &format!("{uploaded} uploaded, {queued} queued, {skipped} skipped, {errors} issues"),
     );
     let issues = if errors > 0 {
         vec![format!("{errors} issue(s) encountered during backfill")]
+    } else if queued > 0 {
+        vec![format!("{queued} session(s) queued for retry")]
     } else {
         Vec::new()
     };
     report_backfill_completion(
         since_days as i32,
         BackfillSyncStats {
-            notes_attached: attached as i64,
+            notes_attached: uploaded as i64,
             notes_skipped: skipped as i64,
             issues,
             repos_scanned: total_repos as i32,
@@ -2436,14 +2458,17 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     backfill_logger.event(
         "backfill_completed",
         serde_json::json!({
-            "attached": attached,
+            "uploaded": uploaded,
+            "queued": queued,
             "skipped": skipped,
             "errors": errors,
             "repos_scanned": total_repos,
             "since_days": since_days,
-            "do_push": true,
         }),
     );
+    if !upload_context.has_token() && queued > 0 {
+        output::note("Run `cadence login` to upload queued AI sessions.");
+    }
     Ok(())
 }
 
@@ -3075,7 +3100,7 @@ async fn run_sessions(command: Option<SessionsCommand>, all: bool) -> Result<()>
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Effective hooks path and whether the post-commit/pre-push shims are installed
+/// - Effective hooks path and whether the post-commit shim is installed
 /// - Warning when a repo-local hooksPath overrides global Cadence hooks
 /// - Org filter config (if any)
 /// - Per-repo enabled/disabled status
@@ -3114,22 +3139,18 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         {
             Some(path) => {
                 let hooks_dir = resolve_hooks_path(Some(root), &path);
-                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
+                let post_installed = cadence_hooks_installed(&hooks_dir).await;
                 let post_str = if post_installed { "yes" } else { "no" };
-                let pre_str = if pre_installed { "yes" } else { "no" };
                 output::detail_to_with_tty(
                     w,
-                    &format!(
-                        "Hooks path: {} (post-commit: {}, pre-push: {})",
-                        path, post_str, pre_str
-                    ),
+                    &format!("Hooks path: {} (post-commit: {})", path, post_str),
                     false,
                 );
 
-                if !post_installed || !pre_installed {
+                if !post_installed {
                     output::note_to_with_tty(
                         w,
-                        "Cadence hooks are not fully installed in the active hooksPath.",
+                        "Cadence post-commit hook is not installed in the active hooksPath.",
                         false,
                     );
                 }
@@ -3162,42 +3183,19 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
     } else if let Some(path) = global_hooks_path {
         let hooks_dir = resolve_hooks_path(None, &path);
-        let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
+        let post_installed = cadence_hooks_installed(&hooks_dir).await;
         let post_str = if post_installed { "yes" } else { "no" };
-        let pre_str = if pre_installed { "yes" } else { "no" };
         output::detail_to_with_tty(
             w,
-            &format!(
-                "Hooks path: {} (post-commit: {}, pre-push: {})",
-                path, post_str, pre_str
-            ),
+            &format!("Hooks path: {} (post-commit: {})", path, post_str),
             false,
         );
     } else {
         output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
     }
 
-    if let Some(ref root) = repo_root {
-        let has_data_ref = git::ref_exists_at(Some(root), git::SESSION_DATA_REF)
-            .await
-            .unwrap_or(false);
-        let has_branch_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_BRANCH_REF)
-            .await
-            .unwrap_or(false);
-        let has_committer_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_COMMITTER_REF)
-            .await
-            .unwrap_or(false);
-        output::detail_to_with_tty(
-            w,
-            &format!(
-                "Session refs: data={} branch-index={} committer-index={}",
-                if has_data_ref { "yes" } else { "no" },
-                if has_branch_ref { "yes" } else { "no" },
-                if has_committer_ref { "yes" } else { "no" }
-            ),
-            false,
-        );
-    }
+    let pending_uploads = upload::pending_upload_count().await.unwrap_or(0);
+    output::detail_to_with_tty(w, &format!("Pending uploads: {}", pending_uploads), false);
 
     // --- Org filter ---
     match git::config_get_global("ai.cadence.org").await {
@@ -3326,22 +3324,21 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
     match &global_hooks_path {
         Some(path) => {
             let hooks_dir = resolve_hooks_path(repo_root.as_deref(), path);
-            let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
+            let post_installed = cadence_hooks_installed(&hooks_dir).await;
             output::detail_to_with_tty(
                 w,
                 &format!(
-                    "Global hooks: {} (post-commit: {}, pre-push: {})",
+                    "Global hooks: {} (post-commit: {})",
                     path,
-                    if post_installed { "yes" } else { "no" },
-                    if pre_installed { "yes" } else { "no" }
+                    if post_installed { "yes" } else { "no" }
                 ),
                 false,
             );
-            if !post_installed || !pre_installed {
+            if !post_installed {
                 output::fail_to_with_tty(
                     w,
                     "Fail",
-                    "Cadence global hooks are not fully installed",
+                    "Cadence global post-commit hook is not installed",
                     false,
                 );
                 output::detail_to_with_tty(w, "Run `cadence install` to repair hooks.", false);
@@ -3359,22 +3356,21 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
         match git::config_get_at(root, "core.hooksPath").await {
             Ok(Some(active_path)) => {
                 let hooks_dir = resolve_hooks_path(Some(root), &active_path);
-                let (post_installed, pre_installed) = cadence_hooks_installed(&hooks_dir).await;
+                let post_installed = cadence_hooks_installed(&hooks_dir).await;
                 output::detail_to_with_tty(
                     w,
                     &format!(
-                        "Active hooks: {} (post-commit: {}, pre-push: {})",
+                        "Active hooks: {} (post-commit: {})",
                         active_path,
-                        if post_installed { "yes" } else { "no" },
-                        if pre_installed { "yes" } else { "no" }
+                        if post_installed { "yes" } else { "no" }
                     ),
                     false,
                 );
-                if !post_installed || !pre_installed {
+                if !post_installed {
                     output::fail_to_with_tty(
                         w,
                         "Fail",
-                        "Active hooksPath does not contain Cadence hooks",
+                        "Active hooksPath does not contain the Cadence post-commit hook",
                         false,
                     );
                     output::detail_to_with_tty(w, "Run `cadence install` or fix hooksPath.", false);
@@ -3433,27 +3429,8 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
         );
     }
 
-    if let Some(root) = repo_root.as_ref() {
-        let has_data_ref = git::ref_exists_at(Some(root), git::SESSION_DATA_REF)
-            .await
-            .unwrap_or(false);
-        let has_branch_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_BRANCH_REF)
-            .await
-            .unwrap_or(false);
-        let has_committer_ref = git::ref_exists_at(Some(root), git::SESSION_INDEX_COMMITTER_REF)
-            .await
-            .unwrap_or(false);
-        output::detail_to_with_tty(
-            w,
-            &format!(
-                "Session refs: data={} branch-index={} committer-index={}",
-                if has_data_ref { "yes" } else { "no" },
-                if has_branch_ref { "yes" } else { "no" },
-                if has_committer_ref { "yes" } else { "no" }
-            ),
-            false,
-        );
-    }
+    let pending_uploads = upload::pending_upload_count().await.unwrap_or(0);
+    output::detail_to_with_tty(w, &format!("Pending uploads: {}", pending_uploads), false);
 
     let updater_health = update::updater_health().await;
     match updater_health.state {
@@ -4378,31 +4355,11 @@ async fn main() {
         Command::Install { org } => run_install(org).await,
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
-            HookCommand::PrePush { remote, url } => run_hook_pre_push(&remote, &url).await,
-            HookCommand::DeferredSync {
-                repo,
-                remote,
-                all_pending,
-                background,
-                max_items,
-                time_budget_ms,
-            } => {
-                run_sync(
-                    repo,
-                    remote,
-                    all_pending,
-                    background,
-                    max_items,
-                    time_budget_ms,
-                )
-                .await
-            }
             HookCommand::AutoUpdate => update::run_background_auto_update().await,
         },
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
         Command::Logout => run_logout().await,
-        Command::Sessions { command, all } => run_sessions(command, all).await,
         Command::Status => run_status().await,
         Command::Config { config_command } => match config_command.unwrap_or(ConfigCommand::List) {
             ConfigCommand::Set { key, value } => run_config_set(&key, &value).await,
@@ -4412,13 +4369,6 @@ async fn main() {
         Command::Doctor { repair } => run_doctor(repair).await,
         Command::Update { check, yes } => run_update(check, yes).await,
         Command::AutoUpdate { command } => run_auto_update(command).await,
-        Command::Keys { keys_command } => match keys_command.unwrap_or(KeysCommands::Status) {
-            KeysCommands::Setup => run_keys_setup().await,
-            KeysCommands::Status => run_keys_status().await,
-            KeysCommands::Disable => run_keys_disable().await,
-            KeysCommands::Refresh => run_keys_refresh().await,
-        },
-        Command::Gc { since, confirm } => run_gc(&since, confirm).await,
     };
 
     // Passive background version check: run after successful command execution
@@ -4535,28 +4485,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_keys_setup() {
-        let cli = Cli::parse_from(["cadence", "keys", "setup"]);
-        match cli.command {
-            Command::Keys { keys_command } => {
-                assert!(matches!(keys_command, Some(KeysCommands::Setup)));
-            }
-            _ => panic!("expected Keys command"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_keys_status_default() {
-        let cli = Cli::parse_from(["cadence", "keys"]);
-        match cli.command {
-            Command::Keys { keys_command } => {
-                assert!(keys_command.is_none());
-            }
-            _ => panic!("expected Keys command"),
-        }
-    }
-
-    #[test]
     fn cli_parses_login_command() {
         let cli = Cli::parse_from(["cadence", "login"]);
         assert!(matches!(cli.command, Command::Login));
@@ -4655,28 +4583,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cli_parses_keys_disable() {
-        let cli = Cli::parse_from(["cadence", "keys", "disable"]);
-        match cli.command {
-            Command::Keys { keys_command } => {
-                assert!(matches!(keys_command, Some(KeysCommands::Disable)));
-            }
-            _ => panic!("expected Keys command"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_keys_refresh() {
-        let cli = Cli::parse_from(["cadence", "keys", "refresh"]);
-        match cli.command {
-            Command::Keys { keys_command } => {
-                assert!(matches!(keys_command, Some(KeysCommands::Refresh)));
-            }
-            _ => panic!("expected Keys command"),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Config command parsing tests
     // -----------------------------------------------------------------------
@@ -4752,32 +4658,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_hook_deferred_sync_defaults() {
-        let cli = Cli::parse_from(["cadence", "hook", "deferred-sync"]);
-        match cli.command {
-            Command::Hook { hook_command } => match hook_command {
-                HookCommand::DeferredSync {
-                    repo,
-                    remote,
-                    all_pending,
-                    background,
-                    max_items,
-                    time_budget_ms,
-                } => {
-                    assert!(repo.is_none());
-                    assert!(remote.is_none());
-                    assert!(!all_pending);
-                    assert!(!background);
-                    assert_eq!(max_items, 4);
-                    assert_eq!(time_budget_ms, 8000);
-                }
-                _ => panic!("expected DeferredSync hook command"),
-            },
-            _ => panic!("expected Hook command"),
-        }
-    }
-
-    #[test]
     fn cli_parses_hidden_hook_auto_update() {
         let cli = Cli::parse_from(["cadence", "hook", "auto-update"]);
         match cli.command {
@@ -4785,18 +4665,6 @@ mod tests {
                 assert!(matches!(hook_command, HookCommand::AutoUpdate));
             }
             _ => panic!("expected Hook command"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_sessions_default() {
-        let cli = Cli::parse_from(["cadence", "sessions"]);
-        match cli.command {
-            Command::Sessions { command, all } => {
-                assert!(command.is_none());
-                assert!(!all);
-            }
-            _ => panic!("expected Sessions command"),
         }
     }
 
@@ -4860,83 +4728,29 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_sessions_all() {
-        let cli = Cli::parse_from(["cadence", "sessions", "--all"]);
-        match cli.command {
-            Command::Sessions { command, all } => {
-                assert!(command.is_none());
-                assert!(all);
-            }
-            _ => panic!("expected Sessions command"),
-        }
+    fn cli_rejects_removed_keys_command() {
+        let err = Cli::try_parse_from(["cadence", "keys"]).expect_err("keys should be removed");
+        assert!(err.to_string().contains("unrecognized subcommand"));
     }
 
     #[test]
-    fn cli_parses_sessions_audit() {
-        let cli = Cli::parse_from(["cadence", "sessions", "audit", "--all"]);
-        match cli.command {
-            Command::Sessions { command, all } => {
-                assert!(!all);
-                assert!(matches!(
-                    command,
-                    Some(SessionsCommand::Audit {
-                        all: true,
-                        show_ok: false
-                    })
-                ));
-            }
-            _ => panic!("expected Sessions command"),
-        }
+    fn cli_rejects_removed_sessions_command() {
+        let err =
+            Cli::try_parse_from(["cadence", "sessions"]).expect_err("sessions should be removed");
+        assert!(err.to_string().contains("unrecognized subcommand"));
     }
 
     #[test]
-    fn cli_parses_sessions_inspect() {
-        let cli = Cli::parse_from(["cadence", "sessions", "inspect", "abc123"]);
-        match cli.command {
-            Command::Sessions { command, all } => {
-                assert!(!all);
-                assert!(matches!(
-                    command,
-                    Some(SessionsCommand::Inspect {
-                        query,
-                        all: false,
-                        raw: false
-                    }) if query == "abc123"
-                ));
-            }
-            _ => panic!("expected Sessions command"),
-        }
+    fn cli_rejects_removed_gc_command() {
+        let err = Cli::try_parse_from(["cadence", "gc"]).expect_err("gc should be removed");
+        assert!(err.to_string().contains("unrecognized subcommand"));
     }
 
     #[test]
-    fn cli_parses_sessions_inspect_raw() {
-        let cli = Cli::parse_from(["cadence", "sessions", "inspect", "abc123", "--raw"]);
-        match cli.command {
-            Command::Sessions { command, all } => {
-                assert!(!all);
-                assert!(matches!(
-                    command,
-                    Some(SessionsCommand::Inspect {
-                        query,
-                        all: false,
-                        raw: true
-                    }) if query == "abc123"
-                ));
-            }
-            _ => panic!("expected Sessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_sessions_list_subcommand() {
-        let cli = Cli::parse_from(["cadence", "sessions", "list", "--all"]);
-        match cli.command {
-            Command::Sessions { command, all } => {
-                assert!(!all);
-                assert!(matches!(command, Some(SessionsCommand::List { all: true })));
-            }
-            _ => panic!("expected Sessions command"),
-        }
+    fn cli_rejects_removed_pre_push_hook_command() {
+        let err = Cli::try_parse_from(["cadence", "hook", "pre-push", "origin", "git@example"])
+            .expect_err("pre-push hook should be removed");
+        assert!(err.to_string().contains("unrecognized subcommand"));
     }
 
     #[test]
@@ -4996,8 +4810,8 @@ mod tests {
     }
 
     #[test]
-    fn match_window_defaults_are_stable() {
-        assert_eq!(POST_COMMIT_MATCH_WINDOW_SECS, 1_800);
+    fn post_commit_fallback_window_defaults_are_stable() {
+        assert_eq!(POST_COMMIT_FALLBACK_WINDOW_SECS, 30 * 86_400);
     }
 
     #[test]
@@ -5198,98 +5012,6 @@ mod tests {
 
         assert_eq!(first_info.blob_sha, second_info.blob_sha);
         assert_eq!(first_info.session_uid, second_info.session_uid);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn backfill_uploads_session_without_commit_candidates() {
-        let repo = init_repo().await;
-        let session_file = repo.path().join("session-no-candidate.jsonl");
-        tokio::fs::write(
-            &session_file,
-            r#"{"timestamp":"2001-01-01T00:00:00Z","session_id":"no-candidate","cwd":"/tmp/repo"}"#,
-        )
-        .await
-        .expect("write session file");
-        let metadata = scanner::SessionMetadata {
-            session_id: Some("no-candidate".to_string()),
-            cwd: Some(repo.path().to_string_lossy().to_string()),
-            agent_type: Some(scanner::AgentType::Claude),
-        };
-        let stats = process_repo_backfill(
-            "example-org/example-repo".to_string(),
-            vec![SessionInfo {
-                log: agents::SessionLog {
-                    agent_type: scanner::AgentType::Claude,
-                    source: agents::SessionSource::File(session_file),
-                    updated_at: Some(0),
-                },
-                session_id: "no-candidate".to_string(),
-                repo_root: repo.path().to_path_buf(),
-                metadata,
-            }],
-            EncryptionMethod::None,
-            None,
-            backfill_log::BackfillLogger::disabled(),
-        )
-        .await;
-
-        assert_eq!(stats.attached, 1);
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF)
-                .await
-                .expect("data ref exists")
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn backfill_uploads_session_without_explicit_commit_matches() {
-        let repo = init_repo().await;
-        let session_file = repo.path().join("session-missing-commit.jsonl");
-        tokio::fs::write(
-            &session_file,
-            r#"{"timestamp":"2026-02-10T01:00:00Z","session_id":"missing-commit","cwd":"/tmp/repo"}"#,
-        )
-        .await
-        .expect("write session file");
-        let metadata = scanner::SessionMetadata {
-            session_id: Some("missing-commit".to_string()),
-            cwd: Some(repo.path().to_string_lossy().to_string()),
-            agent_type: Some(scanner::AgentType::Claude),
-        };
-        let stats = process_repo_backfill(
-            "example-org/example-repo".to_string(),
-            vec![SessionInfo {
-                log: agents::SessionLog {
-                    agent_type: scanner::AgentType::Claude,
-                    source: agents::SessionSource::File(session_file),
-                    updated_at: Some(0),
-                },
-                session_id: "missing-commit".to_string(),
-                repo_root: repo.path().to_path_buf(),
-                metadata,
-            }],
-            EncryptionMethod::None,
-            None,
-            backfill_log::BackfillLogger::disabled(),
-        )
-        .await;
-
-        assert_eq!(stats.attached, 1);
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_DATA_REF)
-                .await
-                .expect("data ref exists")
-        );
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_BRANCH_REF)
-                .await
-                .expect("branch index ref exists")
-        );
-        assert!(
-            git::ref_exists_at(Some(repo.path()), git::SESSION_INDEX_COMMITTER_REF)
-                .await
-                .expect("committer index ref exists")
-        );
     }
 
     #[test]

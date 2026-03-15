@@ -4,6 +4,7 @@
 //! - Public key retrieval for encryption setup
 //! - CLI auth exchange + revoke
 //! - Backfill-complete reporting
+//! - Direct session upload URL + confirmation
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ const KEYS_PUBLIC_PATH: &str = "/api/keys/public";
 const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
 const AUTH_REVOKE_PATH: &str = "/api/auth";
 const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
+const SESSION_UPLOAD_URL_PATH: &str = "/api/sessions/upload-url";
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -70,6 +72,37 @@ pub struct BackfillCompleteResponse {
     pub next_step: String,
 }
 
+/// Request body for `POST /api/sessions/upload-url`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionUploadUrlRequest {
+    pub session_uid: String,
+    pub agent: String,
+    pub agent_session_id: String,
+    pub repo_remote_url: String,
+    pub branch_key: String,
+    pub session_start: Option<i64>,
+    pub content_sha256: String,
+    pub git_user_email: Option<String>,
+    pub git_user_name: Option<String>,
+    pub cli_version: String,
+    pub cwd: Option<String>,
+    pub repo_root: String,
+}
+
+/// Response body from `POST /api/sessions/upload-url`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SessionUploadUrlResponse {
+    pub upload_url: String,
+    pub session_uid: String,
+    pub org_id: String,
+}
+
+/// Response body from `POST /api/sessions/{uid}/confirm`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SessionUploadConfirmResponse {
+    pub status: String,
+}
+
 /// Standard API response envelope used by backend endpoints.
 #[derive(Debug, Deserialize)]
 struct ApiResponseEnvelope<T> {
@@ -84,7 +117,9 @@ struct ApiResponseEnvelope<T> {
 #[derive(Debug)]
 pub enum AuthenticatedRequestError {
     Unauthorized,
+    Conflict(String),
     NotFound,
+    Unprocessable(String),
     Server(String),
     BadRequest(String),
     Network(String),
@@ -96,7 +131,9 @@ impl std::fmt::Display for AuthenticatedRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized => write!(f, "unauthorized"),
+            Self::Conflict(msg) => write!(f, "conflict: {msg}"),
             Self::NotFound => write!(f, "not_found"),
+            Self::Unprocessable(msg) => write!(f, "unprocessable: {msg}"),
             Self::Server(msg) => write!(f, "server_error: {msg}"),
             Self::BadRequest(msg) => write!(f, "bad_request: {msg}"),
             Self::Network(msg) => write!(f, "network_error: {msg}"),
@@ -115,6 +152,7 @@ impl std::error::Error for AuthenticatedRequestError {}
 /// HTTP client for the Cadence API.
 ///
 /// Wraps `reqwest::Client` with a normalized base URL.
+#[derive(Debug)]
 pub struct ApiClient {
     client: reqwest::Client,
     base_url: String,
@@ -243,6 +281,99 @@ impl ApiClient {
         Ok(envelope.data)
     }
 
+    /// Request a presigned S3 upload URL for a session blob.
+    pub async fn request_session_upload_url(
+        &self,
+        token: &str,
+        request: &SessionUploadUrlRequest,
+        timeout: Duration,
+    ) -> std::result::Result<SessionUploadUrlResponse, AuthenticatedRequestError> {
+        let url = self.url(SESSION_UPLOAD_URL_PATH);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .timeout(timeout)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_authenticated_http_error(status, &body));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        serde_json::from_str::<SessionUploadUrlResponse>(&body)
+            .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
+    }
+
+    /// Upload compressed session bytes to a presigned S3 URL.
+    pub async fn upload_presigned(
+        &self,
+        upload_url: &str,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> std::result::Result<(), AuthenticatedRequestError> {
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| AuthenticatedRequestError::Unexpected(e.to_string()))?;
+        let resp = client
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/zstd")
+            .timeout(timeout)
+            .body(payload.to_vec())
+            .send()
+            .await
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(map_authenticated_http_error(status, &body))
+    }
+
+    /// Confirm that a previously-uploaded session blob is ready for ingestion.
+    pub async fn confirm_session_upload(
+        &self,
+        token: &str,
+        session_uid: &str,
+        org_id: &str,
+        timeout: Duration,
+    ) -> std::result::Result<SessionUploadConfirmResponse, AuthenticatedRequestError> {
+        let url = self.url(&format!("/api/sessions/{session_uid}/confirm"));
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .header("x-org-id", org_id)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_authenticated_http_error(status, &body));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        serde_json::from_str::<SessionUploadConfirmResponse>(&body)
+            .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -306,8 +437,10 @@ fn map_authenticated_http_error(status: u16, body: &str) -> AuthenticatedRequest
     let detail = extract_error_message(body);
     match status {
         401 => AuthenticatedRequestError::Unauthorized,
-        400 | 409 => AuthenticatedRequestError::BadRequest(detail),
+        400 => AuthenticatedRequestError::BadRequest(detail),
         404 => AuthenticatedRequestError::NotFound,
+        409 => AuthenticatedRequestError::Conflict(detail),
+        422 => AuthenticatedRequestError::Unprocessable(detail),
         500..=599 => AuthenticatedRequestError::Server(detail),
         _ => AuthenticatedRequestError::Unexpected(format!("HTTP {status}: {detail}")),
     }
@@ -358,6 +491,14 @@ mod tests {
         assert!(matches!(
             map_authenticated_http_error(401, ""),
             AuthenticatedRequestError::Unauthorized
+        ));
+        assert!(matches!(
+            map_authenticated_http_error(409, ""),
+            AuthenticatedRequestError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_authenticated_http_error(422, ""),
+            AuthenticatedRequestError::Unprocessable(_)
         ));
         assert!(matches!(
             map_authenticated_http_error(404, ""),
