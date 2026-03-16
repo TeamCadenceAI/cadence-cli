@@ -765,6 +765,55 @@ async fn head_sha_for_repo(repo: &std::path::Path) -> Option<String> {
     git::head_sha_at(repo).await.ok().flatten()
 }
 
+fn apply_incremental_upload_outcome(
+    stats: &mut UploadRunStats,
+    cursor_advance: &mut IncrementalCursor,
+    log_mtime: Option<i64>,
+    log_source_label: &str,
+    outcome: UploadFromLogOutcome,
+) -> bool {
+    match outcome {
+        UploadFromLogOutcome::Uploaded => {
+            stats.uploaded += 1;
+            *cursor_advance = advance_cursor_for_disposition(
+                cursor_advance,
+                log_mtime,
+                log_source_label,
+                IncrementalLogDisposition::Indexed,
+            );
+            true
+        }
+        UploadFromLogOutcome::AlreadyExists | UploadFromLogOutcome::SkippedRepoNotAssociated => {
+            stats.skipped += 1;
+            *cursor_advance = advance_cursor_for_disposition(
+                cursor_advance,
+                log_mtime,
+                log_source_label,
+                IncrementalLogDisposition::SkippedPermanent,
+            );
+            true
+        }
+        UploadFromLogOutcome::Queued => {
+            stats.queued += 1;
+            *cursor_advance = advance_cursor_for_disposition(
+                cursor_advance,
+                log_mtime,
+                log_source_label,
+                IncrementalLogDisposition::Indexed,
+            );
+            true
+        }
+        UploadFromLogOutcome::Retryable(message) => {
+            stats.issues += 1;
+            if output::is_verbose() {
+                output::detail(&format!("post-commit upload retryable error: {message}"));
+            }
+            // Stop here so we do not persist a cursor past a failed candidate.
+            false
+        }
+    }
+}
+
 fn hook_discovery_concurrency() -> usize {
     std::env::var("CADENCE_HOOK_DISCOVERY_CONCURRENCY")
         .ok()
@@ -1062,13 +1111,7 @@ async fn upload_session_from_log(
             };
         }
     };
-    let repo_remote_url = match git::resolve_push_remote_at(repo_root).await {
-        Ok(Some(remote)) => match git::remote_url_at(repo_root, &remote).await.ok().flatten() {
-            Some(url) if !url.trim().is_empty() => Some(url),
-            _ => None,
-        },
-        _ => None,
-    };
+    let repo_remote_url = git::preferred_remote_url_at(repo_root).await.ok().flatten();
 
     let record = note::SessionRecord {
         session_uid,
@@ -1182,41 +1225,14 @@ async fn upload_incremental_sessions_for_repo(
             continue;
         }
 
-        match upload_session_from_log(context, &parsed, repo_root, repo_root_str).await {
-            UploadFromLogOutcome::Uploaded => {
-                stats.uploaded += 1;
-                cursor_advance = advance_cursor_for_disposition(
-                    &cursor_advance,
-                    log_mtime,
-                    &log_source_label,
-                    IncrementalLogDisposition::Indexed,
-                );
-            }
-            UploadFromLogOutcome::AlreadyExists
-            | UploadFromLogOutcome::SkippedRepoNotAssociated => {
-                stats.skipped += 1;
-                cursor_advance = advance_cursor_for_disposition(
-                    &cursor_advance,
-                    log_mtime,
-                    &log_source_label,
-                    IncrementalLogDisposition::SkippedPermanent,
-                );
-            }
-            UploadFromLogOutcome::Queued => {
-                stats.queued += 1;
-                cursor_advance = advance_cursor_for_disposition(
-                    &cursor_advance,
-                    log_mtime,
-                    &log_source_label,
-                    IncrementalLogDisposition::Indexed,
-                );
-            }
-            UploadFromLogOutcome::Retryable(message) => {
-                stats.issues += 1;
-                if output::is_verbose() {
-                    output::detail(&format!("post-commit upload retryable error: {message}"));
-                }
-            }
+        if !apply_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor_advance,
+            log_mtime,
+            &log_source_label,
+            upload_session_from_log(context, &parsed, repo_root, repo_root_str).await,
+        ) {
+            break;
         }
     }
 
@@ -3259,6 +3275,33 @@ mod tests {
             .map(|log| log.source_label())
             .collect();
         assert_eq!(labels, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn retryable_incremental_outcome_stops_before_cursor_advances() {
+        let mut stats = UploadRunStats::default();
+        let mut cursor = IncrementalCursor {
+            last_scanned_mtime_epoch: 100,
+            last_scanned_source_label: Some("a".to_string()),
+        };
+
+        let should_continue = apply_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor,
+            Some(200),
+            "z",
+            UploadFromLogOutcome::Retryable("queue write failed".to_string()),
+        );
+
+        assert!(!should_continue);
+        assert_eq!(stats.issues, 1);
+        assert_eq!(
+            cursor,
+            IncrementalCursor {
+                last_scanned_mtime_epoch: 100,
+                last_scanned_source_label: Some("a".to_string()),
+            }
+        );
     }
 
     #[tokio::test]

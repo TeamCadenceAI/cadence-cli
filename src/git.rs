@@ -424,6 +424,30 @@ pub(crate) async fn first_remote_url_at(repo: &Path) -> Result<Option<String>> {
     Ok(Some(url.trim().to_string()))
 }
 
+/// Resolve the best available remote URL for uploads.
+///
+/// Prefers the configured push remote, then falls back to `origin`, then to the
+/// first configured remote URL. This keeps uploads working in repos where the
+/// current branch has not been wired to a remote yet.
+pub(crate) async fn preferred_remote_url_at(repo: &Path) -> Result<Option<String>> {
+    if let Some(remote) = resolve_push_remote_at(repo).await?
+        && let Some(url) = remote_url_at(repo, &remote).await?
+        && !url.trim().is_empty()
+    {
+        return Ok(Some(url));
+    }
+
+    if let Some(url) = remote_url_at(repo, "origin").await?
+        && !url.trim().is_empty()
+    {
+        return Ok(Some(url));
+    }
+
+    Ok(first_remote_url_at(repo)
+        .await?
+        .filter(|url| !url.trim().is_empty()))
+}
+
 /// Extract owner/org from ALL remote URLs.
 ///
 /// Returns a deduplicated list of org names extracted from all configured
@@ -1168,6 +1192,43 @@ mod tests {
             .await
             .expect("resolve_push_remote failed");
         assert_eq!(resolved, None);
+
+        std::env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_preferred_remote_url_uses_origin_when_branch_remote_is_unset() {
+        let (dir, original_cwd) = enter_temp_repo().await;
+
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/origin.git",
+            ],
+        )
+        .await;
+        run_git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/example/upstream.git",
+            ],
+        )
+        .await;
+
+        let resolved = preferred_remote_url_at(dir.path())
+            .await
+            .expect("preferred_remote_url_at failed");
+        assert_eq!(
+            resolved,
+            Some("https://github.com/example/origin.git".to_string())
+        );
 
         std::env::set_current_dir(original_cwd).unwrap();
     }

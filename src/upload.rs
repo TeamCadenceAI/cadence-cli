@@ -547,28 +547,36 @@ async fn prepare_pending_upload(record: &PendingUploadRecord) -> Result<Prepared
     let repo_remote_url = resolve_repo_remote_url(Path::new(&envelope.record.repo_root))
         .await?
         .ok_or_else(|| anyhow::anyhow!("repo has no push remote URL"))?;
-    rebuild_prepared_upload(&envelope, repo_remote_url)
+    rebuild_prepared_upload(&envelope, repo_remote_url).await
 }
 
-fn rebuild_prepared_upload(
+async fn rebuild_prepared_upload(
     envelope: &note::SessionEnvelope,
     repo_remote_url: String,
 ) -> Result<PreparedSessionUpload> {
     let mut record = envelope.record.clone();
+    let repo_root = PathBuf::from(record.repo_root.clone());
     record.repo_remote_url = Some(repo_remote_url);
+    refresh_record_git_metadata(&repo_root, &mut record).await;
     prepare_session_upload(record, envelope.session_content.clone())
 }
 
 async fn resolve_repo_remote_url(repo_root: &Path) -> Result<Option<String>> {
-    let remote = match crate::git::resolve_push_remote_at(repo_root).await {
-        Ok(Some(remote)) => remote,
-        _ => return Ok(None),
-    };
-    Ok(crate::git::remote_url_at(repo_root, &remote)
-        .await
-        .ok()
-        .flatten()
-        .filter(|url| !url.trim().is_empty()))
+    crate::git::preferred_remote_url_at(repo_root).await
+}
+
+async fn refresh_record_git_metadata(repo_root: &Path, record: &mut note::SessionRecord) {
+    if let Ok(Some(branch)) = crate::git::current_branch_at(repo_root).await
+        && !branch.trim().is_empty()
+    {
+        record.git_ref = format!("refs/heads/{branch}");
+    }
+
+    if let Ok(Some(head_sha)) = crate::git::head_sha_at(repo_root).await
+        && !head_sha.trim().is_empty()
+    {
+        record.head_sha = head_sha;
+    }
 }
 
 async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
@@ -605,6 +613,7 @@ pub(crate) mod test_support {
 
     struct TestUploadServerState {
         counts: TestUploadServerCounts,
+        upload_requests: Vec<SessionUploadUrlRequest>,
         upload_url_statuses: VecDeque<u16>,
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
@@ -614,6 +623,7 @@ pub(crate) mod test_support {
         fn new(config: TestUploadServerConfig) -> Self {
             Self {
                 counts: TestUploadServerCounts::default(),
+                upload_requests: Vec::new(),
                 upload_url_statuses: config.upload_url_statuses.into(),
                 upload_statuses: config.upload_statuses.into(),
                 confirm_statuses: config.confirm_statuses.into(),
@@ -645,6 +655,14 @@ pub(crate) mod test_support {
     impl TestUploadServer {
         pub fn counts(&self) -> TestUploadServerCounts {
             self.state.lock().expect("server state").counts
+        }
+
+        pub fn upload_requests(&self) -> Vec<SessionUploadUrlRequest> {
+            self.state
+                .lock()
+                .expect("server state")
+                .upload_requests
+                .clone()
         }
     }
 
@@ -774,11 +792,16 @@ pub(crate) mod test_support {
     ) -> TestResponse {
         match (request.method.as_str(), request.path.as_str()) {
             ("POST", "/api/sessions/upload-url") => {
-                let status = state.lock().expect("server state").next_upload_url_status();
+                let mut server_state = state.lock().expect("server state");
+                let status = server_state.next_upload_url_status();
                 if status == 200 {
                     let session_uid =
                         serde_json::from_slice::<SessionUploadUrlRequest>(&request.body)
-                            .map(|request| request.session_uid)
+                            .map(|request| {
+                                let session_uid = request.session_uid.clone();
+                                server_state.upload_requests.push(request);
+                                session_uid
+                            })
                             .unwrap_or_else(|_| "session-uid".to_string());
                     let body = format!(
                         r#"{{"upload_url":"{base_url}/uploads/{session_uid}","session_uid":"{session_uid}","org_id":"org-test"}}"#
@@ -965,8 +988,8 @@ mod tests {
         assert!(err.to_string().contains("missing repo remote URL"));
     }
 
-    #[test]
-    fn rebuild_prepared_upload_refreshes_remote_url_and_hash() {
+    #[tokio::test]
+    async fn rebuild_prepared_upload_refreshes_remote_url_and_hash() {
         let mut record = sample_record();
         record.repo_remote_url = Some("cadence://missing-repo-remote-url".to_string());
         let envelope = note::SessionEnvelope {
@@ -976,6 +999,7 @@ mod tests {
 
         let prepared =
             rebuild_prepared_upload(&envelope, "git@github.com:team/example.git".to_string())
+                .await
                 .expect("rebuild prepared upload");
 
         assert_eq!(
@@ -1143,6 +1167,58 @@ mod tests {
             pending_upload_count().await.expect("pending upload count"),
             0
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_refreshes_branch_and_head_metadata() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
+        let branch = run_git(repo.path(), &["symbolic-ref", "--short", "HEAD"]).await;
+        let head_sha = run_git(repo.path(), &["rev-parse", "HEAD"]).await;
+
+        let record = note::SessionRecord {
+            session_uid: "queued-git-metadata-resolution".to_string(),
+            repo_root: repo.path().to_string_lossy().to_string(),
+            repo_remote_url: None,
+            git_ref: "refs/heads/unknown".to_string(),
+            head_sha: "unknown".to_string(),
+            ..sample_record()
+        };
+        let envelope = note::SessionEnvelope {
+            record,
+            session_content: "hello".to_string(),
+        };
+        enqueue_pending_envelope(&envelope, "repo metadata unavailable")
+            .await
+            .expect("enqueue pending envelope");
+
+        let server = spawn_test_upload_server(TestUploadServerConfig::default())
+            .await
+            .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.uploaded, 1);
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].git_ref, format!("refs/heads/{branch}"));
+        assert_eq!(requests[0].head_sha, head_sha);
     }
 
     #[tokio::test]
