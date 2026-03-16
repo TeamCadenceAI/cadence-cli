@@ -102,16 +102,17 @@ pub fn prepare_session_upload(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("missing repo remote URL"))?;
     let envelope_bytes = note::serialize_session_object(record.clone(), session_content)?;
-    let content_sha256 = sha256_hex(&envelope_bytes);
     let compressed_payload = note::compress_bytes(&envelope_bytes)?;
+    let upload_sha256 = sha256_hex(&compressed_payload);
     let request = SessionUploadUrlRequest {
         session_uid: session_uid.clone(),
         agent: record.agent,
         agent_session_id: record.session_id,
         repo_remote_url,
-        branch_key: record.branch_key,
+        git_ref: record.git_ref,
+        head_sha: record.head_sha,
         session_start: record.session_start,
-        content_sha256,
+        upload_sha256,
         git_user_email: record.git_user_email,
         git_user_name: record.git_user_name,
         cli_version: record.cli_version,
@@ -932,7 +933,8 @@ mod tests {
             session_id: "session-abc".to_string(),
             repo_root: "/tmp/repo".to_string(),
             repo_remote_url: Some("git@github.com:Org/Repo.git".to_string()),
-            branch_key: "origin/main".to_string(),
+            git_ref: "refs/heads/main".to_string(),
+            head_sha: "abc123".to_string(),
             committer_key_hash: "committer-hash".to_string(),
             git_user_email: Some("dev@example.com".to_string()),
             git_user_name: Some("Dev Name".to_string()),
@@ -945,13 +947,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_upload_uses_envelope_sha() {
+    fn prepare_session_upload_uses_uploaded_blob_sha() {
         let record = sample_record();
         let prepared = prepare_session_upload(record.clone(), "hello".to_string())
             .expect("prepare session upload");
         let envelope = note::serialize_session_object(record, "hello".to_string())
             .expect("serialize session object");
-        assert_eq!(prepared.request.content_sha256, sha256_hex(&envelope));
+        let compressed = note::compress_bytes(&envelope).expect("compress uploaded envelope");
+        assert_eq!(prepared.request.upload_sha256, sha256_hex(&compressed));
     }
 
     #[test]
@@ -987,7 +990,8 @@ mod tests {
             "hello".to_string(),
         )
         .expect("serialize rebuilt envelope");
-        assert_eq!(prepared.request.content_sha256, sha256_hex(&envelope));
+        let compressed = note::compress_bytes(&envelope).expect("compress rebuilt envelope");
+        assert_eq!(prepared.request.upload_sha256, sha256_hex(&compressed));
     }
 
     #[tokio::test]

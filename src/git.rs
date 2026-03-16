@@ -198,6 +198,25 @@ pub(crate) async fn current_branch_at(repo: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Return the current HEAD commit SHA for a repo.
+pub(crate) async fn head_sha_at(repo: &Path) -> Result<Option<String>> {
+    let output = run_git_output_at(Some(repo), &["rev-parse", "HEAD"], &[])
+        .await
+        .context("failed to execute git rev-parse HEAD")?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let sha = String::from_utf8(output.stdout).context("head sha output was not valid UTF-8")?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sha.to_string()))
+    }
+}
+
 /// Push the AI-session notes ref to the provided remote.
 ///
 /// Note: Production push paths now use inline force-with-lease pushes

@@ -64,9 +64,10 @@ pub struct SessionUploadUrlRequest {
     pub agent: String,
     pub agent_session_id: String,
     pub repo_remote_url: String,
-    pub branch_key: String,
+    pub git_ref: String,
+    pub head_sha: String,
     pub session_start: Option<i64>,
-    pub content_sha256: String,
+    pub upload_sha256: String,
     pub git_user_email: Option<String>,
     pub git_user_name: Option<String>,
     pub cli_version: String,
@@ -462,5 +463,29 @@ mod tests {
             map_authenticated_http_error(503, "{\"error\":\"bad\"}"),
             AuthenticatedRequestError::Server(_)
         ));
+    }
+
+    #[test]
+    fn session_upload_request_serializes_upload_sha256_field() {
+        let request = SessionUploadUrlRequest {
+            session_uid: "sess-1".to_string(),
+            agent: "codex".to_string(),
+            agent_session_id: "agent-session-1".to_string(),
+            repo_remote_url: "git@github.com:team/repo.git".to_string(),
+            git_ref: "refs/heads/main".to_string(),
+            head_sha: "abc123".to_string(),
+            session_start: None,
+            upload_sha256: "upload-sha".to_string(),
+            git_user_email: None,
+            git_user_name: None,
+            cli_version: "1.0.0".to_string(),
+            cwd: None,
+            repo_root: "/tmp/repo".to_string(),
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(value["upload_sha256"], "upload-sha");
+        assert!(value.get("content_sha256").is_none());
     }
 }

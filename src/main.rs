@@ -756,18 +756,13 @@ fn format_unix_rfc3339(epoch: i64) -> Option<String> {
         .ok()
 }
 
-async fn branch_key_for_repo(repo: &std::path::Path) -> String {
-    let remote = git::resolve_push_remote_at(repo)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "origin".to_string());
-    let branch = git::current_branch_at(repo)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "detached/unknown".to_string());
-    format!("{remote}/{branch}")
+async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
+    let branch = git::current_branch_at(repo).await.ok().flatten()?;
+    Some(format!("refs/heads/{branch}"))
+}
+
+async fn head_sha_for_repo(repo: &std::path::Path) -> Option<String> {
+    git::head_sha_at(repo).await.ok().flatten()
 }
 
 fn hook_discovery_concurrency() -> usize {
@@ -988,7 +983,6 @@ async fn upload_session_from_log(
         .session_start
         .and_then(format_unix_rfc3339)
         .unwrap_or_else(note::now_rfc3339);
-    let branch_key = branch_key_for_repo(repo_root).await;
     let committer_key_hash = committer_key_hash_for_repo(repo_root).await;
     let git_user_email = git::config_get_at(repo_root, "user.email")
         .await
@@ -998,6 +992,76 @@ async fn upload_session_from_log(
         .await
         .ok()
         .flatten();
+    let git_ref = match git_ref_for_repo(repo_root).await {
+        Some(git_ref) => git_ref,
+        None => {
+            return match upload::queue_session_for_remote_resolution(
+                note::SessionRecord {
+                    session_uid,
+                    agent: agent.to_string(),
+                    session_id,
+                    repo_root: repo_root_str.to_string(),
+                    repo_remote_url: None,
+                    git_ref: "refs/heads/unknown".to_string(),
+                    head_sha: "unknown".to_string(),
+                    committer_key_hash,
+                    git_user_email,
+                    git_user_name,
+                    session_start: parsed.session_start,
+                    content_sha256,
+                    cwd: parsed
+                        .metadata
+                        .cwd
+                        .clone()
+                        .or_else(|| Some(repo_root_str.to_string())),
+                    ingested_at,
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                parsed.session_log.clone(),
+                "repo has no attached git branch",
+            )
+            .await
+            {
+                Ok(()) => UploadFromLogOutcome::Queued,
+                Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
+            };
+        }
+    };
+    let head_sha = match head_sha_for_repo(repo_root).await {
+        Some(head_sha) => head_sha,
+        None => {
+            return match upload::queue_session_for_remote_resolution(
+                note::SessionRecord {
+                    session_uid,
+                    agent: agent.to_string(),
+                    session_id,
+                    repo_root: repo_root_str.to_string(),
+                    repo_remote_url: None,
+                    git_ref,
+                    head_sha: "unknown".to_string(),
+                    committer_key_hash,
+                    git_user_email,
+                    git_user_name,
+                    session_start: parsed.session_start,
+                    content_sha256,
+                    cwd: parsed
+                        .metadata
+                        .cwd
+                        .clone()
+                        .or_else(|| Some(repo_root_str.to_string())),
+                    ingested_at,
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                parsed.session_log.clone(),
+                "repo HEAD commit could not be resolved",
+            )
+            .await
+            {
+                Ok(()) => UploadFromLogOutcome::Queued,
+                Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
+            };
+        }
+    };
     let repo_remote_url = match git::resolve_push_remote_at(repo_root).await {
         Ok(Some(remote)) => match git::remote_url_at(repo_root, &remote).await.ok().flatten() {
             Some(url) if !url.trim().is_empty() => Some(url),
@@ -1012,7 +1076,8 @@ async fn upload_session_from_log(
         session_id,
         repo_root: repo_root_str.to_string(),
         repo_remote_url,
-        branch_key,
+        git_ref,
+        head_sha,
         committer_key_hash,
         git_user_email,
         git_user_name,
