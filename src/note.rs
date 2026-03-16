@@ -10,26 +10,6 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Encryption/compression encoding for stored canonical session objects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContentEncoding {
-    Plain,
-    Zstd,
-    Pgp,
-    ZstdPgp,
-}
-
-impl std::fmt::Display for ContentEncoding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ContentEncoding::Plain => write!(f, "plain"),
-            ContentEncoding::Zstd => write!(f, "zstd"),
-            ContentEncoding::Pgp => write!(f, "pgp"),
-            ContentEncoding::ZstdPgp => write!(f, "zstd+pgp"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_uid: String,
@@ -38,7 +18,8 @@ pub struct SessionRecord {
     pub repo_root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
-    pub branch_key: String,
+    pub git_ref: String,
+    pub head_sha: String,
     pub committer_key_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_user_email: Option<String>,
@@ -57,16 +38,6 @@ pub struct SessionRecord {
 pub struct SessionEnvelope {
     pub record: SessionRecord,
     pub session_content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexEntry {
-    pub session_uid: String,
-    pub session_blob_sha: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_start: Option<i64>,
-    pub agent: String,
-    pub ingested_at: String,
 }
 
 pub fn now_rfc3339() -> String {
@@ -115,10 +86,6 @@ pub fn serialize_session_object(record: SessionRecord, session_content: String) 
     Ok(serde_json::to_vec(&envelope)?)
 }
 
-pub fn serialize_index_entry_line(entry: &IndexEntry) -> Result<String> {
-    Ok(serde_json::to_string(entry)?)
-}
-
 pub fn compress_bytes(data: &[u8]) -> Result<Vec<u8>> {
     Ok(zstd::encode_all(std::io::Cursor::new(data), 3)?)
 }
@@ -134,7 +101,8 @@ mod tests {
             session_id: "session-abc".to_string(),
             repo_root: "/tmp/repo".to_string(),
             repo_remote_url: None,
-            branch_key: "main".to_string(),
+            git_ref: "refs/heads/main".to_string(),
+            head_sha: "abc123".to_string(),
             committer_key_hash: "committer-hash".to_string(),
             git_user_email: Some("dev@example.com".to_string()),
             git_user_name: Some("Dev Name".to_string()),
@@ -214,7 +182,8 @@ mod tests {
                 "session_id":"session-abc",
                 "repo_root":"/tmp/repo",
                 "repo_remote_url":null,
-                "branch_key":"main",
+                "git_ref":"refs/heads/main",
+                "head_sha":"abc123",
                 "committer_key_hash":"committer-hash",
                 "git_user_email":"dev@example.com",
                 "git_user_name":"Dev Name",
@@ -242,25 +211,5 @@ mod tests {
         assert_eq!(envelope.record.session_id, "session-abc");
         assert_eq!(envelope.record.session_start, Some(1_700_000_000));
         assert_eq!(envelope.session_content, "line1\nline2");
-    }
-
-    #[test]
-    fn serialize_index_entry_line_is_stable_and_omits_none() {
-        let entry = IndexEntry {
-            session_uid: "uid-1".to_string(),
-            session_blob_sha: "blob-sha".to_string(),
-            session_start: None,
-            agent: "codex".to_string(),
-            ingested_at: "2026-03-02T00:00:00Z".to_string(),
-        };
-
-        let line = serialize_index_entry_line(&entry).expect("serialize index entry");
-        assert_eq!(
-            line,
-            r#"{"session_uid":"uid-1","session_blob_sha":"blob-sha","agent":"codex","ingested_at":"2026-03-02T00:00:00Z"}"#
-        );
-
-        let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse line");
-        assert!(parsed.get("session_start").is_none());
     }
 }
