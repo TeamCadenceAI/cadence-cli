@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{error::Error as _, time::Duration};
 
 // ---------------------------------------------------------------------------
 // Endpoint path constants
@@ -207,7 +207,7 @@ impl ApiClient {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+            .map_err(map_network_error)?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -234,7 +234,7 @@ impl ApiClient {
             .json(report)
             .send()
             .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+            .map_err(map_network_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -242,10 +242,7 @@ impl ApiClient {
             return Err(map_authenticated_http_error(status, &body));
         }
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        let body = resp.text().await.map_err(map_network_error)?;
         let envelope: ApiResponseEnvelope<BackfillCompleteResponse> =
             serde_json::from_str(&body)
                 .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
@@ -268,7 +265,7 @@ impl ApiClient {
             .json(request)
             .send()
             .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+            .map_err(map_network_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -276,10 +273,7 @@ impl ApiClient {
             return Err(map_authenticated_http_error(status, &body));
         }
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        let body = resp.text().await.map_err(map_network_error)?;
         serde_json::from_str::<SessionUploadUrlResponse>(&body)
             .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
     }
@@ -291,15 +285,23 @@ impl ApiClient {
         payload: &[u8],
         timeout: Duration,
     ) -> std::result::Result<(), AuthenticatedRequestError> {
-        let resp = self
-            .raw_client
-            .put(upload_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/zstd")
-            .timeout(timeout)
-            .body(payload.to_vec())
-            .send()
-            .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        let resp = tokio::time::timeout(
+            timeout,
+            self.raw_client
+                .put(upload_url)
+                .header(reqwest::header::CONTENT_TYPE, "application/zstd")
+                .body(payload.to_vec())
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            AuthenticatedRequestError::Network(format!(
+                "presigned upload timed out after {:?} while sending {} bytes",
+                timeout,
+                payload.len()
+            ))
+        })?
+        .map_err(map_network_error)?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -327,7 +329,7 @@ impl ApiClient {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+            .map_err(map_network_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -335,10 +337,7 @@ impl ApiClient {
             return Err(map_authenticated_http_error(status, &body));
         }
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AuthenticatedRequestError::Network(e.to_string()))?;
+        let body = resp.text().await.map_err(map_network_error)?;
         serde_json::from_str::<SessionUploadConfirmResponse>(&body)
             .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
     }
@@ -399,6 +398,37 @@ fn map_authenticated_http_error(status: u16, body: &str) -> AuthenticatedRequest
         500..=599 => AuthenticatedRequestError::Server(detail),
         _ => AuthenticatedRequestError::Unexpected(format!("HTTP {status}: {detail}")),
     }
+}
+
+fn map_network_error(error: reqwest::Error) -> AuthenticatedRequestError {
+    AuthenticatedRequestError::Network(format_network_error(&error))
+}
+
+fn format_network_error(error: &reqwest::Error) -> String {
+    let mut message = if error.is_timeout() {
+        format!("timeout: {error}")
+    } else if error.is_connect() {
+        format!("connect: {error}")
+    } else {
+        error.to_string()
+    };
+
+    let mut sources = Vec::new();
+    let mut current = error.source();
+    while let Some(source) = current {
+        let detail = source.to_string();
+        if !detail.is_empty() {
+            sources.push(detail);
+        }
+        current = source.source();
+    }
+
+    if !sources.is_empty() {
+        message.push_str("; cause: ");
+        message.push_str(&sources.join(": "));
+    }
+
+    message
 }
 
 /// Try to extract a `message` or `error` field from a JSON error body.
