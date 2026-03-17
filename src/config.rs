@@ -139,6 +139,11 @@ impl CliConfig {
         self.save().await
     }
 
+    /// Returns the persisted auth token when present and non-empty.
+    pub fn auth_token(&self) -> Option<String> {
+        non_empty_trimmed(self.token.clone())
+    }
+
     /// Returns whether auto-update is enabled.
     ///
     /// Defaults to `false` when `auto_update` is absent from config.
@@ -770,6 +775,26 @@ mod tests {
         cfg.clear_token_to(&path).await.unwrap();
         assert_eq!(cfg.api_url, Some("https://api.example.com".to_string()));
         assert_eq!(cfg.token, None);
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_trims_value() {
+        let cfg = CliConfig {
+            token: Some("  tok_abc123  ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.auth_token(), Some("tok_abc123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_ignores_empty_values() {
+        let cfg = CliConfig {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.auth_token(), None);
     }
 
     // -----------------------------------------------------------------------
