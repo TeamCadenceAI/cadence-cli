@@ -4,7 +4,6 @@ use crate::api_client::{
     ApiClient, AuthenticatedRequestError, SessionUploadConfirmResponse, SessionUploadUrlRequest,
 };
 use crate::config;
-use crate::keychain::{KeychainStore, KeyringStore};
 use crate::note;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,8 +11,6 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const KEYCHAIN_SERVICE: &str = "cadence-cli";
-const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
 const PRESIGNED_UPLOAD_TARGET_BYTES_PER_SEC: u64 = 200 * 1024;
@@ -88,7 +85,7 @@ enum UploadAttemptError {
 pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<UploadContext> {
     let cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override);
-    let token = resolve_cli_auth_token(&cfg).await;
+    let token = resolve_cli_auth_token(&cfg);
     Ok(UploadContext {
         client: ApiClient::new(&resolved.url),
         token,
@@ -606,12 +603,8 @@ async fn refresh_record_git_metadata(repo_root: &Path, record: &mut note::Sessio
     }
 }
 
-async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
-    let keychain = KeyringStore::new(KEYCHAIN_SERVICE);
-    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
-        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
-        Ok(_) | Err(_) => cfg.token.clone().filter(|token| !token.trim().is_empty()),
-    }
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    cfg.auth_token()
 }
 
 #[cfg(test)]

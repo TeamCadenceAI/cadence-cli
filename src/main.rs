@@ -3,7 +3,6 @@ mod api_client;
 mod backfill_log;
 mod config;
 mod git;
-mod keychain;
 mod login;
 mod note;
 mod output;
@@ -23,10 +22,6 @@ use std::time::Duration;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::keychain::KeychainStore;
-
-const KEYCHAIN_SERVICE: &str = "cadence-cli";
-const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
 const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
@@ -536,16 +531,6 @@ async fn run_login() -> Result<()> {
     cfg.expires_at = Some(exchanged.expires_at.clone());
     cfg.save().await?;
 
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    if let Err(e) = keychain
-        .set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token)
-        .await
-    {
-        output::note(&format!(
-            "Could not store token in OS keychain (using config fallback): {e}"
-        ));
-    }
-
     output::success("Login", &format!("authenticated as {}", exchanged.login));
     output::detail(&format!("Token expires at {}", exchanged.expires_at));
     Ok(())
@@ -555,7 +540,7 @@ async fn run_logout() -> Result<()> {
     let mut cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override());
 
-    if let Some(token) = resolve_cli_auth_token(&cfg).await {
+    if let Some(token) = resolve_cli_auth_token(&cfg) {
         let client = api_client::ApiClient::new(&resolved.url);
         match client
             .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
@@ -573,11 +558,6 @@ async fn run_logout() -> Result<()> {
         output::note("No local token found; clearing local auth state.");
     }
 
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
-        output::note(&format!("Could not clear OS keychain token: {e}"));
-    }
-
     cfg.clear_token().await?;
     output::success("Logout", "authentication cleared");
     Ok(())
@@ -591,12 +571,8 @@ struct BackfillSyncStats {
     repos_scanned: i32,
 }
 
-async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
-        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
-        Ok(_) | Err(_) => cfg.token.clone().filter(|t| !t.trim().is_empty()),
-    }
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    cfg.auth_token()
 }
 
 async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
@@ -605,7 +581,7 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
         Err(_) => return,
     };
 
-    let token = match resolve_cli_auth_token(&cfg).await {
+    let token = match resolve_cli_auth_token(&cfg) {
         Some(token) => token,
         None => {
             output::note("Run `cadence login` to sync results");
