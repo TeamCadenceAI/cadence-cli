@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.0...v2.0.1) (2026-03-17)
+
+
+### Bug Fixes
+
+* **update:** refresh git hooks after self-update ([fc79ce7](https://github.com/TeamCadenceAI/cadence-cli/commit/fc79ce78d045547aab690d090242e3326aea3064))
+
 ## [2.0.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v1.3.0...v2.0.0) (2026-03-16)
 
 
