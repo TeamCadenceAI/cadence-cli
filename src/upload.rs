@@ -1056,6 +1056,12 @@ mod tests {
         assert_eq!(timeout, Duration::from_secs(570));
     }
 
+    #[test]
+    fn presigned_upload_timeout_falls_back_when_expiry_is_missing() {
+        let timeout = presigned_upload_timeout(512 * 1024 * 1024, "https://example.com/upload");
+        assert_eq!(timeout, Duration::from_secs(870));
+    }
+
     #[tokio::test]
     async fn rebuild_prepared_upload_refreshes_remote_url_and_hash() {
         let mut record = sample_record();
@@ -1332,7 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn upload_presigned_reports_timeout_with_payload_details() {
         let server = spawn_test_upload_server(TestUploadServerConfig {
-            upload_response_delay_ms: 200,
+            upload_response_delay_ms: 500,
             ..TestUploadServerConfig::default()
         })
         .await
