@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.2...v2.0.3) (2026-03-17)
+
+
+### Bug Fixes
+
+* **upload:** scale presigned upload timeout for large payloads ([72b9fd0](https://github.com/TeamCadenceAI/cadence-cli/commit/72b9fd02117f80105adec8aad559659f4f2c4fab))
+* **upload:** scale presigned upload timeout for large payloads ([baeba2c](https://github.com/TeamCadenceAI/cadence-cli/commit/baeba2cef700390a2d593b104333d04ddfa61fab))
+
 ## [2.0.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.1...v2.0.2) (2026-03-17)
 
 
