@@ -279,7 +279,10 @@ pub(crate) async fn resolve_repo_root_with_fallbacks(
             Ok(worktrees) => worktrees,
             Err(_) => continue,
         };
-        if let Some(entry) = worktrees.into_iter().find(|entry| entry.path == cwd) {
+        if let Some(entry) = worktrees
+            .into_iter()
+            .find(|entry| cwd == entry.path || cwd.starts_with(&entry.path))
+        {
             diagnostics.resolved_via = Some("worktree_owner_repo");
             diagnostics.matched_worktree_owner_repo_root = Some(candidate_repo_root.clone());
             diagnostics.matched_worktree_path = Some(entry.path);
@@ -1176,6 +1179,83 @@ mod tests {
         assert_eq!(
             resolution.diagnostics.candidate_repo_names,
             vec!["cadence-cli".to_string()]
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_owner_repo_root,
+            Some(repo_root.clone())
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_path,
+            Some(worktree_path.clone())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_repo_root_with_fallbacks_uses_worktree_owner_repo_for_missing_subdir() {
+        let home = TempDir::new().expect("home tempdir");
+        let canonical_home = tokio::fs::canonicalize(home.path())
+            .await
+            .expect("canonicalize home");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(&canonical_home);
+
+        let repo_root = canonical_home.join("dev").join("cadence-cli");
+        tokio::fs::create_dir_all(repo_root.parent().expect("repo parent"))
+            .await
+            .expect("create repo parent");
+        run_git(
+            repo_root.parent().expect("repo parent"),
+            &["init", "cadence-cli"],
+        )
+        .await;
+        run_git(&repo_root, &["config", "user.email", "test@test.com"]).await;
+        run_git(&repo_root, &["config", "user.name", "Test User"]).await;
+        run_git(&repo_root, &["config", "core.hooksPath", "/dev/null"]).await;
+        tokio::fs::write(repo_root.join("README.md"), "hello")
+            .await
+            .expect("write readme");
+        run_git(&repo_root, &["add", "README.md"]).await;
+        run_git(&repo_root, &["commit", "-m", "initial commit"]).await;
+        run_git(&repo_root, &["branch", "feature"]).await;
+
+        let worktree_path = canonical_home
+            .join(".claude-worktrees")
+            .join("cadence-cli")
+            .join("vigorous-engelbart");
+        tokio::fs::create_dir_all(worktree_path.parent().expect("worktree parent"))
+            .await
+            .expect("create worktree parent");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+
+        tokio::fs::remove_dir_all(&worktree_path)
+            .await
+            .expect("remove worktree directory");
+
+        let missing_subdir = worktree_path.join("src").join("nested");
+        let resolution = resolve_repo_root_with_fallbacks(&missing_subdir)
+            .await
+            .expect("resolve repo root via worktree owner");
+
+        assert_eq!(
+            resolution
+                .repo_root
+                .canonicalize()
+                .expect("canonical repo root"),
+            repo_root.canonicalize().expect("canonical main repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.resolved_via,
+            Some("worktree_owner_repo")
         );
         assert_eq!(
             resolution.diagnostics.matched_worktree_owner_repo_root,
