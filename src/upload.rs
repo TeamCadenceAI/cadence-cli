@@ -18,6 +18,7 @@ const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 60;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
 pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
+const MAX_LOCAL_GIT_STATE_ATTEMPTS: u32 = 5;
 
 #[derive(Debug)]
 pub struct UploadContext {
@@ -38,12 +39,12 @@ pub struct PreparedSessionUpload {
     pub compressed_payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveUploadOutcome {
     Uploaded,
     AlreadyExists,
     SkippedRepoNotAssociated,
-    Queued,
+    Queued { reason: String },
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -52,6 +53,7 @@ pub struct PendingUploadSummary {
     pub uploaded: usize,
     pub already_existed: usize,
     pub skipped_repo_not_associated: usize,
+    pub dropped_permanent: usize,
     pub auth_required: bool,
 }
 
@@ -80,6 +82,19 @@ enum UploadAttemptOutcome {
 enum UploadAttemptError {
     Unauthorized,
     Retryable(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFailureKind {
+    Retryable,
+    LocalGitState,
+    PermanentData,
+}
+
+#[derive(Debug)]
+struct PendingPreparationError {
+    kind: PendingFailureKind,
+    message: String,
 }
 
 pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<UploadContext> {
@@ -131,8 +146,11 @@ pub async fn upload_or_queue_prepared_session(
     prepared: &PreparedSessionUpload,
 ) -> Result<LiveUploadOutcome> {
     let Some(token) = context.token.as_deref() else {
-        enqueue_prepared_upload(prepared, "missing Cadence CLI auth token").await?;
-        return Ok(LiveUploadOutcome::Queued);
+        let reason = "missing Cadence CLI auth token";
+        enqueue_prepared_upload(prepared, reason).await?;
+        return Ok(LiveUploadOutcome::Queued {
+            reason: reason.to_string(),
+        });
     };
 
     match attempt_upload(
@@ -149,12 +167,15 @@ pub async fn upload_or_queue_prepared_session(
             Ok(LiveUploadOutcome::SkippedRepoNotAssociated)
         }
         Err(UploadAttemptError::Unauthorized) => {
-            enqueue_prepared_upload(prepared, "Cadence CLI auth token was rejected").await?;
-            Ok(LiveUploadOutcome::Queued)
+            let reason = "Cadence CLI auth token was rejected";
+            enqueue_prepared_upload(prepared, reason).await?;
+            Ok(LiveUploadOutcome::Queued {
+                reason: reason.to_string(),
+            })
         }
         Err(UploadAttemptError::Retryable(message)) => {
             enqueue_prepared_upload(prepared, &message).await?;
-            Ok(LiveUploadOutcome::Queued)
+            Ok(LiveUploadOutcome::Queued { reason: message })
         }
     }
 }
@@ -184,12 +205,38 @@ pub async fn process_pending_uploads(
 
     let records = list_due_pending_uploads(max_items).await?;
     let mut summary = PendingUploadSummary::default();
+    crate::diagnostics_log::event(
+        "pending_uploads_started",
+        serde_json::json!({
+            "max_items": max_items,
+            "due_records": records.len(),
+            "has_token": true,
+        }),
+    );
     for record in records {
         summary.attempted += 1;
         let prepared = match prepare_pending_upload(&record).await {
             Ok(prepared) => prepared,
             Err(err) => {
-                record_pending_failure(&record, &err.to_string()).await?;
+                let should_drop = err.kind == PendingFailureKind::PermanentData
+                    || (err.kind == PendingFailureKind::LocalGitState
+                        && record.attempt_count.saturating_add(1) >= MAX_LOCAL_GIT_STATE_ATTEMPTS);
+                crate::diagnostics_log::event(
+                    "pending_upload_prepare_failed",
+                    serde_json::json!({
+                        "session_uid": record.session_uid,
+                        "attempt_count": record.attempt_count,
+                        "kind": format!("{:?}", err.kind),
+                        "message": err.message,
+                        "dropped": should_drop,
+                    }),
+                );
+                if should_drop {
+                    remove_pending_upload(&record.session_uid).await?;
+                    summary.dropped_permanent += 1;
+                } else {
+                    record_pending_failure(&record, &err.message).await?;
+                }
                 continue;
             }
         };
@@ -224,6 +271,18 @@ pub async fn process_pending_uploads(
         }
     }
 
+    crate::diagnostics_log::event(
+        "pending_uploads_completed",
+        serde_json::json!({
+            "attempted": summary.attempted,
+            "uploaded": summary.uploaded,
+            "already_existed": summary.already_existed,
+            "skipped_repo_not_associated": summary.skipped_repo_not_associated,
+            "dropped_permanent": summary.dropped_permanent,
+            "auth_required": summary.auth_required,
+        }),
+    );
+
     Ok(summary)
 }
 
@@ -238,21 +297,69 @@ async fn attempt_upload(
     request: &SessionUploadUrlRequest,
     compressed_payload: &[u8],
 ) -> std::result::Result<UploadAttemptOutcome, UploadAttemptError> {
+    crate::diagnostics_log::event(
+        "upload_attempt_started",
+        serde_json::json!({
+            "session_uid": request.session_uid,
+            "repo_remote_url": request.repo_remote_url,
+            "repo_root": request.repo_root,
+            "git_ref": request.git_ref,
+            "head_sha": request.head_sha,
+            "payload_bytes": compressed_payload.len(),
+        }),
+    );
     let upload = match client
         .request_session_upload_url(token, request, Duration::from_secs(API_TIMEOUT_SECS))
         .await
     {
-        Ok(upload) => upload,
+        Ok(upload) => {
+            crate::diagnostics_log::event(
+                "upload_request_url_succeeded",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                    "org_id": upload.org_id,
+                }),
+            );
+            upload
+        }
         Err(AuthenticatedRequestError::Conflict(_)) => {
+            crate::diagnostics_log::event(
+                "upload_request_url_conflict",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                }),
+            );
             return Ok(UploadAttemptOutcome::AlreadyExists);
         }
         Err(AuthenticatedRequestError::Unprocessable(_)) => {
+            crate::diagnostics_log::event(
+                "upload_request_url_repo_not_associated",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                    "repo_remote_url": request.repo_remote_url,
+                }),
+            );
             return Ok(UploadAttemptOutcome::SkippedRepoNotAssociated);
         }
         Err(AuthenticatedRequestError::Unauthorized) => {
+            crate::diagnostics_log::event(
+                "upload_request_url_unauthorized",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                }),
+            );
             return Err(UploadAttemptError::Unauthorized);
         }
-        Err(err) => return Err(UploadAttemptError::Retryable(err.to_string())),
+        Err(err) => {
+            crate::diagnostics_log::event(
+                "upload_request_url_failed",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                    "error": err.to_string(),
+                }),
+            );
+            return Err(UploadAttemptError::Retryable(err.to_string()));
+        }
     };
 
     client
@@ -262,7 +369,22 @@ async fn attempt_upload(
             Duration::from_secs(PRESIGNED_UPLOAD_TIMEOUT_SECS),
         )
         .await
-        .map_err(|err| UploadAttemptError::Retryable(err.to_string()))?;
+        .map_err(|err| {
+            crate::diagnostics_log::event(
+                "upload_presigned_failed",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                    "error": err.to_string(),
+                }),
+            );
+            UploadAttemptError::Retryable(err.to_string())
+        })?;
+    crate::diagnostics_log::event(
+        "upload_presigned_succeeded",
+        serde_json::json!({
+            "session_uid": request.session_uid,
+        }),
+    );
 
     match client
         .confirm_session_upload(
@@ -273,12 +395,45 @@ async fn attempt_upload(
         )
         .await
     {
-        Ok(SessionUploadConfirmResponse { .. }) => Ok(UploadAttemptOutcome::Uploaded),
-        Err(AuthenticatedRequestError::Conflict(_)) => Ok(UploadAttemptOutcome::Uploaded),
-        Err(AuthenticatedRequestError::Unauthorized) => Err(UploadAttemptError::Unauthorized),
+        Ok(SessionUploadConfirmResponse { .. }) => {
+            crate::diagnostics_log::event(
+                "upload_confirm_succeeded",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                }),
+            );
+            Ok(UploadAttemptOutcome::Uploaded)
+        }
+        Err(AuthenticatedRequestError::Conflict(_)) => {
+            crate::diagnostics_log::event(
+                "upload_confirm_conflict",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                }),
+            );
+            Ok(UploadAttemptOutcome::Uploaded)
+        }
+        Err(AuthenticatedRequestError::Unauthorized) => {
+            crate::diagnostics_log::event(
+                "upload_confirm_unauthorized",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                }),
+            );
+            Err(UploadAttemptError::Unauthorized)
+        }
         // Pending retries restart from request-url -> PUT -> confirm, so any
         // confirm mismatch is recovered with a fresh presigned upload cycle.
-        Err(err) => Err(UploadAttemptError::Retryable(err.to_string())),
+        Err(err) => {
+            crate::diagnostics_log::event(
+                "upload_confirm_failed",
+                serde_json::json!({
+                    "session_uid": request.session_uid,
+                    "error": err.to_string(),
+                }),
+            );
+            Err(UploadAttemptError::Retryable(err.to_string()))
+        }
     }
 }
 
@@ -306,6 +461,16 @@ async fn enqueue_prepared_upload(prepared: &PreparedSessionUpload, error: &str) 
         last_error: Some(error.to_string()),
     };
 
+    crate::diagnostics_log::event(
+        "pending_upload_enqueued",
+        serde_json::json!({
+            "session_uid": record.session_uid,
+            "mode": "prepared",
+            "attempt_count": record.attempt_count,
+            "next_attempt_at_epoch": record.next_attempt_at_epoch,
+            "error": error,
+        }),
+    );
     write_pending_record(dir.as_path(), &record).await?;
     write_pending_payload(
         dir.as_path(),
@@ -339,6 +504,16 @@ async fn enqueue_pending_envelope(envelope: &note::SessionEnvelope, error: &str)
         last_error: Some(error.to_string()),
     };
 
+    crate::diagnostics_log::event(
+        "pending_upload_enqueued",
+        serde_json::json!({
+            "session_uid": record.session_uid,
+            "mode": "envelope",
+            "attempt_count": record.attempt_count,
+            "next_attempt_at_epoch": record.next_attempt_at_epoch,
+            "error": error,
+        }),
+    );
     write_pending_record(dir.as_path(), &record).await?;
     remove_pending_payload(dir.as_path(), &record.session_uid).await
 }
@@ -358,6 +533,15 @@ async fn record_pending_failure(record: &PendingUploadRecord, error: &str) -> Re
         last_error: Some(error.to_string()),
     };
 
+    crate::diagnostics_log::event(
+        "pending_upload_retry_scheduled",
+        serde_json::json!({
+            "session_uid": updated.session_uid,
+            "attempt_count": updated.attempt_count,
+            "next_attempt_at_epoch": updated.next_attempt_at_epoch,
+            "error": error,
+        }),
+    );
     write_pending_record(pending_dir().await?.as_path(), &updated).await
 }
 
@@ -528,9 +712,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-async fn prepare_pending_upload(record: &PendingUploadRecord) -> Result<PreparedSessionUpload> {
+async fn prepare_pending_upload(
+    record: &PendingUploadRecord,
+) -> std::result::Result<PreparedSessionUpload, PendingPreparationError> {
     if let Some(request) = record.request.clone() {
-        let payload = load_pending_payload(&record.session_uid).await?;
+        let payload = load_pending_payload(&record.session_uid)
+            .await
+            .map_err(|err| PendingPreparationError {
+                kind: PendingFailureKind::PermanentData,
+                message: err.to_string(),
+            })?;
         return Ok(PreparedSessionUpload {
             session_uid: record.session_uid.clone(),
             request,
@@ -538,27 +729,65 @@ async fn prepare_pending_upload(record: &PendingUploadRecord) -> Result<Prepared
         });
     }
 
-    let envelope = record.envelope.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "pending upload {} is missing request data",
-            record.session_uid
-        )
-    })?;
+    let envelope = record
+        .envelope
+        .clone()
+        .ok_or_else(|| PendingPreparationError {
+            kind: PendingFailureKind::PermanentData,
+            message: format!(
+                "pending upload {} is missing request data",
+                record.session_uid
+            ),
+        })?;
     let repo_remote_url = resolve_repo_remote_url(Path::new(&envelope.record.repo_root))
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("repo has no push remote URL"))?;
+        .await
+        .map_err(|err| {
+            let message = err.to_string();
+            let kind = if message.contains("No such file or directory")
+                || message.contains("not a git repository")
+            {
+                PendingFailureKind::LocalGitState
+            } else {
+                PendingFailureKind::Retryable
+            };
+            PendingPreparationError { kind, message }
+        })?
+        .ok_or_else(|| PendingPreparationError {
+            kind: PendingFailureKind::LocalGitState,
+            message: "repo has no push remote URL".to_string(),
+        })?;
     rebuild_prepared_upload(&envelope, repo_remote_url).await
 }
 
 async fn rebuild_prepared_upload(
     envelope: &note::SessionEnvelope,
     repo_remote_url: String,
-) -> Result<PreparedSessionUpload> {
+) -> std::result::Result<PreparedSessionUpload, PendingPreparationError> {
     let mut record = envelope.record.clone();
     let repo_root = PathBuf::from(record.repo_root.clone());
     record.repo_remote_url = Some(repo_remote_url);
     refresh_record_git_metadata(&repo_root, &mut record).await;
-    prepare_session_upload(record, envelope.session_content.clone())
+    if record.git_ref == "refs/heads/unknown" {
+        return Err(PendingPreparationError {
+            kind: PendingFailureKind::LocalGitState,
+            message: "repo has no attached git branch".to_string(),
+        });
+    }
+    if record.head_sha == "unknown" {
+        return Err(PendingPreparationError {
+            kind: PendingFailureKind::LocalGitState,
+            message: "repo HEAD commit could not be resolved".to_string(),
+        });
+    }
+    prepare_session_upload(record, envelope.session_content.clone()).map_err(|err| {
+        let message = err.to_string();
+        let kind = if message.contains("missing repo remote URL") {
+            PendingFailureKind::LocalGitState
+        } else {
+            PendingFailureKind::PermanentData
+        };
+        PendingPreparationError { kind, message }
+    })
 }
 
 async fn resolve_repo_remote_url(repo_root: &Path) -> Result<Option<String>> {
@@ -1092,7 +1321,7 @@ mod tests {
             .await
             .expect("pending record");
         assert_eq!(record.attempt_count, 1);
-        assert!(record.next_attempt_at_epoch >= before + 1);
+        assert!(record.next_attempt_at_epoch > before);
         assert!(
             record
                 .last_error
@@ -1123,7 +1352,7 @@ mod tests {
         let repo_root = repo.path().to_string_lossy().to_string();
         let record = note::SessionRecord {
             session_uid: "queued-remote-resolution".to_string(),
-            repo_root: repo_root,
+            repo_root,
             repo_remote_url: None,
             ..sample_record()
         };
@@ -1259,5 +1488,60 @@ mod tests {
                 confirms: 2,
             }
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_drops_repeated_local_git_state_failures() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let pending_root = dir.path().join(".cadence/cli/pending-uploads");
+        tokio::fs::create_dir_all(&pending_root)
+            .await
+            .expect("create pending dir");
+
+        let record = PendingUploadRecord {
+            session_uid: "uid-local-state".to_string(),
+            request: None,
+            envelope: Some(note::SessionEnvelope {
+                record: note::SessionRecord {
+                    repo_root: dir
+                        .path()
+                        .join("missing-repo")
+                        .to_string_lossy()
+                        .to_string(),
+                    repo_remote_url: None,
+                    ..sample_record()
+                },
+                session_content: "content".to_string(),
+            }),
+            enqueued_at: note::now_rfc3339(),
+            updated_at: note::now_rfc3339(),
+            attempt_count: MAX_LOCAL_GIT_STATE_ATTEMPTS - 1,
+            next_attempt_at_epoch: 0,
+            last_error: Some("repo has no push remote URL".to_string()),
+        };
+        write_pending_record(&pending_root, &record)
+            .await
+            .expect("write pending record");
+
+        let server = spawn_test_upload_server(TestUploadServerConfig::default())
+            .await
+            .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.dropped_permanent, 1);
+        assert_eq!(pending_upload_count().await.expect("pending count"), 0);
+        assert_eq!(server.counts().upload_url_requests, 0);
     }
 }
