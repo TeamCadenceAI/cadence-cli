@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.3...v2.0.4) (2026-03-17)
+
+
+### Bug Fixes
+
+* **auth:** stop storing CLI tokens in OS keychain ([dd263f1](https://github.com/TeamCadenceAI/cadence-cli/commit/dd263f1ff775242e4edb25b456b26d1dc05bfd41))
+* **auth:** stop storing CLI tokens in OS keychain ([8ea1eda](https://github.com/TeamCadenceAI/cadence-cli/commit/8ea1edad245fb944a57e5b2f655080180102f6d0))
+
 ## [2.0.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.2...v2.0.3) (2026-03-17)
 
 
