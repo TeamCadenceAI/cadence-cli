@@ -979,6 +979,33 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var(key).ok(),
+            }
+        }
+
+        fn set_path(&self, value: &std::path::Path) {
+            unsafe { std::env::set_var(self.key, value) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     /// Helper: create a temporary git repo with one commit.
     /// Returns the TempDir (which cleans up on drop) and sets the
     /// working directory for the test by returning a guard.
@@ -1078,6 +1105,112 @@ mod tests {
             resolution.diagnostics.nearest_existing_ancestor,
             Some(dir.path().to_path_buf())
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_repo_root_with_fallbacks_uses_worktree_owner_repo() {
+        let home = TempDir::new().expect("home tempdir");
+        let canonical_home = tokio::fs::canonicalize(home.path())
+            .await
+            .expect("canonicalize home");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(&canonical_home);
+
+        let repo_root = canonical_home.join("dev").join("cadence-cli");
+        tokio::fs::create_dir_all(repo_root.parent().expect("repo parent"))
+            .await
+            .expect("create repo parent");
+        run_git(
+            repo_root.parent().expect("repo parent"),
+            &["init", "cadence-cli"],
+        )
+        .await;
+        run_git(&repo_root, &["config", "user.email", "test@test.com"]).await;
+        run_git(&repo_root, &["config", "user.name", "Test User"]).await;
+        run_git(&repo_root, &["config", "core.hooksPath", "/dev/null"]).await;
+        tokio::fs::write(repo_root.join("README.md"), "hello")
+            .await
+            .expect("write readme");
+        run_git(&repo_root, &["add", "README.md"]).await;
+        run_git(&repo_root, &["commit", "-m", "initial commit"]).await;
+        run_git(&repo_root, &["branch", "feature"]).await;
+
+        let worktree_path = canonical_home
+            .join(".claude-worktrees")
+            .join("cadence-cli")
+            .join("vigorous-engelbart");
+        tokio::fs::create_dir_all(worktree_path.parent().expect("worktree parent"))
+            .await
+            .expect("create worktree parent");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+
+        tokio::fs::remove_dir_all(&worktree_path)
+            .await
+            .expect("remove worktree directory");
+
+        let resolution = resolve_repo_root_with_fallbacks(&worktree_path)
+            .await
+            .expect("resolve repo root via worktree owner");
+
+        assert_eq!(
+            resolution
+                .repo_root
+                .canonicalize()
+                .expect("canonical repo root"),
+            repo_root.canonicalize().expect("canonical main repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.resolved_via,
+            Some("worktree_owner_repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.candidate_repo_names,
+            vec!["cadence-cli".to_string()]
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_owner_repo_root,
+            Some(repo_root.clone())
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_path,
+            Some(worktree_path.clone())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_alternative_repo_roots_include_linked_worktrees() {
+        let dir = init_temp_repo().await;
+        run_git(dir.path(), &["branch", "feature"]).await;
+        let worktree_root = TempDir::new().expect("worktree tempdir");
+        let canonical_worktree_root = tokio::fs::canonicalize(worktree_root.path())
+            .await
+            .expect("canonicalize worktree root");
+        let worktree_path = canonical_worktree_root.join("feature-worktree");
+        run_git(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+
+        let alternatives = alternative_repo_roots_for_repo(dir.path()).await;
+
+        assert!(alternatives.contains(&worktree_path));
     }
 
     #[test]

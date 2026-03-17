@@ -1343,6 +1343,66 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn upload_or_queue_prepared_session_queues_with_reason_when_auth_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let prepared = prepare_session_upload(sample_record(), "hello".to_string())
+            .expect("prepare session upload");
+        let context = UploadContext {
+            client: ApiClient::new("http://127.0.0.1:9"),
+            token: None,
+        };
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .expect("queue upload");
+
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "missing Cadence CLI auth token".to_string()
+            }
+        );
+        assert_eq!(pending_upload_count().await.expect("pending count"), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_queues_with_reason_when_auth_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let prepared = prepare_session_upload(sample_record(), "hello".to_string())
+            .expect("prepare session upload");
+        let server = spawn_test_upload_server(TestUploadServerConfig {
+            upload_url_statuses: vec![401],
+            ..TestUploadServerConfig::default()
+        })
+        .await
+        .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .expect("queue rejected upload");
+
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "Cadence CLI auth token was rejected".to_string()
+            }
+        );
+        assert_eq!(pending_upload_count().await.expect("pending count"), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn process_pending_uploads_rebuilds_remote_after_repo_remote_is_added() {
         let dir = TempDir::new().expect("tempdir");
         let home = EnvGuard::new("HOME");
@@ -1542,6 +1602,113 @@ mod tests {
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.dropped_permanent, 1);
         assert_eq!(pending_upload_count().await.expect("pending count"), 0);
+        assert_eq!(server.counts().upload_url_requests, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_drops_permanent_data_failures_immediately() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let pending_root = dir.path().join(".cadence/cli/pending-uploads");
+        tokio::fs::create_dir_all(&pending_root)
+            .await
+            .expect("create pending dir");
+
+        let prepared = prepare_session_upload(sample_record(), "hello".to_string())
+            .expect("prepare session upload");
+        let record = PendingUploadRecord {
+            session_uid: prepared.session_uid.clone(),
+            request: Some(prepared.request.clone()),
+            envelope: None,
+            enqueued_at: note::now_rfc3339(),
+            updated_at: note::now_rfc3339(),
+            attempt_count: 0,
+            next_attempt_at_epoch: 0,
+            last_error: Some("missing payload".to_string()),
+        };
+        write_pending_record(&pending_root, &record)
+            .await
+            .expect("write pending record");
+
+        let server = spawn_test_upload_server(TestUploadServerConfig::default())
+            .await
+            .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.dropped_permanent, 1);
+        assert_eq!(pending_upload_count().await.expect("pending count"), 0);
+        assert_eq!(server.counts().upload_url_requests, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_retries_local_git_state_failures_below_threshold() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+
+        let pending_root = dir.path().join(".cadence/cli/pending-uploads");
+        tokio::fs::create_dir_all(&pending_root)
+            .await
+            .expect("create pending dir");
+
+        let record = PendingUploadRecord {
+            session_uid: "uid-local-state-retry".to_string(),
+            request: None,
+            envelope: Some(note::SessionEnvelope {
+                record: note::SessionRecord {
+                    repo_root: dir
+                        .path()
+                        .join("missing-repo")
+                        .to_string_lossy()
+                        .to_string(),
+                    repo_remote_url: None,
+                    ..sample_record()
+                },
+                session_content: "content".to_string(),
+            }),
+            enqueued_at: note::now_rfc3339(),
+            updated_at: note::now_rfc3339(),
+            attempt_count: MAX_LOCAL_GIT_STATE_ATTEMPTS - 2,
+            next_attempt_at_epoch: 0,
+            last_error: Some("repo has no push remote URL".to_string()),
+        };
+        write_pending_record(&pending_root, &record)
+            .await
+            .expect("write pending record");
+
+        let server = spawn_test_upload_server(TestUploadServerConfig::default())
+            .await
+            .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.dropped_permanent, 0);
+        assert_eq!(pending_upload_count().await.expect("pending count"), 1);
+
+        let updated = load_pending_record(&record_path(&pending_root, "uid-local-state-retry"))
+            .await
+            .expect("pending record");
+        assert_eq!(updated.attempt_count, MAX_LOCAL_GIT_STATE_ATTEMPTS - 1);
+        assert!(updated.last_error.is_some());
         assert_eq!(server.counts().upload_url_requests, 0);
     }
 }

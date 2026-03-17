@@ -2958,6 +2958,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -3017,6 +3018,54 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var(self.key, value) },
                 None => unsafe { std::env::remove_var(self.key) },
             }
+        }
+    }
+
+    async fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
+        let content = tokio::fs::read_to_string(path).await.expect("read jsonl");
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("json row"))
+            .collect()
+    }
+
+    fn event_names(rows: &[Value]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| {
+                row.get("event")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect()
+    }
+
+    fn sample_inline_session(
+        repo_root: &std::path::Path,
+        label: &str,
+        session_id: &str,
+    ) -> SessionInfo {
+        let content = format!(
+            "{{\"sessionId\":\"{session_id}\",\"cwd\":\"{}\",\"message\":\"hello\"}}\n",
+            repo_root.to_string_lossy()
+        );
+        let mut metadata = scanner::parse_session_metadata_str(&content);
+        metadata.cwd = Some(repo_root.to_string_lossy().to_string());
+        metadata.session_id = Some(session_id.to_string());
+        metadata.agent_type = Some(scanner::AgentType::Claude);
+
+        SessionInfo {
+            log: agents::SessionLog {
+                agent_type: scanner::AgentType::Claude,
+                source: agents::SessionSource::Inline {
+                    label: label.to_string(),
+                    content,
+                },
+                updated_at: Some(1_707_526_800),
+            },
+            session_id: session_id.to_string(),
+            repo_root: repo_root.to_path_buf(),
+            metadata,
         }
     }
 
@@ -3648,5 +3697,161 @@ mod tests {
                 confirms: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_repo_backfill_logs_distinct_skip_reasons() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                upload_url_statuses: vec![409, 422],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        let mut cfg = config::CliConfig::default();
+        cfg.token = Some("test-token".to_string());
+        cfg.save().await.expect("save config");
+        let upload_context = Arc::new(
+            upload::resolve_upload_context(Some(server.base_url.as_str()))
+                .await
+                .expect("resolve upload context"),
+        );
+        let logger = backfill_log::BackfillLogger::new_with_now(
+            config::CliConfig::config_dir_with_home(home.path())
+                .expect("config dir")
+                .as_path(),
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_010).expect("ts"),
+        )
+        .await
+        .expect("create backfill logger");
+
+        let stats = process_repo_backfill(
+            "git@github.com:team/example.git".to_string(),
+            vec![
+                sample_inline_session(repo.path(), "session-1.jsonl", "session-1"),
+                sample_inline_session(repo.path(), "session-2.jsonl", "session-2"),
+            ],
+            upload_context,
+            None,
+            logger.clone(),
+        )
+        .await;
+        logger.flush().await;
+
+        assert_eq!(stats.sessions_seen, 2);
+        assert_eq!(stats.skipped, 2);
+        assert_eq!(stats.uploaded, 0);
+
+        let rows = read_jsonl(&logger.path().expect("logger path")).await;
+        let names = event_names(&rows);
+        assert!(names.contains(&"session_skipped_already_exists".to_string()));
+        assert!(names.contains(&"session_skipped_repo_not_associated".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_drains_pending_uploads_before_scan() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let record = note::SessionRecord {
+            session_uid: "queued-pending-session".to_string(),
+            agent: "claude".to_string(),
+            session_id: "session-pending".to_string(),
+            repo_root: "/tmp/repo".to_string(),
+            repo_remote_url: Some("git@github.com:team/example.git".to_string()),
+            git_ref: "refs/heads/main".to_string(),
+            head_sha: "abc123".to_string(),
+            committer_key_hash: "committer".to_string(),
+            git_user_email: Some("dev@example.com".to_string()),
+            git_user_name: Some("Dev".to_string()),
+            session_start: Some(1_700_000_000),
+            content_sha256: note::content_sha256("hello"),
+            cwd: Some("/tmp/repo".to_string()),
+            ingested_at: "2026-03-02T00:00:00Z".to_string(),
+            cli_version: "1.0.0".to_string(),
+        };
+        let prepared = upload::prepare_session_upload(record, "hello".to_string())
+            .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let mut cfg = config::CliConfig::default();
+        cfg.token = Some("test-token".to_string());
+        cfg.save().await.expect("save config");
+
+        run_backfill_inner("1d", None).await.expect("run backfill");
+
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            0
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 1,
+                uploads: 1,
+                confirms: 1,
+            }
+        );
+
+        let config_dir = config::CliConfig::config_dir_with_home(home.path()).expect("config dir");
+        let mut entries = tokio::fs::read_dir(&config_dir)
+            .await
+            .expect("read config dir");
+        let mut backfill_log_path = None;
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("backfill.") && file_name.ends_with(".log") {
+                backfill_log_path = Some(entry.path());
+                break;
+            }
+        }
+        let rows = read_jsonl(&backfill_log_path.expect("backfill log path")).await;
+        let names = event_names(&rows);
+        assert!(names.contains(&"pending_upload_drain_started".to_string()));
+        assert!(names.contains(&"pending_upload_drain_completed".to_string()));
     }
 }

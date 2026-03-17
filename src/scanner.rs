@@ -1001,6 +1001,19 @@ also not json {{{{
         assert_eq!(metadata.cwd, Some("/tmp/second".to_string()));
     }
 
+    #[tokio::test]
+    async fn test_parse_metadata_direct_cwd_beats_nested_payload_path_in_same_event() {
+        let dir = TempDir::new().unwrap();
+        let content =
+            r#"{"sessionId":"session-1","cwd":"/top/level","payload":{"cwd":"/payload/path"}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("session-1".to_string()));
+        assert_eq!(metadata.cwd, Some("/top/level".to_string()));
+    }
+
     // -----------------------------------------------------------------------
     // parse_session_metadata_str
     // -----------------------------------------------------------------------
