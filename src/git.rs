@@ -67,32 +67,27 @@ pub(crate) async fn run_git_output_at(
         cmd.env(key, value);
     }
 
+    let repo_for_log = repo.map(crate::diagnostics_log::sanitize_path);
+    let env_keys = envs
+        .iter()
+        .map(|(key, _)| (*key).to_string())
+        .collect::<Vec<_>>();
     display_parts.extend(args.iter().map(|s| s.to_string()));
-    crate::diagnostics_log::event(
-        "git_command_started",
-        serde_json::json!({
-            "repo": repo.map(|path| path.to_string_lossy().to_string()),
-            "args": args,
-            "env_keys": envs.iter().map(|(key, _)| (*key).to_string()).collect::<Vec<_>>(),
-        }),
+    tracing::trace!(
+        event = "git_command_started",
+        repo = repo_for_log.as_deref().unwrap_or(""),
+        args = ?args,
+        env_keys = ?env_keys
     );
-    if output::is_verbose() {
+    let verbose = output::is_verbose();
+    if verbose {
         output::detail(&display_parts.join(" "));
         let output = cmd
             .args(args)
             .output()
             .await
             .context("failed to execute git")?;
-        crate::diagnostics_log::event(
-            "git_command_completed",
-            serde_json::json!({
-                "repo": repo.map(|path| path.to_string_lossy().to_string()),
-                "args": args,
-                "status": output.status.code(),
-                "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
-                "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
-            }),
-        );
+        log_git_command_completed(repo, args, &output, verbose);
         if !output.stdout.is_empty() {
             output::detail("stdout:");
             emit_stream_chunk(&output.stdout);
@@ -109,17 +104,34 @@ pub(crate) async fn run_git_output_at(
         .output()
         .await
         .context("failed to execute git")?;
-    crate::diagnostics_log::event(
-        "git_command_completed",
-        serde_json::json!({
-            "repo": repo.map(|path| path.to_string_lossy().to_string()),
-            "args": args,
-            "status": output.status.code(),
-            "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
-            "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
-        }),
-    );
+    log_git_command_completed(repo, args, &output, verbose);
     Ok(output)
+}
+
+fn log_git_command_completed(repo: Option<&Path>, args: &[&str], output: &Output, verbose: bool) {
+    let repo_for_log = repo.map(crate::diagnostics_log::sanitize_path);
+    let status = output.status.code();
+    if verbose || !output.status.success() {
+        tracing::trace!(
+            event = "git_command_completed",
+            repo = repo_for_log.as_deref().unwrap_or(""),
+            args = ?args,
+            status = ?status,
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            stdout = crate::diagnostics_log::truncate_text(String::from_utf8_lossy(&output.stdout), 2048),
+            stderr = crate::diagnostics_log::truncate_text(String::from_utf8_lossy(&output.stderr), 2048),
+        );
+        return;
+    }
+    tracing::trace!(
+        event = "git_command_completed",
+        repo = repo_for_log.as_deref().unwrap_or(""),
+        args = ?args,
+        status = ?status,
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+    );
 }
 
 fn emit_stream_chunk(chunk: &[u8]) {
@@ -1009,6 +1021,25 @@ mod tests {
         }
     }
 
+    fn portable_test_path(path: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let raw = path.as_os_str().to_string_lossy();
+            if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+
+        path.to_path_buf()
+    }
+
+    async fn canonical_test_path(path: &Path) -> PathBuf {
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf());
+        portable_test_path(&canonical)
+    }
+
     /// Helper: create a temporary git repo with one commit.
     /// Returns the TempDir (which cleans up on drop) and sets the
     /// working directory for the test by returning a guard.
@@ -1114,9 +1145,7 @@ mod tests {
     #[serial]
     async fn test_resolve_repo_root_with_fallbacks_uses_worktree_owner_repo() {
         let home = TempDir::new().expect("home tempdir");
-        let canonical_home = tokio::fs::canonicalize(home.path())
-            .await
-            .expect("canonicalize home");
+        let canonical_home = canonical_test_path(home.path()).await;
         let home_guard = EnvGuard::new("HOME");
         home_guard.set_path(&canonical_home);
 
@@ -1194,9 +1223,7 @@ mod tests {
     #[serial]
     async fn test_resolve_repo_root_with_fallbacks_uses_worktree_owner_repo_for_missing_subdir() {
         let home = TempDir::new().expect("home tempdir");
-        let canonical_home = tokio::fs::canonicalize(home.path())
-            .await
-            .expect("canonicalize home");
+        let canonical_home = canonical_test_path(home.path()).await;
         let home_guard = EnvGuard::new("HOME");
         home_guard.set_path(&canonical_home);
 
@@ -1273,9 +1300,7 @@ mod tests {
         let dir = init_temp_repo().await;
         run_git(dir.path(), &["branch", "feature"]).await;
         let worktree_root = TempDir::new().expect("worktree tempdir");
-        let canonical_worktree_root = tokio::fs::canonicalize(worktree_root.path())
-            .await
-            .expect("canonicalize worktree root");
+        let canonical_worktree_root = canonical_test_path(worktree_root.path()).await;
         let worktree_path = canonical_worktree_root.join("feature-worktree");
         run_git(
             dir.path(),
@@ -1289,8 +1314,15 @@ mod tests {
         .await;
 
         let alternatives = alternative_repo_roots_for_repo(dir.path()).await;
+        let canonical_worktree_path = tokio::fs::canonicalize(&worktree_path)
+            .await
+            .expect("canonicalize linked worktree");
 
-        assert!(alternatives.contains(&worktree_path));
+        assert!(alternatives.into_iter().any(|candidate| {
+            std::fs::canonicalize(candidate)
+                .map(|path| path == canonical_worktree_path)
+                .unwrap_or(false)
+        }));
     }
 
     #[test]

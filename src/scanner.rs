@@ -76,8 +76,9 @@ pub struct SessionMetadata {
 ///
 /// This is best-effort: not every line will be valid JSON, and not
 /// every JSON line will contain the fields we need. The function
-/// accumulates fields across all lines, with first-value-wins semantics
-/// (once a field is found, later occurrences are ignored).
+/// accumulates fields across all lines. `session_id` is first-value-wins,
+/// while `cwd` prefers the most recent direct cwd/workdir field so later
+/// worktree handoff records can override stale earlier values.
 pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
     let mut metadata = SessionMetadata::default();
     let content = match tokio::fs::read_to_string(file).await {
