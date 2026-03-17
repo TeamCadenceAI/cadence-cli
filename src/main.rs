@@ -1,13 +1,13 @@
 mod agents;
 mod api_client;
 mod config;
-mod diagnostics_log;
 mod git;
 mod keychain;
 mod login;
 mod note;
 mod output;
 mod scanner;
+mod tracing;
 mod update;
 mod upload;
 mod upload_cursor;
@@ -697,12 +697,12 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     let _activity_lock = update::acquire_activity_lock_blocking("hook-post-commit")
         .await
         .map_err(HookError::Soft)?;
-    let _diagnostics_session = match diagnostics_log::DiagnosticsLogger::new("hook").await {
+    let _diagnostics_session = match tracing::DiagnosticsLogger::new("hook").await {
         Ok(logger) => {
             if let Some(path) = logger.path() {
                 output::detail(&format!("Hook trace: {}", path.display()));
             }
-            Some(diagnostics_log::install_global(logger))
+            Some(tracing::install_global(logger))
         }
         Err(err) => {
             output::detail(&format!("Hook trace unavailable: {err}"));
@@ -724,7 +724,7 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     let upload_context = upload::resolve_upload_context(api_url_override())
         .await
         .map_err(HookError::Soft)?;
-    tracing::info!(
+    ::tracing::info!(
         event = "hook_post_commit_started",
         repo_root = repo_root_str.as_str(),
         has_token = upload_context.has_token()
@@ -763,7 +763,7 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
             pending_summary.dropped_permanent,
         ));
     }
-    tracing::info!(
+    ::tracing::info!(
         event = "hook_post_commit_completed",
         repo_root = repo_root_str.as_str(),
         uploaded = stats.uploaded,
@@ -1481,7 +1481,7 @@ async fn process_repo_backfill(
     let repo_root = match sessions.first() {
         Some(session) => session.repo_root.clone(),
         None => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "repo_skipped",
                 repo_display = repo_display.as_str(),
                 reason = "no_sessions"
@@ -1498,7 +1498,7 @@ async fn process_repo_backfill(
         .map(|session| session.repo_root.to_string_lossy().to_string())
         .collect::<std::collections::BTreeSet<_>>();
 
-    tracing::info!(
+    ::tracing::info!(
         event = "repo_started",
         repo_display = repo_display.as_str(),
         repo_root = repo_root_str.as_str(),
@@ -1515,7 +1515,7 @@ async fn process_repo_backfill(
     match git::repo_matches_org_filter(&repo_root).await {
         Ok(true) => {}
         Ok(false) => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "repo_skipped",
                 repo_display = repo_display.as_str(),
                 repo_root = repo_root_str.as_str(),
@@ -1529,7 +1529,7 @@ async fn process_repo_backfill(
         Err(e) => {
             output::detail(&format!("{}: org filter check failed: {}", repo_display, e));
             stats.errors += 1;
-            tracing::warn!(
+            ::tracing::warn!(
                 event = "repo_error",
                 repo_display = repo_display.as_str(),
                 repo_root = repo_root_str.as_str(),
@@ -1545,7 +1545,7 @@ async fn process_repo_backfill(
 
     let repo_enabled = git::check_enabled_at(&repo_root).await;
     if !repo_enabled {
-        tracing::info!(
+        ::tracing::info!(
             event = "repo_skipped",
             repo_display = repo_display.as_str(),
             repo_root = repo_root_str.as_str(),
@@ -1565,7 +1565,7 @@ async fn process_repo_backfill(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        tracing::info!(
+        ::tracing::info!(
             event = "repo_session_started",
             repo_display = repo_display.as_str(),
             repo_root = repo_root_str.as_str(),
@@ -1578,7 +1578,7 @@ async fn process_repo_backfill(
             Some(content) => content,
             None => {
                 stats.errors += 1;
-                tracing::warn!(
+                ::tracing::warn!(
                     event = "session_error",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
@@ -1609,7 +1609,7 @@ async fn process_repo_backfill(
         {
             UploadFromLogOutcome::Uploaded => {
                 stats.uploaded += 1;
-                tracing::info!(
+                ::tracing::info!(
                     event = "session_uploaded",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
@@ -1619,7 +1619,7 @@ async fn process_repo_backfill(
             }
             UploadFromLogOutcome::Queued(reason) => {
                 stats.queued += 1;
-                tracing::info!(
+                ::tracing::info!(
                     event = "session_queued",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
@@ -1630,7 +1630,7 @@ async fn process_repo_backfill(
             }
             UploadFromLogOutcome::AlreadyExists => {
                 stats.skipped += 1;
-                tracing::info!(
+                ::tracing::info!(
                     event = "session_skipped_already_exists",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
@@ -1640,7 +1640,7 @@ async fn process_repo_backfill(
             }
             UploadFromLogOutcome::SkippedRepoNotAssociated => {
                 stats.skipped += 1;
-                tracing::info!(
+                ::tracing::info!(
                     event = "session_skipped_repo_not_associated",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
@@ -1650,7 +1650,7 @@ async fn process_repo_backfill(
             }
             UploadFromLogOutcome::Retryable(error) => {
                 stats.errors += 1;
-                tracing::warn!(
+                ::tracing::warn!(
                     event = "session_upload_error",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
@@ -1676,7 +1676,7 @@ async fn process_repo_backfill(
         ));
     }
 
-    tracing::info!(
+    ::tracing::info!(
         event = "repo_completed",
         repo_display = repo_display.as_str(),
         repo_root = repo_root_str.as_str(),
@@ -1699,12 +1699,12 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let _diagnostics_session = match diagnostics_log::DiagnosticsLogger::new("backfill").await {
+    let _diagnostics_session = match tracing::DiagnosticsLogger::new("backfill").await {
         Ok(logger) => {
             if let Some(path) = logger.path() {
                 output::detail(&format!("Backfill trace: {}", path.display()));
             }
-            Some(diagnostics_log::install_global(logger))
+            Some(tracing::install_global(logger))
         }
         Err(e) => {
             output::detail(&format!("Backfill trace unavailable: {e}"));
@@ -1714,7 +1714,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
 
     let upload_context = Arc::new(upload::resolve_upload_context(api_url_override()).await?);
     let pending_to_drain = upload::pending_upload_count().await.unwrap_or(0);
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_upload_drain_started",
         pending_records = pending_to_drain
     );
@@ -1722,14 +1722,14 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         match upload::process_pending_uploads(&upload_context, pending_to_drain).await {
             Ok(summary) => summary,
             Err(err) => {
-                tracing::warn!(
+                ::tracing::warn!(
                     event = "pending_upload_drain_error",
                     error = err.to_string()
                 );
                 upload::PendingUploadSummary::default()
             }
         };
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_upload_drain_completed",
         attempted = pending_summary.attempted,
         uploaded = pending_summary.uploaded,
@@ -1754,7 +1754,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         None
     };
 
-    tracing::info!(
+    ::tracing::info!(
         event = "backfill_started",
         cli_version = env!("CARGO_PKG_VERSION"),
         since,
@@ -1767,7 +1767,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     );
 
     // Step 2: Find all session files modified within the --since window
-    tracing::info!(
+    ::tracing::info!(
         event = "scan_recent_files_started",
         now_epoch = now,
         since_secs
@@ -1784,7 +1784,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         let agent = file.agent_type.to_string();
         *agent_counts.entry(agent).or_insert(0) += 1;
     }
-    tracing::info!(
+    ::tracing::info!(
         event = "scan_recent_files_completed",
         files_found = files.len(),
         agent_counts = ?agent_counts
@@ -1829,7 +1829,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
         if metadata.session_id.is_none() && metadata.cwd.is_none() {
-            tracing::info!(
+            ::tracing::info!(
                 event = "session_discovery_skipped",
                 file = file_path.as_str(),
                 reason = "missing_session_metadata"
@@ -1844,7 +1844,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         let cwd = match &metadata.cwd {
             Some(c) => c.clone(),
             None => {
-                tracing::info!(
+                ::tracing::info!(
                     event = "session_discovery_skipped",
                     file = file_path.as_str(),
                     session_id = ?metadata.session_id,
@@ -1864,7 +1864,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             let resolved = match git::resolve_repo_root_with_fallbacks(cwd_path).await {
                 Ok(resolution) => resolution,
                 Err(diagnostics) => {
-                    tracing::warn!(
+                    ::tracing::warn!(
                         event = "session_discovery_skipped",
                         file = file_path.as_str(),
                         session_id = ?metadata.session_id,
@@ -1905,7 +1905,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         if let Some(filter) = repo_filter
             && repo_root != filter
         {
-            tracing::info!(
+            ::tracing::info!(
                 event = "session_discovery_skipped",
                 file = file_path.as_str(),
                 session_id = ?metadata.session_id,
@@ -1940,7 +1940,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             let resolved = match git::first_remote_url_at(&repo_root).await {
                 Ok(Some(url)) => url,
                 Err(e) => {
-                    tracing::warn!(
+                    ::tracing::warn!(
                         event = "repo_display_fallback",
                         file = file_path.as_str(),
                         session_id = session_id.as_str(),
@@ -1966,7 +1966,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             .clone()
             .unwrap_or(scanner::AgentType::Claude)
             .to_string();
-        tracing::info!(
+        ::tracing::info!(
             event = "session_enqueued",
             file = file_path.as_str(),
             session_id = session_id.as_str(),
@@ -2008,7 +2008,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut join_set = tokio::task::JoinSet::new();
     let multi = use_progress.then(MultiProgress::new);
-    tracing::info!(event = "repo_workers_started", total_repos, concurrency);
+    ::tracing::info!(event = "repo_workers_started", total_repos, concurrency);
     if let Some(mp) = &multi {
         mp.set_draw_target(ProgressDrawTarget::stderr());
         mp.set_move_cursor(true);
@@ -2017,7 +2017,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     for (repo_display, sessions) in sessions_by_repo {
         let permit = semaphore.clone().acquire_owned().await?;
         let upload_context = Arc::clone(&upload_context);
-        tracing::info!(
+        ::tracing::info!(
             event = "repo_worker_queued",
             repo_display = repo_display.as_str(),
             sessions = sessions.len()
@@ -2058,7 +2058,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 queued += repo_stats.queued;
                 skipped += repo_stats.skipped;
                 errors += repo_stats.errors;
-                tracing::info!(
+                ::tracing::info!(
                     event = "repo_worker_result",
                     uploaded = repo_stats.uploaded,
                     queued = repo_stats.queued,
@@ -2070,12 +2070,12 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             Ok(Err(e)) => {
                 errors += 1;
                 output::detail(&format!("repo worker failed: {}", e));
-                tracing::warn!(event = "repo_worker_error", error = e.to_string());
+                ::tracing::warn!(event = "repo_worker_error", error = e.to_string());
             }
             Err(e) => {
                 errors += 1;
                 output::detail(&format!("repo task join failed: {}", e));
-                tracing::warn!(event = "repo_worker_join_error", error = e.to_string());
+                ::tracing::warn!(event = "repo_worker_join_error", error = e.to_string());
             }
         }
     }
@@ -2102,7 +2102,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         },
     )
     .await;
-    tracing::info!(
+    ::tracing::info!(
         event = "backfill_completed",
         uploaded,
         queued,
@@ -3653,7 +3653,7 @@ mod tests {
                 .await
                 .expect("resolve upload context"),
         );
-        let logger = diagnostics_log::DiagnosticsLogger::new_in_dir(
+        let logger = tracing::DiagnosticsLogger::new_in_dir(
             config::CliConfig::config_dir_with_home(home.path())
                 .expect("config dir")
                 .as_path(),
@@ -3662,7 +3662,7 @@ mod tests {
         )
         .await
         .expect("create backfill logger");
-        let _session = diagnostics_log::install_global(logger.clone());
+        let _session = tracing::install_global(logger.clone());
 
         let stats = process_repo_backfill(
             "git@github.com:team/example.git".to_string(),

@@ -234,7 +234,7 @@ pub async fn process_pending_uploads(
 
     let records = list_due_pending_uploads(max_items).await?;
     let mut summary = PendingUploadSummary::default();
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_uploads_started",
         max_items,
         due_records = records.len(),
@@ -248,7 +248,7 @@ pub async fn process_pending_uploads(
                 let should_drop = err.kind == PendingFailureKind::PermanentData
                     || (err.kind == PendingFailureKind::LocalGitState
                         && record.attempt_count.saturating_add(1) >= MAX_LOCAL_GIT_STATE_ATTEMPTS);
-                tracing::warn!(
+                ::tracing::warn!(
                     event = "pending_upload_prepare_failed",
                     session_uid = record.session_uid.as_str(),
                     attempt_count = record.attempt_count,
@@ -296,7 +296,7 @@ pub async fn process_pending_uploads(
         }
     }
 
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_uploads_completed",
         attempted = summary.attempted,
         uploaded = summary.uploaded,
@@ -320,11 +320,11 @@ async fn attempt_upload(
     request: &SessionUploadUrlRequest,
     compressed_payload: &[u8],
 ) -> std::result::Result<UploadAttemptOutcome, UploadAttemptError> {
-    tracing::info!(
+    ::tracing::info!(
         event = "upload_attempt_started",
         session_uid = request.session_uid.as_str(),
-        repo_remote_url = crate::diagnostics_log::redact_remote_url(&request.repo_remote_url),
-        repo_root = crate::diagnostics_log::sanitize_path(Path::new(&request.repo_root)),
+        repo_remote_url = crate::tracing::redact_remote_url(&request.repo_remote_url),
+        repo_root = crate::tracing::sanitize_path(Path::new(&request.repo_root)),
         git_ref = request.git_ref.as_str(),
         head_sha = request.head_sha.as_str(),
         payload_bytes = compressed_payload.len()
@@ -334,7 +334,7 @@ async fn attempt_upload(
         .await
     {
         Ok(upload) => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "upload_request_url_succeeded",
                 session_uid = request.session_uid.as_str(),
                 org_id = upload.org_id.as_str()
@@ -342,30 +342,29 @@ async fn attempt_upload(
             upload
         }
         Err(AuthenticatedRequestError::Conflict(_)) => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "upload_request_url_conflict",
                 session_uid = request.session_uid.as_str()
             );
             return Ok(UploadAttemptOutcome::AlreadyExists);
         }
         Err(AuthenticatedRequestError::Unprocessable(_)) => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "upload_request_url_repo_not_associated",
                 session_uid = request.session_uid.as_str(),
-                repo_remote_url =
-                    crate::diagnostics_log::redact_remote_url(&request.repo_remote_url)
+                repo_remote_url = crate::tracing::redact_remote_url(&request.repo_remote_url)
             );
             return Ok(UploadAttemptOutcome::SkippedRepoNotAssociated);
         }
         Err(AuthenticatedRequestError::Unauthorized) => {
-            tracing::warn!(
+            ::tracing::warn!(
                 event = "upload_request_url_unauthorized",
                 session_uid = request.session_uid.as_str()
             );
             return Err(UploadAttemptError::Unauthorized);
         }
         Err(err) => {
-            tracing::warn!(
+            ::tracing::warn!(
                 event = "upload_request_url_failed",
                 session_uid = request.session_uid.as_str(),
                 error = err.to_string()
@@ -382,14 +381,14 @@ async fn attempt_upload(
         )
         .await
         .map_err(|err| {
-            tracing::warn!(
+            ::tracing::warn!(
                 event = "upload_presigned_failed",
                 session_uid = request.session_uid.as_str(),
                 error = err.to_string()
             );
             UploadAttemptError::Retryable(err.to_string())
         })?;
-    tracing::info!(
+    ::tracing::info!(
         event = "upload_presigned_succeeded",
         session_uid = request.session_uid.as_str()
     );
@@ -404,21 +403,21 @@ async fn attempt_upload(
         .await
     {
         Ok(SessionUploadConfirmResponse { .. }) => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "upload_confirm_succeeded",
                 session_uid = request.session_uid.as_str()
             );
             Ok(UploadAttemptOutcome::Uploaded)
         }
         Err(AuthenticatedRequestError::Conflict(_)) => {
-            tracing::info!(
+            ::tracing::info!(
                 event = "upload_confirm_conflict",
                 session_uid = request.session_uid.as_str()
             );
             Ok(UploadAttemptOutcome::Uploaded)
         }
         Err(AuthenticatedRequestError::Unauthorized) => {
-            tracing::warn!(
+            ::tracing::warn!(
                 event = "upload_confirm_unauthorized",
                 session_uid = request.session_uid.as_str()
             );
@@ -427,7 +426,7 @@ async fn attempt_upload(
         // Pending retries restart from request-url -> PUT -> confirm, so any
         // confirm mismatch is recovered with a fresh presigned upload cycle.
         Err(err) => {
-            tracing::warn!(
+            ::tracing::warn!(
                 event = "upload_confirm_failed",
                 session_uid = request.session_uid.as_str(),
                 error = err.to_string()
@@ -461,7 +460,7 @@ async fn enqueue_prepared_upload(prepared: &PreparedSessionUpload, error: &str) 
         last_error: Some(error.to_string()),
     };
 
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_upload_enqueued",
         session_uid = record.session_uid.as_str(),
         mode = "prepared",
@@ -502,7 +501,7 @@ async fn enqueue_pending_envelope(envelope: &note::SessionEnvelope, error: &str)
         last_error: Some(error.to_string()),
     };
 
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_upload_enqueued",
         session_uid = record.session_uid.as_str(),
         mode = "envelope",
@@ -529,7 +528,7 @@ async fn record_pending_failure(record: &PendingUploadRecord, error: &str) -> Re
         last_error: Some(error.to_string()),
     };
 
-    tracing::info!(
+    ::tracing::info!(
         event = "pending_upload_retry_scheduled",
         session_uid = updated.session_uid.as_str(),
         attempt_count = updated.attempt_count,

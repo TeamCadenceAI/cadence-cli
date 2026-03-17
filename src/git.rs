@@ -67,13 +67,13 @@ pub(crate) async fn run_git_output_at(
         cmd.env(key, value);
     }
 
-    let repo_for_log = repo.map(crate::diagnostics_log::sanitize_path);
+    let repo_for_log = repo.map(crate::tracing::sanitize_path);
     let env_keys = envs
         .iter()
         .map(|(key, _)| (*key).to_string())
         .collect::<Vec<_>>();
     display_parts.extend(args.iter().map(|s| s.to_string()));
-    tracing::trace!(
+    ::tracing::trace!(
         event = "git_command_started",
         repo = repo_for_log.as_deref().unwrap_or(""),
         args = ?args,
@@ -109,22 +109,22 @@ pub(crate) async fn run_git_output_at(
 }
 
 fn log_git_command_completed(repo: Option<&Path>, args: &[&str], output: &Output, verbose: bool) {
-    let repo_for_log = repo.map(crate::diagnostics_log::sanitize_path);
+    let repo_for_log = repo.map(crate::tracing::sanitize_path);
     let status = output.status.code();
     if verbose || !output.status.success() {
-        tracing::trace!(
+        ::tracing::trace!(
             event = "git_command_completed",
             repo = repo_for_log.as_deref().unwrap_or(""),
             args = ?args,
             status = ?status,
             stdout_bytes = output.stdout.len(),
             stderr_bytes = output.stderr.len(),
-            stdout = crate::diagnostics_log::truncate_text(String::from_utf8_lossy(&output.stdout), 2048),
-            stderr = crate::diagnostics_log::truncate_text(String::from_utf8_lossy(&output.stderr), 2048),
+            stdout = crate::tracing::truncate_text(String::from_utf8_lossy(&output.stdout), 2048),
+            stderr = crate::tracing::truncate_text(String::from_utf8_lossy(&output.stderr), 2048),
         );
         return;
     }
-    tracing::trace!(
+    ::tracing::trace!(
         event = "git_command_completed",
         repo = repo_for_log.as_deref().unwrap_or(""),
         args = ?args,

@@ -280,7 +280,7 @@ mod tests {
         .expect("create logger");
         let _session = install_global(logger.clone());
 
-        tracing::info!(event = "upload_attempt_started", session_uid = "abc");
+        ::tracing::info!(event = "upload_attempt_started", session_uid = "abc");
         logger.flush().await;
 
         let path = logger.path().expect("path");
@@ -320,13 +320,13 @@ mod tests {
         let second_path = second.path().expect("second path");
 
         let outer = install_global(first.clone());
-        tracing::info!(event = "outer", index = 1);
+        ::tracing::info!(event = "outer", index = 1);
         {
             let inner = install_global(second.clone());
-            tracing::info!(event = "inner", index = 2);
+            ::tracing::info!(event = "inner", index = 2);
             drop(inner);
         }
-        tracing::info!(event = "outer_again", index = 3);
+        ::tracing::info!(event = "outer_again", index = 3);
         drop(outer);
         first.flush().await;
         second.flush().await;
