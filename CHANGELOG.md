@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.1...v2.0.2) (2026-03-17)
+
+
+### Bug Fixes
+
+* **upload:** increase presigned upload timeout from 60s to 5 minutes ([9e6dcc2](https://github.com/TeamCadenceAI/cadence-cli/commit/9e6dcc2c75404c108d6f4cdd70c6ddeaf717486a))
+* **upload:** increase presigned upload timeout to 5 minutes ([68e3588](https://github.com/TeamCadenceAI/cadence-cli/commit/68e3588262a7c2cc2920a0e9e1b95374ed3c88ce))
+
 ## [2.0.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.0...v2.0.1) (2026-03-17)
 
 
