@@ -15,7 +15,7 @@ use std::time::Duration;
 const KEYCHAIN_SERVICE: &str = "cadence-cli";
 const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const API_TIMEOUT_SECS: u64 = 15;
-const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 60;
+const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
 pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 
