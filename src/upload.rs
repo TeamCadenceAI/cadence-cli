@@ -4,7 +4,6 @@ use crate::api_client::{
     ApiClient, AuthenticatedRequestError, SessionUploadConfirmResponse, SessionUploadUrlRequest,
 };
 use crate::config;
-use crate::keychain::{KeychainStore, KeyringStore};
 use crate::note;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,10 +12,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const KEYCHAIN_SERVICE: &str = "cadence-cli";
-const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const API_TIMEOUT_SECS: u64 = 15;
-const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 60;
+const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
+const PRESIGNED_UPLOAD_TARGET_BYTES_PER_SEC: u64 = 200 * 1024;
+const PRESIGNED_UPLOAD_URL_EXPIRY_SECS: u64 = 900;
+const PRESIGNED_UPLOAD_URL_SAFETY_MARGIN_SECS: u64 = 30;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
 pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 const MAX_LOCAL_GIT_STATE_ATTEMPTS: u32 = 5;
@@ -105,6 +105,12 @@ enum ResolveRepoRemoteUrlError {
     Unexpected(anyhow::Error),
 }
 
+#[derive(Debug)]
+struct ResolvedPendingRepo {
+    repo_root: PathBuf,
+    repo_remote_url: Option<String>,
+}
+
 impl fmt::Display for ResolveRepoRemoteUrlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -129,7 +135,7 @@ impl std::error::Error for ResolveRepoRemoteUrlError {
 pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<UploadContext> {
     let cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override);
-    let token = resolve_cli_auth_token(&cfg).await;
+    let token = resolve_cli_auth_token(&cfg);
     Ok(UploadContext {
         client: ApiClient::new(&resolved.url),
         token,
@@ -225,14 +231,48 @@ pub async fn process_pending_uploads(
     context: &UploadContext,
     max_items: usize,
 ) -> Result<PendingUploadSummary> {
+    process_pending_uploads_matching(context, max_items, None).await
+}
+
+pub async fn process_pending_uploads_for_repo(
+    context: &UploadContext,
+    max_items: usize,
+    repo_filter: &Path,
+) -> Result<PendingUploadSummary> {
+    process_pending_uploads_matching(context, max_items, Some(repo_filter)).await
+}
+
+pub async fn pending_upload_count_for_repo(repo_filter: &Path) -> Result<usize> {
+    pending_upload_count_matching(Some(repo_filter)).await
+}
+
+async fn process_pending_uploads_matching(
+    context: &UploadContext,
+    max_items: usize,
+    repo_filter: Option<&Path>,
+) -> Result<PendingUploadSummary> {
     let Some(token) = context.token.as_deref() else {
         return Ok(PendingUploadSummary {
-            auth_required: pending_upload_count().await? > 0,
+            auth_required: pending_upload_count_matching(repo_filter).await? > 0,
             ..PendingUploadSummary::default()
         });
     };
 
-    let records = list_due_pending_uploads(max_items).await?;
+    let mut records = if repo_filter.is_some() {
+        list_due_pending_uploads(usize::MAX).await?
+    } else {
+        list_due_pending_uploads(max_items).await?
+    };
+    if let Some(repo_filter) = repo_filter {
+        let mut filtered = Vec::with_capacity(records.len());
+        for record in records {
+            if pending_record_matches_repo_filter(&record, repo_filter).await {
+                filtered.push(record);
+            }
+        }
+        filtered.truncate(max_items);
+        records = filtered;
+    }
     let mut summary = PendingUploadSummary::default();
     ::tracing::info!(
         event = "pending_uploads_started",
@@ -310,8 +350,22 @@ pub async fn process_pending_uploads(
 }
 
 pub async fn pending_upload_count() -> Result<usize> {
+    pending_upload_count_matching(None).await
+}
+
+async fn pending_upload_count_matching(repo_filter: Option<&Path>) -> Result<usize> {
     let dir = pending_dir().await?;
-    Ok(read_pending_records(&dir).await?.len())
+    let records = read_pending_records(&dir).await?;
+    if let Some(repo_filter) = repo_filter {
+        let mut count = 0usize;
+        for record in records {
+            if pending_record_matches_repo_filter(&record, repo_filter).await {
+                count += 1;
+            }
+        }
+        return Ok(count);
+    }
+    Ok(records.len())
 }
 
 async fn attempt_upload(
@@ -377,7 +431,7 @@ async fn attempt_upload(
         .upload_presigned(
             &upload.upload_url,
             compressed_payload,
-            Duration::from_secs(PRESIGNED_UPLOAD_TIMEOUT_SECS),
+            presigned_upload_timeout(compressed_payload.len(), &upload.upload_url),
         )
         .await
         .map_err(|err| {
@@ -699,6 +753,30 @@ fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
+fn presigned_upload_timeout(payload_len: usize, upload_url: &str) -> Duration {
+    let payload_timeout_secs = (payload_len as u64).div_ceil(PRESIGNED_UPLOAD_TARGET_BYTES_PER_SEC);
+    let desired_timeout_secs = payload_timeout_secs.max(PRESIGNED_UPLOAD_TIMEOUT_SECS);
+    let max_timeout_secs = presigned_upload_max_timeout_secs(upload_url).unwrap_or(
+        PRESIGNED_UPLOAD_URL_EXPIRY_SECS.saturating_sub(PRESIGNED_UPLOAD_URL_SAFETY_MARGIN_SECS),
+    );
+    Duration::from_secs(desired_timeout_secs.min(max_timeout_secs).max(1))
+}
+
+fn presigned_upload_max_timeout_secs(upload_url: &str) -> Option<u64> {
+    let url = reqwest::Url::parse(upload_url).ok()?;
+    let expires_secs = url
+        .query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("X-Amz-Expires"))?
+        .1
+        .parse::<u64>()
+        .ok()?;
+    Some(
+        expires_secs
+            .saturating_sub(PRESIGNED_UPLOAD_URL_SAFETY_MARGIN_SECS)
+            .max(1),
+    )
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -732,7 +810,7 @@ async fn prepare_pending_upload(
                 record.session_uid
             ),
         })?;
-    let repo_remote_url = resolve_repo_remote_url(Path::new(&envelope.record.repo_root))
+    let resolved_repo = resolve_repo_remote_url(Path::new(&envelope.record.repo_root))
         .await
         .map_err(|err| PendingPreparationError {
             kind: match err {
@@ -743,34 +821,25 @@ async fn prepare_pending_upload(
                 ResolveRepoRemoteUrlError::Unexpected(_) => PendingFailureKind::Retryable,
             },
             message: err.to_string(),
-        })?
+        })?;
+    let repo_remote_url = resolved_repo
+        .repo_remote_url
         .ok_or_else(|| PendingPreparationError {
             kind: PendingFailureKind::LocalGitState,
             message: "repo has no push remote URL".to_string(),
         })?;
-    rebuild_prepared_upload(&envelope, repo_remote_url).await
+    rebuild_prepared_upload(&envelope, &resolved_repo.repo_root, repo_remote_url).await
 }
 
 async fn rebuild_prepared_upload(
     envelope: &note::SessionEnvelope,
+    repo_root: &Path,
     repo_remote_url: String,
 ) -> std::result::Result<PreparedSessionUpload, PendingPreparationError> {
     let mut record = envelope.record.clone();
-    let repo_root = PathBuf::from(record.repo_root.clone());
+    record.repo_root = repo_root.to_string_lossy().to_string();
     record.repo_remote_url = Some(repo_remote_url);
-    refresh_record_git_metadata(&repo_root, &mut record).await;
-    if record.git_ref == "refs/heads/unknown" {
-        return Err(PendingPreparationError {
-            kind: PendingFailureKind::LocalGitState,
-            message: "repo has no attached git branch".to_string(),
-        });
-    }
-    if record.head_sha == "unknown" {
-        return Err(PendingPreparationError {
-            kind: PendingFailureKind::LocalGitState,
-            message: "repo HEAD commit could not be resolved".to_string(),
-        });
-    }
+    refresh_record_git_metadata(repo_root, &mut record).await;
     prepare_session_upload(record, envelope.session_content.clone()).map_err(|err| {
         PendingPreparationError {
             kind: PendingFailureKind::PermanentData,
@@ -781,25 +850,25 @@ async fn rebuild_prepared_upload(
 
 async fn resolve_repo_remote_url(
     repo_root: &Path,
-) -> std::result::Result<Option<String>, ResolveRepoRemoteUrlError> {
-    if !tokio::fs::try_exists(repo_root).await.unwrap_or(false) {
-        return Err(ResolveRepoRemoteUrlError::MissingPath(
-            repo_root.to_path_buf(),
-        ));
-    }
-
-    if !tokio::fs::try_exists(repo_root.join(".git"))
+) -> std::result::Result<ResolvedPendingRepo, ResolveRepoRemoteUrlError> {
+    let resolved_repo_root = crate::git::resolve_repo_root_with_fallbacks(repo_root)
         .await
-        .unwrap_or(false)
-    {
-        return Err(ResolveRepoRemoteUrlError::NotGitRepository(
-            repo_root.to_path_buf(),
-        ));
-    }
+        .map(|resolution| resolution.repo_root)
+        .map_err(|diagnostics| {
+            if diagnostics.cwd_exists {
+                ResolveRepoRemoteUrlError::NotGitRepository(repo_root.to_path_buf())
+            } else {
+                ResolveRepoRemoteUrlError::MissingPath(repo_root.to_path_buf())
+            }
+        })?;
 
-    crate::git::preferred_remote_url_at(repo_root)
+    let repo_remote_url = crate::git::preferred_remote_url_at(&resolved_repo_root)
         .await
-        .map_err(ResolveRepoRemoteUrlError::Unexpected)
+        .map_err(ResolveRepoRemoteUrlError::Unexpected)?;
+    Ok(ResolvedPendingRepo {
+        repo_root: resolved_repo_root,
+        repo_remote_url,
+    })
 }
 
 async fn refresh_record_git_metadata(repo_root: &Path, record: &mut note::SessionRecord) {
@@ -816,12 +885,43 @@ async fn refresh_record_git_metadata(repo_root: &Path, record: &mut note::Sessio
     }
 }
 
-async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
-    let keychain = KeyringStore::new(KEYCHAIN_SERVICE);
-    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
-        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
-        Ok(_) | Err(_) => cfg.token.clone().filter(|token| !token.trim().is_empty()),
+async fn pending_record_matches_repo_filter(
+    record: &PendingUploadRecord,
+    repo_filter: &Path,
+) -> bool {
+    let stored_repo_root = record
+        .request
+        .as_ref()
+        .map(|request| request.repo_root.as_str())
+        .or_else(|| {
+            record
+                .envelope
+                .as_ref()
+                .map(|envelope| envelope.record.repo_root.as_str())
+        });
+    let Some(stored_repo_root) = stored_repo_root else {
+        return false;
+    };
+    let stored_repo_root = Path::new(stored_repo_root);
+    if stored_repo_root == repo_filter {
+        return true;
     }
+
+    match crate::git::resolve_repo_root_with_fallbacks(stored_repo_root).await {
+        Ok(resolution) => {
+            resolution.repo_root == repo_filter
+                || resolution
+                    .diagnostics
+                    .alternative_repo_roots
+                    .iter()
+                    .any(|candidate| candidate == repo_filter)
+        }
+        Err(_) => false,
+    }
+}
+
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    cfg.auth_token()
 }
 
 #[cfg(test)]
@@ -830,6 +930,7 @@ pub(crate) mod test_support {
     use anyhow::{Context, Result};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
@@ -839,6 +940,7 @@ pub(crate) mod test_support {
         pub upload_url_statuses: Vec<u16>,
         pub upload_statuses: Vec<u16>,
         pub confirm_statuses: Vec<u16>,
+        pub upload_response_delay_ms: u64,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -854,6 +956,7 @@ pub(crate) mod test_support {
         upload_url_statuses: VecDeque<u16>,
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
+        upload_response_delay_ms: u64,
     }
 
     impl TestUploadServerState {
@@ -864,6 +967,7 @@ pub(crate) mod test_support {
                 upload_url_statuses: config.upload_url_statuses.into(),
                 upload_statuses: config.upload_statuses.into(),
                 confirm_statuses: config.confirm_statuses.into(),
+                upload_response_delay_ms: config.upload_response_delay_ms,
             }
         }
 
@@ -956,6 +1060,7 @@ pub(crate) mod test_support {
         status: u16,
         content_type: &'static str,
         body: Vec<u8>,
+        delay_ms: u64,
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> Result<TestRequest> {
@@ -1048,17 +1153,21 @@ pub(crate) mod test_support {
                         status,
                         content_type: "application/json",
                         body,
+                        delay_ms: 0,
                     }
                 } else {
                     TestResponse {
                         status,
                         content_type: "text/plain",
                         body: format!("upload-url failed with {status}").into_bytes(),
+                        delay_ms: 0,
                     }
                 }
             }
             ("PUT", path) if path.starts_with("/uploads/") => {
-                let status = state.lock().expect("server state").next_upload_status();
+                let mut server_state = state.lock().expect("server state");
+                let status = server_state.next_upload_status();
+                let delay_ms = server_state.upload_response_delay_ms;
                 TestResponse {
                     status,
                     content_type: "text/plain",
@@ -1067,6 +1176,7 @@ pub(crate) mod test_support {
                     } else {
                         format!("upload failed with {status}").into_bytes()
                     },
+                    delay_ms,
                 }
             }
             ("POST", path) if path.starts_with("/api/sessions/") && path.ends_with("/confirm") => {
@@ -1076,12 +1186,14 @@ pub(crate) mod test_support {
                         status,
                         content_type: "application/json",
                         body: br#"{"status":"accepted"}"#.to_vec(),
+                        delay_ms: 0,
                     }
                 } else {
                     TestResponse {
                         status,
                         content_type: "text/plain",
                         body: format!("confirm failed with {status}").into_bytes(),
+                        delay_ms: 0,
                     }
                 }
             }
@@ -1089,11 +1201,15 @@ pub(crate) mod test_support {
                 status: 404,
                 content_type: "text/plain",
                 body: b"not found".to_vec(),
+                delay_ms: 0,
             },
         }
     }
 
     async fn write_http_response(stream: &mut TcpStream, response: TestResponse) -> Result<()> {
+        if response.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
+        }
         let status_text = match response.status {
             200 => "OK",
             401 => "Unauthorized",
@@ -1225,6 +1341,37 @@ mod tests {
         assert!(err.to_string().contains("missing repo remote URL"));
     }
 
+    #[test]
+    fn presigned_upload_timeout_keeps_floor_for_small_payloads() {
+        let timeout =
+            presigned_upload_timeout(1024, "https://example.com/upload?X-Amz-Expires=900");
+        assert_eq!(timeout, Duration::from_secs(PRESIGNED_UPLOAD_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn presigned_upload_timeout_scales_for_large_payloads() {
+        let timeout = presigned_upload_timeout(
+            163 * 1024 * 1024,
+            "https://example.com/upload?X-Amz-Expires=900",
+        );
+        assert_eq!(timeout, Duration::from_secs(835));
+    }
+
+    #[test]
+    fn presigned_upload_timeout_caps_to_presigned_url_expiry() {
+        let timeout = presigned_upload_timeout(
+            512 * 1024 * 1024,
+            "https://example.com/upload?X-Amz-Expires=600",
+        );
+        assert_eq!(timeout, Duration::from_secs(570));
+    }
+
+    #[test]
+    fn presigned_upload_timeout_falls_back_when_expiry_is_missing() {
+        let timeout = presigned_upload_timeout(512 * 1024 * 1024, "https://example.com/upload");
+        assert_eq!(timeout, Duration::from_secs(870));
+    }
+
     #[tokio::test]
     async fn resolve_repo_remote_url_reports_missing_repo_path() {
         let err = resolve_repo_remote_url(Path::new("/path/that/does/not/exist"))
@@ -1242,10 +1389,14 @@ mod tests {
             session_content: "hello".to_string(),
         };
 
-        let prepared =
-            rebuild_prepared_upload(&envelope, "git@github.com:team/example.git".to_string())
-                .await
-                .expect("rebuild prepared upload");
+        let repo_root = PathBuf::from(envelope.record.repo_root.clone());
+        let prepared = rebuild_prepared_upload(
+            &envelope,
+            &repo_root,
+            "git@github.com:team/example.git".to_string(),
+        )
+        .await
+        .expect("rebuild prepared upload");
 
         assert_eq!(
             prepared.request.repo_remote_url,
@@ -1568,10 +1719,19 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn process_pending_uploads_drops_repeated_local_git_state_failures() {
+    async fn process_pending_uploads_allows_detached_head_sessions() {
         let dir = TempDir::new().expect("tempdir");
         let home = EnvGuard::new("HOME");
         home.set_path(dir.path());
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
+        let head_sha = run_git(repo.path(), &["rev-parse", "HEAD"]).await;
+        run_git(repo.path(), &["checkout", "--detach", "HEAD"]).await;
 
         let pending_root = dir.path().join(".cadence/cli/pending-uploads");
         tokio::fs::create_dir_all(&pending_root)
@@ -1579,15 +1739,118 @@ mod tests {
             .expect("create pending dir");
 
         let record = PendingUploadRecord {
-            session_uid: "uid-local-state".to_string(),
+            session_uid: "uid-detached-head".to_string(),
             request: None,
             envelope: Some(note::SessionEnvelope {
                 record: note::SessionRecord {
-                    repo_root: dir
-                        .path()
-                        .join("missing-repo")
-                        .to_string_lossy()
-                        .to_string(),
+                    session_uid: "uid-detached-head".to_string(),
+                    repo_root: repo.path().to_string_lossy().to_string(),
+                    repo_remote_url: None,
+                    git_ref: "refs/heads/unknown".to_string(),
+                    head_sha: "unknown".to_string(),
+                    ..sample_record()
+                },
+                session_content: "content".to_string(),
+            }),
+            enqueued_at: note::now_rfc3339(),
+            updated_at: note::now_rfc3339(),
+            attempt_count: MAX_LOCAL_GIT_STATE_ATTEMPTS - 1,
+            next_attempt_at_epoch: 0,
+            last_error: Some("repo has no attached git branch".to_string()),
+        };
+        write_pending_record(&pending_root, &record)
+            .await
+            .expect("write pending record");
+
+        let server = spawn_test_upload_server(TestUploadServerConfig::default())
+            .await
+            .expect("spawn test server");
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("test-token".to_string()),
+        };
+
+        let summary = process_pending_uploads(&context, 1)
+            .await
+            .expect("process pending uploads");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(summary.dropped_permanent, 0);
+        assert_eq!(pending_upload_count().await.expect("pending count"), 0);
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].git_ref, "refs/heads/unknown");
+        assert_eq!(requests[0].head_sha, head_sha);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_uses_repo_root_fallbacks_for_deleted_worktrees() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        let canonical_home = tokio::fs::canonicalize(dir.path())
+            .await
+            .expect("canonical home");
+        home.set_path(&canonical_home);
+
+        let repo_root = canonical_home.join("dev").join("cadence-cli");
+        tokio::fs::create_dir_all(repo_root.parent().expect("repo parent"))
+            .await
+            .expect("create repo parent");
+        run_git(
+            repo_root.parent().expect("repo parent"),
+            &["init", "cadence-cli"],
+        )
+        .await;
+        run_git(&repo_root, &["config", "user.email", "test@test.com"]).await;
+        run_git(&repo_root, &["config", "user.name", "Test User"]).await;
+        run_git(&repo_root, &["config", "core.hooksPath", "/dev/null"]).await;
+        tokio::fs::write(repo_root.join("README.md"), "hello")
+            .await
+            .expect("write readme");
+        run_git(&repo_root, &["add", "README.md"]).await;
+        run_git(&repo_root, &["commit", "-m", "initial commit"]).await;
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
+        run_git(&repo_root, &["branch", "feature"]).await;
+
+        let worktree_path = canonical_home
+            .join(".claude-worktrees")
+            .join("cadence-cli")
+            .join("vigorous-engelbart");
+        tokio::fs::create_dir_all(worktree_path.parent().expect("worktree parent"))
+            .await
+            .expect("create worktree parent");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+        tokio::fs::remove_dir_all(&worktree_path)
+            .await
+            .expect("remove worktree directory");
+
+        let pending_root = canonical_home.join(".cadence/cli/pending-uploads");
+        tokio::fs::create_dir_all(&pending_root)
+            .await
+            .expect("create pending dir");
+
+        let record = PendingUploadRecord {
+            session_uid: "uid-worktree-fallback".to_string(),
+            request: None,
+            envelope: Some(note::SessionEnvelope {
+                record: note::SessionRecord {
+                    session_uid: "uid-worktree-fallback".to_string(),
+                    repo_root: worktree_path.to_string_lossy().to_string(),
                     repo_remote_url: None,
                     ..sample_record()
                 },
@@ -1616,9 +1879,13 @@ mod tests {
             .expect("process pending uploads");
 
         assert_eq!(summary.attempted, 1);
-        assert_eq!(summary.dropped_permanent, 1);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(summary.dropped_permanent, 0);
         assert_eq!(pending_upload_count().await.expect("pending count"), 0);
-        assert_eq!(server.counts().upload_url_requests, 0);
+        assert_eq!(server.counts().upload_url_requests, 1);
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].repo_root, repo_root.to_string_lossy());
     }
 
     #[tokio::test]
@@ -1726,5 +1993,33 @@ mod tests {
         assert_eq!(updated.attempt_count, MAX_LOCAL_GIT_STATE_ATTEMPTS - 1);
         assert!(updated.last_error.is_some());
         assert_eq!(server.counts().upload_url_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn upload_presigned_reports_timeout_with_payload_details() {
+        let server = spawn_test_upload_server(TestUploadServerConfig {
+            upload_response_delay_ms: 500,
+            ..TestUploadServerConfig::default()
+        })
+        .await
+        .expect("spawn test server");
+        let client = ApiClient::new(&server.base_url);
+
+        let err = client
+            .upload_presigned(
+                &format!("{}/uploads/uid-1?X-Amz-Expires=900", server.base_url),
+                b"hello",
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("presigned upload timeout");
+
+        match err {
+            AuthenticatedRequestError::Network(message) => {
+                assert!(message.contains("timed out after 50ms"));
+                assert!(message.contains("5 bytes"));
+            }
+            other => panic!("expected network timeout, got {other:?}"),
+        }
     }
 }

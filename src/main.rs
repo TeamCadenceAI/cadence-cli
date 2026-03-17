@@ -2,7 +2,6 @@ mod agents;
 mod api_client;
 mod config;
 mod git;
-mod keychain;
 mod login;
 mod note;
 mod output;
@@ -23,10 +22,6 @@ use std::time::Duration;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::keychain::KeychainStore;
-
-const KEYCHAIN_SERVICE: &str = "cadence-cli";
-const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
 const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
@@ -536,16 +531,6 @@ async fn run_login() -> Result<()> {
     cfg.expires_at = Some(exchanged.expires_at.clone());
     cfg.save().await?;
 
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    if let Err(e) = keychain
-        .set(KEYCHAIN_AUTH_TOKEN_ACCOUNT, &exchanged.token)
-        .await
-    {
-        output::note(&format!(
-            "Could not store token in OS keychain (using config fallback): {e}"
-        ));
-    }
-
     output::success("Login", &format!("authenticated as {}", exchanged.login));
     output::detail(&format!("Token expires at {}", exchanged.expires_at));
     Ok(())
@@ -555,7 +540,7 @@ async fn run_logout() -> Result<()> {
     let mut cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override());
 
-    if let Some(token) = resolve_cli_auth_token(&cfg).await {
+    if let Some(token) = resolve_cli_auth_token(&cfg) {
         let client = api_client::ApiClient::new(&resolved.url);
         match client
             .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
@@ -573,11 +558,6 @@ async fn run_logout() -> Result<()> {
         output::note("No local token found; clearing local auth state.");
     }
 
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    if let Err(e) = keychain.delete(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
-        output::note(&format!("Could not clear OS keychain token: {e}"));
-    }
-
     cfg.clear_token().await?;
     output::success("Logout", "authentication cleared");
     Ok(())
@@ -591,12 +571,8 @@ struct BackfillSyncStats {
     repos_scanned: i32,
 }
 
-async fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
-    let keychain = keychain::KeyringStore::new(KEYCHAIN_SERVICE);
-    match keychain.get(KEYCHAIN_AUTH_TOKEN_ACCOUNT).await {
-        Ok(Some(token)) if !token.trim().is_empty() => Some(token),
-        Ok(_) | Err(_) => cfg.token.clone().filter(|t| !t.trim().is_empty()),
-    }
+fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
+    cfg.auth_token()
 }
 
 async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
@@ -605,7 +581,7 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
         Err(_) => return,
     };
 
-    let token = match resolve_cli_auth_token(&cfg).await {
+    let token = match resolve_cli_auth_token(&cfg) {
         Some(token) => token,
         None => {
             output::note("Run `cadence login` to sync results");
@@ -1713,13 +1689,36 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     };
 
     let upload_context = Arc::new(upload::resolve_upload_context(api_url_override()).await?);
-    let pending_to_drain = upload::pending_upload_count().await.unwrap_or(0);
+    let pending_to_drain = match repo_filter {
+        Some(filter) => upload::pending_upload_count_for_repo(filter)
+            .await
+            .unwrap_or(0),
+        None => upload::pending_upload_count().await.unwrap_or(0),
+    };
     ::tracing::info!(
         event = "pending_upload_drain_started",
         pending_records = pending_to_drain
     );
-    let pending_summary =
-        match upload::process_pending_uploads(&upload_context, pending_to_drain).await {
+    let pending_summary = match repo_filter {
+        Some(filter) => {
+            match upload::process_pending_uploads_for_repo(
+                &upload_context,
+                pending_to_drain,
+                filter,
+            )
+            .await
+            {
+                Ok(summary) => summary,
+                Err(err) => {
+                    ::tracing::warn!(
+                        event = "pending_upload_drain_error",
+                        error = err.to_string()
+                    );
+                    upload::PendingUploadSummary::default()
+                }
+            }
+        }
+        None => match upload::process_pending_uploads(&upload_context, pending_to_drain).await {
             Ok(summary) => summary,
             Err(err) => {
                 ::tracing::warn!(
@@ -1728,7 +1727,8 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 );
                 upload::PendingUploadSummary::default()
             }
-        };
+        },
+    };
     ::tracing::info!(
         event = "pending_upload_drain_completed",
         attempted = pending_summary.attempted,
@@ -3773,5 +3773,108 @@ mod tests {
         let names = event_names(&rows);
         assert!(names.contains(&"pending_upload_drain_started".to_string()));
         assert!(names.contains(&"pending_upload_drain_completed".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_repo_filter_only_drains_matching_pending_uploads() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let repo_a = home.path().join("repo-a");
+        let repo_b = home.path().join("repo-b");
+        tokio::fs::create_dir_all(&repo_a)
+            .await
+            .expect("create repo a");
+        tokio::fs::create_dir_all(&repo_b)
+            .await
+            .expect("create repo b");
+
+        for (uid, repo_root) in [
+            ("queued-repo-a", repo_a.as_path()),
+            ("queued-repo-b", repo_b.as_path()),
+        ] {
+            let record = note::SessionRecord {
+                session_uid: uid.to_string(),
+                agent: "claude".to_string(),
+                session_id: format!("session-{uid}"),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                repo_remote_url: Some("git@github.com:team/example.git".to_string()),
+                git_ref: "refs/heads/main".to_string(),
+                head_sha: "abc123".to_string(),
+                committer_key_hash: "committer".to_string(),
+                git_user_email: Some("dev@example.com".to_string()),
+                git_user_name: Some("Dev".to_string()),
+                session_start: Some(1_700_000_000),
+                content_sha256: note::content_sha256("hello"),
+                cwd: Some(repo_root.to_string_lossy().to_string()),
+                ingested_at: "2026-03-02T00:00:00Z".to_string(),
+                cli_version: "1.0.0".to_string(),
+            };
+            let prepared = upload::prepare_session_upload(record, "hello".to_string())
+                .expect("prepare session upload");
+            let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+                .await
+                .expect("context without token");
+            let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+                .await
+                .expect("queue upload");
+            assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+        }
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        run_backfill_inner("1d", Some(repo_a.as_path()))
+            .await
+            .expect("run backfill");
+
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            1
+        );
+        assert_eq!(
+            upload::pending_upload_count_for_repo(repo_a.as_path())
+                .await
+                .expect("pending count repo a"),
+            0
+        );
+        assert_eq!(
+            upload::pending_upload_count_for_repo(repo_b.as_path())
+                .await
+                .expect("pending count repo b"),
+            1
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 1,
+                uploads: 1,
+                confirms: 1,
+            }
+        );
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].repo_root, repo_a.to_string_lossy());
     }
 }

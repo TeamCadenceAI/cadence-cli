@@ -1,6 +1,6 @@
 [package]
 name = "cadence-cli"
-version = "2.0.1"
+version = "2.0.4"
 edition = "2024"
 
 [lib]
@@ -34,7 +34,6 @@ self-replace = "1"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-keyring = "2.3"
 zstd = "0.13"
 open = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
