@@ -1274,6 +1274,25 @@ mod tests {
         }
     }
 
+    fn portable_test_path(path: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let raw = path.to_string_lossy();
+            if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+
+        path.to_path_buf()
+    }
+
+    async fn canonical_test_path(path: &Path) -> PathBuf {
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf());
+        portable_test_path(&canonical)
+    }
+
     async fn run_git(repo: &Path, args: &[&str]) -> String {
         let out = crate::git::run_git_output_at(Some(repo), args, &[])
             .await
@@ -1789,9 +1808,7 @@ mod tests {
     async fn process_pending_uploads_uses_repo_root_fallbacks_for_deleted_worktrees() {
         let dir = TempDir::new().expect("tempdir");
         let home = EnvGuard::new("HOME");
-        let canonical_home = tokio::fs::canonicalize(dir.path())
-            .await
-            .expect("canonical home");
+        let canonical_home = canonical_test_path(dir.path()).await;
         home.set_path(&canonical_home);
 
         let repo_root = canonical_home.join("dev").join("cadence-cli");
