@@ -1013,6 +1013,37 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
     Ok(())
 }
 
+async fn refresh_git_hooks_with_updated_binary() -> Result<()> {
+    let current_exe = std::env::current_exe()
+        .context("failed to resolve current cadence executable path after self-update")?;
+    refresh_git_hooks_with_exe(&current_exe).await
+}
+
+async fn refresh_git_hooks_with_exe(exe_path: &Path) -> Result<()> {
+    let output = Command::new(exe_path)
+        .args(["hook", "refresh-hooks"])
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to launch refreshed cadence binary at {}",
+                exe_path.display()
+            )
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = [stderr, stdout]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("exit status {}", output.status));
+    bail!("hook refresh command failed: {detail}");
+}
+
 async fn run_update_install_from_url_mode(
     release_url: &str,
     yes: bool,
@@ -1133,6 +1164,17 @@ async fn run_update_install_from_url_mode(
 
     // Step 9: Replace running binary
     self_replace_binary(&new_binary)?;
+
+    match refresh_git_hooks_with_updated_binary().await {
+        Ok(()) => {}
+        Err(e) if matches!(mode, InstallMode::Interactive) => {
+            eprintln!(
+                "Warning: cadence updated, but Git hooks were not refreshed automatically: {e}"
+            );
+            eprintln!("Run `cadence install` to repair hooks.");
+        }
+        Err(e) => return Err(e.context("updated cadence, but failed to refresh Git hooks")),
+    }
 
     if matches!(mode, InstallMode::Interactive) {
         println!("Successfully updated cadence v{local} → v{remote_display}");
@@ -3153,5 +3195,57 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn refresh_git_hooks_with_exe_invokes_hidden_hook_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("cadence");
+        let args_log = tmp.path().join("args.log");
+        let script_contents = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            args_log.display()
+        );
+        tokio::fs::write(&script, script_contents)
+            .await
+            .expect("write script");
+
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("chmod script");
+
+        refresh_git_hooks_with_exe(&script)
+            .await
+            .expect("refresh hooks command");
+
+        let args = tokio::fs::read_to_string(&args_log)
+            .await
+            .expect("read args log");
+        assert_eq!(args, "hook\nrefresh-hooks\n");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn refresh_git_hooks_with_exe_surfaces_command_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("cadence");
+        tokio::fs::write(&script, "#!/bin/sh\necho broken >&2\nexit 7\n")
+            .await
+            .expect("write script");
+
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("chmod script");
+
+        let err = refresh_git_hooks_with_exe(&script)
+            .await
+            .expect_err("expected hook refresh failure");
+        assert!(
+            err.to_string().contains("broken"),
+            "unexpected error: {err:#}"
+        );
     }
 }

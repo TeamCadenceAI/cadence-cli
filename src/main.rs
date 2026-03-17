@@ -12,7 +12,7 @@ mod update;
 mod upload;
 mod upload_cursor;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -150,6 +150,9 @@ enum HookCommand {
     /// Internal unattended background updater entrypoint (scheduler-only).
     #[command(hide = true)]
     AutoUpdate,
+    /// Internal Git hook refresh entrypoint used after self-update.
+    #[command(hide = true)]
+    RefreshHooks,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,161 +266,7 @@ async fn run_install_inner(
     println!();
     output::action("Installing", "hooks");
     let install_start = std::time::Instant::now();
-
-    let home = match home_override {
-        Some(h) => h.to_path_buf(),
-        None => agents::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?,
-    };
-
-    let hooks_dir = home.join(".git-hooks");
-    let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
-
-    // Track whether any step failed (but continue regardless)
-    let mut had_errors = false;
-
-    // Step 1: Set git config --global core.hooksPath ~/.git-hooks
-    match git::config_set_global("core.hooksPath", &hooks_dir_str).await {
-        Ok(()) => {
-            output::success("Updated", &format!("core.hooksPath = {}", hooks_dir_str));
-        }
-        Err(e) => {
-            output::fail("Failed", &format!("to set core.hooksPath ({})", e));
-            had_errors = true;
-        }
-    }
-
-    // Step 2: Create ~/.git-hooks/ directory if missing
-    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
-        match tokio::fs::create_dir_all(&hooks_dir).await {
-            Ok(()) => {
-                output::success("Created", &hooks_dir_str);
-            }
-            Err(e) => {
-                output::fail("Failed", &format!("to create {} ({})", hooks_dir_str, e));
-                had_errors = true;
-            }
-        }
-    } else {
-        output::detail(&format!(
-            "Hooks directory already exists: {}",
-            hooks_dir_str
-        ));
-    }
-
-    // Step 3: Write post-commit shim and make it executable
-    let shim_path = hooks_dir.join("post-commit");
-    let shim_content = post_commit_hook_content();
-
-    // Check if hook already exists
-    let should_write = if tokio::fs::try_exists(&shim_path).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&shim_path).await {
-            Ok(existing) => {
-                if is_cadence_hook(&existing) {
-                    output::detail("Post-commit hook already installed; updating");
-                    true
-                } else {
-                    // Back up the existing hook before overwriting
-                    let backup_path = hooks_dir.join("post-commit.pre-cadence");
-                    match tokio::fs::copy(&shim_path, &backup_path).await {
-                        Ok(_) => {
-                            output::note(&format!(
-                                "Existing post-commit hook saved to {}",
-                                backup_path.display()
-                            ));
-                        }
-                        Err(e) => {
-                            output::note(&format!(
-                                "Could not back up existing post-commit hook ({})",
-                                e
-                            ));
-                        }
-                    }
-                    true
-                }
-            }
-            Err(_) => {
-                output::note(&format!(
-                    "Could not read existing {}; overwriting",
-                    shim_path.display()
-                ));
-                true
-            }
-        }
-    } else {
-        true
-    };
-
-    if should_write {
-        match tokio::fs::write(&shim_path, shim_content).await {
-            Ok(()) => {
-                output::success(
-                    "Wrote",
-                    &format!("post-commit hook ({})", shim_path.display()),
-                );
-
-                // Make executable (Unix only)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o755);
-                    match tokio::fs::set_permissions(&shim_path, perms).await {
-                        Ok(()) => {
-                            output::detail(&format!("Made {} executable", shim_path.display()));
-                        }
-                        Err(e) => {
-                            output::fail(
-                                "Failed",
-                                &format!("to make {} executable ({})", shim_path.display(), e),
-                            );
-                            had_errors = true;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                output::fail(
-                    "Failed",
-                    &format!("to write {} ({})", shim_path.display(), e),
-                );
-                had_errors = true;
-            }
-        }
-    }
-
-    let pre_push_path = hooks_dir.join("pre-push");
-    if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&pre_push_path).await {
-            Ok(existing) if is_cadence_hook(&existing) => {
-                match tokio::fs::remove_file(&pre_push_path).await {
-                    Ok(()) => output::success(
-                        "Removed",
-                        &format!("legacy pre-push hook ({})", pre_push_path.display()),
-                    ),
-                    Err(e) => {
-                        output::fail(
-                            "Failed",
-                            &format!("to remove {} ({})", pre_push_path.display(), e),
-                        );
-                        had_errors = true;
-                    }
-                }
-            }
-            Ok(_) => {
-                output::detail(&format!(
-                    "Leaving non-Cadence pre-push hook untouched: {}",
-                    pre_push_path.display()
-                ));
-            }
-            Err(e) => {
-                output::note(&format!(
-                    "Could not inspect legacy pre-push hook {} ({})",
-                    pre_push_path.display(),
-                    e
-                ));
-            }
-        }
-    }
+    let mut had_errors = refresh_cadence_git_hooks(home_override, true).await?;
 
     // Step 4: Scheduler reconciliation is performed after auto-update consent is resolved.
 
@@ -468,6 +317,201 @@ async fn run_install_inner(
         install_start.elapsed().as_millis()
     ));
 
+    Ok(())
+}
+
+async fn refresh_cadence_git_hooks(
+    home_override: Option<&std::path::Path>,
+    log_progress: bool,
+) -> Result<bool> {
+    let home = match home_override {
+        Some(h) => h.to_path_buf(),
+        None => agents::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?,
+    };
+
+    let hooks_dir = home.join(".git-hooks");
+    let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
+    let mut had_errors = false;
+
+    match git::config_set_global("core.hooksPath", &hooks_dir_str).await {
+        Ok(()) => {
+            if log_progress {
+                output::success("Updated", &format!("core.hooksPath = {}", hooks_dir_str));
+            }
+        }
+        Err(e) => {
+            if log_progress {
+                output::fail("Failed", &format!("to set core.hooksPath ({})", e));
+            }
+            had_errors = true;
+        }
+    }
+
+    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
+        match tokio::fs::create_dir_all(&hooks_dir).await {
+            Ok(()) => {
+                if log_progress {
+                    output::success("Created", &hooks_dir_str);
+                }
+            }
+            Err(e) => {
+                if log_progress {
+                    output::fail("Failed", &format!("to create {} ({})", hooks_dir_str, e));
+                }
+                had_errors = true;
+            }
+        }
+    } else if log_progress {
+        output::detail(&format!(
+            "Hooks directory already exists: {}",
+            hooks_dir_str
+        ));
+    }
+
+    let shim_path = hooks_dir.join("post-commit");
+    let shim_content = post_commit_hook_content();
+
+    let should_write = if tokio::fs::try_exists(&shim_path).await.unwrap_or(false) {
+        match tokio::fs::read_to_string(&shim_path).await {
+            Ok(existing) => {
+                if is_cadence_hook(&existing) {
+                    if log_progress {
+                        output::detail("Post-commit hook already installed; updating");
+                    }
+                    true
+                } else {
+                    let backup_path = hooks_dir.join("post-commit.pre-cadence");
+                    match tokio::fs::copy(&shim_path, &backup_path).await {
+                        Ok(_) => {
+                            if log_progress {
+                                output::note(&format!(
+                                    "Existing post-commit hook saved to {}",
+                                    backup_path.display()
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            if log_progress {
+                                output::note(&format!(
+                                    "Could not back up existing post-commit hook ({})",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    true
+                }
+            }
+            Err(_) => {
+                if log_progress {
+                    output::note(&format!(
+                        "Could not read existing {}; overwriting",
+                        shim_path.display()
+                    ));
+                }
+                true
+            }
+        }
+    } else {
+        true
+    };
+
+    if should_write {
+        match tokio::fs::write(&shim_path, shim_content).await {
+            Ok(()) => {
+                if log_progress {
+                    output::success(
+                        "Wrote",
+                        &format!("post-commit hook ({})", shim_path.display()),
+                    );
+                }
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o755);
+                    match tokio::fs::set_permissions(&shim_path, perms).await {
+                        Ok(()) => {
+                            if log_progress {
+                                output::detail(&format!("Made {} executable", shim_path.display()));
+                            }
+                        }
+                        Err(e) => {
+                            if log_progress {
+                                output::fail(
+                                    "Failed",
+                                    &format!("to make {} executable ({})", shim_path.display(), e),
+                                );
+                            }
+                            had_errors = true;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if log_progress {
+                    output::fail(
+                        "Failed",
+                        &format!("to write {} ({})", shim_path.display(), e),
+                    );
+                }
+                had_errors = true;
+            }
+        }
+    }
+
+    let pre_push_path = hooks_dir.join("pre-push");
+    if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
+        match tokio::fs::read_to_string(&pre_push_path).await {
+            Ok(existing) if is_cadence_hook(&existing) => {
+                match tokio::fs::remove_file(&pre_push_path).await {
+                    Ok(()) => {
+                        if log_progress {
+                            output::success(
+                                "Removed",
+                                &format!("legacy pre-push hook ({})", pre_push_path.display()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if log_progress {
+                            output::fail(
+                                "Failed",
+                                &format!("to remove {} ({})", pre_push_path.display(), e),
+                            );
+                        }
+                        had_errors = true;
+                    }
+                }
+            }
+            Ok(_) => {
+                if log_progress {
+                    output::detail(&format!(
+                        "Leaving non-Cadence pre-push hook untouched: {}",
+                        pre_push_path.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                if log_progress {
+                    output::note(&format!(
+                        "Could not inspect legacy pre-push hook {} ({})",
+                        pre_push_path.display(),
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(had_errors)
+}
+
+async fn run_refresh_hooks() -> Result<()> {
+    if refresh_cadence_git_hooks(None, false).await? {
+        bail!("Git hook refresh completed with issues. Run `cadence install` to repair hooks.");
+    }
     Ok(())
 }
 
@@ -2726,6 +2770,7 @@ async fn main() {
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
             HookCommand::AutoUpdate => update::run_background_auto_update().await,
+            HookCommand::RefreshHooks => run_refresh_hooks().await,
         },
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
@@ -3007,6 +3052,17 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_hidden_hook_refresh_hooks() {
+        let cli = Cli::parse_from(["cadence", "hook", "refresh-hooks"]);
+        match cli.command {
+            Command::Hook { hook_command } => {
+                assert!(matches!(hook_command, HookCommand::RefreshHooks));
+            }
+            _ => panic!("expected Hook command"),
+        }
+    }
+
+    #[test]
     fn install_auto_update_ftue_state_matches_config() {
         let mut enabled = config::CliConfig::default();
         enabled.auto_update = Some(true);
@@ -3145,6 +3201,60 @@ mod tests {
         let absolute = hooks_dir.clone();
         let relative = repo.path().join(".git/./hooks");
         assert!(paths_equivalent(&absolute, &relative));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn refresh_cadence_git_hooks_updates_existing_managed_hooks() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let hooks_dir = home.path().join(".git-hooks");
+        tokio::fs::create_dir_all(&hooks_dir)
+            .await
+            .expect("create hooks dir");
+        tokio::fs::write(
+            hooks_dir.join("post-commit"),
+            "#!/bin/sh\nexec cadence hook pre-push\n",
+        )
+        .await
+        .expect("seed stale post-commit hook");
+        tokio::fs::write(
+            hooks_dir.join("pre-push"),
+            "#!/bin/sh\nexec cadence hook pre-push\n",
+        )
+        .await
+        .expect("seed legacy pre-push hook");
+
+        let had_errors = refresh_cadence_git_hooks(Some(home.path()), false)
+            .await
+            .expect("refresh hooks");
+        assert!(!had_errors);
+
+        let post_commit = tokio::fs::read_to_string(hooks_dir.join("post-commit"))
+            .await
+            .expect("read post-commit");
+        assert_eq!(post_commit, post_commit_hook_content());
+        assert!(
+            !hooks_dir.join("pre-push").exists(),
+            "expected legacy pre-push hook to be removed"
+        );
+
+        let configured_hooks_path = crate::git::config_get_global("core.hooksPath")
+            .await
+            .expect("read core.hooksPath");
+        assert_eq!(
+            configured_hooks_path.as_deref(),
+            Some(hooks_dir.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
