@@ -16,6 +16,9 @@ const KEYCHAIN_SERVICE: &str = "cadence-cli";
 const KEYCHAIN_AUTH_TOKEN_ACCOUNT: &str = "auth_token";
 const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
+const PRESIGNED_UPLOAD_TARGET_BYTES_PER_SEC: u64 = 200 * 1024;
+const PRESIGNED_UPLOAD_URL_EXPIRY_SECS: u64 = 900;
+const PRESIGNED_UPLOAD_URL_SAFETY_MARGIN_SECS: u64 = 30;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
 pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 
@@ -259,7 +262,7 @@ async fn attempt_upload(
         .upload_presigned(
             &upload.upload_url,
             compressed_payload,
-            Duration::from_secs(PRESIGNED_UPLOAD_TIMEOUT_SECS),
+            presigned_upload_timeout(compressed_payload.len(), &upload.upload_url),
         )
         .await
         .map_err(|err| UploadAttemptError::Retryable(err.to_string()))?;
@@ -522,6 +525,30 @@ fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
+fn presigned_upload_timeout(payload_len: usize, upload_url: &str) -> Duration {
+    let payload_timeout_secs = (payload_len as u64).div_ceil(PRESIGNED_UPLOAD_TARGET_BYTES_PER_SEC);
+    let desired_timeout_secs = payload_timeout_secs.max(PRESIGNED_UPLOAD_TIMEOUT_SECS);
+    let max_timeout_secs = presigned_upload_max_timeout_secs(upload_url).unwrap_or(
+        PRESIGNED_UPLOAD_URL_EXPIRY_SECS.saturating_sub(PRESIGNED_UPLOAD_URL_SAFETY_MARGIN_SECS),
+    );
+    Duration::from_secs(desired_timeout_secs.min(max_timeout_secs).max(1))
+}
+
+fn presigned_upload_max_timeout_secs(upload_url: &str) -> Option<u64> {
+    let url = reqwest::Url::parse(upload_url).ok()?;
+    let expires_secs = url
+        .query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("X-Amz-Expires"))?
+        .1
+        .parse::<u64>()
+        .ok()?;
+    Some(
+        expires_secs
+            .saturating_sub(PRESIGNED_UPLOAD_URL_SAFETY_MARGIN_SECS)
+            .max(1),
+    )
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -593,6 +620,7 @@ pub(crate) mod test_support {
     use anyhow::{Context, Result};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
@@ -602,6 +630,7 @@ pub(crate) mod test_support {
         pub upload_url_statuses: Vec<u16>,
         pub upload_statuses: Vec<u16>,
         pub confirm_statuses: Vec<u16>,
+        pub upload_response_delay_ms: u64,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -617,6 +646,7 @@ pub(crate) mod test_support {
         upload_url_statuses: VecDeque<u16>,
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
+        upload_response_delay_ms: u64,
     }
 
     impl TestUploadServerState {
@@ -627,6 +657,7 @@ pub(crate) mod test_support {
                 upload_url_statuses: config.upload_url_statuses.into(),
                 upload_statuses: config.upload_statuses.into(),
                 confirm_statuses: config.confirm_statuses.into(),
+                upload_response_delay_ms: config.upload_response_delay_ms,
             }
         }
 
@@ -719,6 +750,7 @@ pub(crate) mod test_support {
         status: u16,
         content_type: &'static str,
         body: Vec<u8>,
+        delay_ms: u64,
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> Result<TestRequest> {
@@ -811,17 +843,21 @@ pub(crate) mod test_support {
                         status,
                         content_type: "application/json",
                         body,
+                        delay_ms: 0,
                     }
                 } else {
                     TestResponse {
                         status,
                         content_type: "text/plain",
                         body: format!("upload-url failed with {status}").into_bytes(),
+                        delay_ms: 0,
                     }
                 }
             }
             ("PUT", path) if path.starts_with("/uploads/") => {
-                let status = state.lock().expect("server state").next_upload_status();
+                let mut server_state = state.lock().expect("server state");
+                let status = server_state.next_upload_status();
+                let delay_ms = server_state.upload_response_delay_ms;
                 TestResponse {
                     status,
                     content_type: "text/plain",
@@ -830,6 +866,7 @@ pub(crate) mod test_support {
                     } else {
                         format!("upload failed with {status}").into_bytes()
                     },
+                    delay_ms,
                 }
             }
             ("POST", path) if path.starts_with("/api/sessions/") && path.ends_with("/confirm") => {
@@ -839,12 +876,14 @@ pub(crate) mod test_support {
                         status,
                         content_type: "application/json",
                         body: br#"{"status":"accepted"}"#.to_vec(),
+                        delay_ms: 0,
                     }
                 } else {
                     TestResponse {
                         status,
                         content_type: "text/plain",
                         body: format!("confirm failed with {status}").into_bytes(),
+                        delay_ms: 0,
                     }
                 }
             }
@@ -852,11 +891,15 @@ pub(crate) mod test_support {
                 status: 404,
                 content_type: "text/plain",
                 body: b"not found".to_vec(),
+                delay_ms: 0,
             },
         }
     }
 
     async fn write_http_response(stream: &mut TcpStream, response: TestResponse) -> Result<()> {
+        if response.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
+        }
         let status_text = match response.status {
             200 => "OK",
             401 => "Unauthorized",
@@ -986,6 +1029,31 @@ mod tests {
         record.repo_remote_url = None;
         let err = prepare_session_upload(record, "hello".to_string()).expect_err("missing remote");
         assert!(err.to_string().contains("missing repo remote URL"));
+    }
+
+    #[test]
+    fn presigned_upload_timeout_keeps_floor_for_small_payloads() {
+        let timeout =
+            presigned_upload_timeout(1024, "https://example.com/upload?X-Amz-Expires=900");
+        assert_eq!(timeout, Duration::from_secs(PRESIGNED_UPLOAD_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn presigned_upload_timeout_scales_for_large_payloads() {
+        let timeout = presigned_upload_timeout(
+            163 * 1024 * 1024,
+            "https://example.com/upload?X-Amz-Expires=900",
+        );
+        assert_eq!(timeout, Duration::from_secs(835));
+    }
+
+    #[test]
+    fn presigned_upload_timeout_caps_to_presigned_url_expiry() {
+        let timeout = presigned_upload_timeout(
+            512 * 1024 * 1024,
+            "https://example.com/upload?X-Amz-Expires=600",
+        );
+        assert_eq!(timeout, Duration::from_secs(570));
     }
 
     #[tokio::test]
@@ -1259,5 +1327,33 @@ mod tests {
                 confirms: 2,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn upload_presigned_reports_timeout_with_payload_details() {
+        let server = spawn_test_upload_server(TestUploadServerConfig {
+            upload_response_delay_ms: 200,
+            ..TestUploadServerConfig::default()
+        })
+        .await
+        .expect("spawn test server");
+        let client = ApiClient::new(&server.base_url);
+
+        let err = client
+            .upload_presigned(
+                &format!("{}/uploads/uid-1?X-Amz-Expires=900", server.base_url),
+                b"hello",
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("presigned upload timeout");
+
+        match err {
+            AuthenticatedRequestError::Network(message) => {
+                assert!(message.contains("timed out after 50ms"));
+                assert!(message.contains("5 bytes"));
+            }
+            other => panic!("expected network timeout, got {other:?}"),
+        }
     }
 }
