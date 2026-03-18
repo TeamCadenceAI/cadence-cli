@@ -95,6 +95,8 @@ pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
         apply_metadata_from_value(&mut metadata, &value);
     }
 
+    apply_metadata_from_path(&mut metadata, file).await;
+
     // Infer agent type from file path
     metadata.agent_type = Some(infer_agent_type(file));
 
@@ -249,6 +251,76 @@ fn parse_numeric_timestamp(value: &serde_json::Value) -> Option<i64> {
 async fn read_json_value(file: &Path) -> Option<serde_json::Value> {
     let content = tokio::fs::read_to_string(file).await.ok()?;
     serde_json::from_str(&content).ok()
+}
+
+async fn apply_metadata_from_path(metadata: &mut SessionMetadata, file: &Path) {
+    let is_claude_project_file = infer_agent_type(file) == AgentType::Claude
+        && file
+            .parent()
+            .and_then(|parent| parent.parent())
+            .and_then(|projects| projects.file_name())
+            .and_then(|name| name.to_str())
+            == Some("projects");
+
+    if metadata.session_id.is_none()
+        && is_claude_project_file
+        && let Some(id) = file.file_stem().and_then(|stem| stem.to_str())
+        && !id.is_empty()
+    {
+        metadata.session_id = Some(id.to_string());
+    }
+
+    if metadata.cwd.is_none()
+        && is_claude_project_file
+        && let Some(cwd) = infer_claude_project_cwd(file).await
+    {
+        metadata.cwd = Some(cwd);
+    }
+}
+
+async fn infer_claude_project_cwd(file: &Path) -> Option<String> {
+    let project_dir = file.parent()?;
+    let projects_dir = project_dir.parent()?;
+    let claude_dir = projects_dir.parent()?;
+    if projects_dir.file_name().and_then(|name| name.to_str()) != Some("projects")
+        || claude_dir.file_name().and_then(|name| name.to_str()) != Some(".claude")
+    {
+        return None;
+    }
+
+    let encoded = project_dir.file_name()?.to_str()?;
+    let decoded = decode_hyphenated_absolute_path(encoded).await?;
+    Some(decoded.to_string_lossy().to_string())
+}
+
+async fn decode_hyphenated_absolute_path(encoded: &str) -> Option<std::path::PathBuf> {
+    let trimmed = encoded.strip_prefix('-')?;
+    let tokens: Vec<&str> = trimmed
+        .split('-')
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut stack = vec![(std::path::PathBuf::from("/"), 0usize)];
+    while let Some((prefix, start_idx)) = stack.pop() {
+        if start_idx == tokens.len() {
+            return Some(prefix);
+        }
+
+        let mut next = Vec::new();
+        for end_idx in (start_idx + 1..=tokens.len()).rev() {
+            let segment = tokens[start_idx..end_idx].join("-");
+            let candidate = prefix.join(segment);
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                next.push((candidate, end_idx));
+            }
+        }
+        stack.extend(next);
+    }
+
+    None
 }
 
 fn parse_session_metadata_reader<R: BufRead>(
@@ -972,6 +1044,32 @@ also not json {{{{
         let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.agent_type, Some(AgentType::OpenCode));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_infers_claude_session_id_and_cwd_from_path() {
+        let dir = TempDir::new().unwrap();
+        let repo_root = dir.path().join("work").join("git-context-explorer");
+        tokio::fs::create_dir_all(&repo_root).await.unwrap();
+
+        let encoded = format!("-{}", repo_root.to_string_lossy().replace('/', "-"));
+        let claude_dir = dir.path().join(".claude").join("projects").join(encoded);
+        tokio::fs::create_dir_all(&claude_dir).await.unwrap();
+
+        let file = write_temp_file(
+            &claude_dir,
+            "042afd87-a800-4248-8234-5e9222dd6f22.jsonl",
+            "{}",
+        )
+        .await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(
+            metadata.session_id,
+            Some("042afd87-a800-4248-8234-5e9222dd6f22".to_string())
+        );
+        assert_eq!(metadata.cwd, Some(repo_root.to_string_lossy().to_string()));
     }
 
     #[tokio::test]

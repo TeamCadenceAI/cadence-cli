@@ -992,7 +992,10 @@ async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSession
         agents::SessionSource::File(path) => tokio::fs::read_to_string(path).await.ok()?,
         agents::SessionSource::Inline { content, .. } => content.clone(),
     };
-    let mut metadata = scanner::parse_session_metadata_str(&session_log);
+    let mut metadata = match &log.source {
+        agents::SessionSource::File(path) => scanner::parse_session_metadata(path).await,
+        agents::SessionSource::Inline { .. } => scanner::parse_session_metadata_str(&session_log),
+    };
     metadata.agent_type = Some(log.agent_type.clone());
     let session_start = scanner::session_time_range_str(&session_log).map(|(start, _)| start);
     Some(ParsedSessionLog {
