@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.0.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.5...v2.0.6) (2026-03-18)
+
+
+### Bug Fixes
+
+* **backfill:** recover Claude metadata from log paths ([d512d09](https://github.com/TeamCadenceAI/cadence-cli/commit/d512d097e9847289d3f1d546e9cee4beeeeafc2a))
+* **cursor:** ignore MCP metadata in project scans ([60dc3fe](https://github.com/TeamCadenceAI/cadence-cli/commit/60dc3febb3b706b44100bbfdcce66440535c6f01))
+* **scanner:** make Claude path recovery Windows-safe ([be70c3f](https://github.com/TeamCadenceAI/cadence-cli/commit/be70c3f658b115611e0ce69733bcf4bd74a93d00))
+* **scanner:** support Windows-safe Claude project names ([546cafa](https://github.com/TeamCadenceAI/cadence-cli/commit/546cafae2790021730feb1e257a3c84c762e62cf))
+
 ## [2.0.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.4...v2.0.5) (2026-03-18)
 
 
