@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.0.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.4...v2.0.5) (2026-03-18)
+
+
+### Bug Fixes
+
+* Uploading reliability + debugging improvements ([5344ad5](https://github.com/TeamCadenceAI/cadence-cli/commit/5344ad5e34545b6ed2707fc927f4fdcadbe852e2))
+* **upload:** normalize Windows test worktree paths ([dbd7046](https://github.com/TeamCadenceAI/cadence-cli/commit/dbd70469e0bfae0906116234f494c897d648f321))
+* **upload:** preserve pending replay across merge updates ([fc6b6f3](https://github.com/TeamCadenceAI/cadence-cli/commit/fc6b6f333c101b11ba9a298c0997800bf79ba37b))
+
 ## [2.0.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.3...v2.0.4) (2026-03-17)
 
 
