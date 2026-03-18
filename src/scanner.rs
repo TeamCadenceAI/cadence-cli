@@ -76,8 +76,9 @@ pub struct SessionMetadata {
 ///
 /// This is best-effort: not every line will be valid JSON, and not
 /// every JSON line will contain the fields we need. The function
-/// accumulates fields across all lines, with first-value-wins semantics
-/// (once a field is found, later occurrences are ignored).
+/// accumulates fields across all lines. `session_id` is first-value-wins,
+/// while `cwd` prefers the most recent direct cwd/workdir field so later
+/// worktree handoff records can override stale earlier values.
 pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
     let mut metadata = SessionMetadata::default();
     let content = match tokio::fs::read_to_string(file).await {
@@ -267,11 +268,6 @@ fn parse_session_metadata_reader<R: BufRead>(
         };
 
         apply_metadata_from_value(&mut metadata, &value);
-
-        // If we have both fields, stop early
-        if metadata.session_id.is_some() && metadata.cwd.is_some() {
-            break;
-        }
     }
 
     metadata
@@ -292,18 +288,19 @@ fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json:
     }
 
     // Extract cwd / workdir (top-level or nested under payload for Codex)
-    if metadata.cwd.is_none()
-        && let Some(cwd) = value
-            .get("cwd")
-            .or_else(|| value.get("workdir"))
-            .or_else(|| value.get("working_directory"))
-            .or_else(|| value.get("directory"))
-            .or_else(|| value.get("workspaceDirectory"))
-            .or_else(|| value.get("workspacePath"))
-            .or_else(|| value.pointer("/payload/cwd"))
-            .and_then(|v| v.as_str())
+    let mut saw_direct_cwd = false;
+    if let Some(cwd) = value
+        .get("cwd")
+        .or_else(|| value.get("workdir"))
+        .or_else(|| value.get("working_directory"))
+        .or_else(|| value.get("directory"))
+        .or_else(|| value.get("workspaceDirectory"))
+        .or_else(|| value.get("workspacePath"))
+        .or_else(|| value.pointer("/payload/cwd"))
+        .and_then(|v| v.as_str())
     {
         metadata.cwd = Some(cwd.to_string());
+        saw_direct_cwd = true;
     }
 
     if metadata.session_id.is_none()
@@ -319,9 +316,7 @@ fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json:
         metadata.session_id = Some(id.to_string());
     }
 
-    if metadata.cwd.is_none()
-        && let Some(path) = extract_cwd_from_value(value)
-    {
+    if !saw_direct_cwd && let Some(path) = extract_cwd_from_value(value) {
         metadata.cwd = Some(path);
     }
 }
@@ -993,6 +988,33 @@ also not json {{{{
         assert_eq!(metadata.session_id, Some("first-id".to_string()));
     }
 
+    #[tokio::test]
+    async fn test_parse_metadata_last_cwd_wins() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"{"session_id":"session-1","cwd":"/tmp/first"}
+{"cwd":"/tmp/second"}
+"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("session-1".to_string()));
+        assert_eq!(metadata.cwd, Some("/tmp/second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_direct_cwd_beats_nested_payload_path_in_same_event() {
+        let dir = TempDir::new().unwrap();
+        let content =
+            r#"{"sessionId":"session-1","cwd":"/top/level","payload":{"cwd":"/payload/path"}}"#;
+        let file = write_temp_file(dir.path(), "session.jsonl", content).await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.session_id, Some("session-1".to_string()));
+        assert_eq!(metadata.cwd, Some("/top/level".to_string()));
+    }
+
     // -----------------------------------------------------------------------
     // parse_session_metadata_str
     // -----------------------------------------------------------------------
@@ -1066,9 +1088,8 @@ also not json {{{{
     }
 
     #[tokio::test]
-    async fn test_parse_metadata_top_level_takes_priority_over_payload() {
+    async fn test_parse_metadata_last_cwd_across_lines_wins_over_earlier_top_level() {
         let dir = TempDir::new().unwrap();
-        // Both top-level and payload fields present -- top-level wins (first-value-wins)
         let content = r#"{"session_id":"top-level-id","cwd":"/top/level"}
 {"type":"session_meta","payload":{"id":"payload-id","cwd":"/payload/path"}}
 "#;
@@ -1077,7 +1098,7 @@ also not json {{{{
         let metadata = parse_session_metadata(&file).await;
 
         assert_eq!(metadata.session_id, Some("top-level-id".to_string()));
-        assert_eq!(metadata.cwd, Some("/top/level".to_string()));
+        assert_eq!(metadata.cwd, Some("/payload/path".to_string()));
     }
 
     // -----------------------------------------------------------------------

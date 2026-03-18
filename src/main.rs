@@ -1,12 +1,12 @@
 mod agents;
 mod api_client;
-mod backfill_log;
 mod config;
 mod git;
 mod login;
 mod note;
 mod output;
 mod scanner;
+mod tracing;
 mod update;
 mod upload;
 mod upload_cursor;
@@ -673,6 +673,18 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     let _activity_lock = update::acquire_activity_lock_blocking("hook-post-commit")
         .await
         .map_err(HookError::Soft)?;
+    let _diagnostics_session = match tracing::DiagnosticsLogger::new("hook").await {
+        Ok(logger) => {
+            if let Some(path) = logger.path() {
+                output::detail(&format!("Hook trace: {}", path.display()));
+            }
+            Some(tracing::install_global(logger))
+        }
+        Err(err) => {
+            output::detail(&format!("Hook trace unavailable: {err}"));
+            None
+        }
+    };
 
     // Step 1: Get repo root
     let repo_root = git::repo_root().await?;
@@ -688,6 +700,11 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     let upload_context = upload::resolve_upload_context(api_url_override())
         .await
         .map_err(HookError::Soft)?;
+    ::tracing::info!(
+        event = "hook_post_commit_started",
+        repo_root = repo_root_str.as_str(),
+        has_token = upload_context.has_token()
+    );
     let pending_summary =
         upload::process_pending_uploads(&upload_context, upload::DEFAULT_PENDING_UPLOADS_PER_RUN)
             .await
@@ -713,14 +730,29 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
     }
     if output::is_verbose() {
         output::detail(&format!(
-            "uploaded={} queued={} skipped={} issues={} retried_pending={}",
+            "uploaded={} queued={} skipped={} issues={} retried_pending={} dropped_pending={}",
             stats.uploaded,
             stats.queued,
             stats.skipped,
             stats.issues,
-            pending_summary.uploaded + pending_summary.already_existed
+            pending_summary.uploaded + pending_summary.already_existed,
+            pending_summary.dropped_permanent,
         ));
     }
+    ::tracing::info!(
+        event = "hook_post_commit_completed",
+        repo_root = repo_root_str.as_str(),
+        uploaded = stats.uploaded,
+        queued = stats.queued,
+        skipped = stats.skipped,
+        issues = stats.issues,
+        pending_attempted = pending_summary.attempted,
+        pending_uploaded = pending_summary.uploaded,
+        pending_already_existed = pending_summary.already_existed,
+        pending_skipped_repo_not_associated = pending_summary.skipped_repo_not_associated,
+        pending_dropped_permanent = pending_summary.dropped_permanent,
+        pending_auth_required = pending_summary.auth_required
+    );
 
     Ok(())
 }
@@ -813,7 +845,7 @@ fn apply_incremental_upload_outcome(
             );
             true
         }
-        UploadFromLogOutcome::Queued => {
+        UploadFromLogOutcome::Queued(_) => {
             stats.queued += 1;
             *cursor_advance = advance_cursor_for_disposition(
                 cursor_advance,
@@ -1019,7 +1051,7 @@ enum UploadFromLogOutcome {
     Uploaded,
     AlreadyExists,
     SkippedRepoNotAssociated,
-    Queued,
+    Queued(String),
     Retryable(String),
 }
 
@@ -1091,7 +1123,9 @@ async fn upload_session_from_log(
             )
             .await
             {
-                Ok(()) => UploadFromLogOutcome::Queued,
+                Ok(()) => {
+                    UploadFromLogOutcome::Queued("repo has no attached git branch".to_string())
+                }
                 Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
             };
         }
@@ -1126,7 +1160,9 @@ async fn upload_session_from_log(
             )
             .await
             {
-                Ok(()) => UploadFromLogOutcome::Queued,
+                Ok(()) => UploadFromLogOutcome::Queued(
+                    "repo HEAD commit could not be resolved".to_string(),
+                ),
                 Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
             };
         }
@@ -1163,7 +1199,7 @@ async fn upload_session_from_log(
         )
         .await
         {
-            Ok(()) => UploadFromLogOutcome::Queued,
+            Ok(()) => UploadFromLogOutcome::Queued("repo has no push remote URL".to_string()),
             Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
         };
     }
@@ -1179,7 +1215,7 @@ async fn upload_session_from_log(
         Ok(upload::LiveUploadOutcome::SkippedRepoNotAssociated) => {
             UploadFromLogOutcome::SkippedRepoNotAssociated
         }
-        Ok(upload::LiveUploadOutcome::Queued) => UploadFromLogOutcome::Queued,
+        Ok(upload::LiveUploadOutcome::Queued { reason }) => UploadFromLogOutcome::Queued(reason),
         Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
     }
 }
@@ -1222,7 +1258,10 @@ async fn upload_incremental_sessions_for_repo(
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
             cached.clone()
         } else {
-            let resolved = git::repo_root_at(std::path::Path::new(&cwd)).await.ok();
+            let resolved = git::resolve_repo_root_with_fallbacks(std::path::Path::new(&cwd))
+                .await
+                .ok()
+                .map(|resolution| resolution.repo_root);
             repo_root_cache.insert(cwd.clone(), resolved.clone());
             resolved
         };
@@ -1407,7 +1446,6 @@ async fn process_repo_backfill(
     sessions: Vec<SessionInfo>,
     upload_context: Arc<upload::UploadContext>,
     repo_progress: Option<ProgressBar>,
-    backfill_logger: backfill_log::BackfillLogger,
 ) -> RepoBackfillStats {
     let mut stats = RepoBackfillStats::default();
     let planned_units: u64 = (sessions.len() as u64).max(1);
@@ -1419,12 +1457,10 @@ async fn process_repo_backfill(
     let repo_root = match sessions.first() {
         Some(session) => session.repo_root.clone(),
         None => {
-            backfill_logger.event(
-                "repo_skipped",
-                serde_json::json!({
-                    "repo_display": repo_display.as_str(),
-                    "reason": "no_sessions",
-                }),
+            ::tracing::info!(
+                event = "repo_skipped",
+                repo_display = repo_display.as_str(),
+                reason = "no_sessions"
             );
             if let Some(pb) = &repo_progress {
                 pb.finish_with_message("no sessions");
@@ -1433,28 +1469,33 @@ async fn process_repo_backfill(
         }
     };
     let repo_root_str = repo_root.to_string_lossy().to_string();
+    let unique_repo_roots = sessions
+        .iter()
+        .map(|session| session.repo_root.to_string_lossy().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
 
-    backfill_logger.event(
-        "repo_started",
-        serde_json::json!({
-            "repo_display": repo_display.as_str(),
-            "repo_root": repo_root_str.as_str(),
-            "sessions": sessions.len(),
-            "planned_units": planned_units,
-            "upload_mode": "direct",
-        }),
+    ::tracing::info!(
+        event = "repo_started",
+        repo_display = repo_display.as_str(),
+        repo_root = repo_root_str.as_str(),
+        alternative_repo_roots = ?unique_repo_roots
+            .iter()
+            .filter(|root| root.as_str() != repo_root_str.as_str())
+            .cloned()
+            .collect::<Vec<_>>(),
+        sessions = sessions.len(),
+        planned_units,
+        upload_mode = "direct"
     );
 
     match git::repo_matches_org_filter(&repo_root).await {
         Ok(true) => {}
         Ok(false) => {
-            backfill_logger.event(
-                "repo_skipped",
-                serde_json::json!({
-                    "repo_display": repo_display.as_str(),
-                    "repo_root": repo_root_str.as_str(),
-                    "reason": "org_filter",
-                }),
+            ::tracing::info!(
+                event = "repo_skipped",
+                repo_display = repo_display.as_str(),
+                repo_root = repo_root_str.as_str(),
+                reason = "org_filter"
             );
             if let Some(pb) = &repo_progress {
                 pb.finish_with_message("skipped (org filter)");
@@ -1464,14 +1505,12 @@ async fn process_repo_backfill(
         Err(e) => {
             output::detail(&format!("{}: org filter check failed: {}", repo_display, e));
             stats.errors += 1;
-            backfill_logger.event(
-                "repo_error",
-                serde_json::json!({
-                    "repo_display": repo_display.as_str(),
-                    "repo_root": repo_root_str.as_str(),
-                    "stage": "org_filter_check",
-                    "error": e.to_string(),
-                }),
+            ::tracing::warn!(
+                event = "repo_error",
+                repo_display = repo_display.as_str(),
+                repo_root = repo_root_str.as_str(),
+                stage = "org_filter_check",
+                error = e.to_string()
             );
             if let Some(pb) = &repo_progress {
                 pb.finish_with_message("error (org filter)");
@@ -1482,13 +1521,11 @@ async fn process_repo_backfill(
 
     let repo_enabled = git::check_enabled_at(&repo_root).await;
     if !repo_enabled {
-        backfill_logger.event(
-            "repo_skipped",
-            serde_json::json!({
-                "repo_display": repo_display.as_str(),
-                "repo_root": repo_root_str.as_str(),
-                "reason": "disabled",
-            }),
+        ::tracing::info!(
+            event = "repo_skipped",
+            repo_display = repo_display.as_str(),
+            repo_root = repo_root_str.as_str(),
+            reason = "disabled"
         );
         if let Some(pb) = &repo_progress {
             pb.finish_with_message("skipped (disabled)");
@@ -1504,31 +1541,27 @@ async fn process_repo_backfill(
             .agent_type
             .clone()
             .unwrap_or(scanner::AgentType::Claude);
-        backfill_logger.event(
-            "repo_session_started",
-            serde_json::json!({
-                "repo_display": repo_display.as_str(),
-                "repo_root": repo_root_str.as_str(),
-                "session_id": session.session_id.as_str(),
-                "file": session_file,
-                "agent": agent_type.to_string(),
-            }),
+        ::tracing::info!(
+            event = "repo_session_started",
+            repo_display = repo_display.as_str(),
+            repo_root = repo_root_str.as_str(),
+            session_id = session.session_id.as_str(),
+            file = session_file.as_str(),
+            agent = agent_type.to_string()
         );
 
         let session_log = match session_log_content_async(&session.log).await {
             Some(content) => content,
             None => {
                 stats.errors += 1;
-                backfill_logger.event(
-                    "session_error",
-                    serde_json::json!({
-                        "repo_display": repo_display.as_str(),
-                        "repo_root": repo_root_str.as_str(),
-                        "session_id": session.session_id.as_str(),
-                        "file": session.log.source_label(),
-                        "stage": "read_session_log",
-                        "error": "failed to read session log",
-                    }),
+                ::tracing::warn!(
+                    event = "session_error",
+                    repo_display = repo_display.as_str(),
+                    repo_root = repo_root_str.as_str(),
+                    session_id = session.session_id.as_str(),
+                    file = session.log.source_label(),
+                    stage = "read_session_log",
+                    error = "failed to read session log"
                 );
                 if let Some(pb) = &repo_progress {
                     pb.inc(1);
@@ -1552,43 +1585,54 @@ async fn process_repo_backfill(
         {
             UploadFromLogOutcome::Uploaded => {
                 stats.uploaded += 1;
-                backfill_logger.event(
-                    "session_uploaded",
-                    serde_json::json!({
-                        "repo_display": repo_display.as_str(),
-                        "repo_root": repo_root_str.as_str(),
-                        "session_id": session.session_id.as_str(),
-                        "file": session.log.source_label(),
-                    }),
+                ::tracing::info!(
+                    event = "session_uploaded",
+                    repo_display = repo_display.as_str(),
+                    repo_root = repo_root_str.as_str(),
+                    session_id = session.session_id.as_str(),
+                    file = session.log.source_label()
                 );
             }
-            UploadFromLogOutcome::Queued => {
+            UploadFromLogOutcome::Queued(reason) => {
                 stats.queued += 1;
-                backfill_logger.event(
-                    "session_queued",
-                    serde_json::json!({
-                        "repo_display": repo_display.as_str(),
-                        "repo_root": repo_root_str.as_str(),
-                        "session_id": session.session_id.as_str(),
-                        "file": session.log.source_label(),
-                    }),
+                ::tracing::info!(
+                    event = "session_queued",
+                    repo_display = repo_display.as_str(),
+                    repo_root = repo_root_str.as_str(),
+                    session_id = session.session_id.as_str(),
+                    file = session.log.source_label(),
+                    reason
                 );
             }
-            UploadFromLogOutcome::AlreadyExists
-            | UploadFromLogOutcome::SkippedRepoNotAssociated => {
+            UploadFromLogOutcome::AlreadyExists => {
                 stats.skipped += 1;
+                ::tracing::info!(
+                    event = "session_skipped_already_exists",
+                    repo_display = repo_display.as_str(),
+                    repo_root = repo_root_str.as_str(),
+                    session_id = session.session_id.as_str(),
+                    file = session.log.source_label()
+                );
+            }
+            UploadFromLogOutcome::SkippedRepoNotAssociated => {
+                stats.skipped += 1;
+                ::tracing::info!(
+                    event = "session_skipped_repo_not_associated",
+                    repo_display = repo_display.as_str(),
+                    repo_root = repo_root_str.as_str(),
+                    session_id = session.session_id.as_str(),
+                    file = session.log.source_label()
+                );
             }
             UploadFromLogOutcome::Retryable(error) => {
                 stats.errors += 1;
-                backfill_logger.event(
-                    "session_upload_error",
-                    serde_json::json!({
-                        "repo_display": repo_display.as_str(),
-                        "repo_root": repo_root_str.as_str(),
-                        "session_id": session.session_id.as_str(),
-                        "file": session.log.source_label(),
-                        "error": error,
-                    }),
+                ::tracing::warn!(
+                    event = "session_upload_error",
+                    repo_display = repo_display.as_str(),
+                    repo_root = repo_root_str.as_str(),
+                    session_id = session.session_id.as_str(),
+                    file = session.log.source_label(),
+                    error
                 );
             }
         }
@@ -1608,17 +1652,15 @@ async fn process_repo_backfill(
         ));
     }
 
-    backfill_logger.event(
-        "repo_completed",
-        serde_json::json!({
-            "repo_display": repo_display.as_str(),
-            "repo_root": repo_root_str.as_str(),
-            "sessions_seen": stats.sessions_seen,
-            "uploaded": stats.uploaded,
-            "queued": stats.queued,
-            "skipped": stats.skipped,
-            "errors": stats.errors,
-        }),
+    ::tracing::info!(
+        event = "repo_completed",
+        repo_display = repo_display.as_str(),
+        repo_root = repo_root_str.as_str(),
+        sessions_seen = stats.sessions_seen,
+        uploaded = stats.uploaded,
+        queued = stats.queued,
+        skipped = stats.skipped,
+        errors = stats.errors
     );
 
     stats
@@ -1633,20 +1675,69 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let backfill_logger = match backfill_log::BackfillLogger::new().await {
+    let _diagnostics_session = match tracing::DiagnosticsLogger::new("backfill").await {
         Ok(logger) => {
             if let Some(path) = logger.path() {
-                output::detail(&format!("Backfill diagnostics: {}", path.display()));
+                output::detail(&format!("Backfill trace: {}", path.display()));
             }
-            logger
+            Some(tracing::install_global(logger))
         }
         Err(e) => {
-            output::detail(&format!("Backfill diagnostics unavailable: {e}"));
-            backfill_log::BackfillLogger::disabled()
+            output::detail(&format!("Backfill trace unavailable: {e}"));
+            None
         }
     };
 
     let upload_context = Arc::new(upload::resolve_upload_context(api_url_override()).await?);
+    let pending_to_drain = match repo_filter {
+        Some(filter) => upload::pending_upload_count_for_repo(filter)
+            .await
+            .unwrap_or(0),
+        None => upload::pending_upload_count().await.unwrap_or(0),
+    };
+    ::tracing::info!(
+        event = "pending_upload_drain_started",
+        pending_records = pending_to_drain
+    );
+    let pending_summary = match repo_filter {
+        Some(filter) => {
+            match upload::process_pending_uploads_for_repo(
+                &upload_context,
+                pending_to_drain,
+                filter,
+            )
+            .await
+            {
+                Ok(summary) => summary,
+                Err(err) => {
+                    ::tracing::warn!(
+                        event = "pending_upload_drain_error",
+                        error = err.to_string()
+                    );
+                    upload::PendingUploadSummary::default()
+                }
+            }
+        }
+        None => match upload::process_pending_uploads(&upload_context, pending_to_drain).await {
+            Ok(summary) => summary,
+            Err(err) => {
+                ::tracing::warn!(
+                    event = "pending_upload_drain_error",
+                    error = err.to_string()
+                );
+                upload::PendingUploadSummary::default()
+            }
+        },
+    };
+    ::tracing::info!(
+        event = "pending_upload_drain_completed",
+        attempted = pending_summary.attempted,
+        uploaded = pending_summary.uploaded,
+        already_existed = pending_summary.already_existed,
+        skipped_repo_not_associated = pending_summary.skipped_repo_not_associated,
+        dropped_permanent = pending_summary.dropped_permanent,
+        auth_required = pending_summary.auth_required
+    );
 
     let use_progress = output::is_stderr_tty();
     let spinner = if use_progress {
@@ -1663,26 +1754,23 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         None
     };
 
-    backfill_logger.event(
-        "backfill_started",
-        serde_json::json!({
-            "cli_version": env!("CARGO_PKG_VERSION"),
-            "since": since,
-            "since_secs": since_secs,
-            "since_days": since_days,
-            "upload_mode": "direct",
-            "repo_filter": repo_filter.map(|p| p.to_string_lossy().to_string()),
-            "use_progress": use_progress,
-        }),
+    ::tracing::info!(
+        event = "backfill_started",
+        cli_version = env!("CARGO_PKG_VERSION"),
+        since,
+        since_secs,
+        since_days,
+        upload_mode = "direct",
+        repo_filter = ?repo_filter.map(|p| p.to_string_lossy().to_string()),
+        use_progress,
+        pending_drain_attempted = pending_summary.attempted
     );
 
     // Step 2: Find all session files modified within the --since window
-    backfill_logger.event(
-        "scan_recent_files_started",
-        serde_json::json!({
-            "now_epoch": now,
-            "since_secs": since_secs,
-        }),
+    ::tracing::info!(
+        event = "scan_recent_files_started",
+        now_epoch = now,
+        since_secs
     );
     let files = agents::discover_recent_sessions(now, since_secs).await;
     if let Some(pb) = spinner {
@@ -1696,12 +1784,10 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         let agent = file.agent_type.to_string();
         *agent_counts.entry(agent).or_insert(0) += 1;
     }
-    backfill_logger.event(
-        "scan_recent_files_completed",
-        serde_json::json!({
-            "files_found": files.len(),
-            "agent_counts": agent_counts,
-        }),
+    ::tracing::info!(
+        event = "scan_recent_files_completed",
+        files_found = files.len(),
+        agent_counts = ?agent_counts
     );
     if !files.is_empty() {
         let summary = agent_counts
@@ -1719,7 +1805,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     let mut errors = 0usize;
     let mut sessions_by_repo: std::collections::BTreeMap<String, Vec<SessionInfo>> =
         std::collections::BTreeMap::new();
-    let mut repo_root_cache: std::collections::HashMap<String, std::path::PathBuf> =
+    let mut repo_root_cache: std::collections::HashMap<String, git::RepoRootResolution> =
         std::collections::HashMap::new();
     let mut repo_display_cache: std::collections::HashMap<std::path::PathBuf, String> =
         std::collections::HashMap::new();
@@ -1743,12 +1829,10 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
         if metadata.session_id.is_none() && metadata.cwd.is_none() {
-            backfill_logger.event(
-                "session_discovery_skipped",
-                serde_json::json!({
-                    "file": file_path.as_str(),
-                    "reason": "missing_session_metadata",
-                }),
+            ::tracing::info!(
+                event = "session_discovery_skipped",
+                file = file_path.as_str(),
+                reason = "missing_session_metadata"
             );
             if let Some(ref pb) = progress {
                 pb.inc(1);
@@ -1760,13 +1844,11 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         let cwd = match &metadata.cwd {
             Some(c) => c.clone(),
             None => {
-                backfill_logger.event(
-                    "session_discovery_skipped",
-                    serde_json::json!({
-                        "file": file_path.as_str(),
-                        "session_id": metadata.session_id,
-                        "reason": "missing_cwd",
-                    }),
+                ::tracing::info!(
+                    event = "session_discovery_skipped",
+                    file = file_path.as_str(),
+                    session_id = ?metadata.session_id,
+                    reason = "missing_cwd"
                 );
                 if let Some(ref pb) = progress {
                     pb.inc(1);
@@ -1775,22 +1857,38 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             }
         };
 
-        let repo_root = if let Some(cached) = repo_root_cache.get(&cwd) {
+        let repo_resolution = if let Some(cached) = repo_root_cache.get(&cwd) {
             cached.clone()
         } else {
             let cwd_path = std::path::Path::new(&cwd);
-            let resolved = match git::repo_root_at(cwd_path).await {
-                Ok(r) => r,
-                Err(e) => {
-                    backfill_logger.event(
-                        "session_discovery_skipped",
-                        serde_json::json!({
-                            "file": file_path.as_str(),
-                            "session_id": metadata.session_id,
-                            "cwd": cwd,
-                            "reason": "repo_root_lookup_failed",
-                            "error": e.to_string(),
-                        }),
+            let resolved = match git::resolve_repo_root_with_fallbacks(cwd_path).await {
+                Ok(resolution) => resolution,
+                Err(diagnostics) => {
+                    ::tracing::warn!(
+                        event = "session_discovery_skipped",
+                        file = file_path.as_str(),
+                        session_id = ?metadata.session_id,
+                        cwd = cwd.as_str(),
+                        requested_cwd = diagnostics.requested_cwd.to_string_lossy().to_string(),
+                        reason = "repo_root_lookup_failed",
+                        error = ?diagnostics.direct_error,
+                        cwd_exists = diagnostics.cwd_exists,
+                        nearest_existing_ancestor = ?diagnostics
+                            .nearest_existing_ancestor
+                            .map(|path| path.to_string_lossy().to_string()),
+                        ancestor_error = ?diagnostics.ancestor_error,
+                        candidate_repo_names = ?diagnostics.candidate_repo_names,
+                        candidate_owner_repo_roots = ?diagnostics
+                            .candidate_owner_repo_roots
+                            .into_iter()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .collect::<Vec<_>>(),
+                        matched_worktree_owner_repo_root = ?diagnostics
+                            .matched_worktree_owner_repo_root
+                            .map(|path| path.to_string_lossy().to_string()),
+                        matched_worktree_path = ?diagnostics
+                            .matched_worktree_path
+                            .map(|path| path.to_string_lossy().to_string()),
                     );
                     if let Some(ref pb) = progress {
                         pb.inc(1);
@@ -1801,21 +1899,27 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             repo_root_cache.insert(cwd.clone(), resolved.clone());
             resolved
         };
+        let repo_root = repo_resolution.repo_root.clone();
 
         // If a repo filter is set, skip sessions that don't match.
         if let Some(filter) = repo_filter
             && repo_root != filter
         {
-            backfill_logger.event(
-                "session_discovery_skipped",
-                serde_json::json!({
-                    "file": file_path.as_str(),
-                    "session_id": metadata.session_id,
-                    "cwd": cwd,
-                    "repo_root": repo_root.to_string_lossy(),
-                    "reason": "repo_filter_mismatch",
-                    "repo_filter": filter.to_string_lossy(),
-                }),
+            ::tracing::info!(
+                event = "session_discovery_skipped",
+                file = file_path.as_str(),
+                session_id = ?metadata.session_id,
+                cwd = cwd.as_str(),
+                repo_root = repo_root.to_string_lossy().to_string(),
+                resolved_via = ?repo_resolution.diagnostics.resolved_via,
+                alternative_repo_roots = ?repo_resolution
+                    .diagnostics
+                    .alternative_repo_roots
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+                reason = "repo_filter_mismatch",
+                repo_filter = filter.to_string_lossy().to_string()
             );
             if let Some(ref pb) = progress {
                 pb.inc(1);
@@ -1836,14 +1940,12 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             let resolved = match git::first_remote_url_at(&repo_root).await {
                 Ok(Some(url)) => url,
                 Err(e) => {
-                    backfill_logger.event(
-                        "repo_display_fallback",
-                        serde_json::json!({
-                            "file": file_path.as_str(),
-                            "session_id": session_id.as_str(),
-                            "repo_root": repo_root.to_string_lossy(),
-                            "error": e.to_string(),
-                        }),
+                    ::tracing::warn!(
+                        event = "repo_display_fallback",
+                        file = file_path.as_str(),
+                        session_id = session_id.as_str(),
+                        repo_root = repo_root.to_string_lossy().to_string(),
+                        error = e.to_string()
                     );
                     repo_root
                         .file_name()
@@ -1864,16 +1966,21 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
             .clone()
             .unwrap_or(scanner::AgentType::Claude)
             .to_string();
-        backfill_logger.event(
-            "session_enqueued",
-            serde_json::json!({
-                "file": file_path.as_str(),
-                "session_id": session_id.as_str(),
-                "cwd": cwd,
-                "repo_root": repo_root.to_string_lossy(),
-                "repo_display": repo_display.as_str(),
-                "agent": agent_label,
-            }),
+        ::tracing::info!(
+            event = "session_enqueued",
+            file = file_path.as_str(),
+            session_id = session_id.as_str(),
+            cwd = cwd.as_str(),
+            repo_root = repo_root.to_string_lossy().to_string(),
+            repo_display = repo_display.as_str(),
+            agent = agent_label,
+            resolved_via = ?repo_resolution.diagnostics.resolved_via,
+            alternative_repo_roots = ?repo_resolution
+                .diagnostics
+                .alternative_repo_roots
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
         );
 
         sessions_by_repo
@@ -1901,13 +2008,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut join_set = tokio::task::JoinSet::new();
     let multi = use_progress.then(MultiProgress::new);
-    backfill_logger.event(
-        "repo_workers_started",
-        serde_json::json!({
-            "total_repos": total_repos,
-            "concurrency": concurrency,
-        }),
-    );
+    ::tracing::info!(event = "repo_workers_started", total_repos, concurrency);
     if let Some(mp) = &multi {
         mp.set_draw_target(ProgressDrawTarget::stderr());
         mp.set_move_cursor(true);
@@ -1916,12 +2017,10 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     for (repo_display, sessions) in sessions_by_repo {
         let permit = semaphore.clone().acquire_owned().await?;
         let upload_context = Arc::clone(&upload_context);
-        backfill_logger.event(
-            "repo_worker_queued",
-            serde_json::json!({
-                "repo_display": repo_display.as_str(),
-                "sessions": sessions.len(),
-            }),
+        ::tracing::info!(
+            event = "repo_worker_queued",
+            repo_display = repo_display.as_str(),
+            sessions = sessions.len()
         );
         let per_repo_bar = if let Some(mp) = &multi {
             let total_units: u64 = (sessions.len() as u64).max(1);
@@ -1944,18 +2043,10 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         } else {
             None
         };
-        let backfill_logger = backfill_logger.clone();
         join_set.spawn(async move {
             let _permit = permit;
             Ok::<RepoBackfillStats, tokio::task::JoinError>(
-                process_repo_backfill(
-                    repo_display,
-                    sessions,
-                    upload_context,
-                    per_repo_bar,
-                    backfill_logger,
-                )
-                .await,
+                process_repo_backfill(repo_display, sessions, upload_context, per_repo_bar).await,
             )
         });
     }
@@ -1967,36 +2058,24 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
                 queued += repo_stats.queued;
                 skipped += repo_stats.skipped;
                 errors += repo_stats.errors;
-                backfill_logger.event(
-                    "repo_worker_result",
-                    serde_json::json!({
-                        "uploaded": repo_stats.uploaded,
-                        "queued": repo_stats.queued,
-                        "sessions_seen": repo_stats.sessions_seen,
-                        "skipped": repo_stats.skipped,
-                        "errors": repo_stats.errors,
-                    }),
+                ::tracing::info!(
+                    event = "repo_worker_result",
+                    uploaded = repo_stats.uploaded,
+                    queued = repo_stats.queued,
+                    sessions_seen = repo_stats.sessions_seen,
+                    skipped = repo_stats.skipped,
+                    errors = repo_stats.errors
                 );
             }
             Ok(Err(e)) => {
                 errors += 1;
                 output::detail(&format!("repo worker failed: {}", e));
-                backfill_logger.event(
-                    "repo_worker_error",
-                    serde_json::json!({
-                        "error": e.to_string(),
-                    }),
-                );
+                ::tracing::warn!(event = "repo_worker_error", error = e.to_string());
             }
             Err(e) => {
                 errors += 1;
                 output::detail(&format!("repo task join failed: {}", e));
-                backfill_logger.event(
-                    "repo_worker_join_error",
-                    serde_json::json!({
-                        "error": e.to_string(),
-                    }),
-                );
+                ::tracing::warn!(event = "repo_worker_join_error", error = e.to_string());
             }
         }
     }
@@ -2023,16 +2102,20 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
         },
     )
     .await;
-    backfill_logger.event(
-        "backfill_completed",
-        serde_json::json!({
-            "uploaded": uploaded,
-            "queued": queued,
-            "skipped": skipped,
-            "errors": errors,
-            "repos_scanned": total_repos,
-            "since_days": since_days,
-        }),
+    ::tracing::info!(
+        event = "backfill_completed",
+        uploaded,
+        queued,
+        skipped,
+        errors,
+        repos_scanned = total_repos,
+        since_days,
+        pending_attempted = pending_summary.attempted,
+        pending_uploaded = pending_summary.uploaded,
+        pending_already_existed = pending_summary.already_existed,
+        pending_skipped_repo_not_associated = pending_summary.skipped_repo_not_associated,
+        pending_dropped_permanent = pending_summary.dropped_permanent,
+        pending_auth_required = pending_summary.auth_required
     );
     if !upload_context.has_token() && queued > 0 {
         output::note("Run `cadence login` to upload queued AI sessions.");
@@ -2781,6 +2864,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -2840,6 +2924,54 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var(self.key, value) },
                 None => unsafe { std::env::remove_var(self.key) },
             }
+        }
+    }
+
+    async fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
+        let content = tokio::fs::read_to_string(path).await.expect("read jsonl");
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("json row"))
+            .collect()
+    }
+
+    fn event_names(rows: &[Value]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| {
+                row.pointer("/fields/event")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect()
+    }
+
+    fn sample_inline_session(
+        repo_root: &std::path::Path,
+        label: &str,
+        session_id: &str,
+    ) -> SessionInfo {
+        let content = format!(
+            "{{\"sessionId\":\"{session_id}\",\"cwd\":\"{}\",\"message\":\"hello\"}}\n",
+            repo_root.to_string_lossy()
+        );
+        let mut metadata = scanner::parse_session_metadata_str(&content);
+        metadata.cwd = Some(repo_root.to_string_lossy().to_string());
+        metadata.session_id = Some(session_id.to_string());
+        metadata.agent_type = Some(scanner::AgentType::Claude);
+
+        SessionInfo {
+            log: agents::SessionLog {
+                agent_type: scanner::AgentType::Claude,
+                source: agents::SessionSource::Inline {
+                    label: label.to_string(),
+                    content,
+                },
+                updated_at: Some(1_707_526_800),
+            },
+            session_id: session_id.to_string(),
+            repo_root: repo_root.to_path_buf(),
+            metadata,
         }
     }
 
@@ -3040,15 +3172,19 @@ mod tests {
 
     #[test]
     fn install_auto_update_ftue_state_matches_config() {
-        let mut enabled = config::CliConfig::default();
-        enabled.auto_update = Some(true);
+        let enabled = config::CliConfig {
+            auto_update: Some(true),
+            ..config::CliConfig::default()
+        };
         assert_eq!(
             install_auto_update_ftue_state(&enabled),
             InstallAutoUpdateFtueState::Disclosure
         );
 
-        let mut disabled = config::CliConfig::default();
-        disabled.auto_update = Some(false);
+        let disabled = config::CliConfig {
+            auto_update: Some(false),
+            ..config::CliConfig::default()
+        };
         assert_eq!(
             install_auto_update_ftue_state(&disabled),
             InstallAutoUpdateFtueState::Skip
@@ -3077,8 +3213,10 @@ mod tests {
     async fn install_auto_update_disclosure_skips_prompt_when_enabled() {
         let dir = TempDir::new().expect("tempdir");
         let config_path = dir.path().join("config.toml");
-        let mut cfg = config::CliConfig::default();
-        cfg.auto_update = Some(true);
+        let cfg = config::CliConfig {
+            auto_update: Some(true),
+            ..config::CliConfig::default()
+        };
 
         run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
 
@@ -3089,8 +3227,10 @@ mod tests {
     async fn install_auto_update_respects_explicit_disable() {
         let dir = TempDir::new().expect("tempdir");
         let config_path = dir.path().join("config.toml");
-        let mut cfg = config::CliConfig::default();
-        cfg.auto_update = Some(false);
+        let cfg = config::CliConfig {
+            auto_update: Some(false),
+            ..config::CliConfig::default()
+        };
 
         run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
 
@@ -3417,8 +3557,10 @@ mod tests {
         .await
         .expect("spawn upload test server");
 
-        let mut cfg = config::CliConfig::default();
-        cfg.token = Some("test-token".to_string());
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
         cfg.save().await.expect("save config");
 
         let upload_context = Arc::new(
@@ -3454,7 +3596,6 @@ mod tests {
             }],
             upload_context,
             None,
-            backfill_log::BackfillLogger::disabled(),
         )
         .await;
 
@@ -3471,5 +3612,269 @@ mod tests {
                 confirms: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_repo_backfill_logs_distinct_skip_reasons() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:team/example.git"],
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                upload_url_statuses: vec![409, 422],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+        let upload_context = Arc::new(
+            upload::resolve_upload_context(Some(server.base_url.as_str()))
+                .await
+                .expect("resolve upload context"),
+        );
+        let logger = tracing::DiagnosticsLogger::new_in_dir(
+            config::CliConfig::config_dir_with_home(home.path())
+                .expect("config dir")
+                .as_path(),
+            "backfill",
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_010).expect("ts"),
+        )
+        .await
+        .expect("create backfill logger");
+        let _session = tracing::install_global(logger.clone());
+
+        let stats = process_repo_backfill(
+            "git@github.com:team/example.git".to_string(),
+            vec![
+                sample_inline_session(repo.path(), "session-1.jsonl", "session-1"),
+                sample_inline_session(repo.path(), "session-2.jsonl", "session-2"),
+            ],
+            upload_context,
+            None,
+        )
+        .await;
+        logger.flush().await;
+
+        assert_eq!(stats.sessions_seen, 2);
+        assert_eq!(stats.skipped, 2);
+        assert_eq!(stats.uploaded, 0);
+
+        let rows = read_jsonl(&logger.path().expect("logger path")).await;
+        let names = event_names(&rows);
+        assert!(names.contains(&"session_skipped_already_exists".to_string()));
+        assert!(names.contains(&"session_skipped_repo_not_associated".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_drains_pending_uploads_before_scan() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let record = note::SessionRecord {
+            session_uid: "queued-pending-session".to_string(),
+            agent: "claude".to_string(),
+            session_id: "session-pending".to_string(),
+            repo_root: "/tmp/repo".to_string(),
+            repo_remote_url: Some("git@github.com:team/example.git".to_string()),
+            git_ref: "refs/heads/main".to_string(),
+            head_sha: "abc123".to_string(),
+            committer_key_hash: "committer".to_string(),
+            git_user_email: Some("dev@example.com".to_string()),
+            git_user_name: Some("Dev".to_string()),
+            session_start: Some(1_700_000_000),
+            content_sha256: note::content_sha256("hello"),
+            cwd: Some("/tmp/repo".to_string()),
+            ingested_at: "2026-03-02T00:00:00Z".to_string(),
+            cli_version: "1.0.0".to_string(),
+        };
+        let prepared = upload::prepare_session_upload(record, "hello".to_string())
+            .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        run_backfill_inner("1d", None).await.expect("run backfill");
+
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            0
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 1,
+                uploads: 1,
+                confirms: 1,
+            }
+        );
+
+        let config_dir = config::CliConfig::config_dir_with_home(home.path()).expect("config dir");
+        let mut entries = tokio::fs::read_dir(&config_dir)
+            .await
+            .expect("read config dir");
+        let mut backfill_log_path = None;
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("backfill.") && file_name.ends_with(".log") {
+                backfill_log_path = Some(entry.path());
+                break;
+            }
+        }
+        let rows = read_jsonl(&backfill_log_path.expect("backfill log path")).await;
+        let names = event_names(&rows);
+        assert!(names.contains(&"pending_upload_drain_started".to_string()));
+        assert!(names.contains(&"pending_upload_drain_completed".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_repo_filter_only_drains_matching_pending_uploads() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let repo_a = home.path().join("repo-a");
+        let repo_b = home.path().join("repo-b");
+        tokio::fs::create_dir_all(&repo_a)
+            .await
+            .expect("create repo a");
+        tokio::fs::create_dir_all(&repo_b)
+            .await
+            .expect("create repo b");
+
+        for (uid, repo_root) in [
+            ("queued-repo-a", repo_a.as_path()),
+            ("queued-repo-b", repo_b.as_path()),
+        ] {
+            let record = note::SessionRecord {
+                session_uid: uid.to_string(),
+                agent: "claude".to_string(),
+                session_id: format!("session-{uid}"),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                repo_remote_url: Some("git@github.com:team/example.git".to_string()),
+                git_ref: "refs/heads/main".to_string(),
+                head_sha: "abc123".to_string(),
+                committer_key_hash: "committer".to_string(),
+                git_user_email: Some("dev@example.com".to_string()),
+                git_user_name: Some("Dev".to_string()),
+                session_start: Some(1_700_000_000),
+                content_sha256: note::content_sha256("hello"),
+                cwd: Some(repo_root.to_string_lossy().to_string()),
+                ingested_at: "2026-03-02T00:00:00Z".to_string(),
+                cli_version: "1.0.0".to_string(),
+            };
+            let prepared = upload::prepare_session_upload(record, "hello".to_string())
+                .expect("prepare session upload");
+            let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+                .await
+                .expect("context without token");
+            let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+                .await
+                .expect("queue upload");
+            assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+        }
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        run_backfill_inner("1d", Some(repo_a.as_path()))
+            .await
+            .expect("run backfill");
+
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            1
+        );
+        assert_eq!(
+            upload::pending_upload_count_for_repo(repo_a.as_path())
+                .await
+                .expect("pending count repo a"),
+            0
+        );
+        assert_eq!(
+            upload::pending_upload_count_for_repo(repo_b.as_path())
+                .await
+                .expect("pending count repo b"),
+            1
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                upload_url_requests: 1,
+                uploads: 1,
+                confirms: 1,
+            }
+        );
+        let requests = server.upload_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].repo_root, repo_a.to_string_lossy());
     }
 }

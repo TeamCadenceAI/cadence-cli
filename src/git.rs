@@ -5,6 +5,7 @@
 
 use crate::output;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use tokio::process::Command;
@@ -66,14 +67,27 @@ pub(crate) async fn run_git_output_at(
         cmd.env(key, value);
     }
 
+    let repo_for_log = repo.map(crate::tracing::sanitize_path);
+    let env_keys = envs
+        .iter()
+        .map(|(key, _)| (*key).to_string())
+        .collect::<Vec<_>>();
     display_parts.extend(args.iter().map(|s| s.to_string()));
-    if output::is_verbose() {
+    ::tracing::trace!(
+        event = "git_command_started",
+        repo = repo_for_log.as_deref().unwrap_or(""),
+        args = ?args,
+        env_keys = ?env_keys
+    );
+    let verbose = output::is_verbose();
+    if verbose {
         output::detail(&display_parts.join(" "));
         let output = cmd
             .args(args)
             .output()
             .await
             .context("failed to execute git")?;
+        log_git_command_completed(repo, args, &output, verbose);
         if !output.stdout.is_empty() {
             output::detail("stdout:");
             emit_stream_chunk(&output.stdout);
@@ -90,7 +104,34 @@ pub(crate) async fn run_git_output_at(
         .output()
         .await
         .context("failed to execute git")?;
+    log_git_command_completed(repo, args, &output, verbose);
     Ok(output)
+}
+
+fn log_git_command_completed(repo: Option<&Path>, args: &[&str], output: &Output, verbose: bool) {
+    let repo_for_log = repo.map(crate::tracing::sanitize_path);
+    let status = output.status.code();
+    if verbose || !output.status.success() {
+        ::tracing::trace!(
+            event = "git_command_completed",
+            repo = repo_for_log.as_deref().unwrap_or(""),
+            args = ?args,
+            status = ?status,
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            stdout = crate::tracing::truncate_text(String::from_utf8_lossy(&output.stdout), 2048),
+            stderr = crate::tracing::truncate_text(String::from_utf8_lossy(&output.stderr), 2048),
+        );
+        return;
+    }
+    ::tracing::trace!(
+        event = "git_command_completed",
+        repo = repo_for_log.as_deref().unwrap_or(""),
+        args = ?args,
+        status = ?status,
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+    );
 }
 
 fn emit_stream_chunk(chunk: &[u8]) {
@@ -175,6 +216,258 @@ pub(crate) async fn repo_root_at(dir: &Path) -> Result<PathBuf> {
 
     let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
     Ok(PathBuf::from(stdout.trim()))
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RepoRootResolutionDiagnostics {
+    pub requested_cwd: PathBuf,
+    pub cwd_exists: bool,
+    pub direct_error: Option<String>,
+    pub nearest_existing_ancestor: Option<PathBuf>,
+    pub ancestor_error: Option<String>,
+    pub candidate_repo_names: Vec<String>,
+    pub candidate_owner_repo_roots: Vec<PathBuf>,
+    pub matched_worktree_owner_repo_root: Option<PathBuf>,
+    pub matched_worktree_path: Option<PathBuf>,
+    pub alternative_repo_roots: Vec<PathBuf>,
+    pub resolved_via: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepoRootResolution {
+    pub repo_root: PathBuf,
+    pub diagnostics: RepoRootResolutionDiagnostics,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeEntry {
+    path: PathBuf,
+}
+
+pub(crate) async fn resolve_repo_root_with_fallbacks(
+    cwd: &Path,
+) -> std::result::Result<RepoRootResolution, RepoRootResolutionDiagnostics> {
+    let mut diagnostics = RepoRootResolutionDiagnostics {
+        requested_cwd: cwd.to_path_buf(),
+        cwd_exists: tokio::fs::try_exists(cwd).await.unwrap_or(false),
+        ..RepoRootResolutionDiagnostics::default()
+    };
+
+    match repo_root_at(cwd).await {
+        Ok(repo_root) => {
+            diagnostics.resolved_via = Some("cwd");
+            diagnostics.alternative_repo_roots = alternative_repo_roots_for_repo(&repo_root).await;
+            return Ok(RepoRootResolution {
+                repo_root,
+                diagnostics,
+            });
+        }
+        Err(err) => diagnostics.direct_error = Some(err.to_string()),
+    }
+
+    if let Some(existing_ancestor) = nearest_existing_ancestor(cwd).await {
+        diagnostics.nearest_existing_ancestor = Some(existing_ancestor.clone());
+        match repo_root_at(&existing_ancestor).await {
+            Ok(repo_root) => {
+                diagnostics.resolved_via = Some("existing_ancestor");
+                diagnostics.alternative_repo_roots =
+                    alternative_repo_roots_for_repo(&repo_root).await;
+                return Ok(RepoRootResolution {
+                    repo_root,
+                    diagnostics,
+                });
+            }
+            Err(err) => diagnostics.ancestor_error = Some(err.to_string()),
+        }
+    }
+
+    let candidate_repo_names = worktree_repo_name_candidates(cwd);
+    diagnostics.candidate_repo_names = candidate_repo_names.clone();
+    let candidate_owner_repo_roots = candidate_owner_repo_roots(cwd, &candidate_repo_names).await;
+    diagnostics.candidate_owner_repo_roots = candidate_owner_repo_roots.clone();
+
+    for candidate_repo_root in candidate_owner_repo_roots {
+        let worktrees = match worktree_list_at(&candidate_repo_root).await {
+            Ok(worktrees) => worktrees,
+            Err(_) => continue,
+        };
+        if let Some(entry) = worktrees
+            .into_iter()
+            .find(|entry| cwd == entry.path || cwd.starts_with(&entry.path))
+        {
+            diagnostics.resolved_via = Some("worktree_owner_repo");
+            diagnostics.matched_worktree_owner_repo_root = Some(candidate_repo_root.clone());
+            diagnostics.matched_worktree_path = Some(entry.path);
+            diagnostics.alternative_repo_roots =
+                alternative_repo_roots_for_repo(&candidate_repo_root).await;
+            return Ok(RepoRootResolution {
+                repo_root: candidate_repo_root,
+                diagnostics,
+            });
+        }
+    }
+
+    Err(diagnostics)
+}
+
+async fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if tokio::fs::try_exists(candidate).await.unwrap_or(false) {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+async fn git_common_dir_at(repo: &Path) -> Result<Option<PathBuf>> {
+    let output = run_git_output_at(
+        Some(repo),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[],
+    )
+    .await
+    .context("failed to execute git rev-parse --git-common-dir")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let common_dir = stdout.trim();
+    if common_dir.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(common_dir)))
+}
+
+async fn alternative_repo_roots_for_repo(repo: &Path) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    roots.insert(repo.to_path_buf());
+
+    if let Ok(Some(common_dir)) = git_common_dir_at(repo).await
+        && common_dir.file_name().and_then(|name| name.to_str()) == Some(".git")
+        && let Some(main_repo_root) = common_dir.parent()
+    {
+        roots.insert(main_repo_root.to_path_buf());
+    }
+
+    if let Ok(worktrees) = worktree_list_at(repo).await {
+        for worktree in worktrees {
+            roots.insert(worktree.path);
+        }
+    }
+
+    roots.into_iter().filter(|path| path != repo).collect()
+}
+
+async fn worktree_list_at(repo: &Path) -> Result<Vec<WorktreeEntry>> {
+    let output = run_git_output_at(Some(repo), &["worktree", "list", "--porcelain"], &[])
+        .await
+        .context("failed to execute git worktree list --porcelain")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git worktree list --porcelain failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(path) = current_path.take() {
+                entries.push(WorktreeEntry { path });
+            }
+            current_path = Some(PathBuf::from(path.trim()));
+        } else if line.trim().is_empty()
+            && let Some(path) = current_path.take()
+        {
+            entries.push(WorktreeEntry { path });
+        }
+    }
+    if let Some(path) = current_path.take() {
+        entries.push(WorktreeEntry { path });
+    }
+    Ok(entries)
+}
+
+fn worktree_repo_name_candidates(cwd: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let segments = cwd
+        .iter()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    for (idx, segment) in segments.iter().enumerate() {
+        if !segment.to_ascii_lowercase().contains("worktree") {
+            continue;
+        }
+        let after = segments.get(idx + 1).cloned();
+        let after_after = segments.get(idx + 2).cloned();
+        if let Some(candidate) = after.clone().filter(|value| is_repo_name_candidate(value)) {
+            names.push(candidate);
+        } else if let Some(candidate) = after_after.filter(|value| is_repo_name_candidate(value)) {
+            names.push(candidate);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(name.to_ascii_lowercase()))
+        .collect()
+}
+
+fn is_repo_name_candidate(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let lowercase = value.to_ascii_lowercase();
+    if lowercase == "worktrees" || lowercase.ends_with("worktrees") {
+        return false;
+    }
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    true
+}
+
+async fn candidate_owner_repo_roots(cwd: &Path, repo_names: &[String]) -> Vec<PathBuf> {
+    let mut candidates = BTreeSet::new();
+    let Some(home) = crate::agents::home_dir() else {
+        return Vec::new();
+    };
+
+    for repo_name in repo_names {
+        for parent in [
+            home.join("dev"),
+            home.join("Documents").join("GitHub"),
+            home.join("src"),
+            home.join("code"),
+            home.join("Projects"),
+            home.join("workspaces"),
+        ] {
+            let candidate = parent.join(repo_name);
+            if tokio::fs::try_exists(candidate.join(".git"))
+                .await
+                .unwrap_or(false)
+            {
+                candidates.insert(candidate);
+            }
+        }
+    }
+
+    if let Some(existing_ancestor) = nearest_existing_ancestor(cwd).await {
+        let mut current = Some(existing_ancestor.as_path());
+        while let Some(candidate) = current {
+            if tokio::fs::try_exists(candidate.join(".git"))
+                .await
+                .unwrap_or(false)
+            {
+                candidates.insert(candidate.to_path_buf());
+            }
+            current = candidate.parent();
+        }
+    }
+
+    candidates.into_iter().collect()
 }
 
 /// Return the current branch name for a repo, if HEAD is attached.
@@ -701,6 +994,52 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var(key).ok(),
+            }
+        }
+
+        fn set_path(&self, value: &std::path::Path) {
+            unsafe { std::env::set_var(self.key, value) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn portable_test_path(path: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let raw = path.as_os_str().to_string_lossy();
+            if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+
+        path.to_path_buf()
+    }
+
+    async fn canonical_test_path(path: &Path) -> PathBuf {
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf());
+        portable_test_path(&canonical)
+    }
+
     /// Helper: create a temporary git repo with one commit.
     /// Returns the TempDir (which cleans up on drop) and sets the
     /// working directory for the test by returning a guard.
@@ -774,6 +1113,228 @@ mod tests {
         assert!(root_path.exists());
         // The root should contain the README we created
         assert!(root_path.join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_repo_root_with_fallbacks_uses_existing_ancestor() {
+        let dir = init_temp_repo().await;
+        let missing = dir.path().join("missing").join("nested");
+
+        let resolution = resolve_repo_root_with_fallbacks(&missing)
+            .await
+            .expect("resolve repo root with fallbacks");
+
+        assert_eq!(
+            resolution
+                .repo_root
+                .canonicalize()
+                .expect("canonical repo root"),
+            dir.path().canonicalize().expect("canonical temp repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.resolved_via,
+            Some("existing_ancestor")
+        );
+        assert_eq!(
+            resolution.diagnostics.nearest_existing_ancestor,
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_repo_root_with_fallbacks_uses_worktree_owner_repo() {
+        let home = TempDir::new().expect("home tempdir");
+        let canonical_home = canonical_test_path(home.path()).await;
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(&canonical_home);
+
+        let repo_root = canonical_home.join("dev").join("cadence-cli");
+        tokio::fs::create_dir_all(repo_root.parent().expect("repo parent"))
+            .await
+            .expect("create repo parent");
+        run_git(
+            repo_root.parent().expect("repo parent"),
+            &["init", "cadence-cli"],
+        )
+        .await;
+        run_git(&repo_root, &["config", "user.email", "test@test.com"]).await;
+        run_git(&repo_root, &["config", "user.name", "Test User"]).await;
+        run_git(&repo_root, &["config", "core.hooksPath", "/dev/null"]).await;
+        tokio::fs::write(repo_root.join("README.md"), "hello")
+            .await
+            .expect("write readme");
+        run_git(&repo_root, &["add", "README.md"]).await;
+        run_git(&repo_root, &["commit", "-m", "initial commit"]).await;
+        run_git(&repo_root, &["branch", "feature"]).await;
+
+        let worktree_path = canonical_home
+            .join(".claude-worktrees")
+            .join("cadence-cli")
+            .join("vigorous-engelbart");
+        tokio::fs::create_dir_all(worktree_path.parent().expect("worktree parent"))
+            .await
+            .expect("create worktree parent");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+
+        tokio::fs::remove_dir_all(&worktree_path)
+            .await
+            .expect("remove worktree directory");
+
+        let resolution = resolve_repo_root_with_fallbacks(&worktree_path)
+            .await
+            .expect("resolve repo root via worktree owner");
+
+        assert_eq!(
+            resolution
+                .repo_root
+                .canonicalize()
+                .expect("canonical repo root"),
+            repo_root.canonicalize().expect("canonical main repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.resolved_via,
+            Some("worktree_owner_repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.candidate_repo_names,
+            vec!["cadence-cli".to_string()]
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_owner_repo_root,
+            Some(repo_root.clone())
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_path,
+            Some(worktree_path.clone())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_repo_root_with_fallbacks_uses_worktree_owner_repo_for_missing_subdir() {
+        let home = TempDir::new().expect("home tempdir");
+        let canonical_home = canonical_test_path(home.path()).await;
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(&canonical_home);
+
+        let repo_root = canonical_home.join("dev").join("cadence-cli");
+        tokio::fs::create_dir_all(repo_root.parent().expect("repo parent"))
+            .await
+            .expect("create repo parent");
+        run_git(
+            repo_root.parent().expect("repo parent"),
+            &["init", "cadence-cli"],
+        )
+        .await;
+        run_git(&repo_root, &["config", "user.email", "test@test.com"]).await;
+        run_git(&repo_root, &["config", "user.name", "Test User"]).await;
+        run_git(&repo_root, &["config", "core.hooksPath", "/dev/null"]).await;
+        tokio::fs::write(repo_root.join("README.md"), "hello")
+            .await
+            .expect("write readme");
+        run_git(&repo_root, &["add", "README.md"]).await;
+        run_git(&repo_root, &["commit", "-m", "initial commit"]).await;
+        run_git(&repo_root, &["branch", "feature"]).await;
+
+        let worktree_path = canonical_home
+            .join(".claude-worktrees")
+            .join("cadence-cli")
+            .join("vigorous-engelbart");
+        tokio::fs::create_dir_all(worktree_path.parent().expect("worktree parent"))
+            .await
+            .expect("create worktree parent");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+
+        tokio::fs::remove_dir_all(&worktree_path)
+            .await
+            .expect("remove worktree directory");
+
+        let missing_subdir = worktree_path.join("src").join("nested");
+        let resolution = resolve_repo_root_with_fallbacks(&missing_subdir)
+            .await
+            .expect("resolve repo root via worktree owner");
+
+        assert_eq!(
+            resolution
+                .repo_root
+                .canonicalize()
+                .expect("canonical repo root"),
+            repo_root.canonicalize().expect("canonical main repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.resolved_via,
+            Some("worktree_owner_repo")
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_owner_repo_root,
+            Some(repo_root.clone())
+        );
+        assert_eq!(
+            resolution.diagnostics.matched_worktree_path,
+            Some(worktree_path.clone())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_alternative_repo_roots_include_linked_worktrees() {
+        let dir = init_temp_repo().await;
+        run_git(dir.path(), &["branch", "feature"]).await;
+        let worktree_root = TempDir::new().expect("worktree tempdir");
+        let canonical_worktree_root = canonical_test_path(worktree_root.path()).await;
+        let worktree_path = canonical_worktree_root.join("feature-worktree");
+        run_git(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().expect("worktree path utf8"),
+                "feature",
+            ],
+        )
+        .await;
+
+        let alternatives = alternative_repo_roots_for_repo(dir.path()).await;
+        let canonical_worktree_path = tokio::fs::canonicalize(&worktree_path)
+            .await
+            .expect("canonicalize linked worktree");
+
+        assert!(alternatives.into_iter().any(|candidate| {
+            std::fs::canonicalize(candidate)
+                .map(|path| path == canonical_worktree_path)
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn test_worktree_repo_name_candidates_cover_common_agent_layouts() {
+        let claude = worktree_repo_name_candidates(Path::new(
+            "/Users/zack/.claude-worktrees/cadence-cli/vigorous-engelbart",
+        ));
+        assert_eq!(claude, vec!["cadence-cli".to_string()]);
+
+        let codex =
+            worktree_repo_name_candidates(Path::new("/Users/zack/.codex/worktrees/3139/cadence"));
+        assert_eq!(codex, vec!["cadence".to_string()]);
     }
 
     // -----------------------------------------------------------------------

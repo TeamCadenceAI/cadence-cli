@@ -39,7 +39,7 @@ open = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
 protobuf = "3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "std", "time"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "std", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
 sysinfo = "0.30"

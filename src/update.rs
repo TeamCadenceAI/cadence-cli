@@ -2732,8 +2732,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_confirmation_config_preserves_manual_auto_update_preference() {
-        let mut cfg = CliConfig::default();
-        cfg.auto_update = Some(true);
+        let cfg = CliConfig {
+            auto_update: Some(true),
+            ..CliConfig::default()
+        };
         assert_eq!(
             update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
             Some(true)
@@ -2743,7 +2745,10 @@ mod tests {
             None
         );
 
-        cfg.auto_update = Some(false);
+        let cfg = CliConfig {
+            auto_update: Some(false),
+            ..CliConfig::default()
+        };
         assert_eq!(
             update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
             Some(false)
