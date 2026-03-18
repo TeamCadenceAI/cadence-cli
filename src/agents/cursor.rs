@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, collect_dirs_with_exts,
-    find_chat_session_dirs, home_dir, recent_files_with_exts,
+    AgentExplorer, SessionLog, SessionSource, app_config_dir_in, find_chat_session_dirs, home_dir,
+    recent_files_with_exts,
 };
 use crate::scanner::AgentType;
 use async_trait::async_trait;
@@ -60,9 +60,46 @@ async fn log_dirs_in(home: &Path) -> Vec<PathBuf> {
 
     // Cursor projects directory (scan recursively for json/txt files).
     let projects_dir = home.join(".cursor").join("projects");
-    collect_dirs_with_exts(&projects_dir, &mut dirs, &["json", "txt"]).await;
+    collect_cursor_project_dirs(&projects_dir, &mut dirs).await;
 
     dirs
+}
+
+async fn collect_cursor_project_dirs(root: &Path, results: &mut Vec<PathBuf>) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        let mut has_match = false;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) == Some("mcps") {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file()
+                && !has_match
+                && let Some(ext) = path.extension().and_then(|ext| ext.to_str())
+                && ["json", "txt"]
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+            {
+                has_match = true;
+            }
+        }
+
+        if has_match {
+            results.push(dir);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,5 +133,33 @@ mod tests {
 
         assert!(dirs.contains(&ws_root));
         assert!(dirs.contains(&projects_dir));
+    }
+
+    #[tokio::test]
+    async fn test_cursor_log_dirs_skips_mcps_project_metadata() {
+        let home = TempDir::new().unwrap();
+        let mcps_tools_dir = home
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join("p1")
+            .join("mcps")
+            .join("user-shadcn-ui")
+            .join("tools");
+        tokio::fs::create_dir_all(&mcps_tools_dir).await.unwrap();
+        tokio::fs::write(mcps_tools_dir.join("get_component.json"), "{}")
+            .await
+            .unwrap();
+
+        let real_project_dir = home.path().join(".cursor").join("projects").join("p2");
+        tokio::fs::create_dir_all(&real_project_dir).await.unwrap();
+        tokio::fs::write(real_project_dir.join("session.txt"), "content")
+            .await
+            .unwrap();
+
+        let dirs = log_dirs_in(home.path()).await;
+
+        assert!(dirs.contains(&real_project_dir));
+        assert!(!dirs.contains(&mcps_tools_dir));
     }
 }
