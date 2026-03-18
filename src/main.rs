@@ -993,7 +993,9 @@ async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSession
         agents::SessionSource::Inline { content, .. } => content.clone(),
     };
     let mut metadata = match &log.source {
-        agents::SessionSource::File(path) => scanner::parse_session_metadata(path).await,
+        agents::SessionSource::File(path) => {
+            scanner::parse_session_metadata_with_content(path, &session_log).await
+        }
         agents::SessionSource::Inline { .. } => scanner::parse_session_metadata_str(&session_log),
     };
     metadata.agent_type = Some(log.agent_type.clone());

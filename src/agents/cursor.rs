@@ -17,6 +17,8 @@ use super::{
 use crate::scanner::AgentType;
 use async_trait::async_trait;
 
+const CURSOR_PROJECT_SKIP_DIRS: &[&str] = &["mcps"];
+
 /// Return all Cursor log directories for use by the post-commit hook.
 pub async fn log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
@@ -81,18 +83,25 @@ async fn collect_cursor_project_dirs(root: &Path, results: &mut Vec<PathBuf>) {
                 Err(_) => continue,
             };
             if file_type.is_dir() {
-                if path.file_name().and_then(|name| name.to_str()) == Some("mcps") {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if CURSOR_PROJECT_SKIP_DIRS.contains(&name) {
                     continue;
                 }
                 stack.push(path);
-            } else if file_type.is_file()
-                && !has_match
-                && let Some(ext) = path.extension().and_then(|ext| ext.to_str())
-                && ["json", "txt"]
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(ext))
-            {
-                has_match = true;
+            } else if file_type.is_file() && !has_match {
+                let has_supported_ext =
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ["json", "txt"]
+                                .iter()
+                                .any(|allowed| allowed.eq_ignore_ascii_case(ext))
+                        });
+                if has_supported_ext {
+                    has_match = true;
+                }
             }
         }
 

@@ -4,7 +4,7 @@
 //! without loading unnecessary structure into the ingest pipeline.
 
 use std::io::{BufRead, BufReader, Cursor};
-use std::path::Path;
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -62,6 +62,8 @@ pub struct SessionMetadata {
     pub agent_type: Option<AgentType>,
 }
 
+const CLAUDE_PATH_DECODE_MAX_CANDIDATES: usize = 65_536;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -80,25 +82,19 @@ pub struct SessionMetadata {
 /// while `cwd` prefers the most recent direct cwd/workdir field so later
 /// worktree handoff records can override stale earlier values.
 pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
-    let mut metadata = SessionMetadata::default();
     let content = match tokio::fs::read_to_string(file).await {
         Ok(c) => c,
-        Err(_) => return metadata,
+        Err(_) => return SessionMetadata::default(),
     };
-    let reader = BufReader::new(Cursor::new(content.as_bytes()));
-    metadata = parse_session_metadata_reader(reader, metadata);
+    parse_session_metadata_with_content(file, &content).await
+}
 
-    // Fallback: parse full JSON (chatSessions format).
-    if (metadata.session_id.is_none() || metadata.cwd.is_none())
-        && let Some(value) = read_json_value(file).await
-    {
-        apply_metadata_from_value(&mut metadata, &value);
-    }
+pub async fn parse_session_metadata_with_content(file: &Path, content: &str) -> SessionMetadata {
+    let mut metadata = parse_session_metadata_str(content);
+    let agent_type = infer_agent_type(file);
 
-    apply_metadata_from_path(&mut metadata, file).await;
-
-    // Infer agent type from file path
-    metadata.agent_type = Some(infer_agent_type(file));
+    apply_metadata_from_path(&mut metadata, file, &agent_type).await;
+    metadata.agent_type = Some(agent_type);
 
     metadata
 }
@@ -253,68 +249,128 @@ async fn read_json_value(file: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&content).ok()
 }
 
-async fn apply_metadata_from_path(metadata: &mut SessionMetadata, file: &Path) {
-    let is_claude_project_file = infer_agent_type(file) == AgentType::Claude
-        && file
-            .parent()
-            .and_then(|parent| parent.parent())
-            .and_then(|projects| projects.file_name())
-            .and_then(|name| name.to_str())
-            == Some("projects");
+async fn apply_metadata_from_path(
+    metadata: &mut SessionMetadata,
+    file: &Path,
+    agent_type: &AgentType,
+) {
+    let Some(project_dir) = claude_project_dir(file, agent_type) else {
+        return;
+    };
 
-    if metadata.session_id.is_none()
-        && is_claude_project_file
-        && let Some(id) = file.file_stem().and_then(|stem| stem.to_str())
-        && !id.is_empty()
-    {
+    let recovered_session_id = file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| !id.is_empty());
+    if metadata.session_id.is_some() {
+        // Keep the first parsed ID when the log already provided one.
+    } else if let Some(id) = recovered_session_id {
+        ::tracing::trace!(
+            recovered_session_id = %id,
+            path = %file.display(),
+            "inferred session_id from Claude project path"
+        );
         metadata.session_id = Some(id.to_string());
     }
 
-    if metadata.cwd.is_none()
-        && is_claude_project_file
-        && let Some(cwd) = infer_claude_project_cwd(file).await
-    {
+    let recovered_cwd = if metadata.cwd.is_none() {
+        infer_claude_project_cwd(project_dir).await
+    } else {
+        None
+    };
+    if let Some(cwd) = recovered_cwd {
+        ::tracing::trace!(
+            recovered_cwd = %cwd,
+            path = %file.display(),
+            "inferred cwd from Claude project directory name"
+        );
         metadata.cwd = Some(cwd);
     }
 }
 
-async fn infer_claude_project_cwd(file: &Path) -> Option<String> {
+fn claude_project_dir<'a>(file: &'a Path, agent_type: &AgentType) -> Option<&'a Path> {
+    if *agent_type != AgentType::Claude {
+        return None;
+    }
+
     let project_dir = file.parent()?;
     let projects_dir = project_dir.parent()?;
     let claude_dir = projects_dir.parent()?;
+    let encoded = project_dir.file_name()?.to_str()?;
+
     if projects_dir.file_name().and_then(|name| name.to_str()) != Some("projects")
         || claude_dir.file_name().and_then(|name| name.to_str()) != Some(".claude")
+        || !encoded.starts_with('-')
+        || encoded.len() <= 1
+        || encoded.contains('/')
+        || encoded.contains('\\')
     {
         return None;
     }
 
+    Some(project_dir)
+}
+
+async fn infer_claude_project_cwd(project_dir: &Path) -> Option<String> {
     let encoded = project_dir.file_name()?.to_str()?;
     let decoded = decode_hyphenated_absolute_path(encoded).await?;
     Some(decoded.to_string_lossy().to_string())
 }
 
-async fn decode_hyphenated_absolute_path(encoded: &str) -> Option<std::path::PathBuf> {
+fn initial_hyphenated_path_state(trimmed: &str) -> (PathBuf, usize) {
+    if MAIN_SEPARATOR == '\\' {
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 3
+            && bytes[1] == b':'
+            && bytes[2] == b'-'
+            && bytes[0].is_ascii_alphabetic()
+        {
+            let drive = char::from(bytes[0]);
+            return (PathBuf::from(format!("{drive}:{MAIN_SEPARATOR}")), 3);
+        }
+    }
+
+    (PathBuf::from(MAIN_SEPARATOR.to_string()), 0)
+}
+
+async fn decode_hyphenated_absolute_path(encoded: &str) -> Option<PathBuf> {
     let trimmed = encoded.strip_prefix('-')?;
-    let tokens: Vec<&str> = trimmed
-        .split('-')
-        .filter(|token| !token.is_empty())
-        .collect();
-    if tokens.is_empty() {
+    if trimmed.is_empty() {
         return None;
     }
 
-    let mut stack = vec![(std::path::PathBuf::from("/"), 0usize)];
+    let mut stack = vec![initial_hyphenated_path_state(trimmed)];
+    let mut checked_candidates = 0usize;
     while let Some((prefix, start_idx)) = stack.pop() {
-        if start_idx == tokens.len() {
+        if start_idx >= trimmed.len() {
             return Some(prefix);
         }
 
         let mut next = Vec::new();
-        for end_idx in (start_idx + 1..=tokens.len()).rev() {
-            let segment = tokens[start_idx..end_idx].join("-");
+        let bytes = trimmed.as_bytes();
+        for end_idx in (start_idx + 1..=trimmed.len()).rev() {
+            if end_idx != trimmed.len() && bytes[end_idx] != b'-' {
+                continue;
+            }
+
+            checked_candidates += 1;
+            if checked_candidates > CLAUDE_PATH_DECODE_MAX_CANDIDATES {
+                return None;
+            }
+
+            let segment = &trimmed[start_idx..end_idx];
+            if segment.is_empty() {
+                continue;
+            }
+
             let candidate = prefix.join(segment);
             if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
-                next.push((candidate, end_idx));
+                let next_idx = if end_idx == trimmed.len() {
+                    end_idx
+                } else {
+                    end_idx + 1
+                };
+                next.push((candidate, next_idx));
             }
         }
         stack.extend(next);
@@ -588,6 +644,7 @@ fn collect_timestamp_candidates(value: &serde_json::Value, out: &mut Vec<serde_j
 mod tests {
     use super::*;
 
+    use std::path::MAIN_SEPARATOR;
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -602,6 +659,16 @@ mod tests {
             .await
             .expect("failed to write temp file");
         path
+    }
+
+    fn encode_claude_project_path(path: &Path) -> String {
+        let raw = path.to_string_lossy();
+        let encoded = raw.replace(['/', '\\'], "-");
+        if encoded.starts_with('-') {
+            encoded
+        } else {
+            format!("-{encoded}")
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1052,7 +1119,7 @@ also not json {{{{
         let repo_root = dir.path().join("work").join("git-context-explorer");
         tokio::fs::create_dir_all(&repo_root).await.unwrap();
 
-        let encoded = format!("-{}", repo_root.to_string_lossy().replace('/', "-"));
+        let encoded = encode_claude_project_path(&repo_root);
         let claude_dir = dir.path().join(".claude").join("projects").join(encoded);
         tokio::fs::create_dir_all(&claude_dir).await.unwrap();
 
@@ -1070,6 +1137,30 @@ also not json {{{{
             Some("042afd87-a800-4248-8234-5e9222dd6f22".to_string())
         );
         assert_eq!(metadata.cwd, Some(repo_root.to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_decode_hyphenated_absolute_path_handles_hyphenated_segments() {
+        let dir = TempDir::new().unwrap();
+        let repo_root = dir.path().join("work").join("git--context-explorer");
+        tokio::fs::create_dir_all(&repo_root).await.unwrap();
+
+        let decoded =
+            decode_hyphenated_absolute_path(&encode_claude_project_path(&repo_root)).await;
+
+        assert_eq!(decoded, Some(repo_root));
+    }
+
+    #[test]
+    fn test_initial_hyphenated_path_state_handles_windows_drive_prefix() {
+        let (root, start_idx) = initial_hyphenated_path_state("C:-Users-zack");
+        if MAIN_SEPARATOR == '\\' {
+            assert_eq!(root, PathBuf::from(r"C:\"));
+            assert_eq!(start_idx, 3);
+        } else {
+            assert_eq!(root, PathBuf::from("/"));
+            assert_eq!(start_idx, 0);
+        }
     }
 
     #[tokio::test]
