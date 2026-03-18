@@ -320,13 +320,14 @@ async fn infer_claude_project_cwd(project_dir: &Path) -> Option<String> {
 fn initial_hyphenated_path_state(trimmed: &str) -> (PathBuf, usize) {
     if MAIN_SEPARATOR == '\\' {
         let bytes = trimmed.as_bytes();
-        if bytes.len() >= 3
-            && bytes[1] == b':'
-            && bytes[2] == b'-'
-            && bytes[0].is_ascii_alphabetic()
-        {
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() {
             let drive = char::from(bytes[0]);
-            return (PathBuf::from(format!("{drive}:{MAIN_SEPARATOR}")), 3);
+            if bytes[1] == b':' && bytes[2] == b'-' {
+                return (PathBuf::from(format!("{drive}:{MAIN_SEPARATOR}")), 3);
+            }
+            if bytes[1] == b'-' && bytes[2] == b'-' {
+                return (PathBuf::from(format!("{drive}:{MAIN_SEPARATOR}")), 3);
+            }
         }
     }
 
@@ -663,7 +664,19 @@ mod tests {
 
     fn encode_claude_project_path(path: &Path) -> String {
         let raw = path.to_string_lossy();
-        let encoded = raw.replace(['/', '\\'], "-");
+        let normalized = raw.replace('\\', "/");
+        let encoded = if let Some(without_drive_root) = normalized
+            .strip_prefix(|c: char| c.is_ascii_alphabetic())
+            .and_then(|rest| rest.strip_prefix(":/"))
+        {
+            format!(
+                "{}--{}",
+                normalized.chars().next().unwrap_or_default(),
+                without_drive_root.replace('/', "-")
+            )
+        } else {
+            normalized.replace('/', "-")
+        };
         if encoded.starts_with('-') {
             encoded
         } else {
@@ -1154,6 +1167,18 @@ also not json {{{{
     #[test]
     fn test_initial_hyphenated_path_state_handles_windows_drive_prefix() {
         let (root, start_idx) = initial_hyphenated_path_state("C:-Users-zack");
+        if MAIN_SEPARATOR == '\\' {
+            assert_eq!(root, PathBuf::from(r"C:\"));
+            assert_eq!(start_idx, 3);
+        } else {
+            assert_eq!(root, PathBuf::from("/"));
+            assert_eq!(start_idx, 0);
+        }
+    }
+
+    #[test]
+    fn test_initial_hyphenated_path_state_handles_windows_safe_drive_prefix() {
+        let (root, start_idx) = initial_hyphenated_path_state("C--Users-zack");
         if MAIN_SEPARATOR == '\\' {
             assert_eq!(root, PathBuf::from(r"C:\"));
             assert_eq!(start_idx, 3);
