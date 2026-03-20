@@ -106,6 +106,14 @@ enum Command {
         #[command(subcommand)]
         config_command: Option<ConfigCommand>,
     },
+
+    /// Remove Cadence CLI hooks, configuration, scheduler, and state.
+    #[command(alias = "reset")]
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2815,6 +2823,321 @@ async fn run_update(check: bool, yes: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Uninstall
+// ---------------------------------------------------------------------------
+
+/// Completely remove Cadence CLI hooks, configuration, scheduler, and state.
+///
+/// Execution order (dependencies noted):
+/// 1. Revoke API token (needs config.toml + network)
+/// 2. Disable auto-update + remove scheduler artifacts
+/// 3. Unset global git config keys
+/// 4. Restore pre-cadence hook backup + remove ~/.git-hooks/ if empty
+/// 5. Clean ai.cadence.enabled from current + sibling repos
+/// 6. Remove ~/.cadence/ directory tree
+/// 7. Remove /tmp/cadence-autoupdate.log
+/// 8. Print summary
+/// 9. Self-delete binary
+async fn run_uninstall(yes: bool) -> Result<()> {
+    println!();
+
+    if !yes {
+        let home = agents::home_dir().unwrap_or_default();
+        let hooks_dir = home.join(".git-hooks");
+        let state_dir = home.join(".cadence");
+        let exe_path = std::env::current_exe().unwrap_or_default();
+
+        output::fail(
+            "Warning",
+            "this will permanently remove all Cadence CLI artifacts:",
+        );
+        output::detail("Git config:  core.hooksPath, ai.cadence.org");
+        output::detail(&format!("Hooks dir:   {}", hooks_dir.display()));
+        output::detail(&format!("State dir:   {}", state_dir.display()));
+        output::detail("Scheduler:   LaunchAgent / systemd / schtasks");
+        output::detail(&format!("Binary:      {}", exe_path.display()));
+        output::detail("API token:   will be revoked on server");
+        println!();
+
+        eprint!("  Type \"uninstall\" to confirm: ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim() != "uninstall" {
+            output::note("Uninstall cancelled.");
+            return Ok(());
+        }
+        println!();
+    }
+
+    let start = std::time::Instant::now();
+    let mut had_errors = false;
+
+    // Step 1: Revoke API token (needs config.toml + network)
+    match revoke_token_for_uninstall().await {
+        Ok(()) => {}
+        Err(e) => {
+            output::note(&format!("Could not revoke token ({e})"));
+            had_errors = true;
+        }
+    }
+
+    // Step 2: Disable auto-update + remove scheduler artifacts
+    match uninstall_scheduler().await {
+        Ok(()) => {}
+        Err(e) => {
+            output::note(&format!("Could not remove scheduler ({e})"));
+            had_errors = true;
+        }
+    }
+
+    // Step 3: Unset global git config keys
+    for key in &["core.hooksPath", "ai.cadence.org"] {
+        match git::config_unset_global(key).await {
+            Ok(()) => output::success("Removed", &format!("git config --global {key}")),
+            Err(e) => {
+                output::note(&format!("Could not unset {key} ({e})"));
+                had_errors = true;
+            }
+        }
+    }
+
+    // Step 4: Restore pre-cadence hook backup + remove ~/.git-hooks/ if empty
+    match uninstall_hooks_dir().await {
+        Ok(()) => {}
+        Err(e) => {
+            output::note(&format!("Could not clean hooks directory ({e})"));
+            had_errors = true;
+        }
+    }
+
+    // Step 5: Clean ai.cadence.enabled from current + sibling repos
+    if let Err(e) = clean_repo_cadence_config().await {
+        output::note(&format!("Could not clean per-repo config ({e})"));
+        had_errors = true;
+    }
+
+    // Step 6: Remove ~/.cadence/ directory tree
+    match uninstall_state_dir().await {
+        Ok(()) => {}
+        Err(e) => {
+            output::note(&format!("Could not remove state directory ({e})"));
+            had_errors = true;
+        }
+    }
+
+    // Step 7: Remove /tmp/cadence-autoupdate.log
+    let log_path = std::path::Path::new("/tmp/cadence-autoupdate.log");
+    if log_path.exists() {
+        match tokio::fs::remove_file(log_path).await {
+            Ok(()) => output::success("Removed", "/tmp/cadence-autoupdate.log"),
+            Err(e) => {
+                output::note(&format!("Could not remove log file ({e})"));
+                had_errors = true;
+            }
+        }
+    }
+
+    // Step 8: Summary
+    println!();
+    if had_errors {
+        output::fail("Uninstall", "completed with issues");
+    } else {
+        output::success("Uninstall", "complete");
+    }
+    output::detail(&format!("Total time: {} ms", start.elapsed().as_millis()));
+
+    // Step 9: Self-delete binary
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if cfg!(windows) {
+                output::note(&format!(
+                    "On Windows, delete the binary manually:\n  del \"{}\"",
+                    exe.display()
+                ));
+            } else {
+                match tokio::fs::remove_file(&exe).await {
+                    Ok(()) => output::success("Removed", &format!("binary {}", exe.display())),
+                    Err(e) => {
+                        output::note(&format!(
+                            "Could not remove binary ({e}).\n  Remove manually: rm \"{}\"",
+                            exe.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            output::note(&format!("Could not determine binary path ({e})"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Revoke the API token on the server, if one exists locally.
+async fn revoke_token_for_uninstall() -> Result<()> {
+    let cfg = config::CliConfig::load().await?;
+    let token = match resolve_cli_auth_token(&cfg) {
+        Some(t) => t,
+        None => return Ok(()), // No token, nothing to revoke
+    };
+
+    let resolved = cfg.resolve_api_url(api_url_override());
+    let client = api_client::ApiClient::new(&resolved.url);
+    match client
+        .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
+        .await
+    {
+        Ok(()) => {
+            output::success("Revoked", "API token on server");
+        }
+        Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+            output::detail("Token was already invalid or expired.");
+        }
+        Err(err) => {
+            output::note(&format!("Could not revoke token on server ({err})"));
+        }
+    }
+    Ok(())
+}
+
+/// Disable auto-update and remove scheduler artifacts.
+async fn uninstall_scheduler() -> Result<()> {
+    // Best-effort disable in config — config may not exist
+    let _ = set_auto_update_enabled(false).await;
+
+    let removed = update::uninstall_auto_update_scheduler().await?;
+    if removed.removed {
+        output::success("Removed", &format!("scheduler ({})", removed.description));
+    } else {
+        output::detail("Scheduler artifacts were already absent.");
+    }
+    Ok(())
+}
+
+/// Remove the ~/.git-hooks/ directory, restoring any pre-cadence backup first.
+async fn uninstall_hooks_dir() -> Result<()> {
+    let home =
+        agents::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let hooks_dir = home.join(".git-hooks");
+
+    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
+        output::detail("Hooks directory already absent.");
+        return Ok(());
+    }
+
+    let post_commit = hooks_dir.join("post-commit");
+    let backup = hooks_dir.join("post-commit.pre-cadence");
+
+    // If there's a pre-cadence backup, restore it
+    if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
+        tokio::fs::rename(&backup, &post_commit).await?;
+        output::success("Restored", "pre-cadence post-commit hook");
+    } else if tokio::fs::try_exists(&post_commit).await.unwrap_or(false) {
+        // Only remove post-commit if it's a cadence hook
+        if let Ok(content) = tokio::fs::read_to_string(&post_commit).await
+            && is_cadence_hook(&content)
+        {
+            tokio::fs::remove_file(&post_commit).await?;
+        }
+    }
+
+    // Check if directory is now empty (or only has cadence files)
+    let mut entries = tokio::fs::read_dir(&hooks_dir).await?;
+    let mut remaining = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        remaining.push(entry.file_name().to_string_lossy().to_string());
+    }
+
+    if remaining.is_empty() {
+        tokio::fs::remove_dir(&hooks_dir).await?;
+        output::success("Removed", &format!("{}", hooks_dir.display()));
+    } else {
+        output::note(&format!(
+            "{} contains non-cadence files ({}), left in place",
+            hooks_dir.display(),
+            remaining.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Clean ai.cadence.enabled from the current repo and sibling repos.
+async fn clean_repo_cadence_config() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+
+    // Check if cwd is inside a git repo
+    let in_repo = git::repo_root_at(&cwd).await.is_ok();
+
+    if !in_repo {
+        output::detail(
+            "Not inside a git repo. To clean per-repo config manually:\n  \
+             git config --unset ai.cadence.enabled",
+        );
+        return Ok(());
+    }
+
+    let repo_root = git::repo_root_at(&cwd).await?;
+    let mut cleaned = 0u32;
+
+    // Clean current repo
+    if let Ok(Some(_)) = git::config_get_local_at(&repo_root, "ai.cadence.enabled").await {
+        git::config_unset_local_at(&repo_root, "ai.cadence.enabled").await?;
+        cleaned += 1;
+    }
+
+    // Clean sibling repos under the same parent directory
+    if let Some(parent) = repo_root.parent() {
+        let mut entries = tokio::fs::read_dir(parent).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path == repo_root || !path.is_dir() {
+                continue;
+            }
+            // Check if it's a git repo with ai.cadence.enabled set
+            if let Ok(Some(_)) = git::config_get_local_at(&path, "ai.cadence.enabled").await
+                && git::config_unset_local_at(&path, "ai.cadence.enabled")
+                    .await
+                    .is_ok()
+            {
+                cleaned += 1;
+            }
+        }
+
+        if cleaned > 0 {
+            output::success(
+                "Cleaned",
+                &format!(
+                    "ai.cadence.enabled from {} repo(s) in {}",
+                    cleaned,
+                    parent.display()
+                ),
+            );
+        } else {
+            output::detail("No repos with ai.cadence.enabled found in sibling directories.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove the ~/.cadence/ state directory.
+async fn uninstall_state_dir() -> Result<()> {
+    let home =
+        agents::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let state_dir = home.join(".cadence");
+
+    if !tokio::fs::try_exists(&state_dir).await.unwrap_or(false) {
+        output::detail("State directory already absent.");
+        return Ok(());
+    }
+
+    tokio::fs::remove_dir_all(&state_dir).await?;
+    output::success("Removed", &format!("{}", state_dir.display()));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2848,6 +3171,7 @@ async fn main() {
         Command::Doctor { repair } => run_doctor(repair).await,
         Command::Update { check, yes } => run_update(check, yes).await,
         Command::AutoUpdate { command } => run_auto_update(command).await,
+        Command::Uninstall { yes } => run_uninstall(yes).await,
     };
 
     // Passive background version check: run after successful command execution
@@ -3881,5 +4205,64 @@ mod tests {
         let requests = server.upload_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].repo_root, repo_a.to_string_lossy());
+    }
+
+    // -----------------------------------------------------------------------
+    // Uninstall command parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_uninstall_command() {
+        let cli = Cli::parse_from(["cadence", "uninstall"]);
+        match cli.command {
+            Command::Uninstall { yes } => {
+                assert!(!yes);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_uninstall_yes_flag() {
+        let cli = Cli::parse_from(["cadence", "uninstall", "--yes"]);
+        match cli.command {
+            Command::Uninstall { yes } => {
+                assert!(yes);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_uninstall_short_yes_flag() {
+        let cli = Cli::parse_from(["cadence", "uninstall", "-y"]);
+        match cli.command {
+            Command::Uninstall { yes } => {
+                assert!(yes);
+            }
+            _ => panic!("expected Uninstall command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_reset_alias() {
+        let cli = Cli::parse_from(["cadence", "reset"]);
+        match cli.command {
+            Command::Uninstall { yes } => {
+                assert!(!yes);
+            }
+            _ => panic!("expected Uninstall command via reset alias"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_reset_alias_with_yes() {
+        let cli = Cli::parse_from(["cadence", "reset", "--yes"]);
+        match cli.command {
+            Command::Uninstall { yes } => {
+                assert!(yes);
+            }
+            _ => panic!("expected Uninstall command via reset alias"),
+        }
     }
 }

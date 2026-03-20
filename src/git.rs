@@ -984,6 +984,45 @@ pub async fn config_set_global(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Unset a global git config key.
+///
+/// Uses `--unset-all` so repeated keys are removed. Returns `Ok(())` if the
+/// key does not exist (git exits with code 5 or 1 in that case).
+pub async fn config_unset_global(key: &str) -> Result<()> {
+    let output = run_git_output_at(None, &["config", "--global", "--unset-all", key], &[])
+        .await
+        .context("failed to execute git config --global --unset-all")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        // Exit code 5 = key not found, 1 = section/key invalid — both are fine for unset
+        if code != 5 && code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git config --global --unset-all failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+/// Unset a local git config key at a specific repo path.
+///
+/// Uses `--unset-all` so repeated keys are removed. Returns `Ok(())` if the
+/// key does not exist.
+pub async fn config_unset_local_at(repo: &Path, key: &str) -> Result<()> {
+    let output = run_git_output_at(Some(repo), &["config", "--local", "--unset-all", key], &[])
+        .await
+        .context("failed to execute git config --local --unset-all")?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        if code != 5 && code != 1 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git config --local --unset-all failed: {}", stderr.trim());
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
