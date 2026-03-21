@@ -9,6 +9,10 @@ OS_NAME="$(uname -s)"
 # --- Main installer ---
 
 main() {
+    # Optional GitHub org to scope tracking (e.g. sh -s MyOrg).
+    # Defaults to empty when omitted — install proceeds without org filtering.
+    org="${1:-}" # $org becomes an empty string when $1 is unset
+
     # Detect architecture and OS
     arch=$(uname -m)
     case "$OS_NAME" in
@@ -68,9 +72,17 @@ main() {
     echo "Installed ${installed_version}"
 
     echo "Running initial setup..."
-    "${INSTALL_DIR}/cadence" install || {
-        echo "Warning: 'cadence install' failed. You can run it manually later." >&2
-    }
+    # Pass --org to scope hook tracking to a specific GitHub org
+    if [ -n "$org" ]; then
+        echo "Installing for org: $org"
+        "${INSTALL_DIR}/cadence" install --org "$org" || {
+            echo "Warning: 'cadence install' failed. You can run it manually later." >&2
+        }
+    else
+        "${INSTALL_DIR}/cadence" install || {
+            echo "Warning: 'cadence install' failed. You can run it manually later." >&2
+        }
+    fi
 
     echo ""
     echo "${installed_version} installed successfully!"
@@ -87,4 +99,5 @@ main() {
     esac
 }
 
-main
+# Forward script args so `sh -s MyOrg` passes the org to main()
+main "$@"
