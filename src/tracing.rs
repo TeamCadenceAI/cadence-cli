@@ -1,3 +1,5 @@
+//! Diagnostics logging infrastructure for CLI sessions and hook runs.
+
 use anyhow::{Context, Result, anyhow};
 use std::fs::File;
 use std::io::{self, LineWriter, Write};
@@ -9,24 +11,29 @@ use tracing_subscriber::filter::{LevelFilter, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 
+/// Per-session diagnostics logger that writes to a dedicated file sink.
 #[derive(Clone, Default)]
 pub struct DiagnosticsLogger {
     inner: Option<Arc<TraceSink>>,
 }
 
+/// Shared sink metadata for an active diagnostics session.
 struct TraceSink {
     path: PathBuf,
     writer: Mutex<LineWriter<File>>,
 }
 
+/// Guard that keeps the global tracing subscriber installed for a session.
 #[derive(Default)]
 pub struct DiagnosticsSessionGuard {
     previous: Option<DiagnosticsLogger>,
 }
 
+/// Factory used by `tracing_subscriber` to obtain the current session writer.
 #[derive(Clone, Default)]
 struct SessionWriterFactory;
 
+/// Concrete writer that forwards tracing output into the active session file.
 struct SessionWriter {
     buffer: Vec<u8>,
 }
@@ -133,6 +140,7 @@ impl Drop for SessionWriter {
     }
 }
 
+/// Installs the process-wide tracing subscriber and activates a diagnostics session.
 pub fn install_global(logger: DiagnosticsLogger) -> DiagnosticsSessionGuard {
     let previous = current_session_slot()
         .lock()
@@ -156,6 +164,7 @@ pub(crate) fn sanitize_path(path: &Path) -> String {
     truncate_text(path.display().to_string(), MAX_TEXT_FIELD_CHARS)
 }
 
+#[cfg(test)]
 pub(crate) fn redact_remote_url(url: &str) -> String {
     if let Ok(parsed) = reqwest::Url::parse(url)
         && matches!(parsed.scheme(), "http" | "https")
@@ -187,6 +196,7 @@ pub(crate) fn truncate_text(value: impl AsRef<str>, max_chars: usize) -> String 
     truncated
 }
 
+/// Ensures that the global tracing subscriber has been installed exactly once.
 fn ensure_tracing_initialized() -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     let result = INIT.get_or_init(|| {
@@ -215,11 +225,13 @@ fn ensure_tracing_initialized() -> Result<()> {
         .map_err(|err| anyhow!(err.clone()))
 }
 
+/// Returns the global storage slot for the current diagnostics session.
 fn current_session_slot() -> &'static Mutex<Option<DiagnosticsLogger>> {
     static SLOT: OnceLock<Mutex<Option<DiagnosticsLogger>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
+/// Returns whether a diagnostics session is currently active.
 fn current_session_installed() -> bool {
     current_session_slot()
         .lock()
@@ -228,6 +240,7 @@ fn current_session_installed() -> bool {
         .is_some()
 }
 
+/// Flushes buffered bytes into the current diagnostics sink.
 fn flush_buffer(buffer: &mut Vec<u8>) -> io::Result<()> {
     if buffer.is_empty() {
         return Ok(());
@@ -248,6 +261,7 @@ fn flush_buffer(buffer: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// Formats a timestamp for diagnostics log file names.
 fn filename_timestamp(now: OffsetDateTime) -> String {
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}{:09}Z",

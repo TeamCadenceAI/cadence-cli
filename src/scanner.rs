@@ -5,7 +5,9 @@
 
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+#[cfg(test)]
 use time::OffsetDateTime;
+#[cfg(test)]
 use time::format_description::well_known::Rfc3339;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +116,7 @@ pub fn parse_session_metadata_str(content: &str) -> SessionMetadata {
     metadata
 }
 
+#[cfg(test)]
 /// Extract the session time range (start, end) from a session log file.
 ///
 /// Scans each line as JSON and looks for known timestamp keys:
@@ -136,6 +139,7 @@ pub async fn session_time_range(file: &Path) -> Option<(i64, i64)> {
     range
 }
 
+#[cfg(test)]
 /// Extract the session time range (start, end) from a session log string.
 pub fn session_time_range_str(content: &str) -> Option<(i64, i64)> {
     let reader = BufReader::new(Cursor::new(content));
@@ -225,6 +229,7 @@ fn infer_agent_type(path: &Path) -> AgentType {
     }
 }
 
+#[cfg(test)]
 /// Parse a timestamp value into epoch seconds.
 fn parse_timestamp(value: &serde_json::Value) -> Option<i64> {
     let s = value.as_str()?;
@@ -232,6 +237,7 @@ fn parse_timestamp(value: &serde_json::Value) -> Option<i64> {
     Some(dt.unix_timestamp())
 }
 
+#[cfg(test)]
 fn parse_numeric_timestamp(value: &serde_json::Value) -> Option<i64> {
     let num = value.as_i64()?;
     if num <= 0 {
@@ -244,6 +250,7 @@ fn parse_numeric_timestamp(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
+#[cfg(test)]
 async fn read_json_value(file: &Path) -> Option<serde_json::Value> {
     let content = tokio::fs::read_to_string(file).await.ok()?;
     serde_json::from_str(&content).ok()
@@ -450,6 +457,7 @@ fn apply_metadata_from_value(metadata: &mut SessionMetadata, value: &serde_json:
     }
 }
 
+#[cfg(test)]
 fn session_time_range_reader<R: BufRead>(reader: R) -> Option<(i64, i64)> {
     let mut min_ts: Option<i64> = None;
     let mut max_ts: Option<i64> = None;
@@ -493,6 +501,7 @@ fn session_time_range_reader<R: BufRead>(reader: R) -> Option<(i64, i64)> {
     }
 }
 
+#[cfg(test)]
 fn session_time_range_from_value(value: &serde_json::Value) -> Option<(i64, i64)> {
     let mut all = Vec::new();
     collect_timestamp_candidates(value, &mut all);
@@ -616,6 +625,7 @@ fn looks_like_file(path: &Path) -> bool {
     false
 }
 
+#[cfg(test)]
 fn collect_timestamp_candidates(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
     match value {
         serde_json::Value::Object(map) => {

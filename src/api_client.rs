@@ -16,7 +16,8 @@ use std::{error::Error as _, time::Duration};
 const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
 const AUTH_REVOKE_PATH: &str = "/api/auth";
 const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
-const SESSION_UPLOAD_URL_PATH: &str = "/api/sessions/upload-url";
+const USER_ORGS_PATH: &str = "/api/user/orgs";
+const SESSION_PUBLICATION_CREATE_PATH: &str = "/api/v2/session-publications";
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -31,61 +32,118 @@ struct ExchangeRequest<'a> {
 /// Data payload from `POST /api/auth/exchange`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CliTokenExchangeResult {
+    /// Bearer token used by the CLI for authenticated API calls.
     pub token: String,
+    /// GitHub login associated with the authenticated user.
     pub login: String,
+    /// RFC 3339 expiration timestamp for the token.
     pub expires_at: String,
 }
 
 /// Request body for `POST /api/onboarding/backfill-complete`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackfillCompleteRequest {
+    /// Number of days covered by the backfill.
     pub window_days: i32,
+    /// Number of sessions attached to repositories during backfill.
     pub notes_attached: i64,
+    /// Number of sessions skipped during backfill processing.
     pub notes_skipped: i64,
+    /// Human-readable issues encountered during backfill.
     pub issues: Vec<String>,
+    /// Number of repositories scanned during backfill.
     pub repos_scanned: i32,
+    /// RFC 3339 completion timestamp emitted by the CLI.
     pub finished_at: String,
+    /// CLI version that reported the backfill completion.
     pub cli_version: String,
 }
 
 /// Data payload from `POST /api/onboarding/backfill-complete`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackfillCompleteResponse {
+    /// Whether the backend recorded the completion event.
     pub recorded: bool,
+    /// Backend timestamp for the recorded completion.
     pub backfill_completed_at: String,
-    #[allow(dead_code)]
-    pub next_step: String,
 }
 
-/// Request body for `POST /api/sessions/upload-url`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionUploadUrlRequest {
-    pub session_uid: String,
-    pub agent: String,
-    pub agent_session_id: String,
-    pub repo_remote_url: String,
-    pub git_ref: String,
-    pub head_sha: String,
-    pub session_start: Option<i64>,
-    pub upload_sha256: String,
-    pub git_user_email: Option<String>,
-    pub git_user_name: Option<String>,
-    pub cli_version: String,
-    pub cwd: Option<String>,
-    pub repo_root: String,
-}
-
-/// Response body from `POST /api/sessions/upload-url`.
+/// Minimal org info from `GET /api/user/orgs`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct SessionUploadUrlResponse {
+pub struct UserOrgInfo {
+    /// GitHub organization id for the account.
+    pub github_org_id: i64,
+    /// GitHub login for the org or personal account.
+    pub github_org_login: String,
+    /// Display name shown to the user, when available.
+    pub display_name: Option<String>,
+    /// Whether this record represents the user's personal account.
+    pub is_personal: bool,
+    /// Whether the org has completed onboarding.
+    pub is_onboarded: bool,
+    /// Whether the Cadence GitHub app is installed for the org.
+    pub has_active_installation: bool,
+    /// Cadence org id, if the org has been provisioned.
+    pub org_id: Option<String>,
+}
+
+/// Response body from `GET /api/user/orgs`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UserOrgsResponse {
+    /// Orgs visible to the authenticated CLI user.
+    pub orgs: Vec<UserOrgInfo>,
+}
+
+/// Request body for `POST /api/v2/session-publications`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSessionPublicationRequest {
+    /// Agent family producing the session, such as `codex`.
+    pub agent: String,
+    /// Stable agent-native session identifier.
+    pub agent_session_id: String,
+    /// Idempotency key for this publication attempt.
+    pub publish_uid: String,
+    /// SHA-256 hash of the uploaded session content.
+    pub upload_sha256: String,
+    /// SHA-256 hash of material publication metadata.
+    pub metadata_sha256: String,
+    /// Canonical git remote URL selected for the session.
+    pub canonical_remote_url: String,
+    /// All observed remote URLs for the repository.
+    pub remote_urls: Vec<String>,
+    /// Canonical repository root associated with the session.
+    pub canonical_repo_root: String,
+    /// Repository and worktree roots observed for the session.
+    pub worktree_roots: Vec<String>,
+    /// Current working directory captured from the session, if any.
+    pub cwd: Option<String>,
+    /// Git ref associated with the upload, if available.
+    pub git_ref: Option<String>,
+    /// HEAD commit SHA associated with the upload, if available.
+    pub head_commit_sha: Option<String>,
+    /// Git user email configured for the repository, if available.
+    pub git_user_email: Option<String>,
+    /// Git user name configured for the repository, if available.
+    pub git_user_name: Option<String>,
+    /// CLI version that created the publication request.
+    pub cli_version: Option<String>,
+}
+
+/// Response body from `POST /api/v2/session-publications`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CreateSessionPublicationResponse {
+    /// Server-generated publication identifier.
+    pub publication_id: String,
+    /// Pre-signed upload URL for the raw session payload.
     pub upload_url: String,
-    pub session_uid: String,
+    /// Resolved Cadence org id that owns the publication.
     pub org_id: String,
 }
 
 /// Response body from `POST /api/sessions/{uid}/confirm`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SessionUploadConfirmResponse {
+    /// Publication status returned after upload confirmation.
     pub status: String,
 }
 
@@ -102,14 +160,23 @@ struct ApiResponseEnvelope<T> {
 /// Classified failures for authenticated CLI requests.
 #[derive(Debug)]
 pub enum AuthenticatedRequestError {
+    /// Authentication failed or the token has expired.
     Unauthorized,
+    /// The request conflicted with current server state.
     Conflict(String),
+    /// The target resource could not be found.
     NotFound,
+    /// The server rejected semantically invalid input.
     Unprocessable(String),
+    /// The server returned a 5xx response.
     Server(String),
+    /// The server rejected the request as malformed.
     BadRequest(String),
+    /// The request failed before receiving a response.
     Network(String),
+    /// The server response could not be decoded.
     Parse(String),
+    /// A non-standard failure occurred.
     Unexpected(String),
 }
 
@@ -249,18 +316,48 @@ impl ApiClient {
         Ok(envelope.data)
     }
 
-    /// Request a presigned S3 upload URL for a session blob.
-    pub async fn request_session_upload_url(
+    /// List orgs accessible to the authenticated CLI user.
+    pub async fn list_user_orgs(
         &self,
         token: &str,
-        request: &SessionUploadUrlRequest,
         timeout: Duration,
-    ) -> std::result::Result<SessionUploadUrlResponse, AuthenticatedRequestError> {
-        let url = self.url(SESSION_UPLOAD_URL_PATH);
+    ) -> std::result::Result<UserOrgsResponse, AuthenticatedRequestError> {
+        let url = self.url(USER_ORGS_PATH);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(map_network_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_authenticated_http_error(status, &body));
+        }
+
+        let body = resp.text().await.map_err(map_network_error)?;
+        let envelope: ApiResponseEnvelope<UserOrgsResponse> = serde_json::from_str(&body)
+            .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
+        Ok(envelope.data)
+    }
+
+    /// Create or fetch a session publication.
+    pub async fn create_session_publication(
+        &self,
+        token: &str,
+        org_id: &str,
+        request: &CreateSessionPublicationRequest,
+        timeout: Duration,
+    ) -> std::result::Result<CreateSessionPublicationResponse, AuthenticatedRequestError> {
+        let url = self.url(SESSION_PUBLICATION_CREATE_PATH);
         let resp = self
             .client
             .post(&url)
             .bearer_auth(token)
+            .header("x-org-id", org_id)
             .timeout(timeout)
             .json(request)
             .send()
@@ -274,14 +371,15 @@ impl ApiClient {
         }
 
         let body = resp.text().await.map_err(map_network_error)?;
-        serde_json::from_str::<SessionUploadUrlResponse>(&body)
+        serde_json::from_str::<CreateSessionPublicationResponse>(&body)
             .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
     }
 
-    /// Upload compressed session bytes to a presigned S3 URL.
+    /// Upload session bytes to a presigned S3 URL.
     pub async fn upload_presigned(
         &self,
         upload_url: &str,
+        content_type: &str,
         payload: &[u8],
         timeout: Duration,
     ) -> std::result::Result<(), AuthenticatedRequestError> {
@@ -289,7 +387,7 @@ impl ApiClient {
             timeout,
             self.raw_client
                 .put(upload_url)
-                .header(reqwest::header::CONTENT_TYPE, "application/zstd")
+                .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(payload.to_vec())
                 .send(),
         )
@@ -316,11 +414,13 @@ impl ApiClient {
     pub async fn confirm_session_upload(
         &self,
         token: &str,
-        session_uid: &str,
+        publication_id: &str,
         org_id: &str,
         timeout: Duration,
     ) -> std::result::Result<SessionUploadConfirmResponse, AuthenticatedRequestError> {
-        let url = self.url(&format!("/api/sessions/{session_uid}/confirm"));
+        let url = self.url(&format!(
+            "/api/v2/session-publications/{publication_id}/confirm"
+        ));
         let resp = self
             .client
             .post(&url)
@@ -497,20 +597,22 @@ mod tests {
 
     #[test]
     fn session_upload_request_serializes_upload_sha256_field() {
-        let request = SessionUploadUrlRequest {
-            session_uid: "sess-1".to_string(),
+        let request = CreateSessionPublicationRequest {
             agent: "codex".to_string(),
             agent_session_id: "agent-session-1".to_string(),
-            repo_remote_url: "git@github.com:team/repo.git".to_string(),
-            git_ref: "refs/heads/main".to_string(),
-            head_sha: "abc123".to_string(),
-            session_start: None,
+            publish_uid: "pub-1".to_string(),
             upload_sha256: "upload-sha".to_string(),
+            metadata_sha256: "metadata-sha".to_string(),
+            canonical_remote_url: "git@github.com:team/repo.git".to_string(),
+            remote_urls: vec!["git@github.com:team/repo.git".to_string()],
+            canonical_repo_root: "/tmp/repo".to_string(),
+            worktree_roots: vec!["/tmp/repo".to_string()],
+            cwd: None,
+            git_ref: Some("refs/heads/main".to_string()),
+            head_commit_sha: Some("abc123".to_string()),
             git_user_email: None,
             git_user_name: None,
-            cli_version: "1.0.0".to_string(),
-            cwd: None,
-            repo_root: "/tmp/repo".to_string(),
+            cli_version: Some("1.0.0".to_string()),
         };
 
         let value = serde_json::to_value(&request).expect("serialize request");

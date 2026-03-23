@@ -1,3 +1,5 @@
+//! Browser-based login flow for exchanging a short-lived code into a CLI token.
+
 use anyhow::{Context, Result, bail};
 use rand08::RngCore;
 use std::time::{Duration, Instant};
@@ -9,6 +11,7 @@ use crate::api_client::{ApiClient, CliTokenExchangeResult};
 const CADENCE_LOCKUP_INLINE_SVG: &str = include_str!("../assets/cadence-lockup-inline.svg");
 
 /// Complete browser-based CLI OAuth login flow.
+/// Completes the browser login flow and returns the exchanged CLI token data.
 pub async fn login_via_browser(
     api_base_url: &str,
     timeout: Duration,
@@ -44,12 +47,14 @@ pub async fn login_via_browser(
         .context("failed to exchange login code for CLI token")
 }
 
+/// Generates a random nonce used to validate the OAuth callback.
 fn generate_nonce() -> String {
     let mut bytes = [0u8; 16];
     rand08::thread_rng().fill_bytes(&mut bytes);
     bytes_to_hex(&bytes)
 }
 
+/// Encodes raw bytes as lowercase hexadecimal.
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -60,6 +65,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Starts the local callback server and waits for a valid exchange code.
 async fn wait_for_exchange_code(
     listener: &TcpListener,
     expected_state: &str,
@@ -82,6 +88,7 @@ async fn wait_for_exchange_code(
     }
 }
 
+/// Handles one HTTP callback request from the browser-based login flow.
 async fn handle_callback_request(
     stream: &mut TcpStream,
     expected_state: &str,
@@ -174,6 +181,7 @@ async fn handle_callback_request(
     Ok(Some(code))
 }
 
+/// Writes a complete HTTP response to the callback socket.
 async fn write_http_response(
     stream: &mut TcpStream,
     status_code: u16,
@@ -197,6 +205,7 @@ async fn write_http_response(
     Ok(())
 }
 
+/// Renders the HTML shown in the browser after login completes or fails.
 fn render_callback_html(status_code: u16, body_text: &str) -> String {
     let is_success = (200..300).contains(&status_code);
     let title = if is_success {
@@ -323,6 +332,7 @@ p {{
     )
 }
 
+/// Escapes user-visible text for safe inclusion in callback HTML.
 fn escape_html(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
     for c in input.chars() {
