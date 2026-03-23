@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.1.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.6...v2.1.0) (2026-03-23)
+
+
+### Features
+
+* **cli:** add `cadence uninstall` command ([0871d60](https://github.com/TeamCadenceAI/cadence-cli/commit/0871d608c09736b9730e7e2ffc1b5fad0b49dfc1))
+* **cli:** add cadence uninstall command ([64fd9f9](https://github.com/TeamCadenceAI/cadence-cli/commit/64fd9f99abadcd04b1291dca2bd8210cd2132a8a))
+* **install:** support org-scoped installation via curl ([398ade4](https://github.com/TeamCadenceAI/cadence-cli/commit/398ade4f4f7ccda47d007fe869dfa10d9679fec8))
+* **install:** support org-scoped installation via curl ([137eaf8](https://github.com/TeamCadenceAI/cadence-cli/commit/137eaf8bc79eab567ccbf839b1472f45c41834ed))
+* **publication:** cut CLI uploads over to v2 session publications ([f6433e0](https://github.com/TeamCadenceAI/cadence-cli/commit/f6433e0d1325df9bfa05e4ac1d30e97797cfa933))
+* V2 publishing ([312343b](https://github.com/TeamCadenceAI/cadence-cli/commit/312343b6b3ec38746a100febccb1edd3a5938116))
+
+
+### Bug Fixes
+
+* **publication:** refresh queued uploads and preserve cross-platform state writes ([580249d](https://github.com/TeamCadenceAI/cadence-cli/commit/580249dab25b97d88f18b803f2a4324a7408d8c4))
+* **upload:** address Copilot publication review findings ([77c837c](https://github.com/TeamCadenceAI/cadence-cli/commit/77c837c15ccf505595414d4d2172c3f80b5f51f0))
+
 ## [2.0.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.5...v2.0.6) (2026-03-18)
 
 
