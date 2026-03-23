@@ -215,15 +215,33 @@ async fn write_atomic(path: &Path, bytes: Vec<u8>) -> Result<()> {
     tokio::fs::write(&tmp, bytes)
         .await
         .with_context(|| format!("failed to write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
+    replace_path(&tmp, path)
         .await
         .with_context(|| format!("failed to move {} into place", path.display()))?;
     Ok(())
 }
 
+#[cfg(not(windows))]
+async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(tmp, path).await
+}
+
+#[cfg(windows)]
+async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(path).await;
+            tokio::fs::rename(tmp, path).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::ffi::OsString;
     use tempfile::TempDir;
 
@@ -286,6 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn state_round_trips_record_and_payload() {
         let temp = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", temp.path());
@@ -303,6 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn remove_record_deletes_payload_and_metadata() {
         let temp = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", temp.path());
@@ -325,5 +345,27 @@ mod tests {
         let first = storage_key(&logical_session, Some("org-a"));
         let second = storage_key(&logical_session, Some("org-b"));
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upsert_record_replaces_existing_files() {
+        let temp = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", temp.path());
+        let mut record = sample_record();
+        let key = storage_key(&record.logical_session, record.target_org_id.as_deref());
+
+        upsert_record(&record, Some("payload-1")).await.unwrap();
+        record.status = PublicationStatus::Published;
+        record.last_error = None;
+        upsert_record(&record, Some("payload-2")).await.unwrap();
+
+        let records = load_all_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.status, PublicationStatus::Published);
+        assert_eq!(
+            load_payload(&key).await.unwrap(),
+            Some("payload-2".to_string())
+        );
     }
 }

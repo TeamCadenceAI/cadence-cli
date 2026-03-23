@@ -15,7 +15,8 @@ use crate::publication_state::{
     now_rfc3339, remove_record, upsert_record,
 };
 use anyhow::Result;
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -156,16 +157,7 @@ async fn process_pending_uploads_matching(
         let Some(payload) = load_payload(&stored.storage_key).await? else {
             continue;
         };
-        let prepared = PreparedSessionUpload {
-            prepared: PreparedPublication {
-                logical_session: stored.record.logical_session.clone(),
-                observations: stored.record.observations.clone(),
-                raw_session_content: payload,
-                content_sha256: stored.record.current_content_sha256.clone(),
-                metadata_sha256: stored.record.current_metadata_sha256.clone(),
-                upload_sha256: stored.record.upload_sha256.clone(),
-            },
-        };
+        let prepared = rebuild_prepared_upload(&stored.record, payload).await?;
 
         match prepare_state_and_attempt(context, &prepared, Some(stored)).await? {
             LiveUploadOutcome::Uploaded => summary.uploaded += 1,
@@ -204,6 +196,72 @@ fn record_matches_repo(record: &PublicationStateRecord, repo_filter: &Path) -> b
         .worktree_roots
         .iter()
         .any(|root| root == &*filter)
+}
+
+async fn rebuild_prepared_upload(
+    record: &PublicationStateRecord,
+    raw_session_content: String,
+) -> Result<PreparedSessionUpload> {
+    let observations = refresh_observations(&record.observations).await?;
+    prepare_session_upload(ObservedSessionUpload {
+        logical_session: record.logical_session.clone(),
+        observations,
+        raw_session_content,
+    })
+}
+
+async fn refresh_observations(
+    observations: &PublicationObservations,
+) -> Result<PublicationObservations> {
+    let Some(repo_root) = resolve_refresh_repo_root(observations).await else {
+        return Ok(observations.clone());
+    };
+
+    let remote_urls = git::remote_urls_at(&repo_root).await?;
+    let canonical_remote_url = git::preferred_remote_url_at(&repo_root)
+        .await?
+        .or_else(|| remote_urls.first().cloned())
+        .unwrap_or_default();
+
+    Ok(PublicationObservations {
+        canonical_remote_url,
+        remote_urls,
+        canonical_repo_root: repo_root.to_string_lossy().to_string(),
+        worktree_roots: git::repo_and_worktree_roots_at(&repo_root).await,
+        cwd: observations.cwd.clone(),
+        git_ref: git::current_branch_at(&repo_root)
+            .await
+            .ok()
+            .flatten()
+            .map(|branch| format!("refs/heads/{branch}")),
+        head_commit_sha: git::head_sha_at(&repo_root).await.ok().flatten(),
+        git_user_email: git::config_get_at(&repo_root, "user.email")
+            .await
+            .ok()
+            .flatten(),
+        git_user_name: git::config_get_at(&repo_root, "user.name")
+            .await
+            .ok()
+            .flatten(),
+        cli_version: observations.cli_version.clone(),
+    })
+}
+
+async fn resolve_refresh_repo_root(observations: &PublicationObservations) -> Option<PathBuf> {
+    let mut candidates = BTreeSet::new();
+    candidates.insert(observations.canonical_repo_root.clone());
+    candidates.extend(observations.worktree_roots.iter().cloned());
+
+    for candidate in candidates {
+        if candidate.trim().is_empty() {
+            continue;
+        }
+        if let Ok(resolution) = git::resolve_repo_root_with_fallbacks(Path::new(&candidate)).await {
+            return Some(resolution.repo_root);
+        }
+    }
+
+    None
 }
 
 async fn prepare_state_and_attempt(
@@ -778,8 +836,10 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::ffi::OsString;
     use tempfile::TempDir;
+    use tokio::process::Command;
 
     struct EnvGuard {
         key: &'static str,
@@ -802,6 +862,35 @@ mod tests {
                 unsafe { std::env::remove_var(self.key) };
             }
         }
+    }
+
+    async fn run_git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .await
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    async fn init_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        run_git(dir.path(), &["init", "-q"]).await;
+        run_git(dir.path(), &["config", "user.name", "Test User"]).await;
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]).await;
+        tokio::fs::write(dir.path().join("README.md"), "hello")
+            .await
+            .unwrap();
+        run_git(dir.path(), &["add", "README.md"]).await;
+        run_git(dir.path(), &["commit", "-m", "init"]).await;
+        dir
     }
 
     fn sample_observed(repo_root: &Path, remote_url: &str) -> ObservedSessionUpload {
@@ -827,6 +916,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn upload_or_queue_prepared_session_queues_without_remote_observations() {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
@@ -865,6 +955,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn upload_or_queue_prepared_session_resolves_org_and_uploads() {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
@@ -892,6 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn upload_or_queue_prepared_session_queues_when_org_is_ambiguous() {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
@@ -934,5 +1026,85 @@ mod tests {
                 reason: "repo remotes matched multiple accessible Cadence orgs".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_refreshes_repo_metadata_before_retry() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let repo = init_repo().await;
+
+        let queued_context = UploadContext {
+            client: ApiClient::new("http://127.0.0.1:9"),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(ObservedSessionUpload {
+            observations: PublicationObservations {
+                canonical_remote_url: String::new(),
+                remote_urls: Vec::new(),
+                canonical_repo_root: repo.path().to_string_lossy().to_string(),
+                worktree_roots: vec![repo.path().to_string_lossy().to_string()],
+                cwd: Some(repo.path().to_string_lossy().to_string()),
+                git_ref: None,
+                head_commit_sha: None,
+                git_user_email: None,
+                git_user_name: None,
+                cli_version: Some("1.0.0".to_string()),
+            },
+            ..sample_observed(repo.path(), "git@github.com:test-org/repo.git")
+        })
+        .unwrap();
+
+        let queued = upload_or_queue_prepared_session(&queued_context, &prepared)
+            .await
+            .unwrap();
+        assert!(matches!(queued, LiveUploadOutcome::Queued { .. }));
+        assert_eq!(pending_upload_count().await.unwrap(), 1);
+
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/repo.git",
+            ],
+        )
+        .await;
+
+        let server =
+            test_support::spawn_test_upload_server(test_support::TestUploadServerConfig::default())
+                .await
+                .unwrap();
+        let retry_context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+
+        let summary = process_pending_uploads(&retry_context, 1).await.unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(pending_upload_count().await.unwrap(), 0);
+
+        let requests = server.create_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].canonical_remote_url,
+            "git@github.com:test-org/repo.git"
+        );
+        assert_eq!(
+            requests[0].remote_urls,
+            vec!["git@github.com:test-org/repo.git".to_string()]
+        );
+        assert!(
+            requests[0]
+                .git_ref
+                .as_deref()
+                .is_some_and(|git_ref| git_ref.starts_with("refs/heads/"))
+        );
+        assert!(requests[0].head_commit_sha.is_some());
     }
 }
