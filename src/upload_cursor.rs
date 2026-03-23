@@ -42,7 +42,7 @@ pub async fn upsert_cursor(
         repo_root: repo_root.to_string(),
         last_scanned_mtime_epoch,
         last_scanned_source_label: last_scanned_source_label.map(str::to_string),
-        updated_at: crate::note::now_rfc3339(),
+        updated_at: crate::publication_state::now_rfc3339(),
     };
     let bytes = serde_json::to_vec_pretty(&record).context("failed to serialize upload cursor")?;
     tokio::fs::write(&tmp, bytes)

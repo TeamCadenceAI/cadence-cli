@@ -16,7 +16,8 @@ use std::{error::Error as _, time::Duration};
 const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
 const AUTH_REVOKE_PATH: &str = "/api/auth";
 const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
-const SESSION_UPLOAD_URL_PATH: &str = "/api/sessions/upload-url";
+const USER_ORGS_PATH: &str = "/api/user/orgs";
+const SESSION_PUBLICATION_CREATE_PATH: &str = "/api/v2/session-publications";
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -57,29 +58,49 @@ pub struct BackfillCompleteResponse {
     pub next_step: String,
 }
 
-/// Request body for `POST /api/sessions/upload-url`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionUploadUrlRequest {
-    pub session_uid: String,
-    pub agent: String,
-    pub agent_session_id: String,
-    pub repo_remote_url: String,
-    pub git_ref: String,
-    pub head_sha: String,
-    pub session_start: Option<i64>,
-    pub upload_sha256: String,
-    pub git_user_email: Option<String>,
-    pub git_user_name: Option<String>,
-    pub cli_version: String,
-    pub cwd: Option<String>,
-    pub repo_root: String,
+/// Minimal org info from `GET /api/user/orgs`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UserOrgInfo {
+    pub github_org_id: i64,
+    pub github_org_login: String,
+    pub display_name: Option<String>,
+    pub is_personal: bool,
+    pub is_onboarded: bool,
+    pub has_active_installation: bool,
+    pub org_id: Option<String>,
 }
 
-/// Response body from `POST /api/sessions/upload-url`.
+/// Response body from `GET /api/user/orgs`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct SessionUploadUrlResponse {
+pub struct UserOrgsResponse {
+    pub orgs: Vec<UserOrgInfo>,
+}
+
+/// Request body for `POST /api/v2/session-publications`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSessionPublicationRequest {
+    pub agent: String,
+    pub agent_session_id: String,
+    pub publish_uid: String,
+    pub upload_sha256: String,
+    pub metadata_sha256: String,
+    pub canonical_remote_url: String,
+    pub remote_urls: Vec<String>,
+    pub canonical_repo_root: String,
+    pub worktree_roots: Vec<String>,
+    pub cwd: Option<String>,
+    pub git_ref: Option<String>,
+    pub head_commit_sha: Option<String>,
+    pub git_user_email: Option<String>,
+    pub git_user_name: Option<String>,
+    pub cli_version: Option<String>,
+}
+
+/// Response body from `POST /api/v2/session-publications`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CreateSessionPublicationResponse {
+    pub publication_id: String,
     pub upload_url: String,
-    pub session_uid: String,
     pub org_id: String,
 }
 
@@ -249,18 +270,48 @@ impl ApiClient {
         Ok(envelope.data)
     }
 
-    /// Request a presigned S3 upload URL for a session blob.
-    pub async fn request_session_upload_url(
+    /// List orgs accessible to the authenticated CLI user.
+    pub async fn list_user_orgs(
         &self,
         token: &str,
-        request: &SessionUploadUrlRequest,
         timeout: Duration,
-    ) -> std::result::Result<SessionUploadUrlResponse, AuthenticatedRequestError> {
-        let url = self.url(SESSION_UPLOAD_URL_PATH);
+    ) -> std::result::Result<UserOrgsResponse, AuthenticatedRequestError> {
+        let url = self.url(USER_ORGS_PATH);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(map_network_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_authenticated_http_error(status, &body));
+        }
+
+        let body = resp.text().await.map_err(map_network_error)?;
+        let envelope: ApiResponseEnvelope<UserOrgsResponse> = serde_json::from_str(&body)
+            .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
+        Ok(envelope.data)
+    }
+
+    /// Create or fetch a v2 session publication.
+    pub async fn create_session_publication(
+        &self,
+        token: &str,
+        org_id: &str,
+        request: &CreateSessionPublicationRequest,
+        timeout: Duration,
+    ) -> std::result::Result<CreateSessionPublicationResponse, AuthenticatedRequestError> {
+        let url = self.url(SESSION_PUBLICATION_CREATE_PATH);
         let resp = self
             .client
             .post(&url)
             .bearer_auth(token)
+            .header("x-org-id", org_id)
             .timeout(timeout)
             .json(request)
             .send()
@@ -274,7 +325,7 @@ impl ApiClient {
         }
 
         let body = resp.text().await.map_err(map_network_error)?;
-        serde_json::from_str::<SessionUploadUrlResponse>(&body)
+        serde_json::from_str::<CreateSessionPublicationResponse>(&body)
             .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
     }
 
@@ -316,11 +367,13 @@ impl ApiClient {
     pub async fn confirm_session_upload(
         &self,
         token: &str,
-        session_uid: &str,
+        publication_id: &str,
         org_id: &str,
         timeout: Duration,
     ) -> std::result::Result<SessionUploadConfirmResponse, AuthenticatedRequestError> {
-        let url = self.url(&format!("/api/sessions/{session_uid}/confirm"));
+        let url = self.url(&format!(
+            "/api/v2/session-publications/{publication_id}/confirm"
+        ));
         let resp = self
             .client
             .post(&url)
@@ -497,20 +550,22 @@ mod tests {
 
     #[test]
     fn session_upload_request_serializes_upload_sha256_field() {
-        let request = SessionUploadUrlRequest {
-            session_uid: "sess-1".to_string(),
+        let request = CreateSessionPublicationRequest {
             agent: "codex".to_string(),
             agent_session_id: "agent-session-1".to_string(),
-            repo_remote_url: "git@github.com:team/repo.git".to_string(),
-            git_ref: "refs/heads/main".to_string(),
-            head_sha: "abc123".to_string(),
-            session_start: None,
+            publish_uid: "pub-1".to_string(),
             upload_sha256: "upload-sha".to_string(),
+            metadata_sha256: "metadata-sha".to_string(),
+            canonical_remote_url: "git@github.com:team/repo.git".to_string(),
+            remote_urls: vec!["git@github.com:team/repo.git".to_string()],
+            canonical_repo_root: "/tmp/repo".to_string(),
+            worktree_roots: vec!["/tmp/repo".to_string()],
+            cwd: None,
+            git_ref: Some("refs/heads/main".to_string()),
+            head_commit_sha: Some("abc123".to_string()),
             git_user_email: None,
             git_user_name: None,
-            cli_version: "1.0.0".to_string(),
-            cwd: None,
-            repo_root: "/tmp/repo".to_string(),
+            cli_version: Some("1.0.0".to_string()),
         };
 
         let value = serde_json::to_value(&request).expect("serialize request");

@@ -627,6 +627,43 @@ pub async fn remote_url_at(repo: &Path, remote: &str) -> Result<Option<String>> 
     Ok(Some(url.trim().to_string()))
 }
 
+/// Return all configured remote URLs for a repository.
+pub async fn remote_urls_at(repo: &Path) -> Result<Vec<String>> {
+    let output = run_git_output_at(Some(repo), &["remote"], &[])
+        .await
+        .context("failed to execute git remote")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let remotes =
+        String::from_utf8(output.stdout).context("git remote output was not valid UTF-8")?;
+    let mut urls = BTreeSet::new();
+    for remote in remotes.lines().filter(|name| !name.trim().is_empty()) {
+        if let Some(url) = remote_url_at(repo, remote).await?
+            && !url.trim().is_empty()
+        {
+            urls.insert(url);
+        }
+    }
+    Ok(urls.into_iter().collect())
+}
+
+/// Return the canonical repo root plus linked worktree roots for a repository.
+pub async fn repo_and_worktree_roots_at(repo: &Path) -> Vec<String> {
+    let mut roots = Vec::with_capacity(1);
+    roots.push(repo.to_string_lossy().to_string());
+    roots.extend(
+        alternative_repo_roots_for_repo(repo)
+            .await
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// Resolve the push remote for a specific repository.
 pub async fn resolve_push_remote_at(repo: &Path) -> Result<Option<String>> {
     let output = run_git_output_at(

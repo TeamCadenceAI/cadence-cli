@@ -3,8 +3,9 @@ mod api_client;
 mod config;
 mod git;
 mod login;
-mod note;
 mod output;
+mod publication_state;
+mod publication_v2;
 mod scanner;
 mod tracing;
 mod update;
@@ -810,12 +811,6 @@ fn hook_status_spinner_finish_err(pb: Option<ProgressBar>, task: &str) {
     }
 }
 
-fn format_unix_rfc3339(epoch: i64) -> Option<String> {
-    let dt = time::OffsetDateTime::from_unix_timestamp(epoch).ok()?;
-    dt.format(&time::format_description::well_known::Rfc3339)
-        .ok()
-}
-
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
     Some(format!("refs/heads/{branch}"))
@@ -889,7 +884,6 @@ fn hook_discovery_concurrency() -> usize {
 struct ParsedSessionLog {
     log: agents::SessionLog,
     metadata: scanner::SessionMetadata,
-    session_start: Option<i64>,
     session_log: String,
 }
 
@@ -1007,11 +1001,9 @@ async fn parse_session_log_once(log: agents::SessionLog) -> Option<ParsedSession
         agents::SessionSource::Inline { .. } => scanner::parse_session_metadata_str(&session_log),
     };
     metadata.agent_type = Some(log.agent_type.clone());
-    let session_start = scanner::session_time_range_str(&session_log).map(|(start, _)| start);
     Some(ParsedSessionLog {
         log,
         metadata,
-        session_start,
         session_log,
     })
 }
@@ -1042,15 +1034,6 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     out.into_iter().map(|(_, parsed)| parsed).collect()
 }
 
-async fn committer_key_hash_for_repo(repo: &std::path::Path) -> String {
-    let email = git::config_get_at(repo, "user.email")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".to_string());
-    note::hash_key(email.trim().to_ascii_lowercase().as_str())
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 struct UploadRunStats {
     uploaded: usize,
@@ -1068,11 +1051,18 @@ enum UploadFromLogOutcome {
     Retryable(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationMode {
+    Live,
+    Backfill,
+}
+
 async fn upload_session_from_log(
     context: &upload::UploadContext,
     parsed: &ParsedSessionLog,
     repo_root: &std::path::Path,
     repo_root_str: &str,
+    mode: PublicationMode,
 ) -> UploadFromLogOutcome {
     let session_id = parsed
         .metadata
@@ -1085,19 +1075,6 @@ async fn upload_session_from_log(
         .agent_type
         .clone()
         .unwrap_or(scanner::AgentType::Claude);
-    let content_sha256 = note::content_sha256(&parsed.session_log);
-    let session_uid = note::compute_session_uid(
-        &agent,
-        &session_id,
-        repo_root_str,
-        parsed.session_start,
-        &content_sha256,
-    );
-    let ingested_at = parsed
-        .session_start
-        .and_then(format_unix_rfc3339)
-        .unwrap_or_else(note::now_rfc3339);
-    let committer_key_hash = committer_key_hash_for_repo(repo_root).await;
     let git_user_email = git::config_get_at(repo_root, "user.email")
         .await
         .ok()
@@ -1106,118 +1083,89 @@ async fn upload_session_from_log(
         .await
         .ok()
         .flatten();
-    let git_ref = match git_ref_for_repo(repo_root).await {
-        Some(git_ref) => git_ref,
-        None => {
-            return match upload::queue_session_for_remote_resolution(
-                note::SessionRecord {
-                    session_uid,
-                    agent: agent.to_string(),
-                    session_id,
-                    repo_root: repo_root_str.to_string(),
-                    repo_remote_url: None,
-                    git_ref: "refs/heads/unknown".to_string(),
-                    head_sha: "unknown".to_string(),
-                    committer_key_hash,
-                    git_user_email,
-                    git_user_name,
-                    session_start: parsed.session_start,
-                    content_sha256,
-                    cwd: parsed
-                        .metadata
-                        .cwd
-                        .clone()
-                        .or_else(|| Some(repo_root_str.to_string())),
-                    ingested_at,
-                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                },
-                parsed.session_log.clone(),
-                "repo has no attached git branch",
-            )
-            .await
-            {
-                Ok(()) => {
-                    UploadFromLogOutcome::Queued("repo has no attached git branch".to_string())
-                }
-                Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
-            };
-        }
+    let remote_urls = match git::remote_urls_at(repo_root).await {
+        Ok(urls) => urls,
+        Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
     };
-    let head_sha = match head_sha_for_repo(repo_root).await {
-        Some(head_sha) => head_sha,
-        None => {
-            return match upload::queue_session_for_remote_resolution(
-                note::SessionRecord {
-                    session_uid,
-                    agent: agent.to_string(),
-                    session_id,
-                    repo_root: repo_root_str.to_string(),
-                    repo_remote_url: None,
-                    git_ref,
-                    head_sha: "unknown".to_string(),
-                    committer_key_hash,
-                    git_user_email,
-                    git_user_name,
-                    session_start: parsed.session_start,
-                    content_sha256,
-                    cwd: parsed
-                        .metadata
-                        .cwd
-                        .clone()
-                        .or_else(|| Some(repo_root_str.to_string())),
-                    ingested_at,
-                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                },
-                parsed.session_log.clone(),
-                "repo HEAD commit could not be resolved",
-            )
-            .await
-            {
-                Ok(()) => UploadFromLogOutcome::Queued(
-                    "repo HEAD commit could not be resolved".to_string(),
-                ),
-                Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
-            };
-        }
-    };
-    let repo_remote_url = git::preferred_remote_url_at(repo_root).await.ok().flatten();
-
-    let record = note::SessionRecord {
-        session_uid,
-        agent: agent.to_string(),
-        session_id,
-        repo_root: repo_root_str.to_string(),
-        repo_remote_url,
-        git_ref,
-        head_sha,
-        committer_key_hash,
-        git_user_email,
-        git_user_name,
-        session_start: parsed.session_start,
-        content_sha256,
-        cwd: parsed
-            .metadata
-            .cwd
-            .clone()
-            .or_else(|| Some(repo_root_str.to_string())),
-        ingested_at,
-        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-
-    if record.repo_remote_url.is_none() {
-        return match upload::queue_session_for_remote_resolution(
-            record,
-            parsed.session_log.clone(),
-            "repo has no push remote URL",
-        )
+    let canonical_remote_url = git::preferred_remote_url_at(repo_root)
         .await
-        {
-            Ok(()) => UploadFromLogOutcome::Queued("repo has no push remote URL".to_string()),
+        .ok()
+        .flatten()
+        .or_else(|| remote_urls.first().cloned());
+    let worktree_roots = git::repo_and_worktree_roots_at(repo_root).await;
+    let (git_ref, head_commit_sha) = match mode {
+        PublicationMode::Live => (
+            git_ref_for_repo(repo_root).await,
+            head_sha_for_repo(repo_root).await,
+        ),
+        PublicationMode::Backfill => (None, None),
+    };
+
+    let Some(canonical_remote_url) = canonical_remote_url else {
+        let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
+            logical_session: publication_v2::LogicalSessionKey {
+                agent: agent.to_string(),
+                agent_session_id: session_id,
+            },
+            observations: publication_v2::PublicationObservations {
+                canonical_remote_url: String::new(),
+                remote_urls,
+                canonical_repo_root: repo_root_str.to_string(),
+                worktree_roots,
+                cwd: parsed
+                    .metadata
+                    .cwd
+                    .clone()
+                    .or_else(|| Some(repo_root_str.to_string())),
+                git_ref,
+                head_commit_sha,
+                git_user_email,
+                git_user_name,
+                cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            },
+            raw_session_content: parsed.session_log.clone(),
+        }) {
+            Ok(prepared) => prepared,
+            Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
+        };
+        return match upload::upload_or_queue_prepared_session(context, &prepared).await {
+            Ok(upload::LiveUploadOutcome::Queued { reason }) => {
+                UploadFromLogOutcome::Queued(reason)
+            }
+            Ok(upload::LiveUploadOutcome::AlreadyExists) => {
+                UploadFromLogOutcome::Queued("repo has no push remote URL".to_string())
+            }
+            Ok(upload::LiveUploadOutcome::Uploaded) => UploadFromLogOutcome::Uploaded,
+            Ok(upload::LiveUploadOutcome::SkippedRepoNotAssociated) => {
+                UploadFromLogOutcome::SkippedRepoNotAssociated
+            }
             Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
         };
-    }
+    };
 
-    let prepared = match upload::prepare_session_upload(record, parsed.session_log.clone()) {
+    let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
+        logical_session: publication_v2::LogicalSessionKey {
+            agent: agent.to_string(),
+            agent_session_id: session_id,
+        },
+        observations: publication_v2::PublicationObservations {
+            canonical_remote_url,
+            remote_urls,
+            canonical_repo_root: repo_root_str.to_string(),
+            worktree_roots,
+            cwd: parsed
+                .metadata
+                .cwd
+                .clone()
+                .or_else(|| Some(repo_root_str.to_string())),
+            git_ref,
+            head_commit_sha,
+            git_user_email,
+            git_user_name,
+            cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        },
+        raw_session_content: parsed.session_log.clone(),
+    }) {
         Ok(prepared) => prepared,
         Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
     };
@@ -1302,7 +1250,14 @@ async fn upload_incremental_sessions_for_repo(
             &mut cursor_advance,
             log_mtime,
             &log_source_label,
-            upload_session_from_log(context, &parsed, repo_root, repo_root_str).await,
+            upload_session_from_log(
+                context,
+                &parsed,
+                repo_root,
+                repo_root_str,
+                PublicationMode::Live,
+            )
+            .await,
         ) {
             break;
         }
@@ -1583,18 +1538,20 @@ async fn process_repo_backfill(
             }
         };
         let repo_str = session.repo_root.to_string_lossy().to_string();
-        let session_start = session_log_time_range(&session.log)
-            .await
-            .map(|(start, _)| start);
-
         let parsed = ParsedSessionLog {
             log: session.log.clone(),
             metadata: session.metadata.clone(),
-            session_start,
             session_log,
         };
 
-        match upload_session_from_log(&upload_context, &parsed, &session.repo_root, &repo_str).await
+        match upload_session_from_log(
+            &upload_context,
+            &parsed,
+            &session.repo_root,
+            &repo_str,
+            PublicationMode::Backfill,
+        )
+        .await
         {
             UploadFromLogOutcome::Uploaded => {
                 stats.uploaded += 1;
@@ -3304,6 +3261,32 @@ mod tests {
         }
     }
 
+    fn sample_observed_upload(
+        repo_root: &std::path::Path,
+        session_id: &str,
+        content: &str,
+    ) -> upload::ObservedSessionUpload {
+        upload::ObservedSessionUpload {
+            logical_session: publication_v2::LogicalSessionKey {
+                agent: "claude".to_string(),
+                agent_session_id: session_id.to_string(),
+            },
+            observations: publication_v2::PublicationObservations {
+                canonical_remote_url: "git@github.com:test-org/example.git".to_string(),
+                remote_urls: vec!["git@github.com:test-org/example.git".to_string()],
+                canonical_repo_root: repo_root.to_string_lossy().to_string(),
+                worktree_roots: vec![repo_root.to_string_lossy().to_string()],
+                cwd: Some(repo_root.to_string_lossy().to_string()),
+                git_ref: Some("refs/heads/main".to_string()),
+                head_commit_sha: Some("abc1234".to_string()),
+                git_user_email: Some("dev@example.com".to_string()),
+                git_user_name: Some("Dev".to_string()),
+                cli_version: Some("1.0.0".to_string()),
+            },
+            raw_session_content: content.to_string(),
+        }
+    }
+
     #[test]
     fn cli_parses_login_command() {
         let cli = Cli::parse_from(["cadence", "login"]);
@@ -3876,7 +3859,12 @@ mod tests {
         let repo = init_repo().await;
         run_git(
             repo.path(),
-            &["remote", "add", "origin", "git@github.com:team/example.git"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
         )
         .await;
 
@@ -3909,7 +3897,7 @@ mod tests {
             .unwrap_or_else(|| "backfill-session".to_string());
 
         let stats = process_repo_backfill(
-            "git@github.com:team/example.git".to_string(),
+            "git@github.com:test-org/example.git".to_string(),
             vec![SessionInfo {
                 log: agents::SessionLog {
                     agent_type: scanner::AgentType::Claude,
@@ -3936,9 +3924,10 @@ mod tests {
         assert_eq!(
             server.counts(),
             crate::upload::test_support::TestUploadServerCounts {
-                upload_url_requests: 1,
+                create_requests: 1,
                 uploads: 1,
                 confirms: 1,
+                user_org_requests: 1,
             }
         );
     }
@@ -3960,13 +3949,18 @@ mod tests {
         let repo = init_repo().await;
         run_git(
             repo.path(),
-            &["remote", "add", "origin", "git@github.com:team/example.git"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
         )
         .await;
 
         let server = crate::upload::test_support::spawn_test_upload_server(
             crate::upload::test_support::TestUploadServerConfig {
-                upload_url_statuses: vec![409, 422],
+                create_statuses: vec![409, 422],
                 ..crate::upload::test_support::TestUploadServerConfig::default()
             },
         )
@@ -3994,7 +3988,7 @@ mod tests {
         let _session = tracing::install_global(logger.clone());
 
         let stats = process_repo_backfill(
-            "git@github.com:team/example.git".to_string(),
+            "git@github.com:test-org/example.git".to_string(),
             vec![
                 sample_inline_session(repo.path(), "session-1.jsonl", "session-1"),
                 sample_inline_session(repo.path(), "session-2.jsonl", "session-2"),
@@ -4006,13 +4000,12 @@ mod tests {
         logger.flush().await;
 
         assert_eq!(stats.sessions_seen, 2);
-        assert_eq!(stats.skipped, 2);
+        assert_eq!(stats.queued, 2);
         assert_eq!(stats.uploaded, 0);
 
         let rows = read_jsonl(&logger.path().expect("logger path")).await;
         let names = event_names(&rows);
-        assert!(names.contains(&"session_skipped_already_exists".to_string()));
-        assert!(names.contains(&"session_skipped_repo_not_associated".to_string()));
+        assert!(names.contains(&"session_queued".to_string()));
     }
 
     #[tokio::test]
@@ -4031,25 +4024,12 @@ mod tests {
 
         let api_url_guard = EnvGuard::new("CADENCE_API_URL");
 
-        let record = note::SessionRecord {
-            session_uid: "queued-pending-session".to_string(),
-            agent: "claude".to_string(),
-            session_id: "session-pending".to_string(),
-            repo_root: "/tmp/repo".to_string(),
-            repo_remote_url: Some("git@github.com:team/example.git".to_string()),
-            git_ref: "refs/heads/main".to_string(),
-            head_sha: "abc123".to_string(),
-            committer_key_hash: "committer".to_string(),
-            git_user_email: Some("dev@example.com".to_string()),
-            git_user_name: Some("Dev".to_string()),
-            session_start: Some(1_700_000_000),
-            content_sha256: note::content_sha256("hello"),
-            cwd: Some("/tmp/repo".to_string()),
-            ingested_at: "2026-03-02T00:00:00Z".to_string(),
-            cli_version: "1.0.0".to_string(),
-        };
-        let prepared = upload::prepare_session_upload(record, "hello".to_string())
-            .expect("prepare session upload");
+        let prepared = upload::prepare_session_upload(sample_observed_upload(
+            Path::new("/tmp/repo"),
+            "session-pending",
+            "hello",
+        ))
+        .expect("prepare session upload");
         let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
             .await
             .expect("context without token");
@@ -4080,9 +4060,10 @@ mod tests {
         assert_eq!(
             server.counts(),
             crate::upload::test_support::TestUploadServerCounts {
-                upload_url_requests: 1,
+                create_requests: 1,
                 uploads: 1,
                 confirms: 1,
+                user_org_requests: 1,
             }
         );
 
@@ -4133,25 +4114,12 @@ mod tests {
             ("queued-repo-a", repo_a.as_path()),
             ("queued-repo-b", repo_b.as_path()),
         ] {
-            let record = note::SessionRecord {
-                session_uid: uid.to_string(),
-                agent: "claude".to_string(),
-                session_id: format!("session-{uid}"),
-                repo_root: repo_root.to_string_lossy().to_string(),
-                repo_remote_url: Some("git@github.com:team/example.git".to_string()),
-                git_ref: "refs/heads/main".to_string(),
-                head_sha: "abc123".to_string(),
-                committer_key_hash: "committer".to_string(),
-                git_user_email: Some("dev@example.com".to_string()),
-                git_user_name: Some("Dev".to_string()),
-                session_start: Some(1_700_000_000),
-                content_sha256: note::content_sha256("hello"),
-                cwd: Some(repo_root.to_string_lossy().to_string()),
-                ingested_at: "2026-03-02T00:00:00Z".to_string(),
-                cli_version: "1.0.0".to_string(),
-            };
-            let prepared = upload::prepare_session_upload(record, "hello".to_string())
-                .expect("prepare session upload");
+            let prepared = upload::prepare_session_upload(sample_observed_upload(
+                repo_root,
+                &format!("session-{uid}"),
+                "hello",
+            ))
+            .expect("prepare session upload");
             let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
                 .await
                 .expect("context without token");
@@ -4197,14 +4165,15 @@ mod tests {
         assert_eq!(
             server.counts(),
             crate::upload::test_support::TestUploadServerCounts {
-                upload_url_requests: 1,
+                create_requests: 1,
                 uploads: 1,
                 confirms: 1,
+                user_org_requests: 1,
             }
         );
-        let requests = server.upload_requests();
+        let requests = server.create_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].repo_root, repo_a.to_string_lossy());
+        assert_eq!(requests[0].canonical_repo_root, repo_a.to_string_lossy());
     }
 
     // -----------------------------------------------------------------------
