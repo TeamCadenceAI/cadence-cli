@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.0...v2.1.1) (2026-03-23)
+
+
+### Bug Fixes
+
+* **login:** improve auth failure diagnostics ([a7ccbd2](https://github.com/TeamCadenceAI/cadence-cli/commit/a7ccbd23be974d4a26ff7cbcd81349a6ecdaa689))
+* **login:** improve auth failure diagnostics ([89f5c99](https://github.com/TeamCadenceAI/cadence-cli/commit/89f5c999699bbcb11a93d48f32df977ec00c5c38))
+
 ## [2.1.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.0.6...v2.1.0) (2026-03-23)
 
 
