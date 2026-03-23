@@ -155,6 +155,8 @@ async fn process_pending_uploads_matching(
     for stored in records.into_iter().take(max_items) {
         summary.attempted += 1;
         let Some(payload) = load_payload(&stored.storage_key).await? else {
+            remove_record(&stored.storage_key).await?;
+            summary.dropped_permanent += 1;
             continue;
         };
         let prepared = rebuild_prepared_upload(&stored.record, payload).await?;
@@ -170,15 +172,20 @@ async fn process_pending_uploads_matching(
 }
 
 async fn pending_upload_count_matching(repo_filter: Option<&Path>) -> Result<usize> {
-    Ok(pending_records(repo_filter).await?.len())
+    Ok(all_pending_records(repo_filter).await?.len())
 }
 
 async fn pending_records(repo_filter: Option<&Path>) -> Result<Vec<StoredPublication>> {
     let now_epoch = now_epoch();
+    let mut records = all_pending_records(repo_filter).await?;
+    records.retain(|stored| stored.record.next_attempt_at_epoch <= now_epoch);
+    Ok(records)
+}
+
+async fn all_pending_records(repo_filter: Option<&Path>) -> Result<Vec<StoredPublication>> {
     let mut records = load_all_records().await?;
     records.retain(|stored| {
         stored.record.status != PublicationStatus::Published
-            && stored.record.next_attempt_at_epoch <= now_epoch
             && repo_filter
                 .map(|filter| record_matches_repo(&stored.record, filter))
                 .unwrap_or(true)
@@ -602,6 +609,7 @@ async fn attempt_upload(
     client
         .upload_presigned(
             &create.upload_url,
+            "application/jsonl",
             prepared.raw_session_content.as_bytes(),
             Duration::from_secs(PRESIGNED_UPLOAD_TIMEOUT_SECS),
         )
@@ -666,6 +674,12 @@ pub(crate) mod test_support {
         pub user_org_requests: usize,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct UploadRequest {
+        pub content_type: Option<String>,
+        pub body: String,
+    }
+
     #[derive(Debug, Clone)]
     pub struct TestUploadServer {
         pub base_url: String,
@@ -676,6 +690,7 @@ pub(crate) mod test_support {
     struct TestUploadServerState {
         counts: TestUploadServerCounts,
         create_requests: Vec<CreateSessionPublicationRequest>,
+        upload_requests: Vec<UploadRequest>,
         create_statuses: VecDeque<u16>,
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
@@ -695,6 +710,14 @@ pub(crate) mod test_support {
                 .create_requests
                 .clone()
         }
+
+        pub fn upload_requests(&self) -> Vec<UploadRequest> {
+            self.state
+                .lock()
+                .expect("server state")
+                .upload_requests
+                .clone()
+        }
     }
 
     pub(crate) async fn spawn_test_upload_server(
@@ -709,6 +732,7 @@ pub(crate) mod test_support {
         let state = Arc::new(Mutex::new(TestUploadServerState {
             counts: TestUploadServerCounts::default(),
             create_requests: Vec::new(),
+            upload_requests: Vec::new(),
             create_statuses: config.create_statuses.into(),
             upload_statuses: config.upload_statuses.into(),
             confirm_statuses: config.confirm_statuses.into(),
@@ -739,16 +763,19 @@ pub(crate) mod test_support {
                 let state = Arc::clone(&task_state);
                 let base_url = task_base_url.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    let Ok(n) = stream.read(&mut buf).await else {
+                    let Ok(request) = read_http_request(&mut stream).await else {
                         return;
                     };
-                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
                     let mut lines = request.lines();
                     let request_line = lines.next().unwrap_or_default();
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default();
                     let path = parts.next().unwrap_or_default();
+                    let content_type = lines.clone().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-type")
+                            .then(|| value.trim().to_string())
+                    });
                     let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
 
                     let (status, response_body) = match (method, path) {
@@ -788,6 +815,10 @@ pub(crate) mod test_support {
                             let (status, delay_ms) = {
                                 let mut guard = state.lock().expect("server state");
                                 guard.counts.uploads += 1;
+                                guard.upload_requests.push(UploadRequest {
+                                    content_type,
+                                    body: body.to_string(),
+                                });
                                 (
                                     guard.upload_statuses.pop_front().unwrap_or(200),
                                     guard.upload_response_delay_ms,
@@ -831,11 +862,56 @@ pub(crate) mod test_support {
 
         Ok(TestUploadServer { base_url, state })
     }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<String> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        let mut content_length = None;
+
+        loop {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+
+            if buf.len() >= 64 * 1024 {
+                break;
+            }
+
+            let Some(headers_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers_len = headers_end + 4;
+            if content_length.is_none() {
+                let headers = String::from_utf8_lossy(&buf[..headers_len]);
+                content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+            }
+
+            match content_length {
+                Some(expected_body_len) if buf.len() >= headers_len + expected_body_len => break,
+                None if buf.len() >= headers_len => break,
+                _ => {}
+            }
+        }
+
+        if buf.is_empty() {
+            anyhow::bail!("empty request");
+        }
+
+        Ok(String::from_utf8_lossy(&buf).to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publication_state::{load_all_records, remove_record, storage_key};
     use serial_test::serial;
     use std::ffi::OsString;
     use tempfile::TempDir;
@@ -979,6 +1055,13 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, LiveUploadOutcome::Uploaded);
         assert_eq!(server.counts().create_requests, 1);
+        let upload_requests = server.upload_requests();
+        assert_eq!(upload_requests.len(), 1);
+        assert_eq!(
+            upload_requests[0].content_type.as_deref(),
+            Some("application/jsonl")
+        );
+        assert_eq!(upload_requests[0].body, "hello");
         assert_eq!(pending_upload_count().await.unwrap(), 0);
     }
 
@@ -1106,5 +1189,127 @@ mod tests {
                 .is_some_and(|git_ref| git_ref.starts_with("refs/heads/"))
         );
         assert!(requests[0].head_commit_sha.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pending_upload_count_includes_future_retryable_records() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            create_statuses: vec![500],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, LiveUploadOutcome::Queued { .. }));
+
+        let records = load_all_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].record.status,
+            PublicationStatus::RetryableFailure
+        );
+        assert!(records[0].record.next_attempt_at_epoch > now_epoch());
+        assert_eq!(pending_upload_count().await.unwrap(), 1);
+
+        remove_record(&records[0].storage_key).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn process_pending_uploads_drops_records_missing_payloads() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let queued_context = UploadContext {
+            client: ApiClient::new("http://127.0.0.1:9"),
+            token: None,
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(ObservedSessionUpload {
+            observations: PublicationObservations {
+                canonical_remote_url: String::new(),
+                remote_urls: Vec::new(),
+                canonical_repo_root: "/tmp/repo".to_string(),
+                worktree_roots: vec!["/tmp/repo".to_string()],
+                cwd: Some("/tmp/repo".to_string()),
+                git_ref: None,
+                head_commit_sha: None,
+                git_user_email: None,
+                git_user_name: None,
+                cli_version: Some("1.0.0".to_string()),
+            },
+            ..sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git")
+        })
+        .unwrap();
+
+        upload_or_queue_prepared_session(&queued_context, &prepared)
+            .await
+            .unwrap();
+
+        let key = storage_key(&prepared.prepared.logical_session, None);
+        let payload_path = home
+            .path()
+            .join(".cadence")
+            .join("cli")
+            .join("publication-state")
+            .join(format!("{key}.blob"));
+        tokio::fs::remove_file(payload_path).await.unwrap();
+
+        let retry_context = UploadContext {
+            client: ApiClient::new("http://127.0.0.1:9"),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+        let summary = process_pending_uploads(&retry_context, 1).await.unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.dropped_permanent, 1);
+        assert_eq!(pending_upload_count().await.unwrap(), 0);
+        assert!(load_all_records().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_server_reads_full_request_body_for_large_uploads() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let server =
+            test_support::spawn_test_upload_server(test_support::TestUploadServerConfig::default())
+                .await
+                .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+        let large_body = "line\n".repeat(10_000);
+        let prepared = prepare_session_upload(ObservedSessionUpload {
+            raw_session_content: large_body.clone(),
+            ..sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git")
+        })
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+
+        let upload_requests = server.upload_requests();
+        assert_eq!(upload_requests.len(), 1);
+        assert_eq!(upload_requests[0].body, large_body);
     }
 }

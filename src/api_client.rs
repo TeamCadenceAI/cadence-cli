@@ -375,10 +375,11 @@ impl ApiClient {
             .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))
     }
 
-    /// Upload compressed session bytes to a presigned S3 URL.
+    /// Upload session bytes to a presigned S3 URL.
     pub async fn upload_presigned(
         &self,
         upload_url: &str,
+        content_type: &str,
         payload: &[u8],
         timeout: Duration,
     ) -> std::result::Result<(), AuthenticatedRequestError> {
@@ -386,7 +387,7 @@ impl ApiClient {
             timeout,
             self.raw_client
                 .put(upload_url)
-                .header(reqwest::header::CONTENT_TYPE, "application/zstd")
+                .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(payload.to_vec())
                 .send(),
         )
