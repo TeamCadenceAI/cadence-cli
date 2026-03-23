@@ -30,6 +30,34 @@ const API_TIMEOUT_SECS: u64 = 5;
 const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
 static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
+fn error_chain_messages(err: &anyhow::Error) -> Vec<String> {
+    let mut messages = Vec::new();
+    for cause in err.chain() {
+        let msg = cause.to_string();
+        if msg.trim().is_empty() {
+            continue;
+        }
+        if messages.last().map(|last| last == &msg).unwrap_or(false) {
+            continue;
+        }
+        messages.push(msg);
+    }
+    messages
+}
+
+fn report_error(err: &anyhow::Error) {
+    let mut messages = error_chain_messages(err).into_iter();
+    match messages.next() {
+        Some(first) => {
+            output::fail("Failed", &first);
+            for cause in messages {
+                output::detail(&format!("Caused by: {cause}"));
+            }
+        }
+        None => output::fail("Failed", "unknown error"),
+    }
+}
+
 /// Cadence CLI: upload AI coding agent sessions directly to Cadence.
 ///
 /// Provides provenance and measurement of AI-assisted development
@@ -3078,7 +3106,7 @@ async fn main() {
     }
 
     if let Err(e) = result {
-        output::fail("Failed", &format!("{}", e));
+        report_error(&e);
         process::exit(1);
     }
 }
@@ -3090,6 +3118,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use serde_json::Value;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -3446,6 +3475,29 @@ mod tests {
             install_auto_update_ftue_state(&config::CliConfig::default()),
             InstallAutoUpdateFtueState::EnableByDefault
         );
+    }
+
+    #[test]
+    fn error_chain_messages_include_context_and_root_cause() {
+        let err = anyhow!("root cause")
+            .context("mid context")
+            .context("top context");
+
+        assert_eq!(
+            error_chain_messages(&err),
+            vec![
+                "top context".to_string(),
+                "mid context".to_string(),
+                "root cause".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn error_chain_messages_skip_adjacent_duplicates() {
+        let err = anyhow!("same").context("same");
+
+        assert_eq!(error_chain_messages(&err), vec!["same".to_string()]);
     }
 
     #[tokio::test]

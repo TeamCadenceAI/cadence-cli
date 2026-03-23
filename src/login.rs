@@ -129,30 +129,8 @@ async fn handle_callback_request(
         return Ok(None);
     }
 
-    let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
-        .context("failed to parse callback URL")?;
-
-    let code = url
-        .query_pairs()
-        .find_map(|(k, v)| {
-            if k == "code" {
-                Some(v.into_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    let returned_state = url
-        .query_pairs()
-        .find_map(|(k, v)| {
-            if k == "state" {
-                Some(v.into_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let code = callback_query_param(target, "code").unwrap_or_default();
+    let returned_state = callback_query_param(target, "state").unwrap_or_default();
 
     if code.is_empty() {
         write_http_response(
@@ -332,6 +310,50 @@ p {{
     )
 }
 
+fn callback_query_param(target: &str, key: &str) -> Option<String> {
+    let (_, query) = target.split_once('?')?;
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if decode_callback_component(raw_key) == key {
+            return Some(decode_callback_component(raw_value));
+        }
+    }
+    None
+}
+
+fn decode_callback_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2]))
+        {
+            out.push((high << 4) | low);
+            i += 3;
+            continue;
+        }
+
+        // Preserve literal '+' to avoid corrupting auth codes when the upstream
+        // callback URL is not form-encoded.
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Escapes user-visible text for safe inclusion in callback HTML.
 fn escape_html(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
@@ -391,5 +413,25 @@ mod tests {
         let html = render_callback_html(400, "<script>alert('xss')</script>");
         assert!(html.contains("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"));
         assert!(!html.contains("<script>alert('xss')</script>"));
+    }
+
+    #[test]
+    fn callback_query_param_preserves_literal_plus_in_exchange_code() {
+        let target = "/callback?code=a+b%2Bc&state=state123";
+
+        assert_eq!(
+            callback_query_param(target, "code"),
+            Some("a+b+c".to_string())
+        );
+    }
+
+    #[test]
+    fn callback_query_param_decodes_percent_escapes() {
+        let target = "/callback?state=hello%20world&code=abc123";
+
+        assert_eq!(
+            callback_query_param(target, "state"),
+            Some("hello world".to_string())
+        );
     }
 }
