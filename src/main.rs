@@ -4,8 +4,8 @@ mod config;
 mod git;
 mod login;
 mod output;
+mod publication;
 mod publication_state;
-mod publication_v2;
 mod scanner;
 mod tracing;
 mod update;
@@ -838,7 +838,7 @@ fn apply_incremental_upload_outcome(
             );
             true
         }
-        UploadFromLogOutcome::AlreadyExists | UploadFromLogOutcome::SkippedRepoNotAssociated => {
+        UploadFromLogOutcome::AlreadyExists => {
             stats.skipped += 1;
             *cursor_advance = advance_cursor_for_disposition(
                 cursor_advance,
@@ -1046,7 +1046,6 @@ struct UploadRunStats {
 enum UploadFromLogOutcome {
     Uploaded,
     AlreadyExists,
-    SkippedRepoNotAssociated,
     Queued(String),
     Retryable(String),
 }
@@ -1103,11 +1102,11 @@ async fn upload_session_from_log(
 
     let Some(canonical_remote_url) = canonical_remote_url else {
         let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
-            logical_session: publication_v2::LogicalSessionKey {
+            logical_session: publication::LogicalSessionKey {
                 agent: agent.to_string(),
                 agent_session_id: session_id,
             },
-            observations: publication_v2::PublicationObservations {
+            observations: publication::PublicationObservations {
                 canonical_remote_url: String::new(),
                 remote_urls,
                 canonical_repo_root: repo_root_str.to_string(),
@@ -1136,19 +1135,16 @@ async fn upload_session_from_log(
                 UploadFromLogOutcome::Queued("repo has no push remote URL".to_string())
             }
             Ok(upload::LiveUploadOutcome::Uploaded) => UploadFromLogOutcome::Uploaded,
-            Ok(upload::LiveUploadOutcome::SkippedRepoNotAssociated) => {
-                UploadFromLogOutcome::SkippedRepoNotAssociated
-            }
             Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
         };
     };
 
     let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
-        logical_session: publication_v2::LogicalSessionKey {
+        logical_session: publication::LogicalSessionKey {
             agent: agent.to_string(),
             agent_session_id: session_id,
         },
-        observations: publication_v2::PublicationObservations {
+        observations: publication::PublicationObservations {
             canonical_remote_url,
             remote_urls,
             canonical_repo_root: repo_root_str.to_string(),
@@ -1173,9 +1169,6 @@ async fn upload_session_from_log(
     match upload::upload_or_queue_prepared_session(context, &prepared).await {
         Ok(upload::LiveUploadOutcome::Uploaded) => UploadFromLogOutcome::Uploaded,
         Ok(upload::LiveUploadOutcome::AlreadyExists) => UploadFromLogOutcome::AlreadyExists,
-        Ok(upload::LiveUploadOutcome::SkippedRepoNotAssociated) => {
-            UploadFromLogOutcome::SkippedRepoNotAssociated
-        }
         Ok(upload::LiveUploadOutcome::Queued { reason }) => UploadFromLogOutcome::Queued(reason),
         Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
     }
@@ -1284,13 +1277,6 @@ async fn session_log_metadata(log: &agents::SessionLog) -> scanner::SessionMetad
     };
     metadata.agent_type = Some(log.agent_type.clone());
     metadata
-}
-
-async fn session_log_time_range(log: &agents::SessionLog) -> Option<(i64, i64)> {
-    match &log.source {
-        agents::SessionSource::File(path) => scanner::session_time_range(path).await,
-        agents::SessionSource::Inline { content, .. } => scanner::session_time_range_str(content),
-    }
 }
 
 async fn session_log_content_async(log: &agents::SessionLog) -> Option<String> {
@@ -1578,16 +1564,6 @@ async fn process_repo_backfill(
                 stats.skipped += 1;
                 ::tracing::info!(
                     event = "session_skipped_already_exists",
-                    repo_display = repo_display.as_str(),
-                    repo_root = repo_root_str.as_str(),
-                    session_id = session.session_id.as_str(),
-                    file = session.log.source_label()
-                );
-            }
-            UploadFromLogOutcome::SkippedRepoNotAssociated => {
-                stats.skipped += 1;
-                ::tracing::info!(
-                    event = "session_skipped_repo_not_associated",
                     repo_display = repo_display.as_str(),
                     repo_root = repo_root_str.as_str(),
                     session_id = session.session_id.as_str(),
@@ -3267,11 +3243,11 @@ mod tests {
         content: &str,
     ) -> upload::ObservedSessionUpload {
         upload::ObservedSessionUpload {
-            logical_session: publication_v2::LogicalSessionKey {
+            logical_session: publication::LogicalSessionKey {
                 agent: "claude".to_string(),
                 agent_session_id: session_id.to_string(),
             },
-            observations: publication_v2::PublicationObservations {
+            observations: publication::PublicationObservations {
                 canonical_remote_url: "git@github.com:test-org/example.git".to_string(),
                 remote_urls: vec!["git@github.com:test-org/example.git".to_string()],
                 canonical_repo_root: repo_root.to_string_lossy().to_string(),

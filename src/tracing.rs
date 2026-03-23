@@ -156,6 +156,7 @@ pub(crate) fn sanitize_path(path: &Path) -> String {
     truncate_text(path.display().to_string(), MAX_TEXT_FIELD_CHARS)
 }
 
+#[cfg(test)]
 pub(crate) fn redact_remote_url(url: &str) -> String {
     if let Ok(parsed) = reqwest::Url::parse(url)
         && matches!(parsed.scheme(), "http" | "https")

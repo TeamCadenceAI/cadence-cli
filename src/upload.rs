@@ -1,4 +1,4 @@
-//! V2 session publication pipeline and durable retry state.
+//! Session publication pipeline and durable retry state.
 
 use crate::api_client::{
     ApiClient, AuthenticatedRequestError, CreateSessionPublicationRequest,
@@ -6,13 +6,13 @@ use crate::api_client::{
 };
 use crate::config;
 use crate::git;
+use crate::publication::{
+    LogicalSessionKey, PreparedPublication, PublicationObservations, new_publish_uid,
+    prepare_publication,
+};
 use crate::publication_state::{
     PublicationStateRecord, PublicationStatus, StoredPublication, load_all_records, load_payload,
     now_rfc3339, remove_record, upsert_record,
-};
-use crate::publication_v2::{
-    LogicalSessionKey, PreparedPublication, PublicationObservations, new_publish_uid,
-    prepare_publication,
 };
 use anyhow::Result;
 use std::path::Path;
@@ -22,8 +22,10 @@ use tokio::sync::Mutex;
 const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
+/// Maximum number of pending publications drained in one run by default.
 pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 
+/// Shared upload context for one CLI invocation.
 #[derive(Debug)]
 pub struct UploadContext {
     client: ApiClient,
@@ -32,11 +34,13 @@ pub struct UploadContext {
 }
 
 impl UploadContext {
+    /// Returns whether the current context has an auth token available.
     pub fn has_token(&self) -> bool {
         self.token.is_some()
     }
 }
 
+/// Raw session content plus publish-time observations ready for preparation.
 #[derive(Debug, Clone)]
 pub struct ObservedSessionUpload {
     pub logical_session: LogicalSessionKey,
@@ -44,19 +48,21 @@ pub struct ObservedSessionUpload {
     pub raw_session_content: String,
 }
 
+/// Prepared publication data ready for immediate upload or durable queueing.
 #[derive(Debug, Clone)]
 pub struct PreparedSessionUpload {
     pub prepared: PreparedPublication,
 }
 
+/// Outcome for an attempted live publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveUploadOutcome {
     Uploaded,
     AlreadyExists,
-    SkippedRepoNotAssociated,
     Queued { reason: String },
 }
 
+/// Aggregate result when draining pending publication state.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PendingUploadSummary {
     pub attempted: usize,
@@ -73,6 +79,7 @@ enum PublishAttemptError {
     Retryable(String),
 }
 
+/// Resolves the API client and auth state used for session publication.
 pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<UploadContext> {
     let cfg = config::CliConfig::load().await?;
     let resolved = cfg.resolve_api_url(api_url_override);
@@ -84,6 +91,7 @@ pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<Up
     })
 }
 
+/// Converts observed session data into a prepared publication.
 pub fn prepare_session_upload(observed: ObservedSessionUpload) -> Result<PreparedSessionUpload> {
     Ok(PreparedSessionUpload {
         prepared: prepare_publication(
@@ -94,6 +102,7 @@ pub fn prepare_session_upload(observed: ObservedSessionUpload) -> Result<Prepare
     })
 }
 
+/// Attempts to upload a prepared session immediately or queues it durably.
 pub async fn upload_or_queue_prepared_session(
     context: &UploadContext,
     prepared: &PreparedSessionUpload,
@@ -101,6 +110,7 @@ pub async fn upload_or_queue_prepared_session(
     prepare_state_and_attempt(context, prepared, None).await
 }
 
+/// Drains due pending publication records.
 pub async fn process_pending_uploads(
     context: &UploadContext,
     max_items: usize,
@@ -108,6 +118,7 @@ pub async fn process_pending_uploads(
     process_pending_uploads_matching(context, max_items, None).await
 }
 
+/// Drains due pending publication records scoped to one repository.
 pub async fn process_pending_uploads_for_repo(
     context: &UploadContext,
     max_items: usize,
@@ -116,10 +127,12 @@ pub async fn process_pending_uploads_for_repo(
     process_pending_uploads_matching(context, max_items, Some(repo_filter)).await
 }
 
+/// Returns the number of pending publication records for one repository.
 pub async fn pending_upload_count_for_repo(repo_filter: &Path) -> Result<usize> {
     pending_upload_count_matching(Some(repo_filter)).await
 }
 
+/// Returns the total number of pending publication records.
 pub async fn pending_upload_count() -> Result<usize> {
     pending_upload_count_matching(None).await
 }
@@ -157,7 +170,7 @@ async fn process_pending_uploads_matching(
         match prepare_state_and_attempt(context, &prepared, Some(stored)).await? {
             LiveUploadOutcome::Uploaded => summary.uploaded += 1,
             LiveUploadOutcome::AlreadyExists => summary.already_existed += 1,
-            LiveUploadOutcome::SkippedRepoNotAssociated | LiveUploadOutcome::Queued { .. } => {}
+            LiveUploadOutcome::Queued { .. } => {}
         }
     }
 
@@ -759,5 +772,167 @@ pub(crate) mod test_support {
         });
 
         Ok(TestUploadServer { base_url, state })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use tempfile::TempDir;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, path: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, path) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn sample_observed(repo_root: &Path, remote_url: &str) -> ObservedSessionUpload {
+        ObservedSessionUpload {
+            logical_session: LogicalSessionKey {
+                agent: "codex".to_string(),
+                agent_session_id: "session-1".to_string(),
+            },
+            observations: PublicationObservations {
+                canonical_remote_url: remote_url.to_string(),
+                remote_urls: vec![remote_url.to_string()],
+                canonical_repo_root: repo_root.to_string_lossy().to_string(),
+                worktree_roots: vec![repo_root.to_string_lossy().to_string()],
+                cwd: Some(repo_root.to_string_lossy().to_string()),
+                git_ref: Some("refs/heads/main".to_string()),
+                head_commit_sha: Some("abc1234".to_string()),
+                git_user_email: Some("dev@example.com".to_string()),
+                git_user_name: Some("Dev".to_string()),
+                cli_version: Some("1.0.0".to_string()),
+            },
+            raw_session_content: "hello".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_or_queue_prepared_session_queues_without_remote_observations() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let context = UploadContext {
+            client: ApiClient::new("http://127.0.0.1:9"),
+            token: None,
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(ObservedSessionUpload {
+            observations: PublicationObservations {
+                canonical_remote_url: String::new(),
+                remote_urls: Vec::new(),
+                canonical_repo_root: "/tmp/repo".to_string(),
+                worktree_roots: vec!["/tmp/repo".to_string()],
+                cwd: Some("/tmp/repo".to_string()),
+                git_ref: None,
+                head_commit_sha: None,
+                git_user_email: None,
+                git_user_name: None,
+                cli_version: Some("1.0.0".to_string()),
+            },
+            ..sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git")
+        })
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "repo has no remote URL observations".to_string(),
+            }
+        );
+        assert_eq!(pending_upload_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn upload_or_queue_prepared_session_resolves_org_and_uploads() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let server =
+            test_support::spawn_test_upload_server(test_support::TestUploadServerConfig::default())
+                .await
+                .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+        assert_eq!(server.counts().create_requests, 1);
+        assert_eq!(pending_upload_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_or_queue_prepared_session_queues_when_org_is_ambiguous() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let context = UploadContext {
+            client: ApiClient::new("http://127.0.0.1:9"),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(Some(vec![
+                UserOrgInfo {
+                    github_org_id: 1,
+                    github_org_login: "test-org".to_string(),
+                    display_name: Some("Test Org".to_string()),
+                    is_personal: false,
+                    is_onboarded: true,
+                    has_active_installation: true,
+                    org_id: Some("org-1".to_string()),
+                },
+                UserOrgInfo {
+                    github_org_id: 2,
+                    github_org_login: "TEST-ORG".to_string(),
+                    display_name: Some("Duplicate Org".to_string()),
+                    is_personal: false,
+                    is_onboarded: true,
+                    has_active_installation: true,
+                    org_id: Some("org-2".to_string()),
+                },
+            ])),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "repo remotes matched multiple accessible Cadence orgs".to_string(),
+            }
+        );
     }
 }

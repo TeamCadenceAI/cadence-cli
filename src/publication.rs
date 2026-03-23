@@ -1,37 +1,58 @@
-//! V2 session publication primitives.
+//! Session publication primitives.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Stable client-side key for a logical tool session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalSessionKey {
+    /// Stable agent identifier such as `codex` or `claude-code`.
     pub agent: String,
+    /// Tool-native session identifier parsed from the source transcript.
     pub agent_session_id: String,
 }
 
+/// Publish-time observations sent alongside a raw session blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationObservations {
+    /// The best current remote URL observation for this publish attempt.
     pub canonical_remote_url: String,
+    /// All currently observed remote URLs for the repo context.
     pub remote_urls: Vec<String>,
+    /// The best current repo-root observation for this publish attempt.
     pub canonical_repo_root: String,
+    /// All known worktree roots currently linked to the repo.
     pub worktree_roots: Vec<String>,
+    /// The current working directory observation, when available.
     pub cwd: Option<String>,
+    /// The current git ref observation, when available.
     pub git_ref: Option<String>,
+    /// The current HEAD commit observation, when available.
     pub head_commit_sha: Option<String>,
+    /// The current git email observation, when available.
     pub git_user_email: Option<String>,
+    /// The current git user-name observation, when available.
     pub git_user_name: Option<String>,
+    /// The CLI version used for this publish attempt.
     pub cli_version: Option<String>,
 }
 
+/// Fully prepared publication data ready for transport or durable state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedPublication {
+    /// Stable logical session identity.
     pub logical_session: LogicalSessionKey,
+    /// Publish-time observations included in the create request.
     pub observations: PublicationObservations,
+    /// Raw tool session content uploaded to storage.
     pub raw_session_content: String,
+    /// SHA-256 of the raw session content.
     pub content_sha256: String,
+    /// SHA-256 of material publish-time metadata.
     pub metadata_sha256: String,
+    /// SHA-256 of the uploaded blob bytes.
     pub upload_sha256: String,
 }
 
@@ -47,16 +68,22 @@ struct MaterialMetadataHashInput<'a> {
     head_commit_sha: Option<&'a str>,
 }
 
+/// Returns the SHA-256 hex digest for raw session content.
 pub fn content_sha256(content: &str) -> String {
     sha256_hex(content.as_bytes())
 }
 
+/// Returns the SHA-256 hex digest for arbitrary bytes.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
 }
 
+/// Computes the material metadata hash used to decide whether to republish.
+///
+/// Incidental fields such as `cwd`, git user identity, and `cli_version` are
+/// intentionally excluded so they do not force new publications.
 pub fn metadata_sha256(observations: &PublicationObservations) -> Result<String> {
     let input = MaterialMetadataHashInput {
         canonical_remote_url: &observations.canonical_remote_url,
@@ -70,6 +97,7 @@ pub fn metadata_sha256(observations: &PublicationObservations) -> Result<String>
     Ok(sha256_hex(&bytes))
 }
 
+/// Prepares a raw session publication with all derived hashes.
 pub fn prepare_publication(
     logical_session: LogicalSessionKey,
     observations: PublicationObservations,
@@ -88,6 +116,7 @@ pub fn prepare_publication(
     })
 }
 
+/// Generates a fresh publication identifier for a new publish attempt.
 pub fn new_publish_uid() -> String {
     format!("pub_{}", Uuid::new_v4().simple())
 }
@@ -135,6 +164,34 @@ mod tests {
         observations.head_commit_sha = Some("deadbeef".repeat(8));
         let second = metadata_sha256(&observations).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn metadata_hash_changes_for_remote_changes() {
+        let mut observations = sample_observations();
+        let first = metadata_sha256(&observations).unwrap();
+        observations
+            .remote_urls
+            .push("https://github.com/other/repo".to_string());
+        let second = metadata_sha256(&observations).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn prepare_publication_uses_raw_content_for_hashes() {
+        let prepared = prepare_publication(
+            LogicalSessionKey {
+                agent: "codex".to_string(),
+                agent_session_id: "session-1".to_string(),
+            },
+            sample_observations(),
+            "hello".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.content_sha256, sha256_hex(b"hello"));
+        assert_eq!(prepared.upload_sha256, sha256_hex(b"hello"));
+        assert!(!prepared.metadata_sha256.is_empty());
     }
 
     #[test]

@@ -298,7 +298,7 @@ impl ApiClient {
         Ok(envelope.data)
     }
 
-    /// Create or fetch a v2 session publication.
+    /// Create or fetch a session publication.
     pub async fn create_session_publication(
         &self,
         token: &str,

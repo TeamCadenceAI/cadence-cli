@@ -1,13 +1,14 @@
-//! Durable v2 publication state and payload storage.
+//! Durable publication state and payload storage.
 
 use crate::config::CliConfig;
-use crate::publication_v2::{LogicalSessionKey, PublicationObservations, sha256_hex};
+use crate::publication::{LogicalSessionKey, PublicationObservations, sha256_hex};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+/// Current durable status for a publication attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationStatus {
@@ -20,8 +21,10 @@ pub enum PublicationStatus {
     Published,
 }
 
+/// On-disk state for one logical session within one target org context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicationStateRecord {
+    /// Stable logical session identity.
     pub logical_session: LogicalSessionKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_org_id: Option<String>,
@@ -46,12 +49,14 @@ pub struct PublicationStateRecord {
     pub created_at: String,
 }
 
+/// Publication record paired with its filesystem storage key.
 #[derive(Debug, Clone)]
 pub struct StoredPublication {
     pub storage_key: String,
     pub record: PublicationStateRecord,
 }
 
+/// Writes or updates a publication-state record and optional raw payload.
 pub async fn upsert_record(record: &PublicationStateRecord, payload: Option<&str>) -> Result<()> {
     let dir = state_dir()?;
     tokio::fs::create_dir_all(&dir)
@@ -82,6 +87,7 @@ pub async fn upsert_record(record: &PublicationStateRecord, payload: Option<&str
     Ok(())
 }
 
+/// Removes a publication-state record and any stored payload.
 pub async fn remove_record(storage_key: &str) -> Result<()> {
     let dir = state_dir()?;
     let _ = tokio::fs::remove_file(record_path(&dir, storage_key)).await;
@@ -89,6 +95,7 @@ pub async fn remove_record(storage_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Loads every stored publication-state record from disk.
 pub async fn load_all_records() -> Result<Vec<StoredPublication>> {
     let dir = state_dir()?;
     let mut entries = match tokio::fs::read_dir(&dir).await {
@@ -127,6 +134,7 @@ pub async fn load_all_records() -> Result<Vec<StoredPublication>> {
     Ok(out)
 }
 
+/// Loads the stored raw payload for a publication-state record.
 pub async fn load_payload(storage_key: &str) -> Result<Option<String>> {
     let dir = state_dir()?;
     let path = payload_path(&dir, storage_key);
@@ -137,6 +145,7 @@ pub async fn load_payload(storage_key: &str) -> Result<Option<String>> {
     }
 }
 
+/// Builds the stable storage key for a logical session plus target org.
 pub fn storage_key(logical_session: &LogicalSessionKey, target_org_id: Option<&str>) -> String {
     let key = format!(
         "{}|{}|{}",
@@ -147,10 +156,118 @@ pub fn storage_key(logical_session: &LogicalSessionKey, target_org_id: Option<&s
     sha256_hex(key.as_bytes())
 }
 
+/// Returns the current UTC timestamp formatted as RFC 3339.
 pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use tempfile::TempDir;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, path: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, path) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn sample_record() -> PublicationStateRecord {
+        PublicationStateRecord {
+            logical_session: LogicalSessionKey {
+                agent: "codex".to_string(),
+                agent_session_id: "session-1".to_string(),
+            },
+            target_org_id: Some("org-1".to_string()),
+            status: PublicationStatus::RetryableFailure,
+            current_content_sha256: "a".repeat(64),
+            current_metadata_sha256: "b".repeat(64),
+            last_published_content_sha256: None,
+            last_published_metadata_sha256: None,
+            publish_uid: Some("pub_123".to_string()),
+            publication_id: Some("publication-1".to_string()),
+            upload_sha256: "c".repeat(64),
+            attempt_count: 2,
+            next_attempt_at_epoch: 42,
+            last_error: Some("boom".to_string()),
+            observations: PublicationObservations {
+                canonical_remote_url: "git@github.com:test-org/repo.git".to_string(),
+                remote_urls: vec!["git@github.com:test-org/repo.git".to_string()],
+                canonical_repo_root: "/tmp/repo".to_string(),
+                worktree_roots: vec!["/tmp/repo".to_string()],
+                cwd: Some("/tmp/repo".to_string()),
+                git_ref: Some("refs/heads/main".to_string()),
+                head_commit_sha: Some("abc1234".to_string()),
+                git_user_email: Some("dev@example.com".to_string()),
+                git_user_name: Some("Dev".to_string()),
+                cli_version: Some("1.0.0".to_string()),
+            },
+            updated_at: now_rfc3339(),
+            created_at: now_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn state_round_trips_record_and_payload() {
+        let temp = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", temp.path());
+        let record = sample_record();
+        let key = storage_key(&record.logical_session, record.target_org_id.as_deref());
+
+        upsert_record(&record, Some("payload")).await.unwrap();
+        let records = load_all_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].storage_key, key);
+        assert_eq!(
+            load_payload(&key).await.unwrap(),
+            Some("payload".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_record_deletes_payload_and_metadata() {
+        let temp = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", temp.path());
+        let record = sample_record();
+        let key = storage_key(&record.logical_session, record.target_org_id.as_deref());
+
+        upsert_record(&record, Some("payload")).await.unwrap();
+        remove_record(&key).await.unwrap();
+
+        assert!(load_all_records().await.unwrap().is_empty());
+        assert_eq!(load_payload(&key).await.unwrap(), None);
+    }
+
+    #[test]
+    fn storage_key_changes_with_target_org() {
+        let logical_session = LogicalSessionKey {
+            agent: "codex".to_string(),
+            agent_session_id: "session-1".to_string(),
+        };
+        let first = storage_key(&logical_session, Some("org-a"));
+        let second = storage_key(&logical_session, Some("org-b"));
+        assert_ne!(first, second);
+    }
 }
 
 fn state_dir() -> Result<PathBuf> {
