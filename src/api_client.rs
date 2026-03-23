@@ -32,81 +32,118 @@ struct ExchangeRequest<'a> {
 /// Data payload from `POST /api/auth/exchange`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CliTokenExchangeResult {
+    /// Bearer token used by the CLI for authenticated API calls.
     pub token: String,
+    /// GitHub login associated with the authenticated user.
     pub login: String,
+    /// RFC 3339 expiration timestamp for the token.
     pub expires_at: String,
 }
 
 /// Request body for `POST /api/onboarding/backfill-complete`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackfillCompleteRequest {
+    /// Number of days covered by the backfill.
     pub window_days: i32,
+    /// Number of sessions attached to repositories during backfill.
     pub notes_attached: i64,
+    /// Number of sessions skipped during backfill processing.
     pub notes_skipped: i64,
+    /// Human-readable issues encountered during backfill.
     pub issues: Vec<String>,
+    /// Number of repositories scanned during backfill.
     pub repos_scanned: i32,
+    /// RFC 3339 completion timestamp emitted by the CLI.
     pub finished_at: String,
+    /// CLI version that reported the backfill completion.
     pub cli_version: String,
 }
 
 /// Data payload from `POST /api/onboarding/backfill-complete`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackfillCompleteResponse {
+    /// Whether the backend recorded the completion event.
     pub recorded: bool,
+    /// Backend timestamp for the recorded completion.
     pub backfill_completed_at: String,
-    #[allow(dead_code)]
-    pub next_step: String,
 }
 
 /// Minimal org info from `GET /api/user/orgs`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UserOrgInfo {
+    /// GitHub organization id for the account.
     pub github_org_id: i64,
+    /// GitHub login for the org or personal account.
     pub github_org_login: String,
+    /// Display name shown to the user, when available.
     pub display_name: Option<String>,
+    /// Whether this record represents the user's personal account.
     pub is_personal: bool,
+    /// Whether the org has completed onboarding.
     pub is_onboarded: bool,
+    /// Whether the Cadence GitHub app is installed for the org.
     pub has_active_installation: bool,
+    /// Cadence org id, if the org has been provisioned.
     pub org_id: Option<String>,
 }
 
 /// Response body from `GET /api/user/orgs`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UserOrgsResponse {
+    /// Orgs visible to the authenticated CLI user.
     pub orgs: Vec<UserOrgInfo>,
 }
 
 /// Request body for `POST /api/v2/session-publications`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionPublicationRequest {
+    /// Agent family producing the session, such as `codex`.
     pub agent: String,
+    /// Stable agent-native session identifier.
     pub agent_session_id: String,
+    /// Idempotency key for this publication attempt.
     pub publish_uid: String,
+    /// SHA-256 hash of the uploaded session content.
     pub upload_sha256: String,
+    /// SHA-256 hash of material publication metadata.
     pub metadata_sha256: String,
+    /// Canonical git remote URL selected for the session.
     pub canonical_remote_url: String,
+    /// All observed remote URLs for the repository.
     pub remote_urls: Vec<String>,
+    /// Canonical repository root associated with the session.
     pub canonical_repo_root: String,
+    /// Repository and worktree roots observed for the session.
     pub worktree_roots: Vec<String>,
+    /// Current working directory captured from the session, if any.
     pub cwd: Option<String>,
+    /// Git ref associated with the upload, if available.
     pub git_ref: Option<String>,
+    /// HEAD commit SHA associated with the upload, if available.
     pub head_commit_sha: Option<String>,
+    /// Git user email configured for the repository, if available.
     pub git_user_email: Option<String>,
+    /// Git user name configured for the repository, if available.
     pub git_user_name: Option<String>,
+    /// CLI version that created the publication request.
     pub cli_version: Option<String>,
 }
 
 /// Response body from `POST /api/v2/session-publications`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionPublicationResponse {
+    /// Server-generated publication identifier.
     pub publication_id: String,
+    /// Pre-signed upload URL for the raw session payload.
     pub upload_url: String,
+    /// Resolved Cadence org id that owns the publication.
     pub org_id: String,
 }
 
 /// Response body from `POST /api/sessions/{uid}/confirm`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SessionUploadConfirmResponse {
+    /// Publication status returned after upload confirmation.
     pub status: String,
 }
 
@@ -123,14 +160,23 @@ struct ApiResponseEnvelope<T> {
 /// Classified failures for authenticated CLI requests.
 #[derive(Debug)]
 pub enum AuthenticatedRequestError {
+    /// Authentication failed or the token has expired.
     Unauthorized,
+    /// The request conflicted with current server state.
     Conflict(String),
+    /// The target resource could not be found.
     NotFound,
+    /// The server rejected semantically invalid input.
     Unprocessable(String),
+    /// The server returned a 5xx response.
     Server(String),
+    /// The server rejected the request as malformed.
     BadRequest(String),
+    /// The request failed before receiving a response.
     Network(String),
+    /// The server response could not be decoded.
     Parse(String),
+    /// A non-standard failure occurred.
     Unexpected(String),
 }
 

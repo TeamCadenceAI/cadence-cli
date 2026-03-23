@@ -5,15 +5,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// Persisted high-water mark for one repository's incremental upload scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadCursorRecord {
+    /// Canonical repository root used to scope the cursor.
     pub repo_root: String,
+    /// Latest modification time that has been fully scanned.
     pub last_scanned_mtime_epoch: i64,
+    /// Stable tiebreaker label for logs sharing the same modification time.
     #[serde(default)]
     pub last_scanned_source_label: Option<String>,
+    /// Timestamp of the most recent cursor update.
     pub updated_at: String,
 }
 
+/// Loads the persisted cursor for the provided repository root, if present.
 pub async fn load_cursor(repo_root: &str) -> Result<Option<UploadCursorRecord>> {
     let dir = cursor_dir().await?;
     let path = record_path(&dir, repo_root);
@@ -30,6 +36,7 @@ pub async fn load_cursor(repo_root: &str) -> Result<Option<UploadCursorRecord>> 
     }
 }
 
+/// Persists the latest scanned position for the repository's incremental uploader.
 pub async fn upsert_cursor(
     repo_root: &str,
     last_scanned_mtime_epoch: i64,
@@ -55,11 +62,13 @@ pub async fn upsert_cursor(
 }
 
 #[cfg(not(windows))]
+/// Atomically replaces a cursor record on Unix-like platforms.
 async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
     tokio::fs::rename(tmp, path).await
 }
 
 #[cfg(windows)]
+/// Atomically replaces a cursor record on Windows, handling rename collisions.
 async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
     match tokio::fs::rename(tmp, path).await {
         Ok(()) => Ok(()),
@@ -76,6 +85,7 @@ async fn replace_path(tmp: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Resolves and creates the directory used for upload-cursor persistence.
 async fn cursor_dir() -> Result<PathBuf> {
     let home = crate::agents::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
@@ -86,10 +96,12 @@ async fn cursor_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns the cursor JSON path for a specific repository root.
 fn record_path(dir: &Path, repo_root: &str) -> PathBuf {
     dir.join(format!("{}.json", short_hash(repo_root)))
 }
 
+/// Produces a short stable hash suitable for cursor file names.
 fn short_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());

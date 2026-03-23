@@ -12,12 +12,19 @@ use time::format_description::well_known::Rfc3339;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationStatus {
+    /// Waiting for enough repository metadata to identify a target repository.
     AwaitingRemote,
+    /// Waiting to resolve a concrete Cadence org.
     AwaitingOrg,
+    /// Ready to create a new server-side publication.
     ReadyToPublish,
+    /// Currently creating the publication or uploading content.
     Publishing,
+    /// Raw content uploaded and waiting for API confirmation.
     AwaitingConfirm,
+    /// Failed transiently and should be retried later.
     RetryableFailure,
+    /// Publication succeeded and matches the latest observed content.
     Published,
 }
 
@@ -26,33 +33,50 @@ pub enum PublicationStatus {
 pub struct PublicationStateRecord {
     /// Stable logical session identity.
     pub logical_session: LogicalSessionKey,
+    /// Resolved Cadence org id targeted by this record, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_org_id: Option<String>,
+    /// Current state-machine status for publication processing.
     pub status: PublicationStatus,
+    /// SHA-256 of the latest observed raw session content.
     pub current_content_sha256: String,
+    /// SHA-256 of the latest observed material metadata.
     pub current_metadata_sha256: String,
+    /// Content hash most recently confirmed by the server, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_published_content_sha256: Option<String>,
+    /// Metadata hash most recently confirmed by the server, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_published_metadata_sha256: Option<String>,
+    /// Active idempotency token for the current publish attempt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_uid: Option<String>,
+    /// Server-generated publication id for the current or last attempt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_id: Option<String>,
+    /// SHA-256 echoed to the upload API for the current attempt.
     pub upload_sha256: String,
+    /// Number of failed attempts recorded for the current state.
     pub attempt_count: u32,
+    /// Earliest epoch time when the next retry may run.
     pub next_attempt_at_epoch: i64,
+    /// Most recent human-readable error, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Repository and session observations associated with this upload.
     pub observations: PublicationObservations,
+    /// RFC 3339 timestamp of the last record mutation.
     pub updated_at: String,
+    /// RFC 3339 timestamp when the record was first created.
     pub created_at: String,
 }
 
 /// Publication record paired with its filesystem storage key.
 #[derive(Debug, Clone)]
 pub struct StoredPublication {
+    /// File-system-safe identifier used for the persisted record.
     pub storage_key: String,
+    /// Parsed publication state loaded from disk.
     pub record: PublicationStateRecord,
 }
 
@@ -163,6 +187,40 @@ pub fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Resolves the directory used to persist publication state.
+fn state_dir() -> Result<PathBuf> {
+    CliConfig::config_dir()
+        .map(|dir| dir.join("publication-state"))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine Cadence config directory"))
+}
+
+/// Returns the JSON record path for a storage key.
+fn record_path(dir: &Path, storage_key: &str) -> PathBuf {
+    dir.join(format!("{storage_key}.json"))
+}
+
+/// Returns the raw payload path for a storage key.
+fn payload_path(dir: &Path, storage_key: &str) -> PathBuf {
+    dir.join(format!("{storage_key}.blob"))
+}
+
+/// Writes bytes atomically by replacing the target file with a temporary file.
+async fn write_atomic(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("tmp")
+    ));
+    tokio::fs::write(&tmp, bytes)
+        .await
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("failed to move {} into place", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,34 +326,4 @@ mod tests {
         let second = storage_key(&logical_session, Some("org-b"));
         assert_ne!(first, second);
     }
-}
-
-fn state_dir() -> Result<PathBuf> {
-    CliConfig::config_dir()
-        .map(|dir| dir.join("publication-state"))
-        .ok_or_else(|| anyhow::anyhow!("cannot determine Cadence config directory"))
-}
-
-fn record_path(dir: &Path, storage_key: &str) -> PathBuf {
-    dir.join(format!("{storage_key}.json"))
-}
-
-fn payload_path(dir: &Path, storage_key: &str) -> PathBuf {
-    dir.join(format!("{storage_key}.blob"))
-}
-
-async fn write_atomic(path: &Path, bytes: Vec<u8>) -> Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("tmp")
-    ));
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("failed to move {} into place", path.display()))?;
-    Ok(())
 }

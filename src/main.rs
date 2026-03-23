@@ -1,3 +1,5 @@
+//! Cadence CLI binary entrypoint and subcommand orchestration.
+
 mod agents;
 mod api_client;
 mod config;
@@ -830,32 +832,20 @@ fn apply_incremental_upload_outcome(
     match outcome {
         UploadFromLogOutcome::Uploaded => {
             stats.uploaded += 1;
-            *cursor_advance = advance_cursor_for_disposition(
-                cursor_advance,
-                log_mtime,
-                log_source_label,
-                IncrementalLogDisposition::Indexed,
-            );
+            *cursor_advance =
+                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
             true
         }
         UploadFromLogOutcome::AlreadyExists => {
             stats.skipped += 1;
-            *cursor_advance = advance_cursor_for_disposition(
-                cursor_advance,
-                log_mtime,
-                log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
+            *cursor_advance =
+                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
             true
         }
         UploadFromLogOutcome::Queued(_) => {
             stats.queued += 1;
-            *cursor_advance = advance_cursor_for_disposition(
-                cursor_advance,
-                log_mtime,
-                log_source_label,
-                IncrementalLogDisposition::Indexed,
-            );
+            *cursor_advance =
+                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
             true
         }
         UploadFromLogOutcome::Retryable(message) => {
@@ -911,14 +901,6 @@ impl IncrementalCursor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum IncrementalLogDisposition {
-    Indexed,
-    SkippedPermanent,
-    ErrorRetriable,
-}
-
 fn source_label_is_scanned(cursor: &IncrementalCursor, mtime: i64, source_label: &str) -> bool {
     if mtime < cursor.last_scanned_mtime_epoch {
         return true;
@@ -936,33 +918,27 @@ fn advance_cursor_for_disposition(
     current_cursor: &IncrementalCursor,
     mtime: Option<i64>,
     source_label: &str,
-    disposition: IncrementalLogDisposition,
 ) -> IncrementalCursor {
-    match disposition {
-        IncrementalLogDisposition::Indexed | IncrementalLogDisposition::SkippedPermanent => {
-            let Some(mtime) = mtime else {
-                return current_cursor.clone();
-            };
-            if mtime > current_cursor.last_scanned_mtime_epoch {
-                return IncrementalCursor {
-                    last_scanned_mtime_epoch: mtime,
-                    last_scanned_source_label: Some(source_label.to_string()),
-                };
-            }
-            if mtime == current_cursor.last_scanned_mtime_epoch {
-                let next_label = match current_cursor.last_scanned_source_label.as_deref() {
-                    Some(existing) if existing >= source_label => existing.to_string(),
-                    _ => source_label.to_string(),
-                };
-                return IncrementalCursor {
-                    last_scanned_mtime_epoch: mtime,
-                    last_scanned_source_label: Some(next_label),
-                };
-            }
-            current_cursor.clone()
-        }
-        IncrementalLogDisposition::ErrorRetriable => current_cursor.clone(),
+    let Some(mtime) = mtime else {
+        return current_cursor.clone();
+    };
+    if mtime > current_cursor.last_scanned_mtime_epoch {
+        return IncrementalCursor {
+            last_scanned_mtime_epoch: mtime,
+            last_scanned_source_label: Some(source_label.to_string()),
+        };
     }
+    if mtime == current_cursor.last_scanned_mtime_epoch {
+        let next_label = match current_cursor.last_scanned_source_label.as_deref() {
+            Some(existing) if existing >= source_label => existing.to_string(),
+            _ => source_label.to_string(),
+        };
+        return IncrementalCursor {
+            last_scanned_mtime_epoch: mtime,
+            last_scanned_source_label: Some(next_label),
+        };
+    }
+    current_cursor.clone()
 }
 
 fn select_incremental_candidates(
@@ -1201,12 +1177,8 @@ async fn upload_incremental_sessions_for_repo(
         let log_mtime = parsed.log.updated_at;
         let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance = advance_cursor_for_disposition(
-                &cursor_advance,
-                log_mtime,
-                &log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -1220,21 +1192,13 @@ async fn upload_incremental_sessions_for_repo(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
-            cursor_advance = advance_cursor_for_disposition(
-                &cursor_advance,
-                log_mtime,
-                &log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
         if resolved_repo != repo_root {
-            cursor_advance = advance_cursor_for_disposition(
-                &cursor_advance,
-                log_mtime,
-                &log_source_label,
-                IncrementalLogDisposition::SkippedPermanent,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         }
 
@@ -3692,7 +3656,6 @@ mod tests {
             },
             Some(150),
             "b",
-            IncrementalLogDisposition::Indexed,
         );
         assert_eq!(updated.last_scanned_mtime_epoch, 150);
         assert_eq!(updated.last_scanned_source_label.as_deref(), Some("b"));
@@ -3707,30 +3670,9 @@ mod tests {
             },
             Some(140),
             "c",
-            IncrementalLogDisposition::SkippedPermanent,
         );
         assert_eq!(updated.last_scanned_mtime_epoch, 140);
         assert_eq!(updated.last_scanned_source_label.as_deref(), Some("c"));
-    }
-
-    #[test]
-    fn cursor_does_not_advance_for_retriable_errors() {
-        let updated = advance_cursor_for_disposition(
-            &IncrementalCursor {
-                last_scanned_mtime_epoch: 100,
-                last_scanned_source_label: Some("a".to_string()),
-            },
-            Some(180),
-            "z",
-            IncrementalLogDisposition::ErrorRetriable,
-        );
-        assert_eq!(
-            updated,
-            IncrementalCursor {
-                last_scanned_mtime_epoch: 100,
-                last_scanned_source_label: Some("a".to_string()),
-            }
-        );
     }
 
     #[test]
@@ -3742,7 +3684,6 @@ mod tests {
             },
             Some(100),
             "c",
-            IncrementalLogDisposition::Indexed,
         );
         assert_eq!(updated.last_scanned_mtime_epoch, 100);
         assert_eq!(updated.last_scanned_source_label.as_deref(), Some("c"));

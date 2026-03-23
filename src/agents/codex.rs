@@ -18,7 +18,6 @@ use async_trait::async_trait;
 /// contain session log files.
 ///
 /// Used by the `backfill` command to scan all sessions regardless of repo.
-#[allow(dead_code)]
 pub async fn all_log_dirs() -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,

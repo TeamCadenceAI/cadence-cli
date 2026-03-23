@@ -11,6 +11,7 @@ use std::process::Output;
 use tokio::process::Command;
 
 /// The dedicated git notes ref for AI session data.
+#[cfg(test)]
 pub const NOTES_REF: &str = "refs/cadence/sessions/data";
 
 // ---------------------------------------------------------------------------
@@ -514,12 +515,13 @@ pub(crate) async fn head_sha_at(repo: &Path) -> Result<Option<String>> {
 ///
 /// Note: Production push paths now use inline force-with-lease pushes
 /// (see `push.rs`). This function is retained for test use.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn push_notes(remote: &str) -> Result<()> {
     push_notes_at(None, remote).await
 }
 
-#[allow(dead_code)]
+/// Push the AI-session notes ref to the provided remote within a test repository.
+#[cfg(test)]
 pub async fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
     let output = run_git_output_at(
         repo,
@@ -541,7 +543,7 @@ pub async fn push_notes_at(repo: Option<&Path>, remote: &str) -> Result<()> {
 /// Returns `Ok(false)` if `git remote` fails (e.g., not in a git repository)
 /// rather than propagating the error. This matches the `git_succeeds` pattern
 /// used by `note_exists` and makes the function safe to call defensively.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn has_upstream() -> Result<bool> {
     match git_output(&["remote"]).await {
         Ok(remotes) => Ok(!remotes.is_empty()),
@@ -788,7 +790,7 @@ pub(crate) async fn preferred_remote_url_at(repo: &Path) -> Result<Option<String
 /// (PLAN.md)
 ///
 /// Returns an empty Vec if no remotes are configured or no URLs can be parsed.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn remote_orgs() -> Result<Vec<String>> {
     let remotes = git_output(&["remote"]).await?;
     let mut orgs = Vec::new();
