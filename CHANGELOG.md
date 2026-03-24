@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.1.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.3...v2.1.4) (2026-03-24)
+
+
+### Bug Fixes
+
+* **opencode:** dedupe mixed records and scope SQLite queries ([009bbcd](https://github.com/TeamCadenceAI/cadence-cli/commit/009bbcdb428231c28061c76c710eb6a438a7e5a7))
+* **opencode:** load SQLite-backed sessions across storage layouts ([1c41fbc](https://github.com/TeamCadenceAI/cadence-cli/commit/1c41fbc9942fa9745909bfbf516f9798d24eec4f))
+* **opencode:** load SQLite-backed sessions across storage layouts ([781a29b](https://github.com/TeamCadenceAI/cadence-cli/commit/781a29b9f7cc95b593079c2cf0db39cee4ccbe8b))
+* **release:** pin release-please action to a newer SHA ([65beff3](https://github.com/TeamCadenceAI/cadence-cli/commit/65beff3d1fb6c64e077025b1377d03bbe88eb51e))
+
 ## [2.1.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.2...v2.1.3) (2026-03-24)
 
 
