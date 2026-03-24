@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 use super::{AgentExplorer, SessionLog, SessionSource, home_dir};
 use crate::scanner::AgentType;
 use async_trait::async_trait;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use serde_json::{Value, json};
 
 pub struct OpenCodeExplorer;
@@ -429,10 +429,21 @@ fn merge_message_records(
 ) {
     for record in incoming {
         message_to_session.insert(record.id.clone(), record.session_id.clone());
-        messages_by_session
+        let messages = messages_by_session
             .entry(record.session_id.clone())
-            .or_default()
-            .push(record);
+            .or_default();
+
+        if let Some(existing) = messages
+            .iter_mut()
+            .find(|existing| existing.id == record.id)
+        {
+            if message_record_recency(&record) > message_record_recency(existing) {
+                *existing = record;
+            }
+            continue;
+        }
+
+        messages.push(record);
     }
 }
 
@@ -442,9 +453,26 @@ fn merge_part_records(
 ) {
     for record in incoming {
         if let Some(session_id) = record.session_id.clone() {
-            parts_by_session.entry(session_id).or_default().push(record);
+            let parts = parts_by_session.entry(session_id).or_default();
+
+            if let Some(existing) = parts.iter_mut().find(|existing| existing.id == record.id) {
+                if part_record_recency(&record) > part_record_recency(existing) {
+                    *existing = record;
+                }
+                continue;
+            }
+
+            parts.push(record);
         }
     }
+}
+
+fn message_record_recency(record: &MessageRecord) -> i64 {
+    record.created_at.or(record.file_mtime).unwrap_or_default()
+}
+
+fn part_record_recency(record: &PartRecord) -> i64 {
+    record.created_at.or(record.file_mtime).unwrap_or_default()
 }
 
 #[derive(Debug, Default)]
@@ -504,10 +532,18 @@ fn fetch_db_sessions(
     db_path: &Path,
     session_ids: &HashSet<String>,
 ) -> Vec<(String, SessionRecord)> {
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let placeholders = sql_in_placeholders(session_ids.len());
+
     if let Ok(mut stmt) =
-        conn.prepare("SELECT id, directory, title, time_created, time_updated, data FROM session")
+        conn.prepare(&format!(
+            "SELECT id, directory, title, time_created, time_updated, data FROM session WHERE id IN ({placeholders})"
+        ))
     {
-        let Ok(rows) = stmt.query_map([], |row| {
+        let Ok(rows) = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1).ok(),
@@ -522,7 +558,6 @@ fn fetch_db_sessions(
 
         return rows
             .flatten()
-            .filter(|(session_id, ..)| session_ids.contains(session_id))
             .map(
                 |(session_id, directory, title, time_created, time_updated, raw_json)| {
                     build_db_session_record(
@@ -539,13 +574,14 @@ fn fetch_db_sessions(
             .collect();
     }
 
-    let Ok(mut stmt) =
-        conn.prepare("SELECT id, directory, title, time_created, time_updated FROM session")
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT id, directory, title, time_created, time_updated FROM session WHERE id IN ({placeholders})"
+    ))
     else {
         return Vec::new();
     };
 
-    let Ok(rows) = stmt.query_map([], |row| {
+    let Ok(rows) = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1).ok(),
@@ -558,7 +594,6 @@ fn fetch_db_sessions(
     };
 
     rows.flatten()
-        .filter(|(session_id, ..)| session_ids.contains(session_id))
         .map(
             |(session_id, directory, title, time_created, time_updated)| {
                 build_db_session_record(
@@ -617,13 +652,19 @@ fn fetch_db_messages(
     db_path: &Path,
     session_ids: &HashSet<String>,
 ) -> Vec<MessageRecord> {
-    let Ok(mut stmt) =
-        conn.prepare("SELECT id, session_id, time_created, time_updated, data FROM message")
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let placeholders = sql_in_placeholders(session_ids.len());
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id IN ({placeholders})"
+    ))
     else {
         return Vec::new();
     };
 
-    let Ok(rows) = stmt.query_map([], |row| {
+    let Ok(rows) = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -636,7 +677,6 @@ fn fetch_db_messages(
     };
 
     rows.flatten()
-        .filter(|(_, session_id, ..)| session_ids.contains(session_id))
         .map(|(id, session_id, time_created, time_updated, raw_json)| {
             let raw = raw_json
                 .as_deref()
@@ -676,13 +716,19 @@ fn fetch_db_parts(
     db_path: &Path,
     session_ids: &HashSet<String>,
 ) -> Vec<PartRecord> {
-    let Ok(mut stmt) = conn
-        .prepare("SELECT id, message_id, session_id, time_created, time_updated, data FROM part")
+    if session_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let placeholders = sql_in_placeholders(session_ids.len());
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id IN ({placeholders})"
+    ))
     else {
         return Vec::new();
     };
 
-    let Ok(rows) = stmt.query_map([], |row| {
+    let Ok(rows) = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -696,7 +742,6 @@ fn fetch_db_parts(
     };
 
     rows.flatten()
-        .filter(|(_, _, session_id, ..)| session_ids.contains(session_id))
         .map(
             |(id, message_id, session_id, time_created, time_updated, raw_json)| {
                 let raw = raw_json
@@ -737,6 +782,10 @@ fn fetch_db_parts(
 
 fn parse_json(raw_json: &str) -> Option<Value> {
     serde_json::from_str(raw_json).ok()
+}
+
+fn sql_in_placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
 }
 
 fn merge_json_object(base: Value, fallback: Value) -> Value {
@@ -1148,6 +1197,120 @@ mod tests {
                 assert!(content.contains("\"sessionID\":\"ses_db_nodata\""));
                 assert!(content.contains("\"cwd\":\"/Users/zack/dev/cadence-cli\""));
                 assert!(content.contains("\"directory\":\"/Users/zack/dev/cadence-cli\""));
+            }
+            SessionSource::File(_) => panic!("expected inline session"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_opencode_deduplicates_mixed_file_and_sqlite_records() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        write_json(
+            &root
+                .join("storage")
+                .join("session")
+                .join("global")
+                .join("ses_mixed.json"),
+            r#"{"id":"ses_mixed","directory":"/repo","time":{"created":1772602456000,"updated":1772602457000}}"#,
+        )
+        .await;
+        write_json(
+            &root
+                .join("storage")
+                .join("message")
+                .join("ses_mixed")
+                .join("msg_same.json"),
+            r#"{"id":"msg_same","sessionID":"ses_mixed","role":"user","time":{"created":1772602458000}}"#,
+        )
+        .await;
+        write_json(
+            &root
+                .join("storage")
+                .join("part")
+                .join("msg_same")
+                .join("prt_same.json"),
+            r#"{"id":"prt_same","sessionID":"ses_mixed","messageID":"msg_same","type":"text","time":{"created":1772602459000}}"#,
+        )
+        .await;
+
+        let db_path = root.join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, title, version, time_created, time_updated, data)
+             VALUES (?1, 'global', '/repo', 'Mixed session', '1.0.0', ?2, ?3, ?4)",
+            rusqlite::params![
+                "ses_mixed",
+                1_772_602_456_000_i64,
+                1_772_602_557_000_i64,
+                r#"{"slug":"mixed-session"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "msg_same",
+                "ses_mixed",
+                1_772_602_558_000_i64,
+                1_772_602_558_000_i64,
+                r#"{"role":"user","time":{"created":1772602558000}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "prt_same",
+                "msg_same",
+                "ses_mixed",
+                1_772_602_559_000_i64,
+                1_772_602_559_000_i64,
+                r#"{"type":"text","text":"hello from db"}"#,
+            ],
+        )
+        .unwrap();
+
+        let logs = discover_recent_in(&[root.to_path_buf()], 1_772_602_700, 9_999_999).await;
+        assert_eq!(logs.len(), 1);
+
+        match &logs[0].source {
+            SessionSource::Inline { content, .. } => {
+                assert_eq!(content.matches("\"id\":\"msg_same\"").count(), 1);
+                assert_eq!(content.matches("\"partID\":\"prt_same\"").count(), 1);
             }
             SessionSource::File(_) => panic!("expected inline session"),
         }
