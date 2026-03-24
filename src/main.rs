@@ -287,6 +287,10 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     left_norm == right_norm
 }
 
+fn normalized_repo_match_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 async fn cadence_hooks_installed(hooks_dir: &Path) -> bool {
     let post_path = hooks_dir.join("post-commit");
     match tokio::fs::read_to_string(&post_path).await {
@@ -306,8 +310,6 @@ async fn run_install_inner(
     let install_start = std::time::Instant::now();
     let mut had_errors = refresh_cadence_git_hooks(home_override, true).await?;
 
-    // Step 4: Scheduler reconciliation is performed after auto-update consent is resolved.
-
     // Step 5: Persist org filter if provided
     if let Some(ref org_value) = org {
         match git::config_set_global("ai.cadence.org", org_value).await {
@@ -321,15 +323,19 @@ async fn run_install_inner(
         }
     }
 
-    // Step 5.5: Optional auto-update preference prompt
-    run_install_auto_update_prompt().await;
+    // Step 5.5: Force-enable unattended auto-update during install and
+    // reconcile scheduler artifacts immediately.
+    if output::is_stderr_tty() && Term::stdout().is_term() {
+        println!();
+        output::action("Auto-update", "enabled");
+        output::detail(
+            "Cadence runs unattended background update checks hourly and installs stable releases only.",
+        );
+        output::detail("Disable anytime: `cadence auto-update disable`");
+        output::detail("Remove scheduler artifacts: `cadence auto-update uninstall`");
+    }
 
-    // Step 5.6: Reconcile scheduler with persisted user intent.
-    let auto_update_enabled = config::CliConfig::load()
-        .await
-        .unwrap_or_default()
-        .auto_update_enabled();
-    match update::reconcile_scheduler_for_auto_update_enabled(auto_update_enabled).await {
+    match update::ensure_auto_update_enabled_and_reconciled().await {
         Ok(result) if result.configured => {
             output::success(
                 "Updated",
@@ -1196,6 +1202,12 @@ async fn upload_incremental_sessions_for_repo(
     repo_root: &std::path::Path,
     repo_root_str: &str,
 ) -> Result<UploadRunStats> {
+    let repo_family_roots = git::repo_and_worktree_roots_at(repo_root)
+        .await
+        .into_iter()
+        .map(PathBuf::from)
+        .map(|path| normalized_repo_match_path(&path))
+        .collect::<std::collections::BTreeSet<_>>();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1237,7 +1249,7 @@ async fn upload_incremental_sessions_for_repo(
                 advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
-        if resolved_repo != repo_root {
+        if !repo_family_roots.contains(&normalized_repo_match_path(&resolved_repo)) {
             cursor_advance =
                 advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
@@ -2503,114 +2515,6 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
-// Install: auto-update preference prompt
-// ---------------------------------------------------------------------------
-
-/// Configure automatic updates during install.
-///
-/// This is non-critical: failures are logged but never abort install.
-/// Skipped silently if output is not interactive.
-async fn run_install_auto_update_prompt() {
-    let cfg = match config::CliConfig::load().await {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let config_path = match config::CliConfig::config_path() {
-        Some(p) => p,
-        None => return,
-    };
-    run_install_auto_update_prompt_inner(
-        &cfg,
-        &config_path,
-        output::is_stderr_tty() && Term::stdout().is_term(),
-    )
-    .await;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallAutoUpdateFtueState {
-    Skip,
-    Disclosure,
-    EnableByDefault,
-}
-
-fn install_auto_update_ftue_state(cfg: &config::CliConfig) -> InstallAutoUpdateFtueState {
-    match cfg.auto_update {
-        Some(true) => InstallAutoUpdateFtueState::Disclosure,
-        Some(false) => InstallAutoUpdateFtueState::Skip,
-        None => InstallAutoUpdateFtueState::EnableByDefault,
-    }
-}
-
-/// Testable inner implementation of the install-time auto-update behavior.
-async fn run_install_auto_update_prompt_inner(
-    cfg: &config::CliConfig,
-    config_path: &std::path::Path,
-    is_tty: bool,
-) {
-    if !is_tty {
-        return;
-    }
-
-    let mut stdout = std::io::stdout();
-    match install_auto_update_ftue_state(cfg) {
-        InstallAutoUpdateFtueState::Skip => return,
-        InstallAutoUpdateFtueState::Disclosure => {
-            println!();
-            output::action_to_with_tty(&mut stdout, "Auto-update", "disclosure", is_tty);
-            output::detail_to_with_tty(
-                &mut stdout,
-                "Cadence background updater runs unattended and installs stable releases only.",
-                is_tty,
-            );
-            output::detail_to_with_tty(
-                &mut stdout,
-                "Controls: `cadence auto-update disable` or `cadence auto-update uninstall`.",
-                is_tty,
-            );
-            output::detail_to_with_tty(&mut stdout, "Current setting: enabled", is_tty);
-            return;
-        }
-        InstallAutoUpdateFtueState::EnableByDefault => {}
-    }
-
-    println!();
-    output::action_to_with_tty(&mut stdout, "Auto-update", "enabled", is_tty);
-    output::detail_to_with_tty(
-        &mut stdout,
-        "Cadence enables unattended background updates by default (stable channel only, no prompts).",
-        is_tty,
-    );
-    output::detail_to_with_tty(
-        &mut stdout,
-        "Disable anytime: `cadence auto-update disable`",
-        is_tty,
-    );
-    output::detail_to_with_tty(
-        &mut stdout,
-        "Remove scheduler artifacts: `cadence auto-update uninstall`",
-        is_tty,
-    );
-
-    let mut updated_cfg = cfg.clone();
-    if let Err(e) = updated_cfg.set_key(config::ConfigKey::AutoUpdate, "true") {
-        output::note_to_with_tty(
-            &mut stdout,
-            &format!("Could not save auto-update preference: {e}"),
-            is_tty,
-        );
-        return;
-    }
-    if let Err(e) = updated_cfg.save_to(config_path).await {
-        output::note_to_with_tty(
-            &mut stdout,
-            &format!("Could not save auto-update preference: {e}"),
-            is_tty,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Config subcommand handlers
 // ---------------------------------------------------------------------------
 
@@ -3269,6 +3173,34 @@ mod tests {
         }
     }
 
+    async fn write_codex_session_log(
+        home: &std::path::Path,
+        session_id: &str,
+        cwd: &std::path::Path,
+        updated_at: i64,
+    ) -> PathBuf {
+        let dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("03")
+            .join("24");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create codex session dir");
+        let path = dir.join(format!("{session_id}.jsonl"));
+        let content = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.to_string_lossy()
+        );
+        tokio::fs::write(&path, content)
+            .await
+            .expect("write codex session log");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(updated_at, 0))
+            .expect("set codex session mtime");
+        path
+    }
+
     #[test]
     fn cli_parses_login_command() {
         let cli = Cli::parse_from(["cadence", "login"]);
@@ -3465,32 +3397,6 @@ mod tests {
     }
 
     #[test]
-    fn install_auto_update_ftue_state_matches_config() {
-        let enabled = config::CliConfig {
-            auto_update: Some(true),
-            ..config::CliConfig::default()
-        };
-        assert_eq!(
-            install_auto_update_ftue_state(&enabled),
-            InstallAutoUpdateFtueState::Disclosure
-        );
-
-        let disabled = config::CliConfig {
-            auto_update: Some(false),
-            ..config::CliConfig::default()
-        };
-        assert_eq!(
-            install_auto_update_ftue_state(&disabled),
-            InstallAutoUpdateFtueState::Skip
-        );
-
-        assert_eq!(
-            install_auto_update_ftue_state(&config::CliConfig::default()),
-            InstallAutoUpdateFtueState::EnableByDefault
-        );
-    }
-
-    #[test]
     fn error_chain_messages_include_context_and_root_cause() {
         let err = anyhow!("root cause")
             .context("mid context")
@@ -3511,47 +3417,6 @@ mod tests {
         let err = anyhow!("same").context("same");
 
         assert_eq!(error_chain_messages(&err), vec!["same".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn install_auto_update_defaults_to_enabled_when_unset() {
-        let dir = TempDir::new().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-        let cfg = config::CliConfig::default();
-
-        run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
-        let saved = config::CliConfig::load_from(&config_path)
-            .await
-            .expect("load config");
-        assert_eq!(saved.auto_update, Some(true));
-    }
-
-    #[tokio::test]
-    async fn install_auto_update_disclosure_skips_prompt_when_enabled() {
-        let dir = TempDir::new().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-        let cfg = config::CliConfig {
-            auto_update: Some(true),
-            ..config::CliConfig::default()
-        };
-
-        run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
-
-        assert!(!config_path.exists());
-    }
-
-    #[tokio::test]
-    async fn install_auto_update_respects_explicit_disable() {
-        let dir = TempDir::new().expect("tempdir");
-        let config_path = dir.path().join("config.toml");
-        let cfg = config::CliConfig {
-            auto_update: Some(false),
-            ..config::CliConfig::default()
-        };
-
-        run_install_auto_update_prompt_inner(&cfg, &config_path, true).await;
-
-        assert!(!config_path.exists());
     }
 
     #[test]
@@ -3820,6 +3685,95 @@ mod tests {
             IncrementalCursor {
                 last_scanned_mtime_epoch: 100,
                 last_scanned_source_label: Some("a".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn incremental_upload_accepts_repo_family_worktree_matches() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+        let codex_home_guard = EnvGuard::new("CODEX_HOME");
+        codex_home_guard.set_path(&home.path().join(".codex"));
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
+        )
+        .await;
+
+        let worktree_root = home.path().join("worktrees").join("feature");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree_root.to_str().expect("worktree path utf8"),
+            ],
+        )
+        .await;
+
+        let session_updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current epoch")
+            .as_secs() as i64;
+        write_codex_session_log(
+            home.path(),
+            "session-worktree-family",
+            repo.path(),
+            session_updated_at,
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let stats = upload_incremental_sessions_for_repo(
+            &upload_context,
+            worktree_root.as_path(),
+            &worktree_root.to_string_lossy(),
+        )
+        .await
+        .expect("upload incremental sessions");
+
+        assert_eq!(stats.uploaded, 1);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.issues, 0);
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 1,
+                uploads: 1,
+                confirms: 1,
+                user_org_requests: 1,
             }
         );
     }

@@ -58,7 +58,8 @@ pub struct CliConfig {
     pub github_login: Option<String>,
     /// Token expiry timestamp (ISO 8601 string).
     pub expires_at: Option<String>,
-    /// When true, `cadence update` skips the confirmation prompt.
+    /// When true, unattended background updates are enabled and
+    /// interactive `cadence update` skips the confirmation prompt.
     pub auto_update: Option<bool>,
     /// How often the passive background version check runs (e.g., "8h", "24h", "1d").
     pub update_check_interval: Option<String>,
