@@ -3123,10 +3123,13 @@ mod tests {
         label: &str,
         session_id: &str,
     ) -> SessionInfo {
-        let content = format!(
-            "{{\"sessionId\":\"{session_id}\",\"cwd\":\"{}\",\"message\":\"hello\"}}\n",
-            repo_root.to_string_lossy()
-        );
+        let content = serde_json::json!({
+            "sessionId": session_id,
+            "cwd": repo_root.to_string_lossy().to_string(),
+            "message": "hello",
+        })
+        .to_string()
+            + "\n";
         let mut metadata = scanner::parse_session_metadata_str(&content);
         metadata.cwd = Some(repo_root.to_string_lossy().to_string());
         metadata.session_id = Some(session_id.to_string());
@@ -3189,10 +3192,15 @@ mod tests {
             .await
             .expect("create codex session dir");
         let path = dir.join(format!("{session_id}.jsonl"));
-        let content = format!(
-            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"{}\"}}}}\n",
-            cwd.to_string_lossy()
-        );
+        let content = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": cwd.to_string_lossy().to_string(),
+            }
+        })
+        .to_string()
+            + "\n";
         tokio::fs::write(&path, content)
             .await
             .expect("write codex session log");
