@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.1...v2.1.2) (2026-03-24)
+
+
+### Bug Fixes
+
+* **publication:** stop republishing sessions for head-only changes ([8686853](https://github.com/TeamCadenceAI/cadence-cli/commit/86868532bebfdf7fd9d55ec8308930972fb6adb4))
+* **publication:** stop republishing sessions for head-only changes ([22975e2](https://github.com/TeamCadenceAI/cadence-cli/commit/22975e2cef131fb20c496a3b4aaaa3d85463142c))
+
 ## [2.1.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.0...v2.1.1) (2026-03-23)
 
 
