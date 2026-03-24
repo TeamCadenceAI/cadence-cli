@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.1.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.2...v2.1.3) (2026-03-24)
+
+
+### Bug Fixes
+
+* **release:** publish assets for draft release-please releases ([7dcc222](https://github.com/TeamCadenceAI/cadence-cli/commit/7dcc222c7eb747183d956096c875d2f2d70ca78b))
+* **release:** publish assets for draft release-please releases ([c86c273](https://github.com/TeamCadenceAI/cadence-cli/commit/c86c2739d4d8197d607aa7ebe6aa466bcf0a3dbf))
+* **transport:** support enterprise TLS roots ([1541eea](https://github.com/TeamCadenceAI/cadence-cli/commit/1541eeab0201ae40b3ad09fe9e8d02e40c58cdf0))
+* **transport:** support enterprise TLS roots ([fa3e5a7](https://github.com/TeamCadenceAI/cadence-cli/commit/fa3e5a7377454ed59bf22a4fb713f5707a175eea))
+
 ## [2.1.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.1...v2.1.2) (2026-03-24)
 
 
