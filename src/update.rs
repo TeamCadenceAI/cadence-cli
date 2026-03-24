@@ -1751,61 +1751,7 @@ pub async fn reconcile_scheduler_for_auto_update_enabled(
 pub async fn scheduler_health() -> SchedulerHealth {
     #[cfg(target_os = "macos")]
     {
-        let plist_path = match macos_launch_agent_path() {
-            Ok(v) => v,
-            Err(e) => {
-                return SchedulerHealth {
-                    state: SchedulerHealthState::Broken,
-                    details: format!("LaunchAgent path unavailable: {e}"),
-                    remediation: "Run `cadence install` to repair scheduler setup.".to_string(),
-                };
-            }
-        };
-        if !tokio::fs::try_exists(&plist_path).await.unwrap_or(false) {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Missing,
-                details: format!("missing LaunchAgent {}", plist_path.display()),
-                remediation: "Run `cadence auto-update enable` or `cadence install` to create it."
-                    .to_string(),
-            };
-        }
-        let contents = tokio::fs::read_to_string(&plist_path)
-            .await
-            .unwrap_or_default();
-        if !contents.contains("<string>auto-update</string>") {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Broken,
-                details: format!(
-                    "LaunchAgent exists but contents look invalid: {}",
-                    plist_path.display()
-                ),
-                remediation: "Run `cadence install` to rewrite scheduler artifacts.".to_string(),
-            };
-        }
-        match macos_launch_agent_loaded(MACOS_LAUNCH_AGENT_LABEL).await {
-            Ok(true) => SchedulerHealth {
-                state: SchedulerHealthState::Installed,
-                details: format!("LaunchAgent installed and loaded: {}", plist_path.display()),
-                remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
-            },
-            Ok(false) => SchedulerHealth {
-                state: SchedulerHealthState::Broken,
-                details: format!(
-                    "LaunchAgent exists but is not loaded in launchd: {}",
-                    plist_path.display()
-                ),
-                remediation:
-                    "Run `cadence auto-update enable` or `cadence install` to load it."
-                        .to_string(),
-            },
-            Err(err) => SchedulerHealth {
-                state: SchedulerHealthState::Broken,
-                details: format!("LaunchAgent health check failed: {err}"),
-                remediation:
-                    "Run `cadence auto-update enable` or `cadence install` to repair it."
-                        .to_string(),
-            },
-        };
+        return scheduler_health_macos().await;
     }
 
     #[cfg(target_os = "linux")]
@@ -1897,6 +1843,78 @@ pub async fn scheduler_health() -> SchedulerHealth {
         details: "scheduler unsupported on this platform".to_string(),
         remediation: "No scheduler action required.".to_string(),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_scheduler_health_from_probe(
+    plist_path: &Path,
+    contents: &str,
+    loaded: Result<bool>,
+) -> SchedulerHealth {
+    if !contents.contains("<string>auto-update</string>") {
+        return SchedulerHealth {
+            state: SchedulerHealthState::Broken,
+            details: format!(
+                "LaunchAgent exists but contents look invalid: {}",
+                plist_path.display()
+            ),
+            remediation: "Run `cadence install` to rewrite scheduler artifacts.".to_string(),
+        };
+    }
+
+    match loaded {
+        Ok(true) => SchedulerHealth {
+            state: SchedulerHealthState::Installed,
+            details: format!("LaunchAgent installed and loaded: {}", plist_path.display()),
+            remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
+        },
+        Ok(false) => SchedulerHealth {
+            state: SchedulerHealthState::Broken,
+            details: format!(
+                "LaunchAgent exists but is not loaded in launchd: {}",
+                plist_path.display()
+            ),
+            remediation: "Run `cadence auto-update enable` or `cadence install` to load it."
+                .to_string(),
+        },
+        Err(err) => SchedulerHealth {
+            state: SchedulerHealthState::Broken,
+            details: format!("LaunchAgent health check failed: {err}"),
+            remediation: "Run `cadence auto-update enable` or `cadence install` to repair it."
+                .to_string(),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn scheduler_health_macos() -> SchedulerHealth {
+    let plist_path = match macos_launch_agent_path() {
+        Ok(v) => v,
+        Err(e) => {
+            return SchedulerHealth {
+                state: SchedulerHealthState::Broken,
+                details: format!("LaunchAgent path unavailable: {e}"),
+                remediation: "Run `cadence install` to repair scheduler setup.".to_string(),
+            };
+        }
+    };
+    if !tokio::fs::try_exists(&plist_path).await.unwrap_or(false) {
+        return SchedulerHealth {
+            state: SchedulerHealthState::Missing,
+            details: format!("missing LaunchAgent {}", plist_path.display()),
+            remediation: "Run `cadence auto-update enable` or `cadence install` to create it."
+                .to_string(),
+        };
+    }
+
+    let contents = tokio::fs::read_to_string(&plist_path)
+        .await
+        .unwrap_or_default();
+    macos_scheduler_health_from_probe(
+        &plist_path,
+        &contents,
+        macos_launch_agent_loaded(MACOS_LAUNCH_AGENT_LABEL).await,
+    )
 }
 
 pub fn auto_update_policy_summary() -> &'static str {
@@ -3384,6 +3402,19 @@ mod tests {
         assert!(plist.contains("<string>auto-update</string>"));
         assert!(plist.contains("<key>StartInterval</key>"));
         assert!(plist.contains("<integer>3600</integer>"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_scheduler_health_reports_installed_when_launch_agent_is_loaded() {
+        let plist_path = PathBuf::from("/tmp/ai.teamcadence.cadence.autoupdate.plist");
+        let health = macos_scheduler_health_from_probe(
+            &plist_path,
+            "<string>auto-update</string>",
+            Ok(true),
+        );
+        assert_eq!(health.state, SchedulerHealthState::Installed);
+        assert!(health.details.contains("installed and loaded"));
     }
 
     #[test]
