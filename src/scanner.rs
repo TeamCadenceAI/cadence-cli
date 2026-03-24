@@ -179,6 +179,9 @@ fn infer_agent_type(path: &Path) -> AgentType {
     if path_lower.contains(".codex") {
         AgentType::Codex
     } else if path_lower.contains("/.local/share/opencode/")
+        || path_lower.contains("/opencode/storage/")
+        || path_lower.contains("/opencode/log/")
+        || path_lower.ends_with("/opencode/opencode.db")
         || path_lower.contains("/library/application support/opencode/")
         || path_lower.contains("/appdata/roaming/opencode/")
     {
@@ -1128,6 +1131,23 @@ also not json {{{{
     async fn test_parse_metadata_agent_type_from_opencode_path() {
         let dir = TempDir::new().unwrap();
         let opencode_dir = dir.path().join(".local").join("share").join("opencode");
+        tokio::fs::create_dir_all(&opencode_dir).await.unwrap();
+        let file = write_temp_file(&opencode_dir, "session.json", "{}").await;
+
+        let metadata = parse_session_metadata(&file).await;
+
+        assert_eq!(metadata.agent_type, Some(AgentType::OpenCode));
+    }
+
+    #[tokio::test]
+    async fn test_parse_metadata_agent_type_from_opencode_custom_xdg_path() {
+        let dir = TempDir::new().unwrap();
+        let opencode_dir = dir
+            .path()
+            .join("custom-data")
+            .join("opencode")
+            .join("storage")
+            .join("session");
         tokio::fs::create_dir_all(&opencode_dir).await.unwrap();
         let file = write_temp_file(&opencode_dir, "session.json", "{}").await;
 
