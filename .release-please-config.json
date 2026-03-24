@@ -3,6 +3,8 @@
   "sequential-calls": true,
   "packages": {
     ".": {
+      "draft": true,
+      "force-tag-creation": true,
       "release-type": "rust",
       "include-component-in-tag": false,
       "include-v-in-tag": true,
