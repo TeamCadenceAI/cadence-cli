@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.4...v2.1.5) (2026-03-24)
+
+
+### Bug Fixes
+
+* **update:** recover worktree sessions and self-heal upgrades ([887f6ea](https://github.com/TeamCadenceAI/cadence-cli/commit/887f6ea4f67b8eeaa250e179a3180a956a5fc72c))
+* **update:** recover worktree sessions and self-heal upgrades ([4682983](https://github.com/TeamCadenceAI/cadence-cli/commit/4682983c5eadca9f227fe74463666e479b353fbd))
+
 ## [2.1.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.3...v2.1.4) (2026-03-24)
 
 
