@@ -10,6 +10,7 @@ mod publication;
 mod publication_state;
 mod scanner;
 mod tracing;
+mod transport;
 mod update;
 mod upload;
 mod upload_cursor;
@@ -52,6 +53,9 @@ fn report_error(err: &anyhow::Error) {
             output::fail("Failed", &first);
             for cause in messages {
                 output::detail(&format!("Caused by: {cause}"));
+            }
+            if let Some(help) = transport::tls_failure_help(err) {
+                output::note(&help);
             }
         }
         None => output::fail("Failed", "unknown error"),
@@ -580,7 +584,7 @@ async fn run_logout() -> Result<()> {
     let resolved = cfg.resolve_api_url(api_url_override());
 
     if let Some(token) = resolve_cli_auth_token(&cfg) {
-        let client = api_client::ApiClient::new(&resolved.url);
+        let client = api_client::ApiClient::new(&resolved.url).await?;
         match client
             .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
             .await
@@ -629,7 +633,16 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
     };
 
     let resolved = cfg.resolve_api_url(api_url_override());
-    let client = api_client::ApiClient::new(&resolved.url);
+    let client = match api_client::ApiClient::new(&resolved.url).await {
+        Ok(client) => client,
+        Err(err) => {
+            output::detail(&format!("Backfill sync skipped: {err}"));
+            if let Some(help) = transport::tls_failure_help(&err) {
+                output::note(&help);
+            }
+            return;
+        }
+    };
     let finished_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
@@ -2908,7 +2921,7 @@ async fn revoke_token_for_uninstall() -> Result<()> {
     };
 
     let resolved = cfg.resolve_api_url(api_url_override());
-    let client = api_client::ApiClient::new(&resolved.url);
+    let client = api_client::ApiClient::new(&resolved.url).await?;
     match client
         .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
         .await

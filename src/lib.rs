@@ -4,4 +4,5 @@
 //! expose internal modules to integration tests and future spec consumers.
 
 pub mod config;
+pub mod transport;
 pub mod update;

@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{error::Error as _, time::Duration};
 
+use crate::transport;
+
 // ---------------------------------------------------------------------------
 // Endpoint path constants
 // ---------------------------------------------------------------------------
@@ -217,24 +219,33 @@ impl ApiClient {
     ///
     /// `base_url` is trimmed and stripped of a trailing slash to prevent
     /// double-slash issues when joining endpoint paths.
-    pub fn new(base_url: &str) -> Self {
+    pub async fn new(base_url: &str) -> Result<Self> {
         let normalized = base_url.trim().trim_end_matches('/').to_string();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::HeaderName::from_static("x-cadence-cli-version"),
             reqwest::header::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
         );
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("build Cadence API HTTP client");
-        let raw_client = reqwest::Client::builder()
-            .build()
-            .expect("build raw HTTP client");
-        Self {
+        let client = transport::build_client(
+            reqwest::Client::builder().default_headers(headers),
+            "Cadence API HTTP client",
+        )
+        .await?;
+        let raw_client =
+            transport::build_client(reqwest::Client::builder(), "raw HTTP client").await?;
+        Ok(Self {
             client,
             raw_client,
             base_url: normalized,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(base_url: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            raw_client: reqwest::Client::new(),
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
         }
     }
 
@@ -564,7 +575,7 @@ mod tests {
 
     #[test]
     fn url_joins_paths() {
-        let client = ApiClient::new("https://api.example.com/");
+        let client = ApiClient::new_for_test("https://api.example.com/");
         assert_eq!(
             client.url("/api/keys/public"),
             "https://api.example.com/api/keys/public"
