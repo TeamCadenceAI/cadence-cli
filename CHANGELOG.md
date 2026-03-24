@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.1.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.5...v2.1.6) (2026-03-24)
+
+
+### Bug Fixes
+
+* **release:** pin release-please action to newer runtime ([9ca602c](https://github.com/TeamCadenceAI/cadence-cli/commit/9ca602ca74efeb82800684c687891b323edc15bd))
+* **update:** report loaded macOS scheduler correctly ([83c84dc](https://github.com/TeamCadenceAI/cadence-cli/commit/83c84dca4fafaf05f00257bc2c83ac0b66a13823))
+* **update:** report loaded macOS scheduler correctly ([daa3d78](https://github.com/TeamCadenceAI/cadence-cli/commit/daa3d783dfa0d539d1217c136326344924d57ba0))
+
 ## [2.1.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.4...v2.1.5) (2026-03-24)
 
 
