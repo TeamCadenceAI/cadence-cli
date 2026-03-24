@@ -497,10 +497,39 @@ async fn load_existing_for_org(
     logical_session: &LogicalSessionKey,
     target_org_id: Option<&str>,
 ) -> Result<Option<StoredPublication>> {
-    Ok(load_all_records().await?.into_iter().find(|stored| {
+    let stored = load_all_records().await?.into_iter().find(|stored| {
         stored.record.logical_session == *logical_session
             && stored.record.target_org_id.as_deref() == target_org_id
-    }))
+    });
+    normalize_stored_publication(stored).await
+}
+
+async fn normalize_stored_publication(
+    stored: Option<StoredPublication>,
+) -> Result<Option<StoredPublication>> {
+    let Some(mut stored) = stored else {
+        return Ok(None);
+    };
+
+    if stored.record.status != PublicationStatus::Published {
+        return Ok(Some(stored));
+    }
+
+    let normalized_metadata_sha256 =
+        crate::publication::metadata_sha256(&stored.record.observations)?;
+    let current_changed = stored.record.current_metadata_sha256 != normalized_metadata_sha256;
+    let last_published_changed = stored.record.last_published_metadata_sha256.as_deref()
+        != Some(normalized_metadata_sha256.as_str());
+
+    if !current_changed && !last_published_changed {
+        return Ok(Some(stored));
+    }
+
+    stored.record.current_metadata_sha256 = normalized_metadata_sha256.clone();
+    stored.record.last_published_metadata_sha256 = Some(normalized_metadata_sha256);
+    stored.record.updated_at = now_rfc3339();
+    upsert_record(&stored.record, None).await?;
+    Ok(Some(stored))
 }
 
 async fn resolve_target_org(
@@ -1063,6 +1092,177 @@ mod tests {
         );
         assert_eq!(upload_requests[0].body, "hello");
         assert_eq!(pending_upload_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_skips_when_only_head_or_ref_changes() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let server =
+            test_support::spawn_test_upload_server(test_support::TestUploadServerConfig::default())
+                .await
+                .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+
+        let initial = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+        let outcome = upload_or_queue_prepared_session(&context, &initial)
+            .await
+            .unwrap();
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+
+        let mut changed =
+            sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git");
+        changed.observations.git_ref = Some("refs/heads/feature/test".to_string());
+        changed.observations.head_commit_sha = Some("deadbeef".repeat(8));
+        let changed = prepare_session_upload(changed).unwrap();
+        let outcome = upload_or_queue_prepared_session(&context, &changed)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, LiveUploadOutcome::AlreadyExists);
+        assert_eq!(server.counts().create_requests, 1);
+        assert_eq!(server.upload_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_reuploads_content_with_latest_head_and_ref() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let server =
+            test_support::spawn_test_upload_server(test_support::TestUploadServerConfig::default())
+                .await
+                .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+
+        let initial = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+        let outcome = upload_or_queue_prepared_session(&context, &initial)
+            .await
+            .unwrap();
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+
+        let mut changed =
+            sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git");
+        changed.raw_session_content = "hello again".to_string();
+        changed.observations.git_ref = Some("refs/heads/feature/test".to_string());
+        changed.observations.head_commit_sha = Some("deadbeef".repeat(8));
+        let changed = prepare_session_upload(changed).unwrap();
+        let outcome = upload_or_queue_prepared_session(&context, &changed)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+        let requests = server.create_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].git_ref.as_deref(),
+            Some("refs/heads/feature/test")
+        );
+        assert_eq!(
+            requests[1].head_commit_sha.as_deref(),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        );
+        let uploads = server.upload_requests();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[1].body, "hello again");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn published_records_normalize_legacy_metadata_hashes_before_deduping() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let server =
+            test_support::spawn_test_upload_server(test_support::TestUploadServerConfig::default())
+                .await
+                .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+        let legacy_metadata_sha = crate::publication::sha256_hex(
+            format!(
+                "{}:{}",
+                prepared.prepared.metadata_sha256,
+                prepared
+                    .prepared
+                    .observations
+                    .head_commit_sha
+                    .as_deref()
+                    .unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        let record = PublicationStateRecord {
+            logical_session: prepared.prepared.logical_session.clone(),
+            target_org_id: Some("org-test".to_string()),
+            status: PublicationStatus::Published,
+            current_content_sha256: prepared.prepared.content_sha256.clone(),
+            current_metadata_sha256: legacy_metadata_sha.clone(),
+            last_published_content_sha256: Some(prepared.prepared.content_sha256.clone()),
+            last_published_metadata_sha256: Some(legacy_metadata_sha),
+            publish_uid: Some("pub_legacy".to_string()),
+            publication_id: Some("publication-1".to_string()),
+            upload_sha256: prepared.prepared.upload_sha256.clone(),
+            attempt_count: 0,
+            next_attempt_at_epoch: now_epoch(),
+            last_error: None,
+            observations: prepared.prepared.observations.clone(),
+            updated_at: now_rfc3339(),
+            created_at: now_rfc3339(),
+        };
+        upsert_record(&record, None).await.unwrap();
+
+        let mut changed =
+            sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git");
+        changed.observations.git_ref = Some("refs/heads/feature/test".to_string());
+        changed.observations.head_commit_sha = Some("deadbeef".repeat(8));
+        let changed = prepare_session_upload(changed).unwrap();
+        let outcome = upload_or_queue_prepared_session(&context, &changed)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, LiveUploadOutcome::AlreadyExists);
+        assert_eq!(server.counts().create_requests, 0);
+        let key = storage_key(&prepared.prepared.logical_session, Some("org-test"));
+        let normalized = load_all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.storage_key == key)
+            .unwrap();
+        assert_eq!(
+            normalized.record.current_metadata_sha256,
+            prepared.prepared.metadata_sha256
+        );
+        assert_eq!(
+            normalized.record.last_published_metadata_sha256.as_deref(),
+            Some(prepared.prepared.metadata_sha256.as_str())
+        );
     }
 
     #[tokio::test]

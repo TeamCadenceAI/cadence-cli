@@ -154,10 +154,12 @@ The CLI should compute `metadata_sha256` from at least:
 - all remote observations
 - canonical repo-root observation
 - all linked worktree-root observations
-- `git_ref`
-- `head_commit_sha`
 
-`cli_version` must not trigger a new publication by itself.
+`cli_version`, `git_ref`, and `head_commit_sha` must not trigger a new
+publication by themselves.
+
+`git_ref` and `head_commit_sha` are still sent and stored as live publish-time
+observations/hints whenever some other change causes a publication.
 
 For backfill:
 
@@ -189,6 +191,10 @@ The CLI should create a new publication when either changes:
 
 - content hash
 - material metadata hash
+
+Changing only `git_ref` or `head_commit_sha` must not create a new publication.
+If content changes and a new publication is created, the latest observed
+`git_ref` and `head_commit_sha` should still be attached to that publication.
 
 The CLI should retry the same publication when a failure occurs after that
 publication has already been created.

@@ -62,10 +62,6 @@ struct MaterialMetadataHashInput<'a> {
     remote_urls: &'a [String],
     canonical_repo_root: &'a str,
     worktree_roots: &'a [String],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    git_ref: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    head_commit_sha: Option<&'a str>,
 }
 
 /// Returns the SHA-256 hex digest for raw session content.
@@ -82,16 +78,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Computes the material metadata hash used to decide whether to republish.
 ///
-/// Incidental fields such as `cwd`, git user identity, and `cli_version` are
-/// intentionally excluded so they do not force new publications.
+/// Incidental fields such as `cwd`, git user identity, `cli_version`, and live
+/// branch/HEAD hints are intentionally excluded so they do not force new
+/// publications on their own.
 pub fn metadata_sha256(observations: &PublicationObservations) -> Result<String> {
     let input = MaterialMetadataHashInput {
         canonical_remote_url: &observations.canonical_remote_url,
         remote_urls: &observations.remote_urls,
         canonical_repo_root: &observations.canonical_repo_root,
         worktree_roots: &observations.worktree_roots,
-        git_ref: observations.git_ref.as_deref(),
-        head_commit_sha: observations.head_commit_sha.as_deref(),
     };
     let bytes = serde_json::to_vec(&input)?;
     Ok(sha256_hex(&bytes))
@@ -158,12 +153,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_hash_changes_for_head_or_ref_changes() {
+    fn metadata_hash_ignores_head_or_ref_changes() {
         let mut observations = sample_observations();
         let first = metadata_sha256(&observations).unwrap();
         observations.head_commit_sha = Some("deadbeef".repeat(8));
+        observations.git_ref = Some("refs/heads/feature/test".to_string());
         let second = metadata_sha256(&observations).unwrap();
-        assert_ne!(first, second);
+        assert_eq!(first, second);
     }
 
     #[test]
