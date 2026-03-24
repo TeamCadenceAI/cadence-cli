@@ -19,6 +19,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::CliConfig;
+use crate::transport;
 
 #[cfg(not(any(unix, windows)))]
 use sysinfo::{Pid, System};
@@ -476,12 +477,14 @@ pub async fn check_latest_version_from_url(url: &str) -> Result<LatestRelease> {
 /// from the redirect `Location` header without actually following it. This
 /// is efficient (single request) and avoids the GitHub API entirely.
 async fn discover_latest_tag(url: &str, timeout: Duration) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("Failed to build HTTP client")?;
+    let client = transport::build_client(
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none()),
+        "update HTTP client",
+    )
+    .await?;
     let response = client
         .get(url)
         .send()
@@ -630,18 +633,20 @@ pub fn pick_checksums_asset(assets: &[ReleaseAsset]) -> Result<ReleaseAsset> {
 // HTTP download helpers
 // ---------------------------------------------------------------------------
 
-/// Builds a reqwest blocking client with standard headers and timeout.
-fn build_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(120))
-        .build()
-        .context("Failed to build HTTP client")
+/// Builds a reqwest client with the shared Cadence trust configuration.
+async fn build_http_client() -> Result<reqwest::Client> {
+    transport::build_client(
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(120)),
+        "download HTTP client",
+    )
+    .await
 }
 
 /// Downloads a URL to a file in the given directory. Returns the file path.
 pub async fn download_to_file(url: &str, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
-    let client = build_http_client()?;
+    let client = build_http_client().await?;
     let response = client
         .get(url)
         .send()

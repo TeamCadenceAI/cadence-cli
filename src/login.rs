@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::api_client::{ApiClient, CliTokenExchangeResult};
+use crate::output;
 
 const CADENCE_LOCKUP_INLINE_SVG: &str = include_str!("../assets/cadence-lockup-inline.svg");
 
@@ -17,6 +18,7 @@ pub async fn login_via_browser(
     timeout: Duration,
 ) -> Result<CliTokenExchangeResult> {
     let nonce = generate_nonce();
+    let client = ApiClient::new(api_base_url).await?;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -33,6 +35,7 @@ pub async fn login_via_browser(
         nonce
     );
 
+    output::detail(&format!("Open this URL manually if needed: {auth_url}"));
     open::that(&auth_url).with_context(|| {
         format!("failed to open browser. Open this URL manually to continue login: {auth_url}")
     })?;
@@ -40,7 +43,6 @@ pub async fn login_via_browser(
     let deadline = Instant::now() + timeout;
     let exchange_code = wait_for_exchange_code(&listener, &nonce, deadline).await?;
 
-    let client = ApiClient::new(api_base_url);
     client
         .exchange_cli_code(&exchange_code, Duration::from_secs(10))
         .await

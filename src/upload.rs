@@ -86,7 +86,7 @@ pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<Up
     let resolved = cfg.resolve_api_url(api_url_override);
     let token = resolve_cli_auth_token(&cfg);
     Ok(UploadContext {
-        client: ApiClient::new(&resolved.url),
+        client: ApiClient::new(&resolved.url).await?,
         token,
         user_orgs: Mutex::new(None),
     })
@@ -1026,7 +1026,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
         let context = UploadContext {
-            client: ApiClient::new("http://127.0.0.1:9"),
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
             token: None,
             user_orgs: Mutex::new(None),
         };
@@ -1069,7 +1069,7 @@ mod tests {
                 .await
                 .unwrap();
         let context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1104,7 +1104,7 @@ mod tests {
                 .await
                 .unwrap();
         let context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1143,7 +1143,7 @@ mod tests {
                 .await
                 .unwrap();
         let context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1194,7 +1194,7 @@ mod tests {
                 .await
                 .unwrap();
         let context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1271,7 +1271,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
         let context = UploadContext {
-            client: ApiClient::new("http://127.0.0.1:9"),
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(Some(vec![
                 UserOrgInfo {
@@ -1319,7 +1319,7 @@ mod tests {
         let repo = init_repo().await;
 
         let queued_context = UploadContext {
-            client: ApiClient::new("http://127.0.0.1:9"),
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1362,7 +1362,7 @@ mod tests {
                 .await
                 .unwrap();
         let retry_context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1403,7 +1403,7 @@ mod tests {
         .await
         .unwrap();
         let context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1436,7 +1436,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
         let queued_context = UploadContext {
-            client: ApiClient::new("http://127.0.0.1:9"),
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
             token: None,
             user_orgs: Mutex::new(None),
         };
@@ -1471,7 +1471,7 @@ mod tests {
         tokio::fs::remove_file(payload_path).await.unwrap();
 
         let retry_context = UploadContext {
-            client: ApiClient::new("http://127.0.0.1:9"),
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
@@ -1492,7 +1492,7 @@ mod tests {
                 .await
                 .unwrap();
         let context = UploadContext {
-            client: ApiClient::new(&server.base_url),
+            client: ApiClient::new_for_test(&server.base_url),
             token: Some("token".to_string()),
             user_orgs: Mutex::new(None),
         };
