@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Run release-please
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@ef9c2745dbfb629d38ebfafa3347a81ab2d51409
         with:
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
