@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -63,8 +63,11 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const AUTO_UPDATE_INTERVAL_SECS: u64 = 60 * 60;
 const AUTO_UPDATE_JITTER_SECS: u64 = 5 * 60;
 
-/// Automatic recovery backfill window to run after every successful upgrade.
-const POST_UPGRADE_BACKFILL_SINCE: &str = "2d";
+/// File recording the last version whose automatic recovery completed locally.
+const VERSION_RECOVERY_MARKER_FILE: &str = "last-version-recovery";
+
+/// Automatic recovery backfill window to run on every first run of a new version.
+pub(crate) const VERSION_RECOVERY_BACKFILL_SINCE: &str = "7d";
 
 /// Retry backoff defaults.
 const UPDATE_RETRY_BASE_SECS: u64 = 60;
@@ -230,6 +233,10 @@ fn updater_state_path() -> Result<PathBuf> {
     Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
 }
 
+fn version_recovery_marker_path() -> Option<PathBuf> {
+    Some(CliConfig::config_dir()?.join(VERSION_RECOVERY_MARKER_FILE))
+}
+
 fn activity_lock_path() -> Result<PathBuf> {
     Ok(cadence_dir()?
         .join(ACTIVITY_LOCKS_DIR)
@@ -269,6 +276,39 @@ async fn load_updater_state() -> Result<UpdaterState> {
 async fn save_updater_state(state: &UpdaterState) -> Result<()> {
     let path = updater_state_path()?;
     write_json_atomic(&path, state).await
+}
+
+async fn read_version_recovery_marker(path: &Path) -> Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(match content.trim() {
+            "" => None,
+            value => Some(value.to_string()),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e)
+            .with_context(|| format!("failed to read version recovery marker {}", path.display())),
+    }
+}
+
+async fn write_version_recovery_marker(path: &Path, version: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    tokio::fs::write(path, format!("{version}\n"))
+        .await
+        .with_context(|| format!("failed to write version recovery marker {}", path.display()))
+}
+
+fn version_recovery_is_due(last_completed_version: Option<&str>, target_version: &str) -> bool {
+    match last_completed_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(version) => version != target_version,
+        None => true,
+    }
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -988,12 +1028,16 @@ pub fn confirm_update(
 ///
 /// If `check` is true, only checks and prints whether an update is available.
 /// Otherwise, downloads, verifies, extracts, and replaces the running binary.
-pub async fn run_update(check: bool, yes: bool) -> Result<()> {
+pub async fn run_update(check: bool, yes: bool) -> Result<bool> {
     if check {
-        return run_update_check().await;
+        run_update_check().await?;
+        return Ok(false);
     }
 
-    run_update_install(yes).await
+    Ok(matches!(
+        run_update_install(yes).await?,
+        AttemptOutcome::Installed
+    ))
 }
 
 /// Check-only path: prints whether an update is available.
@@ -1027,11 +1071,13 @@ async fn run_update_check() -> Result<()> {
 }
 
 /// Full install path: download, verify, extract, confirm, replace.
-async fn run_update_install(yes: bool) -> Result<()> {
-    run_update_install_from_url(GITHUB_RELEASES_LATEST_URL, yes).await
+async fn run_update_install(yes: bool) -> Result<AttemptOutcome> {
+    run_update_install_from_url_mode(GITHUB_RELEASES_LATEST_URL, yes, InstallMode::Interactive)
+        .await
 }
 
 /// Install path with injectable URL for testing.
+#[allow(dead_code)]
 pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
     let _ = run_update_install_from_url_mode(release_url, yes, InstallMode::Interactive).await?;
     Ok(())
@@ -1211,16 +1257,22 @@ async fn run_update_install_from_url_mode(
         );
     }
 
-    if let Err(err) = run_post_upgrade_backfill_with_exe(
-        &std::env::current_exe()
-            .context("failed to resolve current cadence executable path after self-update")?,
-    )
-    .await
+    let current_exe = std::env::current_exe()
+        .context("failed to resolve current cadence executable path after self-update")?;
+    if let Err(err) =
+        run_version_recovery_backfill_with_exe(&current_exe, remote_display, "after upgrade").await
     {
         report_best_effort_post_upgrade_failure(
             mode,
-            "automatic 2d recovery backfill did not complete",
-            "Run `cadence backfill --since 2d` if you need to recover recent local sessions manually.",
+            "automatic 7d recovery backfill did not complete",
+            "Run `cadence backfill --since 7d` if you need to recover recent local sessions manually.",
+            &err,
+        );
+    } else if let Err(err) = mark_version_recovery_complete(remote_display).await {
+        report_best_effort_post_upgrade_failure(
+            mode,
+            "cadence could not record completed version recovery",
+            "A later command may rerun the automatic recovery backfill for this version.",
             &err,
         );
     }
@@ -1388,11 +1440,21 @@ fn command_failure_detail(output: &Output) -> String {
         .unwrap_or_else(|| format!("exit status {}", output.status))
 }
 
-async fn run_post_upgrade_backfill_with_exe(exe_path: &Path) -> Result<()> {
-    let output = Command::new(exe_path)
-        .args(["backfill", "--since", POST_UPGRADE_BACKFILL_SINCE])
+async fn run_version_recovery_backfill_with_exe(
+    exe_path: &Path,
+    target_version: &str,
+    trigger: &str,
+) -> Result<()> {
+    eprintln!(
+        "Running automatic session recovery for cadence v{target_version} ({trigger}; backfill --since {VERSION_RECOVERY_BACKFILL_SINCE})..."
+    );
+
+    let status = Command::new(exe_path)
+        .args(["backfill", "--since", VERSION_RECOVERY_BACKFILL_SINCE])
         .env(PASSIVE_CHECK_ENV_VAR, "1")
-        .output()
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .await
         .with_context(|| {
             format!(
@@ -1401,14 +1463,56 @@ async fn run_post_upgrade_backfill_with_exe(exe_path: &Path) -> Result<()> {
             )
         })?;
 
-    if output.status.success() {
+    if status.success() {
+        eprintln!("Automatic session recovery for cadence v{target_version} completed.");
         return Ok(());
     }
 
-    bail!(
-        "automatic recovery backfill failed: {}",
-        command_failure_detail(&output)
-    );
+    bail!("automatic recovery backfill failed with exit status {status}");
+}
+
+async fn mark_version_recovery_complete(version: &str) -> Result<()> {
+    let Some(path) = version_recovery_marker_path() else {
+        return Ok(());
+    };
+    write_version_recovery_marker(&path, version).await
+}
+
+pub async fn mark_current_version_recovery_complete() -> Result<()> {
+    mark_version_recovery_complete(current_version()).await
+}
+
+async fn maybe_run_version_recovery_with_exe_and_marker(
+    exe_path: &Path,
+    marker_path: Option<&Path>,
+    target_version: &str,
+    trigger: &str,
+) -> Result<bool> {
+    let Some(marker_path) = marker_path else {
+        return Ok(false);
+    };
+
+    let last_completed = read_version_recovery_marker(marker_path).await?;
+    if !version_recovery_is_due(last_completed.as_deref(), target_version) {
+        return Ok(false);
+    }
+
+    run_version_recovery_backfill_with_exe(exe_path, target_version, trigger).await?;
+    write_version_recovery_marker(marker_path, target_version).await?;
+    Ok(true)
+}
+
+pub async fn maybe_run_current_version_recovery() -> Result<bool> {
+    let exe_path = std::env::current_exe()
+        .context("failed to resolve current cadence executable path for version recovery")?;
+    let marker_path = version_recovery_marker_path();
+    maybe_run_version_recovery_with_exe_and_marker(
+        &exe_path,
+        marker_path.as_deref(),
+        current_version(),
+        "on first run",
+    )
+    .await
 }
 
 fn report_best_effort_post_upgrade_failure(
@@ -3453,7 +3557,8 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn run_post_upgrade_backfill_with_exe_invokes_two_day_backfill_and_skips_passive_check() {
+    async fn run_version_recovery_backfill_with_exe_invokes_seven_day_backfill_and_skips_passive_check()
+     {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("cadence");
         let args_log = tmp.path().join("args.log");
@@ -3472,19 +3577,106 @@ mod tests {
             .await
             .expect("chmod script");
 
-        run_post_upgrade_backfill_with_exe(&script)
+        run_version_recovery_backfill_with_exe(&script, "9.9.9", "test")
             .await
-            .expect("run post-upgrade backfill");
+            .expect("run version recovery backfill");
 
         let args = tokio::fs::read_to_string(&args_log)
             .await
             .expect("read args log");
-        assert_eq!(args, "backfill\n--since\n2d\n");
+        assert_eq!(args, "backfill\n--since\n7d\n");
 
         let env = tokio::fs::read_to_string(&env_log)
             .await
             .expect("read env log");
         assert_eq!(env, "1");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn maybe_run_version_recovery_with_exe_and_marker_runs_once_per_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("cadence");
+        let args_log = tmp.path().join("args.log");
+        let env_log = tmp.path().join("env.log");
+        let marker = tmp.path().join("last-version-recovery");
+        let script_contents = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nprintf '%s\\n' \"$CADENCE_NO_UPDATE_CHECK\" >> \"{}\"\n",
+            args_log.display(),
+            env_log.display()
+        );
+        tokio::fs::write(&script, script_contents)
+            .await
+            .expect("write script");
+
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("chmod script");
+
+        let ran = maybe_run_version_recovery_with_exe_and_marker(
+            &script,
+            Some(&marker),
+            "2.1.7",
+            "test first run",
+        )
+        .await
+        .expect("run first recovery");
+        assert!(ran, "expected recovery to run when marker is missing");
+
+        let args = tokio::fs::read_to_string(&args_log)
+            .await
+            .expect("read args after first run");
+        assert_eq!(args, "backfill\n--since\n7d\n");
+
+        let marker_contents = tokio::fs::read_to_string(&marker)
+            .await
+            .expect("read marker after first run");
+        assert_eq!(marker_contents.trim(), "2.1.7");
+
+        let ran_again = maybe_run_version_recovery_with_exe_and_marker(
+            &script,
+            Some(&marker),
+            "2.1.7",
+            "test second run",
+        )
+        .await
+        .expect("rerun same version");
+        assert!(
+            !ran_again,
+            "expected recovery to be skipped when marker matches current version"
+        );
+
+        let args_after_skip = tokio::fs::read_to_string(&args_log)
+            .await
+            .expect("read args after skip");
+        assert_eq!(args_after_skip, "backfill\n--since\n7d\n");
+
+        let ran_new_version = maybe_run_version_recovery_with_exe_and_marker(
+            &script,
+            Some(&marker),
+            "2.1.8",
+            "test next version",
+        )
+        .await
+        .expect("run next version recovery");
+        assert!(
+            ran_new_version,
+            "expected recovery to rerun for a new version"
+        );
+
+        let args_after_new_version = tokio::fs::read_to_string(&args_log)
+            .await
+            .expect("read args after next version");
+        assert_eq!(
+            args_after_new_version,
+            "backfill\n--since\n7d\nbackfill\n--since\n7d\n"
+        );
+
+        let env = tokio::fs::read_to_string(&env_log)
+            .await
+            .expect("read env log");
+        assert_eq!(env, "1\n1\n");
     }
 
     // -- check_latest_version_from_url_with_timeout ---------------------------
