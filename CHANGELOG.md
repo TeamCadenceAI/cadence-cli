@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.1.7](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.6...v2.1.7) (2026-03-25)
+
+
+### Bug Fixes
+
+* **update:** keep macOS auto-update scheduler persistent ([89ad0bd](https://github.com/TeamCadenceAI/cadence-cli/commit/89ad0bde06649cfbd28add401f0d73feb1074038))
+* **update:** keep macOS auto-update scheduler persistent ([8190d4f](https://github.com/TeamCadenceAI/cadence-cli/commit/8190d4f162996f718cf3bc5af22716255916635a))
+* **update:** recover sessions on first run of each version ([2e193ef](https://github.com/TeamCadenceAI/cadence-cli/commit/2e193ef19e06cfa888593c4c924320d3c6948530))
+* **update:** recover sessions on first run of each version ([205432b](https://github.com/TeamCadenceAI/cadence-cli/commit/205432b75e459493c5e5d28a0e4e8d8003f78df1))
+
 ## [2.1.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.5...v2.1.6) (2026-03-24)
 
 
