@@ -276,11 +276,7 @@ mod tests {
         tokio::fs::write(&transcript, "{}\n").await.unwrap();
         set_file_mtime(&transcript, now - (since_secs + 10));
 
-        let manifest_dir = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
+        let manifest_dir = app_config_dir_in("Claude", home.path())
             .join("claude-code-sessions")
             .join("workspace")
             .join("window");
@@ -310,11 +306,7 @@ mod tests {
         let now: i64 = 1_700_000_000;
         let since_secs: i64 = 86_400;
 
-        let manifest_dir = home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
+        let manifest_dir = app_config_dir_in("Claude", home.path())
             .join("claude-code-sessions")
             .join("workspace")
             .join("window");
