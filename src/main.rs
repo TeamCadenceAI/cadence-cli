@@ -2653,17 +2653,6 @@ async fn run_auto_update(command: Option<AutoUpdateCommand>) -> Result<()> {
     }
 }
 
-/// Check for or install updates.
-///
-/// With `--check`: queries GitHub for the latest release and reports whether
-/// an update is available. Never downloads or writes files.
-///
-/// Without `--check`: downloads, verifies, and replaces the running binary.
-/// Use `--yes` / `-y` to skip the confirmation prompt.
-async fn run_update(check: bool, yes: bool) -> Result<()> {
-    update::run_update(check, yes).await
-}
-
 // ---------------------------------------------------------------------------
 // Uninstall
 // ---------------------------------------------------------------------------
@@ -2993,6 +2982,8 @@ async fn main() {
 
     let is_update_command = matches!(&cli.command, Command::Update { .. });
     let is_hook_command = matches!(&cli.command, Command::Hook { .. });
+    let is_backfill_command = matches!(&cli.command, Command::Backfill { .. });
+    let mut update_installed = false;
 
     let result = match cli.command {
         Command::Install { org } => run_install(org).await,
@@ -3011,10 +3002,35 @@ async fn main() {
             ConfigCommand::List => run_config_list().await,
         },
         Command::Doctor { repair } => run_doctor(repair).await,
-        Command::Update { check, yes } => run_update(check, yes).await,
+        Command::Update { check, yes } => match update::run_update(check, yes).await {
+            Ok(installed) => {
+                update_installed = installed;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        },
         Command::AutoUpdate { command } => run_auto_update(command).await,
         Command::Uninstall { yes } => run_uninstall(yes).await,
     };
+
+    if result.is_ok() && !is_hook_command && !update_installed {
+        if is_backfill_command {
+            if let Err(err) = update::mark_current_version_recovery_complete().await {
+                eprintln!(
+                    "Warning: cadence backfill succeeded, but recovery state could not be recorded: {err:#}"
+                );
+            }
+        } else if let Err(err) = update::maybe_run_current_version_recovery().await {
+            eprintln!(
+                "Warning: automatic {} recovery backfill did not complete: {err:#}",
+                update::VERSION_RECOVERY_BACKFILL_SINCE
+            );
+            eprintln!(
+                "Run `cadence backfill --since {}` if you need to recover recent local sessions manually.",
+                update::VERSION_RECOVERY_BACKFILL_SINCE
+            );
+        }
+    }
 
     // Passive background version check: run after successful command execution
     // on all non-Update commands. Failures are silently ignored.
