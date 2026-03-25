@@ -1200,7 +1200,9 @@ async fn run_update_install_from_url_mode(
         Err(e) => return Err(e.context("updated cadence, but failed to refresh Git hooks")),
     }
 
-    if let Err(err) = ensure_auto_update_enabled_and_reconciled().await {
+    if should_reconcile_auto_update_after_install(mode)
+        && let Err(err) = ensure_auto_update_enabled_and_reconciled().await
+    {
         report_best_effort_post_upgrade_failure(
             mode,
             "unattended auto-update could not be enabled automatically",
@@ -1239,6 +1241,10 @@ async fn apply_auto_update_jitter() {
 
 fn retry_delay_from_state(state: &UpdaterState) -> u64 {
     retry_delay_secs(state.consecutive_failures.max(1))
+}
+
+fn should_reconcile_auto_update_after_install(mode: InstallMode) -> bool {
+    !matches!(mode, InstallMode::SilentUnattended)
 }
 
 pub async fn run_background_auto_update() -> Result<()> {
@@ -1442,6 +1448,21 @@ async fn launchctl_output(args: &[&str]) -> Result<Output> {
 }
 
 #[cfg(target_os = "macos")]
+async fn launchctl_file_operation(operation: &str, plist_path: &Path) -> Result<Output> {
+    Command::new("launchctl")
+        .args([operation, "-w"])
+        .arg(plist_path)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to execute launchctl {operation} -w {}",
+                plist_path.display()
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
 fn launchctl_reports_missing_service(detail: &str) -> bool {
     detail.contains("Could not find service")
         || detail.contains("Could not find specified service")
@@ -1551,36 +1572,28 @@ pub async fn provision_auto_update_scheduler_for_exe(
         let plist = launch_agent_plist(MACOS_LAUNCH_AGENT_LABEL, exe);
         tokio::fs::write(&plist_path, plist).await?;
 
-        let domain = macos_launchctl_domain();
-        let service_target = format!("{domain}/{MACOS_LAUNCH_AGENT_LABEL}");
-        if let Ok(output) = launchctl_output(&["bootout", &service_target]).await
+        // `bootstrap` leaves this user LaunchAgent as a transient partial import on macOS 15,
+        // so the service disappears after the first RunAtLoad execution. Use the documented
+        // `load -w` path here because it leaves the LaunchAgent registered for future intervals.
+        if let Ok(output) = launchctl_file_operation("unload", &plist_path).await
             && !output.status.success()
         {
             let detail = command_failure_detail(&output);
             if !launchctl_reports_missing_service(&detail) {
                 ::tracing::warn!(
-                    event = "launchctl_bootout_failed",
-                    service = service_target.as_str(),
+                    event = "launchctl_unload_failed",
+                    plist = plist_path.display().to_string(),
                     error = detail
                 );
             }
         }
 
-        let bootstrap =
-            launchctl_output(&["bootstrap", &domain, &plist_path.to_string_lossy()]).await?;
-        if !bootstrap.status.success() {
+        let load = launchctl_file_operation("load", &plist_path).await?;
+        if !load.status.success() {
             bail!(
-                "launchctl bootstrap failed for {}: {}",
+                "launchctl load failed for {}: {}",
                 plist_path.display(),
-                command_failure_detail(&bootstrap)
-            );
-        }
-
-        let enable = launchctl_output(&["enable", &service_target]).await?;
-        if !enable.status.success() {
-            bail!(
-                "launchctl enable failed for {service_target}: {}",
-                command_failure_detail(&enable)
+                command_failure_detail(&load)
             );
         }
 
@@ -1660,20 +1673,20 @@ pub async fn uninstall_auto_update_scheduler() -> Result<SchedulerUninstallResul
     #[cfg(target_os = "macos")]
     {
         let plist_path = macos_launch_agent_path()?;
-        let service_target = format!("{}/{}", macos_launchctl_domain(), MACOS_LAUNCH_AGENT_LABEL);
-        if let Ok(output) = launchctl_output(&["bootout", &service_target]).await
+        let existed = tokio::fs::try_exists(&plist_path).await.unwrap_or(false);
+        if existed
+            && let Ok(output) = launchctl_file_operation("unload", &plist_path).await
             && !output.status.success()
         {
             let detail = command_failure_detail(&output);
             if !launchctl_reports_missing_service(&detail) {
                 ::tracing::warn!(
-                    event = "launchctl_bootout_failed",
-                    service = service_target.as_str(),
+                    event = "launchctl_unload_failed",
+                    plist = plist_path.display().to_string(),
                     error = detail
                 );
             }
         }
-        let existed = tokio::fs::try_exists(&plist_path).await.unwrap_or(false);
         if existed {
             let _ = tokio::fs::remove_file(&plist_path).await;
         }
@@ -3415,6 +3428,16 @@ mod tests {
         );
         assert_eq!(health.state, SchedulerHealthState::Installed);
         assert!(health.details.contains("installed and loaded"));
+    }
+
+    #[test]
+    fn should_reconcile_auto_update_after_interactive_install_only() {
+        assert!(should_reconcile_auto_update_after_install(
+            InstallMode::Interactive
+        ));
+        assert!(!should_reconcile_auto_update_after_install(
+            InstallMode::SilentUnattended
+        ));
     }
 
     #[test]
