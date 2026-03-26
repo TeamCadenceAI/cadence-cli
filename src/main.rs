@@ -221,24 +221,6 @@ enum HookCommand {
     RefreshHooks,
 }
 
-// ---------------------------------------------------------------------------
-// Hook error taxonomy
-// ---------------------------------------------------------------------------
-
-/// Error classification for the post-commit hook.
-///
-/// Direct uploads must never block a commit, so all hook failures are soft.
-enum HookError {
-    /// Any hook failure is logged as a note and the commit proceeds.
-    Soft(anyhow::Error),
-}
-
-impl From<anyhow::Error> for HookError {
-    fn from(e: anyhow::Error) -> Self {
-        HookError::Soft(e)
-    }
-}
-
 fn api_url_override() -> Option<&'static str> {
     API_URL_OVERRIDE.get().map(String::as_str)
 }
@@ -399,131 +381,16 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
     }
 }
 
-/// The post-commit hook handler. This is the critical hot path.
+/// Legacy post-commit compatibility hook.
 ///
-/// Direct uploads must never block a commit, so all failures are swallowed
-/// after being surfaced as a note.
+/// Old installs may still invoke `cadence hook post-commit` briefly before the
+/// new runtime bootstrap removes Cadence-owned hook artifacts. This must remain
+/// a silent success no-op during that migration window.
 async fn run_hook_post_commit() -> Result<()> {
-    // Catch-all: catch panics
-    let result = tokio::spawn(async { hook_post_commit_inner().await }).await;
-
-    let final_result = match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(HookError::Soft(e))) => {
-            output::note(&format!("Hook issue: {}", e));
-            Ok(())
-        }
-        Err(e) => {
-            if e.is_panic() {
-                output::note("Hook panicked (please report this issue)");
-            } else {
-                output::note(&format!("Hook task failed: {}", e));
-            }
-            Ok(())
-        }
-    };
-
-    eprintln!();
-    final_result
-}
-
-/// Inner implementation of the post-commit hook.
-async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
-    let _diagnostics_session = match tracing::DiagnosticsLogger::new("hook").await {
-        Ok(logger) => {
-            if let Some(path) = logger.path() {
-                output::detail(&format!("Hook trace: {}", path.display()));
-            }
-            Some(tracing::install_global(logger))
-        }
-        Err(err) => {
-            output::detail(&format!("Hook trace unavailable: {err}"));
-            None
-        }
-    };
-
-    let uploading_progress =
-        hook_status_spinner_start("Running background monitor compatibility tick");
-    let summary = match run_monitor_tick_internal(MonitorTickOptions {
-        force: true,
-        drain_pending: false,
-        run_auto_update: false,
-    })
-    .await
-    {
-        Ok(summary) => {
-            hook_status_spinner_finish_ok(
-                uploading_progress,
-                "Running background monitor compatibility tick",
-            );
-            summary
-        }
-        Err(e) => {
-            hook_status_spinner_finish_err(
-                uploading_progress,
-                "Running background monitor compatibility tick",
-            );
-            return Err(HookError::Soft(e));
-        }
-    };
-
-    ::tracing::info!(
-        event = "hook_post_commit_completed",
-        uploaded = summary.uploaded,
-        queued = summary.queued,
-        skipped = summary.skipped,
-        issues = summary.issues,
-        pending_attempted = summary.pending_attempted,
-        pending_uploaded = summary.pending_uploaded
-    );
-
     Ok(())
 }
 
 const POST_COMMIT_FALLBACK_WINDOW_SECS: i64 = 30 * 86_400;
-
-fn cadence_hook_label(is_tty: bool) -> String {
-    if is_tty {
-        console::style("[Cadence]")
-            .bold()
-            .fg(console::Color::Cyan)
-            .to_string()
-    } else {
-        "[Cadence]".to_string()
-    }
-}
-
-fn hook_status_spinner_start(task: &str) -> Option<ProgressBar> {
-    if !output::is_stderr_tty() {
-        eprintln!("{} {}", cadence_hook_label(false), task);
-        eprintln!();
-        return None;
-    }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb.set_message(format!("{} {}", cadence_hook_label(true), task));
-    Some(pb)
-}
-
-fn hook_status_spinner_finish_ok(pb: Option<ProgressBar>, task: &str) {
-    if let Some(pb) = pb {
-        let check = console::style("✓").fg(console::Color::Green).to_string();
-        pb.finish_with_message(format!("{} {} {}", check, cadence_hook_label(true), task));
-    } else {
-        eprintln!("✓ {} {}", cadence_hook_label(false), task);
-    }
-}
-
-fn hook_status_spinner_finish_err(pb: Option<ProgressBar>, task: &str) {
-    if let Some(pb) = pb {
-        let cross = console::style("✗").fg(console::Color::Red).to_string();
-        pb.finish_with_message(format!("{} {} {}", cross, cadence_hook_label(true), task));
-    }
-}
 
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
@@ -3245,6 +3112,13 @@ mod tests {
             }
             _ => panic!("expected Hook command"),
         }
+    }
+
+    #[tokio::test]
+    async fn hook_post_commit_is_a_success_no_op() {
+        run_hook_post_commit()
+            .await
+            .expect("post-commit compatibility hook should no-op successfully");
     }
 
     #[test]
