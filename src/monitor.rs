@@ -139,6 +139,21 @@ pub async fn monitor_enabled() -> bool {
         .unwrap_or(false)
 }
 
+pub async fn configured_enabled_state() -> Result<Option<bool>> {
+    let path = monitor_state_path()?;
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => {
+            let state = serde_json::from_str::<MonitorState>(&content)
+                .with_context(|| format!("failed to parse monitor state {}", path.display()))?;
+            Ok(Some(state.enabled))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read monitor state {}", path.display()))
+        }
+    }
+}
+
 pub async fn load_discovery_cursor() -> Result<Option<DiscoveryCursorRecord>> {
     let path = discovery_cursor_path()?;
     match tokio::fs::read_to_string(&path).await {

@@ -2,6 +2,7 @@
 
 mod agents;
 mod api_client;
+mod bootstrap;
 mod config;
 mod git;
 mod login;
@@ -18,7 +19,6 @@ mod upload_cursor;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -89,6 +89,9 @@ enum Command {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
         org: Option<String>,
+        /// Internal upgrade/bootstrap path that preserves an explicit disabled runtime.
+        #[arg(long, hide = true)]
+        preserve_disable_state: bool,
     },
 
     /// Git hook entry points.
@@ -242,549 +245,12 @@ fn api_url_override() -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 /// The install subcommand: enable background monitoring.
-async fn run_install(org: Option<String>) -> Result<()> {
-    run_install_inner(org, None).await
-}
-
-fn is_cadence_hook(content: &str) -> bool {
-    content.contains("cadence hook") || content.contains("cadence")
-}
-
-fn hook_command_exe() -> String {
-    if cfg!(debug_assertions)
-        && let Some(path) = debug_hook_exe_path()
-    {
-        return path;
-    }
-    "cadence".to_string()
-}
-
-fn debug_hook_exe_path() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    if let Some(name) = exe.file_name().and_then(|s| s.to_str())
-        && name.starts_with("cadence")
-    {
-        return Some(exe.display().to_string());
-    }
-
-    let dir = exe.parent()?;
-    if dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
-        let candidate = dir.parent()?.join("cadence");
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-    }
-
-    None
-}
-
-fn post_commit_hook_content() -> String {
-    format!("#!/bin/sh\nexec {} hook post-commit\n", hook_command_exe())
-}
-
-fn resolve_hooks_path(repo_root: Option<&Path>, configured_path: &str) -> PathBuf {
-    let path = Path::new(configured_path);
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    match repo_root {
-        Some(root) => root.join(path),
-        None => path.to_path_buf(),
-    }
-}
-
-fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    let left_norm = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
-    let right_norm = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    left_norm == right_norm
+async fn run_install(org: Option<String>, preserve_disable_state: bool) -> Result<()> {
+    bootstrap::run_install(org, preserve_disable_state).await
 }
 
 fn normalized_repo_match_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-async fn cadence_hooks_installed(hooks_dir: &Path) -> bool {
-    let post_path = hooks_dir.join("post-commit");
-    match tokio::fs::read_to_string(&post_path).await {
-        Ok(content) => is_cadence_hook(&content),
-        Err(_) => false,
-    }
-}
-
-/// Inner implementation of install, accepting an optional home directory override
-/// for testability. If `home_override` is `None`, uses the real home directory.
-async fn run_install_inner(
-    org: Option<String>,
-    home_override: Option<&std::path::Path>,
-) -> Result<()> {
-    println!();
-    output::action("Installing", "background monitor");
-    let install_start = std::time::Instant::now();
-    let mut had_errors = cleanup_cadence_hook_ownership(home_override, true).await?;
-
-    if let Some(ref org_value) = org {
-        match git::config_set_global("ai.cadence.org", org_value).await {
-            Ok(()) => {
-                output::success("Updated", &format!("org filter = {}", org_value));
-            }
-            Err(e) => {
-                output::fail("Failed", &format!("to set org filter ({})", e));
-                had_errors = true;
-            }
-        }
-    }
-
-    if output::is_stderr_tty() && Term::stdout().is_term() {
-        println!();
-        output::action("Monitor", "enabled");
-        output::detail(&format!(
-            "Cadence scans supported agent session sources every {} without taking ownership of Git hooks.",
-            monitor::cadence_label()
-        ));
-        output::detail("Disable anytime: `cadence monitor disable`");
-        output::detail("Remove scheduler artifacts: `cadence monitor uninstall`");
-        println!();
-        output::action("Auto-update", "enabled");
-        output::detail(
-            "Cadence runs unattended background update checks inside the monitor runtime and installs stable releases only.",
-        );
-        output::detail("Disable anytime: `cadence auto-update disable`");
-        output::detail("Scheduler lifecycle: `cadence monitor ...`");
-    }
-
-    match monitor::ensure_enabled_and_reconciled().await {
-        Ok(result) if result.configured => {
-            output::success(
-                "Updated",
-                &format!("monitor scheduler ({})", result.description),
-            );
-        }
-        Ok(result) => {
-            output::detail(&format!("Monitor scheduler: {}", result.description));
-        }
-        Err(e) => {
-            output::note(&format!("Could not reconcile monitor scheduler ({e})"));
-            had_errors = true;
-        }
-    }
-
-    match update::persist_auto_update_enabled().await {
-        Ok(changed) if changed => {
-            output::success("Updated", "auto-update policy = enabled");
-        }
-        Ok(_) => {
-            output::detail("Auto-update policy already enabled.");
-        }
-        Err(e) => {
-            output::note(&format!("Could not enable auto-update policy ({e})"));
-            had_errors = true;
-        }
-    }
-
-    println!();
-    if had_errors {
-        output::fail("Install", "completed with issues");
-    } else {
-        output::success("Install", "complete");
-    }
-    output::detail(&format!(
-        "Total time: {} ms",
-        install_start.elapsed().as_millis()
-    ));
-
-    Ok(())
-}
-
-async fn cleanup_cadence_hook_ownership(
-    home_override: Option<&std::path::Path>,
-    log_progress: bool,
-) -> Result<bool> {
-    let home = match home_override {
-        Some(h) => h.to_path_buf(),
-        None => agents::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?,
-    };
-
-    let hooks_dir = home.join(".git-hooks");
-    let mut had_errors = false;
-
-    let global_hooks_path = match git::config_get_global("core.hooksPath").await {
-        Ok(path) => path,
-        Err(err) => {
-            if log_progress {
-                output::note(&format!("Could not inspect global core.hooksPath ({err})"));
-            }
-            had_errors = true;
-            None
-        }
-    };
-    let global_points_to_cadence_hooks = global_hooks_path
-        .as_ref()
-        .map(|path| paths_equivalent(&resolve_hooks_path(None, path), &hooks_dir))
-        .unwrap_or(false);
-
-    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
-        if global_points_to_cadence_hooks {
-            match git::config_unset_global("core.hooksPath").await {
-                Ok(()) => {
-                    if log_progress {
-                        output::success("Removed", "Cadence-owned global core.hooksPath");
-                    }
-                }
-                Err(err) => {
-                    if log_progress {
-                        output::note(&format!("Could not unset global core.hooksPath ({err})"));
-                    }
-                    had_errors = true;
-                }
-            }
-        }
-        return Ok(had_errors);
-    }
-
-    let post_commit = hooks_dir.join("post-commit");
-    let backup = hooks_dir.join("post-commit.pre-cadence");
-    let pre_push = hooks_dir.join("pre-push");
-    let mut restored_backup = false;
-
-    if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
-        let should_restore = match tokio::fs::read_to_string(&post_commit).await {
-            Ok(content) => is_cadence_hook(&content),
-            Err(_) => true,
-        };
-        if should_restore {
-            let _ = tokio::fs::remove_file(&post_commit).await;
-            match tokio::fs::rename(&backup, &post_commit).await {
-                Ok(()) => {
-                    restored_backup = true;
-                    if log_progress {
-                        output::success("Restored", "pre-Cadence post-commit hook");
-                    }
-                }
-                Err(err) => {
-                    if log_progress {
-                        output::note(&format!("Could not restore pre-Cadence hook ({err})"));
-                    }
-                    had_errors = true;
-                }
-            }
-        }
-    } else if tokio::fs::try_exists(&post_commit).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&post_commit).await {
-            Ok(content) if is_cadence_hook(&content) => {
-                match tokio::fs::remove_file(&post_commit).await {
-                    Ok(()) => {
-                        if log_progress {
-                            output::success(
-                                "Removed",
-                                &format!("Cadence post-commit hook ({})", post_commit.display()),
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        if log_progress {
-                            output::note(&format!(
-                                "Could not remove Cadence post-commit hook ({err})"
-                            ));
-                        }
-                        had_errors = true;
-                    }
-                }
-            }
-            Ok(_) => {
-                if log_progress {
-                    output::detail(&format!(
-                        "Leaving non-Cadence post-commit hook untouched: {}",
-                        post_commit.display()
-                    ));
-                }
-            }
-            Err(err) => {
-                if log_progress {
-                    output::note(&format!(
-                        "Could not inspect post-commit hook {} ({err})",
-                        post_commit.display()
-                    ));
-                }
-                had_errors = true;
-            }
-        }
-    }
-
-    if tokio::fs::try_exists(&pre_push).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&pre_push).await {
-            Ok(content) if is_cadence_hook(&content) => {
-                match tokio::fs::remove_file(&pre_push).await {
-                    Ok(()) => {
-                        if log_progress {
-                            output::success(
-                                "Removed",
-                                &format!("legacy Cadence pre-push hook ({})", pre_push.display()),
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        if log_progress {
-                            output::note(&format!("Could not remove legacy pre-push hook ({err})"));
-                        }
-                        had_errors = true;
-                    }
-                }
-            }
-            Ok(_) => {
-                if log_progress {
-                    output::detail(&format!(
-                        "Leaving non-Cadence pre-push hook untouched: {}",
-                        pre_push.display()
-                    ));
-                }
-            }
-            Err(err) => {
-                if log_progress {
-                    output::note(&format!(
-                        "Could not inspect legacy pre-push hook {} ({err})",
-                        pre_push.display()
-                    ));
-                }
-                had_errors = true;
-            }
-        }
-    }
-
-    let mut entries = tokio::fs::read_dir(&hooks_dir).await?;
-    let mut remaining = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        remaining.push(entry.file_name().to_string_lossy().to_string());
-    }
-
-    if remaining.is_empty() {
-        if let Err(err) = tokio::fs::remove_dir(&hooks_dir).await {
-            if log_progress {
-                output::note(&format!(
-                    "Could not remove empty hooks directory {} ({err})",
-                    hooks_dir.display()
-                ));
-            }
-            had_errors = true;
-        } else if log_progress {
-            output::success("Removed", &format!("{}", hooks_dir.display()));
-        }
-    } else if log_progress {
-        output::detail(&format!(
-            "Hooks directory still contains preserved files: {}",
-            remaining.join(", ")
-        ));
-    }
-
-    if global_points_to_cadence_hooks && !restored_backup && remaining.is_empty() {
-        match git::config_unset_global("core.hooksPath").await {
-            Ok(()) => {
-                if log_progress {
-                    output::success("Removed", "Cadence-owned global core.hooksPath");
-                }
-            }
-            Err(err) => {
-                if log_progress {
-                    output::note(&format!("Could not unset global core.hooksPath ({err})"));
-                }
-                had_errors = true;
-            }
-        }
-    } else if global_points_to_cadence_hooks && log_progress {
-        output::detail(
-            "Preserved global core.hooksPath because the hooks directory still contains user-owned hooks.",
-        );
-    }
-
-    Ok(had_errors)
-}
-
-async fn refresh_cadence_git_hooks(
-    home_override: Option<&std::path::Path>,
-    log_progress: bool,
-) -> Result<bool> {
-    let home = match home_override {
-        Some(h) => h.to_path_buf(),
-        None => agents::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?,
-    };
-
-    let hooks_dir = home.join(".git-hooks");
-    let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
-    let mut had_errors = false;
-
-    match git::config_set_global("core.hooksPath", &hooks_dir_str).await {
-        Ok(()) => {
-            if log_progress {
-                output::success("Updated", &format!("core.hooksPath = {}", hooks_dir_str));
-            }
-        }
-        Err(e) => {
-            if log_progress {
-                output::fail("Failed", &format!("to set core.hooksPath ({})", e));
-            }
-            had_errors = true;
-        }
-    }
-
-    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
-        match tokio::fs::create_dir_all(&hooks_dir).await {
-            Ok(()) => {
-                if log_progress {
-                    output::success("Created", &hooks_dir_str);
-                }
-            }
-            Err(e) => {
-                if log_progress {
-                    output::fail("Failed", &format!("to create {} ({})", hooks_dir_str, e));
-                }
-                had_errors = true;
-            }
-        }
-    } else if log_progress {
-        output::detail(&format!(
-            "Hooks directory already exists: {}",
-            hooks_dir_str
-        ));
-    }
-
-    let shim_path = hooks_dir.join("post-commit");
-    let shim_content = post_commit_hook_content();
-
-    let should_write = if tokio::fs::try_exists(&shim_path).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&shim_path).await {
-            Ok(existing) => {
-                if is_cadence_hook(&existing) {
-                    if log_progress {
-                        output::detail("Post-commit hook already installed; updating");
-                    }
-                    true
-                } else {
-                    let backup_path = hooks_dir.join("post-commit.pre-cadence");
-                    match tokio::fs::copy(&shim_path, &backup_path).await {
-                        Ok(_) => {
-                            if log_progress {
-                                output::note(&format!(
-                                    "Existing post-commit hook saved to {}",
-                                    backup_path.display()
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            if log_progress {
-                                output::note(&format!(
-                                    "Could not back up existing post-commit hook ({})",
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                    true
-                }
-            }
-            Err(_) => {
-                if log_progress {
-                    output::note(&format!(
-                        "Could not read existing {}; overwriting",
-                        shim_path.display()
-                    ));
-                }
-                true
-            }
-        }
-    } else {
-        true
-    };
-
-    if should_write {
-        match tokio::fs::write(&shim_path, shim_content).await {
-            Ok(()) => {
-                if log_progress {
-                    output::success(
-                        "Wrote",
-                        &format!("post-commit hook ({})", shim_path.display()),
-                    );
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o755);
-                    match tokio::fs::set_permissions(&shim_path, perms).await {
-                        Ok(()) => {
-                            if log_progress {
-                                output::detail(&format!("Made {} executable", shim_path.display()));
-                            }
-                        }
-                        Err(e) => {
-                            if log_progress {
-                                output::fail(
-                                    "Failed",
-                                    &format!("to make {} executable ({})", shim_path.display(), e),
-                                );
-                            }
-                            had_errors = true;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if log_progress {
-                    output::fail(
-                        "Failed",
-                        &format!("to write {} ({})", shim_path.display(), e),
-                    );
-                }
-                had_errors = true;
-            }
-        }
-    }
-
-    let pre_push_path = hooks_dir.join("pre-push");
-    if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&pre_push_path).await {
-            Ok(existing) if is_cadence_hook(&existing) => {
-                match tokio::fs::remove_file(&pre_push_path).await {
-                    Ok(()) => {
-                        if log_progress {
-                            output::success(
-                                "Removed",
-                                &format!("legacy pre-push hook ({})", pre_push_path.display()),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        if log_progress {
-                            output::fail(
-                                "Failed",
-                                &format!("to remove {} ({})", pre_push_path.display(), e),
-                            );
-                        }
-                        had_errors = true;
-                    }
-                }
-            }
-            Ok(_) => {
-                if log_progress {
-                    output::detail(&format!(
-                        "Leaving non-Cadence pre-push hook untouched: {}",
-                        pre_push_path.display()
-                    ));
-                }
-            }
-            Err(e) => {
-                if log_progress {
-                    output::note(&format!(
-                        "Could not inspect legacy pre-push hook {} ({})",
-                        pre_push_path.display(),
-                        e
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(had_errors)
 }
 
 async fn run_refresh_hooks() -> Result<()> {
@@ -3107,7 +2573,7 @@ async fn run_uninstall(yes: bool) -> Result<()> {
     }
 
     // Step 4: Clean up legacy Cadence hook ownership where safe
-    match cleanup_cadence_hook_ownership(None, true).await {
+    match bootstrap::cleanup_cadence_hook_ownership(None, true).await {
         Ok(had_cleanup_errors) => {
             had_errors |= had_cleanup_errors;
         }
@@ -3224,53 +2690,6 @@ async fn uninstall_scheduler() -> Result<()> {
     Ok(())
 }
 
-/// Remove the ~/.git-hooks/ directory, restoring any pre-cadence backup first.
-async fn uninstall_hooks_dir() -> Result<()> {
-    let home =
-        agents::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    let hooks_dir = home.join(".git-hooks");
-
-    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
-        output::detail("Hooks directory already absent.");
-        return Ok(());
-    }
-
-    let post_commit = hooks_dir.join("post-commit");
-    let backup = hooks_dir.join("post-commit.pre-cadence");
-
-    // If there's a pre-cadence backup, restore it
-    if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
-        tokio::fs::rename(&backup, &post_commit).await?;
-        output::success("Restored", "pre-cadence post-commit hook");
-    } else if tokio::fs::try_exists(&post_commit).await.unwrap_or(false) {
-        // Only remove post-commit if it's a cadence hook
-        if let Ok(content) = tokio::fs::read_to_string(&post_commit).await
-            && is_cadence_hook(&content)
-        {
-            tokio::fs::remove_file(&post_commit).await?;
-        }
-    }
-
-    // Check if directory is now empty (or only has cadence files)
-    let mut entries = tokio::fs::read_dir(&hooks_dir).await?;
-    let mut remaining = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        remaining.push(entry.file_name().to_string_lossy().to_string());
-    }
-
-    if remaining.is_empty() {
-        tokio::fs::remove_dir(&hooks_dir).await?;
-        output::success("Removed", &format!("{}", hooks_dir.display()));
-    } else {
-        output::note(&format!(
-            "{} contains non-cadence files ({}), left in place",
-            hooks_dir.display(),
-            remaining.join(", ")
-        ));
-    }
-    Ok(())
-}
-
 /// Clean ai.cadence.enabled from the current repo and sibling repos.
 async fn clean_repo_cadence_config() -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -3366,11 +2785,29 @@ async fn main() {
             command: Some(MonitorCommand::Tick)
         }
     );
+    let is_install_command = matches!(&cli.command, Command::Install { .. });
+    let is_monitor_command = matches!(&cli.command, Command::Monitor { .. });
+    let is_uninstall_command = matches!(&cli.command, Command::Uninstall { .. });
     let is_backfill_command = matches!(&cli.command, Command::Backfill { .. });
-    let mut update_installed = false;
+
+    if !is_hook_command
+        && !is_monitor_tick_command
+        && !is_install_command
+        && !is_monitor_command
+        && !is_uninstall_command
+        && let Err(err) = bootstrap::maybe_run_current_version_bootstrap(!is_backfill_command).await
+    {
+        eprintln!("Warning: automatic runtime bootstrap did not complete: {err:#}");
+        eprintln!(
+            "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership."
+        );
+    }
 
     let result = match cli.command {
-        Command::Install { org } => run_install(org).await,
+        Command::Install {
+            org,
+            preserve_disable_state,
+        } => run_install(org, preserve_disable_state).await,
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
             HookCommand::AutoUpdate => run_monitor_tick(true).await,
@@ -3387,35 +2824,10 @@ async fn main() {
             ConfigCommand::List => run_config_list().await,
         },
         Command::Doctor { repair } => run_doctor(repair).await,
-        Command::Update { check, yes } => match update::run_update(check, yes).await {
-            Ok(installed) => {
-                update_installed = installed;
-                Ok(())
-            }
-            Err(err) => Err(err),
-        },
+        Command::Update { check, yes } => update::run_update(check, yes).await.map(|_| ()),
         Command::AutoUpdate { command } => run_auto_update(command).await,
         Command::Uninstall { yes } => run_uninstall(yes).await,
     };
-
-    if result.is_ok() && !is_hook_command && !is_monitor_tick_command && !update_installed {
-        if is_backfill_command {
-            if let Err(err) = update::mark_current_version_recovery_complete().await {
-                eprintln!(
-                    "Warning: cadence backfill succeeded, but recovery state could not be recorded: {err:#}"
-                );
-            }
-        } else if let Err(err) = update::maybe_run_current_version_recovery().await {
-            eprintln!(
-                "Warning: automatic {} recovery backfill did not complete: {err:#}",
-                update::VERSION_RECOVERY_BACKFILL_SINCE
-            );
-            eprintln!(
-                "Run `cadence backfill --since {}` if you need to recover recent local sessions manually.",
-                update::VERSION_RECOVERY_BACKFILL_SINCE
-            );
-        }
-    }
 
     // Passive background version check: run after successful command execution
     // on all non-Update commands. Failures are silently ignored.
@@ -3926,7 +3338,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_hooks_path_uses_repo_root_for_relative_paths() {
         let repo = TempDir::new().expect("tempdir");
-        let resolved = resolve_hooks_path(Some(repo.path()), ".git/hooks");
+        let resolved = bootstrap::resolve_hooks_path(Some(repo.path()), ".git/hooks");
         assert_eq!(resolved, repo.path().join(".git/hooks"));
     }
 
@@ -3940,12 +3352,12 @@ mod tests {
 
         let absolute = hooks_dir.clone();
         let relative = repo.path().join(".git/./hooks");
-        assert!(paths_equivalent(&absolute, &relative));
+        assert!(bootstrap::paths_equivalent(&absolute, &relative));
     }
 
     #[tokio::test]
     #[serial]
-    async fn refresh_cadence_git_hooks_updates_existing_managed_hooks() {
+    async fn cleanup_cadence_hook_ownership_removes_managed_hooks() {
         let home = TempDir::new().expect("home tempdir");
         let home_guard = EnvGuard::new("HOME");
         home_guard.set_path(home.path());
@@ -3961,12 +3373,15 @@ mod tests {
         tokio::fs::create_dir_all(&hooks_dir)
             .await
             .expect("create hooks dir");
+        crate::git::config_set_global("core.hooksPath", &hooks_dir.to_string_lossy())
+            .await
+            .expect("set core.hooksPath");
         tokio::fs::write(
             hooks_dir.join("post-commit"),
-            "#!/bin/sh\nexec cadence hook pre-push\n",
+            "#!/bin/sh\nexec cadence hook post-commit\n",
         )
         .await
-        .expect("seed stale post-commit hook");
+        .expect("seed cadence post-commit hook");
         tokio::fs::write(
             hooks_dir.join("pre-push"),
             "#!/bin/sh\nexec cadence hook pre-push\n",
@@ -3974,27 +3389,20 @@ mod tests {
         .await
         .expect("seed legacy pre-push hook");
 
-        let had_errors = refresh_cadence_git_hooks(Some(home.path()), false)
+        let had_errors = bootstrap::cleanup_cadence_hook_ownership(Some(home.path()), false)
             .await
-            .expect("refresh hooks");
+            .expect("cleanup hook ownership");
         assert!(!had_errors);
 
-        let post_commit = tokio::fs::read_to_string(hooks_dir.join("post-commit"))
-            .await
-            .expect("read post-commit");
-        assert_eq!(post_commit, post_commit_hook_content());
         assert!(
-            !hooks_dir.join("pre-push").exists(),
-            "expected legacy pre-push hook to be removed"
+            !hooks_dir.exists(),
+            "expected managed hooks directory to be removed"
         );
 
         let configured_hooks_path = crate::git::config_get_global("core.hooksPath")
             .await
             .expect("read core.hooksPath");
-        assert_eq!(
-            configured_hooks_path.as_deref(),
-            Some(hooks_dir.to_string_lossy().as_ref())
-        );
+        assert!(configured_hooks_path.is_none());
     }
 
     #[test]
