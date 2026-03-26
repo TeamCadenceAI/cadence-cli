@@ -1235,26 +1235,24 @@ async fn run_update_install_from_url_mode(
     // Step 9: Replace running binary
     self_replace_binary(&new_binary)?;
 
-    match refresh_git_hooks_with_updated_binary().await {
-        Ok(()) => {}
-        Err(e) if matches!(mode, InstallMode::Interactive) => {
-            eprintln!(
-                "Warning: cadence updated, but Git hooks were not refreshed automatically: {e}"
+    if should_reconcile_auto_update_after_install(mode) {
+        if let Err(err) = persist_auto_update_enabled().await {
+            report_best_effort_post_upgrade_failure(
+                mode,
+                "unattended auto-update policy could not be enabled automatically",
+                "Run `cadence auto-update enable` to re-enable unattended update checks.",
+                &err,
             );
-            eprintln!("Run `cadence install` to repair hooks.");
         }
-        Err(e) => return Err(e.context("updated cadence, but failed to refresh Git hooks")),
-    }
-
-    if should_reconcile_auto_update_after_install(mode)
-        && let Err(err) = ensure_auto_update_enabled_and_reconciled().await
-    {
-        report_best_effort_post_upgrade_failure(
-            mode,
-            "unattended auto-update could not be enabled automatically",
-            "Run `cadence auto-update enable` to repair scheduler setup.",
-            &err,
-        );
+        let monitor_enabled = crate::monitor::monitor_enabled().await;
+        if let Err(err) = crate::monitor::reconcile_scheduler_for_enabled(monitor_enabled).await {
+            report_best_effort_post_upgrade_failure(
+                mode,
+                "background monitor scheduler could not be reconciled automatically",
+                "Run `cadence monitor enable` or `cadence install` to repair background monitoring.",
+                &err,
+            );
+        }
     }
 
     let current_exe = std::env::current_exe()
