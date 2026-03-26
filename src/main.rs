@@ -975,7 +975,13 @@ async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
 
     let uploading_progress =
         hook_status_spinner_start("Running background monitor compatibility tick");
-    let summary = match run_monitor_tick_internal(true).await {
+    let summary = match run_monitor_tick_internal(MonitorTickOptions {
+        force: true,
+        drain_pending: false,
+        run_auto_update: false,
+    })
+    .await
+    {
         Ok(summary) => {
             hook_status_spinner_finish_ok(
                 uploading_progress,
@@ -2294,6 +2300,13 @@ struct MonitorTickSummary {
     pending_uploaded: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MonitorTickOptions {
+    force: bool,
+    drain_pending: bool,
+    run_auto_update: bool,
+}
+
 async fn upload_incremental_sessions_globally(
     context: &upload::UploadContext,
 ) -> Result<MonitorTickSummary> {
@@ -2325,6 +2338,9 @@ async fn upload_incremental_sessions_globally(
         ..MonitorTickSummary::default()
     };
     let mut cursor_advance = initial_cursor.clone();
+    // Once a session needs retry, keep scanning but stop advancing the global cursor
+    // so the blocked item is retried on the next monitor tick.
+    let mut cursor_blocked = false;
 
     for parsed in parsed_logs {
         let log_mtime = parsed.log.updated_at;
@@ -2370,7 +2386,8 @@ async fn upload_incremental_sessions_globally(
                 Ok(matches) => matches,
                 Err(_) => {
                     stats.issues += 1;
-                    break;
+                    cursor_blocked = true;
+                    continue;
                 }
             };
             repo_org_cache.insert(resolved_repo.clone(), matches);
@@ -2394,22 +2411,38 @@ async fn upload_incremental_sessions_globally(
         match outcome {
             UploadFromLogOutcome::Uploaded => {
                 stats.uploaded += 1;
-                cursor_advance =
-                    advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+                if !cursor_blocked {
+                    cursor_advance = advance_cursor_for_disposition(
+                        &cursor_advance,
+                        log_mtime,
+                        &log_source_label,
+                    );
+                }
             }
             UploadFromLogOutcome::AlreadyExists => {
                 stats.skipped += 1;
-                cursor_advance =
-                    advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+                if !cursor_blocked {
+                    cursor_advance = advance_cursor_for_disposition(
+                        &cursor_advance,
+                        log_mtime,
+                        &log_source_label,
+                    );
+                }
             }
             UploadFromLogOutcome::Queued(_) => {
                 stats.queued += 1;
-                cursor_advance =
-                    advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+                if !cursor_blocked {
+                    cursor_advance = advance_cursor_for_disposition(
+                        &cursor_advance,
+                        log_mtime,
+                        &log_source_label,
+                    );
+                }
             }
             UploadFromLogOutcome::Retryable(_) => {
                 stats.issues += 1;
-                break;
+                cursor_blocked = true;
+                continue;
             }
         }
     }
@@ -2425,9 +2458,9 @@ async fn upload_incremental_sessions_globally(
     Ok(stats)
 }
 
-async fn run_monitor_tick_internal(force: bool) -> Result<MonitorTickSummary> {
+async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<MonitorTickSummary> {
     let mut state = monitor::load_state().await.unwrap_or_default();
-    if !force && !state.enabled {
+    if !options.force && !state.enabled {
         return Ok(MonitorTickSummary::default());
     }
 
@@ -2443,13 +2476,18 @@ async fn run_monitor_tick_internal(force: bool) -> Result<MonitorTickSummary> {
 
     let run_result: Result<MonitorTickSummary> = async {
         let upload_context = upload::resolve_upload_context(api_url_override()).await?;
-        let pending_to_drain = upload::pending_upload_count().await.unwrap_or(0);
-        let pending_summary =
-            upload::process_pending_uploads(&upload_context, pending_to_drain).await?;
+        let pending_summary = if options.drain_pending {
+            let pending_to_drain = upload::pending_upload_count().await.unwrap_or(0);
+            upload::process_pending_uploads(&upload_context, pending_to_drain).await?
+        } else {
+            upload::PendingUploadSummary::default()
+        };
         let mut summary = upload_incremental_sessions_globally(&upload_context).await?;
         summary.pending_attempted = pending_summary.attempted;
         summary.pending_uploaded = pending_summary.uploaded + pending_summary.already_existed;
-        update::run_background_auto_update().await?;
+        if options.run_auto_update {
+            update::run_background_auto_update().await?;
+        }
         Ok(summary)
     }
     .await;
@@ -2477,7 +2515,12 @@ async fn run_monitor_tick_internal(force: bool) -> Result<MonitorTickSummary> {
 }
 
 async fn run_monitor_tick(force: bool) -> Result<()> {
-    let _ = run_monitor_tick_internal(force).await?;
+    let _ = run_monitor_tick_internal(MonitorTickOptions {
+        force,
+        drain_pending: true,
+        run_auto_update: true,
+    })
+    .await?;
     Ok(())
 }
 
