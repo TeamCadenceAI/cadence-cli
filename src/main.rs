@@ -165,7 +165,7 @@ enum Command {
 enum ConfigCommand {
     /// Set a configuration value.
     Set {
-        /// Configuration key (e.g. auto_update, update_check_interval, api_url).
+        /// Configuration key (e.g. update_check_interval, api_url).
         key: String,
         /// Value to set.
         value: String,
@@ -183,11 +183,14 @@ enum ConfigCommand {
 enum AutoUpdateCommand {
     /// Show auto-update status and runtime health.
     Status,
-    /// Enable unattended background auto-update work during monitor ticks.
+    /// Hidden compatibility command; background updates now follow monitor state.
+    #[command(hide = true)]
     Enable,
-    /// Disable unattended background auto-update work.
+    /// Hidden compatibility command; background updates now follow monitor state.
+    #[command(hide = true)]
     Disable,
-    /// Compatibility command that removes the shared monitor scheduler.
+    /// Hidden compatibility command; scheduler lifecycle is monitor-owned.
+    #[command(hide = true)]
     Uninstall,
 }
 
@@ -2080,11 +2083,7 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         ),
         false,
     );
-    output::detail_to_with_tty(
-        w,
-        "Controls: `cadence auto-update status|enable|disable`",
-        false,
-    );
+    output::detail_to_with_tty(w, "Controls: `cadence auto-update status`", false);
 
     Ok(())
 }
@@ -2159,7 +2158,11 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
     let updater_health = update::updater_health().await;
     match updater_health.state {
         update::UpdaterHealthState::Disabled => {
-            output::detail_to_with_tty(w, "Auto-update: disabled", false);
+            output::detail_to_with_tty(
+                w,
+                "Auto-update: disabled because background monitoring is disabled",
+                false,
+            );
         }
         update::UpdaterHealthState::NeverRun => {
             output::detail_to_with_tty(w, "Auto-update: enabled, never run yet", false);
@@ -2276,13 +2279,6 @@ async fn run_config_list() -> Result<()> {
         let value = cfg.get_key(*key);
         println!("{} = {}", key.name(), value);
     }
-    Ok(())
-}
-
-async fn set_auto_update_enabled(enabled: bool) -> Result<()> {
-    let mut cfg = config::CliConfig::load().await?;
-    cfg.auto_update = Some(enabled);
-    cfg.save().await?;
     Ok(())
 }
 
@@ -2442,7 +2438,11 @@ async fn run_auto_update_status() -> Result<()> {
             false,
         );
     }
-    output::detail_to_with_tty(&mut stderr, "Runtime: monitor-driven", false);
+    output::detail_to_with_tty(
+        &mut stderr,
+        "Runtime: monitor-driven; monitor enablement controls unattended updates.",
+        false,
+    );
     output::detail_to_with_tty(
         &mut stderr,
         "Use `cadence monitor status` for scheduler visibility.",
@@ -2452,28 +2452,26 @@ async fn run_auto_update_status() -> Result<()> {
 }
 
 async fn run_auto_update_enable() -> Result<()> {
-    set_auto_update_enabled(true).await?;
-    output::success(
-        "Auto-update",
-        "enabled. Stable-channel update checks will run during monitor ticks.",
+    output::note(
+        "`cadence auto-update enable` is now a compatibility command. Unattended updates run automatically whenever background monitoring is enabled.",
     );
-    if !monitor::monitor_enabled().await {
+    if monitor::monitor_enabled().await {
+        output::detail("Background monitoring is already enabled.");
+    } else {
         output::detail(
-            "Background monitoring is currently disabled; re-enable it with `cadence monitor enable` if you want unattended checks to run.",
+            "Run `cadence monitor enable` or `cadence install` to turn the runtime back on.",
         );
     }
-    output::detail("Disable with `cadence auto-update disable`.");
-    output::detail("Scheduler lifecycle now lives under `cadence monitor ...`.");
     Ok(())
 }
 
 async fn run_auto_update_disable() -> Result<()> {
-    set_auto_update_enabled(false).await?;
-    output::success(
-        "Auto-update",
-        "disabled. Monitor ticks will skip unattended update work.",
+    output::note(
+        "`cadence auto-update disable` is no longer supported because Cadence updates now follow monitor state.",
     );
-    output::detail("Re-enable with `cadence auto-update enable`.");
+    output::detail(
+        "Run `cadence monitor disable` if you need to stop all background Cadence work.",
+    );
     Ok(())
 }
 
@@ -2680,7 +2678,6 @@ async fn revoke_token_for_uninstall() -> Result<()> {
 
 /// Disable background monitoring and remove scheduler artifacts.
 async fn uninstall_scheduler() -> Result<()> {
-    let _ = set_auto_update_enabled(false).await;
     let removed = monitor::uninstall_monitor().await?;
     if removed.removed {
         output::success("Removed", &format!("scheduler ({})", removed.description));
@@ -2810,7 +2807,7 @@ async fn main() {
         } => run_install(org, preserve_disable_state).await,
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
-            HookCommand::AutoUpdate => run_monitor_tick(true).await,
+            HookCommand::AutoUpdate => run_monitor_tick(false).await,
             HookCommand::RefreshHooks => run_refresh_hooks().await,
         },
         Command::Backfill { since } => run_backfill(&since).await,
@@ -3127,12 +3124,12 @@ mod tests {
 
     #[test]
     fn cli_parses_config_set() {
-        let cli = Cli::parse_from(["cadence", "config", "set", "auto_update", "true"]);
+        let cli = Cli::parse_from(["cadence", "config", "set", "update_check_interval", "24h"]);
         match cli.command {
             Command::Config { config_command } => match config_command {
                 Some(ConfigCommand::Set { key, value }) => {
-                    assert_eq!(key, "auto_update");
-                    assert_eq!(value, "true");
+                    assert_eq!(key, "update_check_interval");
+                    assert_eq!(value, "24h");
                 }
                 other => panic!("expected Config Set, got {:?}", other),
             },
@@ -3301,11 +3298,11 @@ mod tests {
 
     #[test]
     fn cli_parses_config_get() {
-        let cli = Cli::parse_from(["cadence", "config", "get", "auto_update"]);
+        let cli = Cli::parse_from(["cadence", "config", "get", "update_check_interval"]);
         match cli.command {
             Command::Config { config_command } => match config_command {
                 Some(ConfigCommand::Get { key }) => {
-                    assert_eq!(key, "auto_update");
+                    assert_eq!(key, "update_check_interval");
                 }
                 other => panic!("expected Config Get, got {:?}", other),
             },

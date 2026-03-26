@@ -201,28 +201,6 @@ fn cadence_dir() -> Result<PathBuf> {
     })
 }
 
-pub async fn persist_auto_update_enabled() -> Result<bool> {
-    let mut cfg = CliConfig::load().await?;
-    if cfg.auto_update == Some(true) {
-        return Ok(false);
-    }
-    cfg.auto_update = Some(true);
-    cfg.save().await?;
-    Ok(true)
-}
-
-pub async fn ensure_auto_update_enabled_and_reconciled() -> Result<SchedulerProvisionResult> {
-    let _ = persist_auto_update_enabled().await?;
-    reconcile_scheduler_for_auto_update_enabled(true).await
-}
-
-fn update_confirmation_config(mode: InstallMode, config: Option<&CliConfig>) -> Option<bool> {
-    if matches!(mode, InstallMode::Interactive) {
-        return config.map(CliConfig::auto_update_enabled);
-    }
-    None
-}
-
 fn updater_state_path() -> Result<PathBuf> {
     Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
 }
@@ -944,23 +922,11 @@ pub fn self_replace_binary(replacement_path: &Path) -> Result<()> {
 
 /// Asks the user to confirm the update. Returns `true` if they accept.
 ///
-/// Precedence (highest wins):
-/// 1. `yes` (`--yes` CLI flag) — always skips prompt
-/// 2. `auto_update_config` — if `Some(true)`, skips prompt (from config `auto_update = true`)
-/// 3. Interactive prompt — asks user with [y/N] default No
-pub fn confirm_update(
-    local_version: &str,
-    remote_version: &str,
-    yes: bool,
-    auto_update_config: Option<bool>,
-) -> Result<bool> {
+/// `--yes` always skips the prompt. Otherwise this falls back to the
+/// interactive confirmation prompt with [y/N] default No.
+pub fn confirm_update(local_version: &str, remote_version: &str, yes: bool) -> Result<bool> {
     // --yes flag always wins
     if yes {
-        return Ok(true);
-    }
-
-    // Config-driven auto-update skips prompt when true
-    if auto_update_config.unwrap_or(false) {
         return Ok(true);
     }
 
@@ -1079,15 +1045,6 @@ async fn run_update_install_from_url_mode(
 ) -> Result<AttemptOutcome> {
     let local = current_version();
 
-    let config = if matches!(mode, InstallMode::Interactive) {
-        // Manual update keeps config load strict to preserve existing UX.
-        Some(CliConfig::load().await.context(
-            "Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.",
-        )?)
-    } else {
-        None
-    };
-
     // Step 1: Fetch release metadata
     let release = check_latest_version_from_url(release_url)
         .await
@@ -1120,15 +1077,7 @@ async fn run_update_install_from_url_mode(
     let checksums_asset = pick_checksums_asset(&release.assets)?;
 
     // Step 4: Prompt for confirmation
-    // Precedence: --yes > config auto_update > interactive prompt
-    if matches!(mode, InstallMode::Interactive)
-        && !confirm_update(
-            local,
-            remote_display,
-            yes,
-            update_confirmation_config(mode, config.as_ref()),
-        )?
-    {
+    if matches!(mode, InstallMode::Interactive) && !confirm_update(local, remote_display, yes)? {
         println!("Update cancelled.");
         return Ok(AttemptOutcome::NoUpdate);
     }
@@ -1226,15 +1175,6 @@ pub async fn run_background_auto_update() -> Result<()> {
     let mut state = load_updater_state().await.unwrap_or_default();
     let now = now_rfc3339();
     state.last_attempt_at = Some(now.clone());
-
-    let config = CliConfig::load().await.unwrap_or_default();
-    if !config.auto_update_enabled() {
-        state.last_error = None;
-        state.consecutive_failures = 0;
-        state.next_retry_after = None;
-        save_updater_state(&state).await?;
-        return Ok(());
-    }
 
     if !update_due_for_retry(&state, now_epoch()) {
         return Ok(());
@@ -1881,12 +1821,11 @@ async fn scheduler_health_macos() -> SchedulerHealth {
 }
 
 pub fn auto_update_policy_summary() -> &'static str {
-    "hourly checks; stable channel only; prereleases are excluded by default"
+    "monitor-driven; stable channel only; no separate auto-update toggle"
 }
 
 pub async fn updater_health() -> UpdaterHealth {
-    let cfg = CliConfig::load().await.unwrap_or_default();
-    let enabled = cfg.auto_update_enabled();
+    let enabled = crate::monitor::monitor_enabled().await;
     let state = load_updater_state().await.unwrap_or_default();
     derive_updater_health(enabled, &state)
 }
@@ -1896,7 +1835,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
         return UpdaterHealth {
             enabled,
             state: UpdaterHealthState::Disabled,
-            last_result: "disabled".to_string(),
+            last_result: "monitor disabled".to_string(),
             last_attempt_at: state.last_attempt_at.clone(),
             next_retry_after: None,
             last_error: None,
@@ -2865,103 +2804,26 @@ mod tests {
         );
     }
 
-    // -- confirm_update (precedence matrix) ----------------------------------
+    // -- confirm_update ------------------------------------------------------
 
     #[tokio::test]
     async fn confirm_update_yes_bypass() {
-        // --yes flag should skip prompt and return true
-        let result = confirm_update("0.2.1", "0.3.0", true, None).unwrap();
+        let result = confirm_update("0.2.1", "0.3.0", true).unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn confirm_update_yes_overrides_config_false() {
-        // --yes wins even when config says auto_update=false
-        let result = confirm_update("0.2.1", "0.3.0", true, Some(false)).unwrap();
+    async fn confirm_update_yes_is_idempotent() {
+        let result = confirm_update("0.2.1", "0.3.0", true).unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn confirm_update_yes_overrides_config_true() {
-        // --yes wins over config=true (both are "yes", should still bypass)
-        let result = confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn confirm_update_auto_config_true_skips_prompt() {
-        // auto_update=true should skip prompt without --yes
-        let result = confirm_update("0.2.1", "0.3.0", false, Some(true)).unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn persist_auto_update_enabled_overrides_explicit_disable() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = EnvGuard::new("HOME");
-        home.set(tmp.path().to_str().expect("home path utf8"));
-
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..CliConfig::default()
-        };
-        cfg.save().await.expect("save config");
-
-        let changed = persist_auto_update_enabled()
-            .await
-            .expect("persist auto-update enabled");
-        assert!(changed);
-
-        let saved = CliConfig::load().await.expect("load config");
-        assert_eq!(saved.auto_update, Some(true));
-    }
-
-    #[tokio::test]
-    async fn update_confirmation_config_preserves_manual_auto_update_preference() {
-        let cfg = CliConfig {
-            auto_update: Some(true),
-            ..CliConfig::default()
-        };
-        assert_eq!(
-            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
-            Some(true)
-        );
-        assert_eq!(
-            update_confirmation_config(InstallMode::SilentUnattended, Some(&cfg)),
-            None
-        );
-
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..CliConfig::default()
-        };
-        assert_eq!(
-            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
-            Some(false)
-        );
-    }
-
-    #[tokio::test]
-    async fn confirm_update_auto_config_false_no_yes_would_prompt() {
-        // auto_update=false, no --yes: would go to interactive prompt.
-        // We can't test the actual prompt here without a TTY,
-        // but we verify the None/false config path doesn't auto-accept.
-        // The dialoguer prompt will fail or return None in non-interactive.
-        // Skip this test in CI — just verify the yes/auto paths cover all branches.
-    }
-
-    #[tokio::test]
-    async fn confirm_update_config_none_no_yes_would_prompt() {
-        // No config, no --yes: same as auto_update=false — would prompt.
-        // Confirm that None acts like false.
-        let result = confirm_update("0.2.1", "0.3.0", false, None);
-        // In a non-interactive test, this either fails or returns false.
-        // The key assertion is that it does NOT return Ok(true).
+    async fn confirm_update_without_yes_does_not_auto_accept() {
+        let result = confirm_update("0.2.1", "0.3.0", false);
         if let Ok(val) = result {
-            assert!(!val, "should not auto-accept without --yes or config");
+            assert!(!val, "should not auto-accept without --yes");
         }
-        // Err is acceptable in non-interactive environments
     }
 
     // -- parse_timestamp_string -----------------------------------------------
