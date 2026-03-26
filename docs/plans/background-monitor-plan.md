@@ -1,128 +1,230 @@
-# Cadence Background Monitor Plan (V1 API)
+# Cadence Background Monitor Plan
 
 ## Summary
 
-This document is the phase-1 plan for moving Cadence from hook-owned triggering
-to background monitoring while keeping the existing v1 session-upload API.
+This document is the current plan for moving Cadence from hook-owned live
+ingestion to background monitoring.
 
-It is intentionally scoped to:
+It was revised against the codebase on 2026-03-26.
 
-- monitor/runtime/install/status/doctor changes
-- how the CLI should behave while still publishing through the current v1 API
+The previous version of this document was no longer accurate because it assumed
+the CLI was still on a pre-v2 publication path. That is no longer true:
 
-It is intentionally not the plan for the new v2 publication contract.
+- the CLI already publishes through `/api/v2/session-publications`
+- the codebase already has `LogicalSessionKey`, `publish_uid`, and durable
+  `publication_state`
+- backfill already uses the same publication pipeline as live ingestion
 
-For the v2 publication cutover, see
-`docs/cli-v2-session-publication-plan.md`.
+This plan is therefore a runtime/install/status/doctor migration plan on top of
+the current publication stack. It is not a plan for changing publication
+contracts.
 
-Phase 1 should optimize for shipping the correct v1 runtime behavior. It does
-not need to preserve internal publication abstractions for later reuse by v2.
+## Current Codebase Snapshot
 
-## Boundary
+As of 2026-03-26, the relevant runtime shape is:
 
-This plan assumes the current v1 API and transport model remain in place:
-
-- current direct-upload create/upload/confirm flow
-- current request model and required fields
-- current `session_uid`-based publication identity
-- current semantic envelope / blob shape
-- current retry queue model
-
-This plan does not redesign:
-
-- stable logical session identity
-- `publish_uid`
-- raw tool-session blob publication
-- org-target selection as an explicit client responsibility
-- server-side unresolved publication semantics
-
-Those are phase-2 concerns and belong only to the v2 plan.
+- `cadence install` sets global `core.hooksPath`, writes `~/.git-hooks/post-commit`,
+  removes a Cadence-managed `pre-push` hook, persists `ai.cadence.org`, and
+  reconciles the auto-update scheduler
+- live ingestion is triggered by `cadence hook post-commit`
+- `hook post-commit` drains pending publications, incrementally scans recent
+  session logs for the current repo, and uploads through `src/upload.rs`
+- the publication stack already uses:
+  - `src/publication.rs`
+  - `src/publication_state.rs`
+  - `src/upload.rs`
+  - `/api/v2/session-publications`
+- current live incremental discovery is driven by repo-scoped upload cursors in
+  `src/upload_cursor.rs`
+- `cadence backfill` already performs global session discovery, repo
+  resolution, repo grouping, and publication through the same upload pipeline
+- OS-native scheduler support already exists, but it is owned by `src/update.rs`
+  and currently targets `cadence hook auto-update`
+- `status` and `doctor` are still hook-centric and treat hook presence as a
+  primary source of install truth
 
 ## Goal
 
 After `cadence install`, Cadence should behave like a background capability
 without taking ownership of the user's Git hook setup.
 
-Phase-1 outcomes:
+Desired outcomes:
 
 - `cadence install` enables background monitoring
-- Cadence no longer installs or manages Git hooks
+- Cadence no longer requires `post-commit` hooks for correctness
 - existing user hooks continue to work untouched
-- repo-local `core.hooksPath` no longer disables Cadence
-- session discovery and retry move off `post-commit`
-- uploads still go through the existing v1 API contract
+- repo-local or global `core.hooksPath` no longer determines whether Cadence
+  works
+- live discovery and retry move off commit-time execution
+- the current publication semantics remain intact
 
 ## Non-Goals
 
-- Redesigning the session-publication contract
-- Introducing stable logical session identity in the server contract
-- Metadata-only republishes under the v1 API
-- Replacing the current v1 semantic envelope
-- Reconstructing historical branch/HEAD truth for backfill
-- Changing repo/org ignore logic
-- Building a true long-lived daemon
-- Adding burst mode or sub-30-second fast paths
+- redesigning the current publication contract
+- rolling the CLI back to any v1 upload model
+- redesigning `LogicalSessionKey`, `publish_uid`, or durable publication-state
+  semantics
+- changing org-selection rules
+- changing material metadata hash semantics
+- reconstructing historical branch/HEAD truth for old sessions
+- changing repo/org ignore behavior
+- building a long-lived daemon
+- adding burst mode or sub-30-second fast paths
 
 ## Locked Decisions
 
-- This is a real deployable phase that ships before v2.
-- `cadence install` means "enable background monitoring", not "install hooks".
-- Hook installation is removed entirely.
-- Install performs aggressive cleanup of existing Cadence-managed hook
-  ownership.
+- This is a runtime migration, not a publication migration.
+- The current v2 publication stack is fixed input for this plan.
+- The monitor continues to publish through the current `upload` /
+  `publication_state` pipeline.
+- A new publication is still created when content or material metadata changes.
+- `git_ref` and `head_commit_sha` remain current publish-time hints only; by
+  themselves they do not force new publication.
+- Remote observations and a single target org remain publication prerequisites.
+- Retryable or ineligible work remains in durable local state and is retried
+  later.
 - Background monitoring runs on an OS-native scheduler:
   - macOS/Linux: 30-second ticks
   - Windows: 60-second ticks
-- Auto-update work folds into the monitor tick.
-- Watch all supported session locations by default.
-- Existing repo/org ignore behavior stays unchanged.
-- This phase keeps the current v1 upload contract.
-- Remote remains an upload gate.
-- Branch and HEAD continue to follow the existing v1 upload contract rather
-  than the future v2 hint model.
-- The v1 plan should not try to emulate v2 publication semantics on top of the
-  old API.
+- Auto-update due checks fold into the monitor tick; the monitor becomes the
+  periodic runtime substrate.
+- Existing repo/org opt-out behavior stays unchanged.
+- Hidden hook entrypoints stay around temporarily as migration compatibility
+  paths, but they stop being the primary runtime.
 
-## Existing V1 Constraints
+## Resolved Planning Questions
 
-The current CLI and API shape impose real limits on what phase 1 can do.
+These were the main stale or ambiguous parts of the old document.
 
-### Publication Identity
+### 1. Publication Boundary
 
-The current upload path is built around the existing v1 identity and envelope
-shape.
+Resolved decision:
 
-Implications for phase 1:
+- the monitor should reuse the current v2 publication stack exactly as it
+  exists today
+- this plan should not use v1 terminology or pretend that `publish_uid` /
+  `publication_state` work is still pending
 
-- the monitor can switch the trigger substrate from hooks to background ticks
-- it cannot make v1 behave like v2 stable logical-session publication
-- changed content snapshots still follow the current v1 semantics
+### 2. Incremental Discovery State
 
-### Metadata Model
+Resolved decision:
 
-Under the current v1 path, the CLI still derives and sends:
+- the current repo-scoped upload cursor is hook-shaped and does not fit a
+  scheduler that scans all supported session sources globally
+- the monitor should adopt a global discovery cursor keyed by:
+  - last scanned mtime
+  - source label tiebreaker
+- repo-scoped cursors may remain only as migration baggage or for temporary
+  compatibility, not as the long-term monitor model
 
-- repo remote URL
-- repo root
-- branch / ref
-- HEAD SHA
-- user identity
+Reason:
 
-Phase 1 should continue to operate within those constraints rather than
-pretending the v1 API has v2-style observation semantics.
+- a periodic monitor tick has no single "current repo"
+- reusing the current repo-scoped cursor model would either rescan too much or
+  couple the monitor to repo-by-repo scheduling that the codebase does not
+  currently have
 
-### Retry Model
+### 3. Scheduler Ownership
 
-The existing durable queue and repo-scoped upload cursor are already in the
-codebase.
+Resolved decision:
 
-Phase 1 should reuse and adapt those mechanisms where possible instead of
-building the v2 publication-state machine early.
+- the monitor should own the periodic scheduler
+- `auto-update` becomes policy and health inside the monitor runtime rather than
+  a separate scheduler owner
 
-## Runtime Architecture
+Implication:
 
-Cadence runs as a scheduled monitor tick, not a Git hook and not a persistent
-daemon.
+- `cadence monitor enable|disable|uninstall` own scheduler lifecycle
+- `cadence auto-update status|enable|disable` remain as update-policy commands
+- `cadence auto-update uninstall` should be deprecated or turned into a
+  compatibility message that points users to `cadence monitor uninstall`
+
+### 4. Hook Compatibility
+
+Resolved decision:
+
+- hidden hook entrypoints should not become blind no-ops immediately
+- for at least one migration release, `hook post-commit` should remain a
+  best-effort compatibility shim that exits successfully and attempts monitor
+  work indirectly
+
+Reason:
+
+- users may upgrade binaries before rerunning `cadence install`
+- a pure no-op risks silently dropping live ingestion during the transition
+
+## Current Constraints
+
+### Publication Stack
+
+The monitor should treat these as existing platform facts:
+
+- `src/publication.rs` already defines logical session identity and metadata
+  hashing
+- `src/publication_state.rs` already persists durable per-session/per-org state
+- `src/upload.rs` already performs create/upload/confirm, target-org selection,
+  retry scheduling, and pending-state draining
+- backfill already publishes through this stack
+
+This plan should not try to replace those pieces unless runtime extraction
+requires small refactors.
+
+### Discovery And Repo Resolution
+
+Current live ingestion is split across two useful but differently shaped paths:
+
+- `hook post-commit`:
+  - efficient current-repo incremental scan
+  - repo-scoped cursor
+  - commit-triggered execution
+- `backfill`:
+  - global discovery
+  - repo resolution from session metadata
+  - repo grouping and filter checks
+
+The monitor should reuse the backfill-style global discovery shape more than the
+current hook path, while still preserving the efficient incremental cursor
+behavior.
+
+### Scheduler Infrastructure
+
+Current scheduler provisioning and health checks live in `src/update.rs` and
+assume:
+
+- an hourly updater cadence
+- scheduler artifacts target `cadence hook auto-update`
+- `status` and `doctor` surface scheduler health as "auto-update scheduler"
+
+That code is useful, but it is not yet the correct ownership boundary for a
+30-second or 60-second monitor runtime.
+
+### Install / Update Coupling
+
+Current self-update behavior still refreshes hooks after replacing the binary.
+
+Once hook ownership is removed:
+
+- post-update follow-up should reconcile monitor scheduler/runtime state instead
+  of refreshing hooks
+- hidden hook refresh entrypoints can remain only as compatibility shims
+
+### Hook Cleanup Safety
+
+The install migration cannot assume every `core.hooksPath` or every file under
+`~/.git-hooks` is safely disposable.
+
+Cleanup rules should be:
+
+- remove Cadence-managed hook files
+- restore `post-commit.pre-cadence` when present
+- leave non-Cadence hooks untouched
+- only unset global `core.hooksPath` when Cadence can prove it still owns that
+  configuration path and cleanup will not break preserved user hooks
+
+## Target Runtime Architecture
+
+Cadence runs as a scheduled one-shot monitor tick, not a Git hook and not a
+persistent daemon.
 
 Recommended hidden entrypoint:
 
@@ -130,84 +232,58 @@ Recommended hidden entrypoint:
 
 Each tick should:
 
-- acquire a nonblocking global activity lock
-- exit immediately if another Cadence activity is already running
-- scan supported session sources incrementally
-- derive current local Git metadata using the existing v1 rules
-- publish any newly discovered upload-eligible sessions through the v1 API
-- drain retry work
-- perform cheap auto-update due checks and only run update work when due
+1. Acquire a nonblocking global activity lock.
+2. Exit immediately if another Cadence activity is already running.
+3. Load monitor config/state and confirm monitoring is enabled.
+4. Scan supported session sources incrementally using a global discovery
+   cursor.
+5. Parse session metadata and resolve repo roots from `cwd`.
+6. Apply existing repo/org filters.
+7. Group eligible sessions by repo.
+8. Publish newly discovered work through the existing live publication path.
+9. Drain due pending publication records.
+10. Run cheap auto-update due checks and invoke update work only when due.
+11. Persist monitor health:
+    - last run
+    - last success
+    - last error
+    - counts / summary
 
-## Upload Behavior In Phase 1
+The monitor should be conservative:
 
-Phase 1 keeps the current v1 publication model.
+- unchanged sessions should not be republished every tick
+- retryable failures should remain durable and retry later
+- monitor lock contention should be an expected fast-exit condition
 
-That means:
+## Command And UX Model
 
-- keep the existing v1 create/upload/confirm contract
-- keep the current envelope/blob semantics
-- keep the current retry queue concept
-- keep the current repo-local upload cursor concept where it still fits
+Recommended command surface:
 
-Phase-1 publish triggers should stay conservative:
+- `cadence monitor status`
+- `cadence monitor enable`
+- `cadence monitor disable`
+- `cadence monitor uninstall`
 
-- new content should publish
-- existing pending/retry work should be retried
-- metadata-only republish is not a goal for phase 1
+Updated semantics:
 
-The reason is simple:
+- `cadence install` means "enable background monitoring"
+- `cadence auto-update enable|disable` control whether update work runs inside
+  the monitor
+- `cadence auto-update status` remains an update-health view
+- `cadence auto-update uninstall` should stop being the primary scheduler-removal
+  command once the monitor owns scheduler lifecycle
 
-- v1 is not the final publication model
-- trying to force v2-style republish semantics into v1 would create churn and
-  confusion
+Compatibility behavior:
 
-## Eligibility Rules In Phase 1
-
-Phase 1 should preserve the current v1 eligibility rules unless they are proven
-safe to relax without changing the v1 server contract.
-
-Specifically:
-
-- a remote is still required
-- branch/ref and HEAD continue to be derived the current v1 way
-- sessions that fail current v1 upload eligibility should remain in durable
-  local state and be retried later
-
-This is one of the deliberate differences between phase 1 and phase 2:
-
-- v1 remains constrained by the current API
-- v2 will revisit publication eligibility and metadata semantics explicitly
-
-## Backfill In Phase 1
-
-Backfill remains supported in phase 1, but it should remain a v1 backfill path.
-
-This phase should:
-
-- move backfill triggering onto the monitor-aligned runtime where helpful
-- keep the existing v1 publication semantics
-- avoid introducing v2-only concepts into backfill
-
-Backfill's publication-model cleanup belongs to the v2 plan, not here.
-
-## Install / Migration
-
-`cadence install` should:
-
-- aggressively remove Cadence-managed hook ownership
-- enable the background monitor scheduler
-- preserve existing user hooks untouched
-- stop writing or refreshing Git hooks
-
-Because this phase is still shipping before v2:
-
-- hidden hook entrypoints should remain temporarily for upgrade compatibility
-- they should become harmless compatibility paths or explicit no-ops
+- `cadence hook post-commit` remains hidden and exits success
+- it should trigger best-effort compatibility behavior rather than remaining the
+  primary runtime
+- `cadence hook refresh-hooks` becomes a compatibility shim or explicit no-op
 - remediation should point users to rerun `cadence install`
 
 ## Status / Doctor Model
 
-`status` and `doctor` should stop treating hook presence as the install truth.
+`status` and `doctor` should stop treating hook presence as install truth.
 
 ### Status should report
 
@@ -215,7 +291,7 @@ Because this phase is still shipping before v2:
 - monitor scheduler health
 - actual cadence on this platform
 - last monitor run / last success / last error
-- pending v1 upload count
+- pending publication count
 - auto-update policy and health
 - current repo enabled/disabled state from existing repo/org rules
 
@@ -223,9 +299,9 @@ Because this phase is still shipping before v2:
 
 - monitor scheduler artifacts are present and correct
 - monitor command target is valid
-- old Cadence hook ownership was removed successfully
-- existing local state directories are readable/writable
-- existing pending-upload state is coherent
+- monitor state and discovery cursor files are readable/writable
+- publication-state and payload directories are coherent
+- old Cadence hook ownership was cleaned up where Cadence can prove ownership
 - auto-update due-check state is healthy
 
 ### Doctor should stop failing on
@@ -236,152 +312,159 @@ Because this phase is still shipping before v2:
 
 ## Recommended Code Shape
 
-Phase 1 should add monitor/runtime structure without prematurely adopting v2
-publication abstractions.
-
 Recommended additions:
 
 - `src/monitor.rs`
-  - monitor tick orchestration
-  - scheduler-facing commands
-- optional `src/monitor_scheduler.rs`
-  - if separating scheduler ownership from `update.rs` improves clarity
+  - tick orchestration
+  - monitor state persistence
+  - compatibility hook delegation
+- `src/monitor_scheduler.rs`
+  - monitor scheduler provisioning
+  - monitor scheduler health probes
+- `src/discovery_cursor.rs`
+  - global monitor cursor persistence
 
-Recommended phase-1 reuse:
+Recommended extractions:
 
-- reuse the existing upload transport layer where it is still truly v1
-- reuse the existing queue/cursor patterns where they fit
+- extract reusable global discovery / repo-grouping helpers out of `main.rs`
+  so `backfill` and `monitor` can share them cleanly
+- extract or generalize scheduler primitives from `src/update.rs` where that
+  reduces duplication
 
-Recommended phase-1 avoidance:
+Recommended avoidance:
 
-- do not introduce `publish_uid`
-- do not rename v1 structures as if they were already v2
-- do not build the v2 local publication-state machine early
+- do not reintroduce v1 upload terminology into the code shape
+- do not couple monitor correctness to `core.hooksPath`
+- do not preserve hook-refresh abstractions longer than needed for migration
 
 ## Phased Implementation Plan
 
-### Phase 1: Monitor Entry Point And Scheduler
+### Phase 1: Monitor Primitives And Scheduler
 
 Goal:
 
-- create the background execution substrate without changing the v1 upload
-  contract
+- add a real monitor runtime substrate without changing publication semantics
 
 Work:
 
-- add hidden monitor tick command
-- provision scheduler artifacts for the monitor tick
-- set cadence to:
-  - 30 seconds on macOS/Linux
-  - 60 seconds on Windows
-- fold auto-update due checks into the monitor tick
+- add hidden `cadence monitor tick`
+- add monitor state persistence
+- add a global discovery cursor
+- add monitor scheduler provisioning and health probes
+- expose cadence / health in monitor-aware status surfaces
 
 Acceptance criteria:
 
-- monitor tick exists
+- `cadence monitor tick` exists
 - scheduler artifacts invoke the monitor tick
-- the platform cadence is visible and correct
+- platform cadence is visible and correct
+- monitor state records last run / success / error
 
-### Phase 2: Rewire V1 Upload Triggering
+### Phase 2: Global Live Ingestion
 
 Goal:
 
-- move live ingestion from `post-commit` to the monitor while keeping the v1
-  upload path
+- move live discovery and retry off `post-commit` onto the monitor tick
 
 Work:
 
-- move incremental discovery into the monitor tick
-- publish through the existing v1 upload flow
-- drain the existing pending-upload queue from the monitor tick
-- keep v1 eligibility and retry behavior coherent
+- extract global discovery / repo-grouping helpers from current backfill logic
+- scan all supported session sources incrementally from the monitor tick
+- apply current repo/org filters
+- publish through the existing live upload path
+- drain pending publication records from the monitor tick
 
 Acceptance criteria:
 
-- new sessions upload without a commit
-- existing v1 retry behavior still works
-- unchanged sessions are not continuously re-uploaded by the monitor
+- new eligible sessions upload without requiring a commit
+- retryable pending work is drained by the monitor
+- unchanged sessions are not continuously reprocessed
+- disabled repos and org-filtered repos stay skipped under the monitor
 
-### Phase 3: Install Migration Off Hooks
+### Phase 3: Install / Update / Uninstall Migration Off Hooks
 
 Goal:
 
-- remove Cadence hook ownership from install
+- remove Cadence hook ownership from the primary product model
 
 Work:
 
 - rewrite `cadence install` to:
-  - aggressively clean up old Cadence-managed hook ownership
-  - remove Cadence-managed hook files/directories
-  - unset Cadence-owned global `core.hooksPath` where applicable
   - enable monitor scheduling
-- stop writing hooks during install
-- remove hook-refresh behavior from update/install paths where possible
-- keep hidden hook commands as temporary compatibility no-ops
+  - stop writing or refreshing Git hooks
+  - clean up old Cadence-managed hook ownership where safe
+- update self-update follow-up to reconcile monitor runtime state instead of
+  refreshing hooks
+- update uninstall to remove monitor scheduler artifacts and legacy Cadence hook
+  remnants safely
+- keep hook entrypoints as temporary compatibility paths
 
 Acceptance criteria:
 
 - fresh install enables monitoring without touching user hooks
-- upgraded install removes old Cadence hook ownership
-- hook ownership is no longer required for correctness
+- upgraded install cleans up Cadence-owned hook artifacts where safe
+- update no longer depends on hook refresh for correctness
+- hook ownership is no longer required for live ingestion
 
-### Phase 4: Status / Doctor / Commands
+### Phase 4: Status / Doctor / Command Surface
 
 Goal:
 
-- make the CLI describe phase-1 reality accurately
+- make the CLI describe monitor reality accurately
 
 Work:
 
-- add `monitor` subcommands:
-  - `cadence monitor status`
-  - `cadence monitor enable`
-  - `cadence monitor disable`
-  - `cadence monitor uninstall`
-- update `status`
-- update `doctor`
-- keep `auto-update` commands, but narrow them to update policy/visibility
+- add visible `monitor` lifecycle commands
+- reframe `status` around monitor health rather than hooks
+- reframe `doctor` around monitor runtime, state, and safe migration cleanup
+- narrow `auto-update` commands to policy / health
+- deprecate or compatibility-wrap `cadence auto-update uninstall`
 
 Acceptance criteria:
 
-- status/doctor speak about monitor health, not hooks
+- status and doctor speak about monitor health, not hook presence
 - users have explicit monitor lifecycle controls
-- auto-update remains visible but no longer owns scheduler semantics
+- auto-update remains visible without pretending it owns the scheduler
 
-### Phase 5: Backfill / Compatibility / Docs
+### Phase 5: Compatibility Cleanup And Docs
 
 Goal:
 
-- finish the v1 runtime migration cleanly
+- finish the migration cleanly and remove stale user-model language
 
 Work:
 
-- align backfill with the phase-1 monitor/runtime where appropriate
-- document the v1 limitations explicitly
-- add compatibility messaging for old hook entrypoints
-- update README/install/uninstall guidance
+- update README and install/uninstall guidance
+- update docs that still describe hook-owned ingestion
+- update cross-doc references that still describe background monitoring as a
+  pre-v2 publication phase
+- add clear compatibility messaging for old hidden hook entrypoints
 
 Acceptance criteria:
 
-- docs clearly describe phase 1 as "background monitor over v1 API"
-- docs point to the separate v2 publication plan for the next phase
+- docs describe Cadence as background monitoring rather than post-commit-owned
+  ingestion
+- docs stop describing the publication stack as pre-v2
+- migration guidance is explicit for upgraded users
 
-## Explicit Phase-1 Limitations
+## Related Docs That Need Reconciliation
 
-These are intentional and should remain explicit in the document:
+This plan is now ahead of a few other documents that still describe older
+states:
 
-- phase 1 does not introduce stable logical session identity
-- phase 1 does not add `publish_uid`
-- phase 1 does not add metadata-only republish semantics
-- phase 1 does not redefine branch/HEAD as v2-style hints
-- phase 1 does not change the current semantic envelope / blob model
-- phase 1 is not the final publication model
+- `README.md`
+- `docs/plans/install-process.md`
+- `docs/plans/cli-v2-session-publication-plan.md`
+
+Those docs do not need to be rewritten as part of this plan refresh, but they
+should be updated alongside implementation or immediately after it lands.
 
 ## Review Checklist
 
-- Does this doc stay strictly within the current v1 API boundary?
-- Is the runtime/install/status/doctor scope clear enough to implement as a
-  real shipped phase?
-- Are the intentional limitations of phase 1 explicit enough that an
-  implementation agent will not accidentally build v2 semantics into it?
-- Are the boundaries with `docs/cli-v2-session-publication-plan.md` clear?
+- Does this doc match the codebase as of 2026-03-26?
+- Does it clearly treat the current v2 publication stack as fixed input?
+- Is the global discovery cursor decision explicit enough?
+- Is scheduler ownership between `monitor` and `auto-update` explicit enough?
+- Is hook cleanup safety specific enough to avoid breaking preserved user hooks?
+- Are the runtime/install/status/doctor/doc changes scoped clearly enough for an
+  implementation agent to execute?
