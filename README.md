@@ -1,7 +1,8 @@
 # Cadence CLI
 
-Cadence CLI uploads AI coding agent session logs directly to Cadence after each commit.
-It adds provenance for AI-assisted development without altering your commit history.
+Cadence CLI uploads AI coding agent session logs to Cadence from a scheduled
+background monitor. It adds provenance for AI-assisted development without
+taking ownership of your normal Git workflow.
 
 ## Install
 
@@ -30,22 +31,45 @@ cargo build --release
 
 ## Quick Start
 
-1. Install hooks:
+1. Enable background monitoring:
 ```sh
 cadence install
 ```
 
-2. Make commits as usual.
+2. Code normally. Cadence scans supported agent session stores in the
+background.
 
-3. Check upload status:
+3. Check runtime and upload status:
 ```sh
 cadence status
+cadence monitor status
 ```
 
-4. Diagnose install issues (hooks, rewrite safety):
+4. Diagnose or repair install issues:
 ```sh
 cadence doctor
+cadence doctor --repair
 ```
+
+## Monitor Lifecycle
+
+```sh
+cadence monitor status
+cadence monitor enable
+cadence monitor disable
+cadence monitor uninstall
+```
+
+- `cadence install` enables the monitor and reconciles scheduler artifacts.
+- `cadence monitor enable` re-enables background monitoring and recreates the
+  scheduler if needed.
+- `cadence monitor disable` keeps state but makes scheduled ticks exit early.
+- `cadence monitor uninstall` removes the shared scheduler artifacts and leaves
+  monitoring disabled.
+
+`cadence install` does not install or refresh Git hooks. If Cadence previously
+owned `~/.git-hooks`, install cleans up Cadence-managed hook artifacts where it
+can prove ownership and leaves non-Cadence hooks untouched.
 
 ## Updates and Auto-Update
 
@@ -53,20 +77,18 @@ Cadence has two update paths:
 
 1. Manual update commands:
 ```sh
-cadence update --check   # check only
-cadence update           # interactive install if newer stable version exists
-cadence update -y        # non-interactive manual install
+cadence update --check
+cadence update
+cadence update -y
 ```
 
-2. Background auto-update (unattended):
-- Runs from OS scheduler artifacts created/reconciled by `cadence install`.
-- Installs stable releases only (no prereleases).
-- Uses a shared activity lock so updater does not interfere with commit/push hook paths.
-- Uses retry/backoff when checks or installs fail.
-- If disabled (`auto_update=false`), scheduled runs exit immediately without installing.
+2. Background auto-update policy:
+- Update checks run inside monitor ticks.
+- Stable releases only; prereleases are ignored.
+- A shared activity lock prevents overlap with other Cadence work.
+- Retry and backoff state is persisted locally.
 
-### Control Commands
-
+Control commands:
 ```sh
 cadence auto-update status
 cadence auto-update enable
@@ -74,11 +96,31 @@ cadence auto-update disable
 cadence auto-update uninstall
 ```
 
-- `enable`: enables unattended background updates and reconciles scheduler artifacts.
-- `disable`: keeps scheduler invocation safe but forces updater no-op behavior.
-- `uninstall`: removes scheduler artifacts (idempotent) and disables background auto-update intent.
+- `enable` and `disable` control whether update work runs during monitor ticks.
+- `status` reports updater health and policy.
+- `uninstall` is a compatibility wrapper to `cadence monitor uninstall` because
+  the monitor owns the scheduler lifecycle.
 
-### Visibility and Repair
+## How It Works
+
+Cadence installs an OS-native scheduled one-shot monitor tick:
+
+- macOS and Linux: every 30 seconds
+- Windows: every 60 seconds
+
+Each tick:
+
+- scans supported agent session sources globally
+- resolves repo roots from session metadata
+- applies existing repo and org filters
+- publishes through the current v2 session-publication pipeline
+- drains due pending uploads
+- runs unattended update checks when auto-update is enabled
+
+Legacy hidden hook entrypoints still exist as upgrade-compatibility shims, but
+they are no longer the primary runtime path.
+
+## Visibility and Repair
 
 ```sh
 cadence status
@@ -86,14 +128,11 @@ cadence doctor
 cadence doctor --repair
 ```
 
-- `status` shows updater state, scheduler state, retry/error context, policy, and remediation hints.
-- `doctor` flags broken/missing scheduler states and provides concrete fix commands.
-- `doctor --repair` reconciles scheduler artifacts based on current user intent (`auto_update` setting).
-
-## How It Works
-
-Cadence installs a global `post-commit` hook that scans for recent AI session logs, uploads them
-directly to Cadence, and queues transient failures locally for retry on the next hook run.
+- `status` shows monitor health, cadence, pending uploads, and updater health.
+- `doctor` validates monitor state, scheduler artifacts, pending upload state,
+  and safe migration cleanup.
+- `doctor --repair` rewrites scheduler artifacts based on current monitor
+  intent.
 
 ## Supported Agents
 
@@ -109,25 +148,25 @@ directly to Cadence, and queues transient failures locally for retry on the next
 - Antigravity
 - Warp
 
-Note: Warp stores sessions in a local SQLite database. In some local-only cases the
-assistant output may be missing, so Cadence stores prompts/context without responses.
-OpenCode sessions are normalized from fragmented storage (`session`, `message`, `part`)
-into one synthetic session log per session ID before ingestion.
+Note: Warp stores sessions in a local SQLite database. In some local-only
+cases the assistant output may be missing, so Cadence stores prompts/context
+without responses. OpenCode sessions are normalized from fragmented storage
+(`session`, `message`, `part`) into one synthetic session log per session ID
+before ingestion.
 
 ## Uninstall
 
-- Disable and remove auto-update scheduler artifacts:
+Stop background monitoring but keep the CLI installed:
 ```sh
-cadence auto-update uninstall
+cadence monitor uninstall
 ```
 
-- Remove hooks:
+Remove Cadence state, scheduler artifacts, and legacy hook ownership:
 ```sh
-git config --global --unset core.hooksPath
-rm -rf ~/.git-hooks
+cadence uninstall -y
 ```
 
-- Remove the binary from your PATH (for example `~/.local/bin/cadence`).
+Remove the binary from your PATH if you installed it manually.
 
 ## License
 

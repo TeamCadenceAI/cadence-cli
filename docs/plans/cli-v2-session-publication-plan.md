@@ -2,8 +2,16 @@
 
 ## Summary
 
-This document is the phase-2 CLI plan for cutting Cadence over from the
-existing v1 session-upload contract to the new v2 session-publication API.
+This document is the publication-contract plan that drove Cadence's cutover
+from the old v1 session-upload contract to the v2 session-publication API.
+
+Historical status note:
+
+- the v2 publication stack described here has now shipped
+- the current runtime/install migration work lives in
+  `docs/plans/background-monitor-plan.md`
+- this document remains useful as publication-contract history and rationale,
+  not as a description of the current runtime gaps
 
 It is a CLI-only plan. The server endpoints and server behavior described by
 `../ai-barometer/docs/plans/cli-v2-session-publication-spec-2026-03-22.md` are
@@ -11,27 +19,21 @@ treated as already available and fixed input.
 
 This document is the canonical publication-contract plan.
 
-For the shipped phase-1 background-monitor work on the existing API, see
-`docs/background-monitor-plan.md`.
+For the current background-monitor runtime plan, see
+`docs/plans/background-monitor-plan.md`.
 
-## Relationship To Phase 1
+## Relationship To Current Runtime
 
-The two documents represent two real delivery phases:
+This document is no longer a forward-looking runtime plan. The v2 publication
+layer is now the fixed input for current monitor work.
 
-1. phase 1: background monitor over the existing v1 API
-2. phase 2: hard cutover to the v2 publication contract
+What is current:
 
-Phase 2 is not constrained to preserve all implementation details from phase 1.
-It may revisit significant monitor/runtime internals where the v1 publication
-model would otherwise fight the v2 contract.
-
-What is fixed:
-
-- v1 ships first
-- v2 is a hard cutover
-- the CLI does not need to keep a long-lived dual-path publication layer
-- phase 2 may significantly refactor phase-1 internals if that produces a
-  cleaner v2 publication architecture
+- the CLI already publishes through `/api/v2/session-publications`
+- the CLI already has `LogicalSessionKey`, `publish_uid`, and durable
+  `publication_state`
+- current background-monitor work is about runtime/install/status behavior, not
+  about replacing the publication contract again
 
 ## Goals
 
@@ -98,9 +100,9 @@ The CLI plan must treat these as fixed:
 - branch and HEAD are hints only
 - backfill omits branch and HEAD
 
-## Current CLI Gaps Relative To V2
+## Historical CLI Gaps Relative To V2
 
-The current CLI is materially incompatible with v2 in several ways:
+At planning time, the CLI was materially incompatible with v2 in several ways:
 
 - it uses `session_uid` as a publication-facing identity
 - it ties identity to content-derived state
@@ -335,7 +337,8 @@ The CLI must not plan around synchronous session finalization on confirm.
 
 ## Monitor Integration
 
-Phase 2 will cut the background monitor over to v2 publication semantics.
+This part of the plan is now implemented history rather than future work. The
+background monitor uses the v2 publication semantics described here.
 
 The monitor should:
 
@@ -349,9 +352,8 @@ The monitor should:
 - create a new publication when required
 - retry the same publication with the same `publish_uid` when appropriate
 
-Because phase 2 is allowed to revisit significant details, the implementation
-agent may refactor phase-1 monitor internals if the v1 publication model is too
-entangled with scheduling/runtime code.
+The remaining runtime work can still refactor monitor internals, but it should
+continue treating the v2 publication layer as fixed.
 
 ## Backfill Integration
 
