@@ -258,6 +258,18 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+fn parent_pid_for_logs() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() as u32 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 async fn try_create_activity_lock(path: &Path, record: &ActivityLockRecord) -> Result<bool> {
     let mut opts = tokio::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -996,23 +1008,54 @@ async fn run_install_with_updated_binary(preserve_disable_state: bool) -> Result
 }
 
 async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> Result<()> {
+    let xpc_service_name = std::env::var("XPC_SERVICE_NAME").ok();
+    ::tracing::info!(
+        event = "post_self_replace_install_handoff_start",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        exe = exe_path.display().to_string(),
+        preserve_disable_state,
+        xpc_service_name = xpc_service_name.as_deref().unwrap_or("")
+    );
     let mut command = Command::new(exe_path);
     command.arg("install");
     if preserve_disable_state {
         command.arg("--preserve-disable-state");
     }
-    let status = command
+    let mut child = command
         .env(PASSIVE_CHECK_ENV_VAR, "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
-        .await
+        .spawn()
         .with_context(|| {
             format!(
                 "failed to launch bootstrap install with {}",
                 exe_path.display()
             )
         })?;
+    ::tracing::info!(
+        event = "post_self_replace_install_handoff_spawned",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        child_pid = ?child.id(),
+        exe = exe_path.display().to_string(),
+        xpc_service_name = xpc_service_name.as_deref().unwrap_or("")
+    );
+    let status = child.wait().await.with_context(|| {
+        format!(
+            "failed while waiting for bootstrap install with {}",
+            exe_path.display()
+        )
+    })?;
+    ::tracing::info!(
+        event = "post_self_replace_install_handoff_finished",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        child_pid = ?child.id(),
+        status = %status,
+        success = status.success(),
+        xpc_service_name = xpc_service_name.as_deref().unwrap_or("")
+    );
 
     if status.success() {
         return Ok(());
@@ -1125,7 +1168,36 @@ async fn run_update_install_from_url_mode(
     }
 
     // Step 9: Replace running binary
+    ::tracing::info!(
+        event = "self_update_self_replace_start",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        local_version = local,
+        remote_version = remote_display,
+        replacement = new_binary.display().to_string(),
+        mode = ?mode,
+        xpc_service_name = std::env::var("XPC_SERVICE_NAME")
+            .ok()
+            .as_deref()
+            .unwrap_or("")
+    );
     self_replace_binary(&new_binary)?;
+    ::tracing::info!(
+        event = "self_update_self_replace_complete",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        local_version = local,
+        remote_version = remote_display,
+        mode = ?mode,
+        current_exe = std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        xpc_service_name = std::env::var("XPC_SERVICE_NAME")
+            .ok()
+            .as_deref()
+            .unwrap_or("")
+    );
 
     if let Err(err) = run_install_with_updated_binary(true).await {
         report_best_effort_post_upgrade_failure(

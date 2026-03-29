@@ -175,6 +175,18 @@ fn scheduler_command_line(exe_path: &Path) -> String {
     format!("\"{}\" monitor tick", exe_path.display())
 }
 
+fn parent_pid_for_logs() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() as u32 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -236,6 +248,43 @@ async fn macos_launch_agent_loaded(label: &str) -> Result<bool> {
     }
 
     bail!("launchctl print {service_target} failed: {detail}");
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_disabled_from_output(output: &str, label: &str) -> Option<bool> {
+    let needle = format!("\"{label}\" =>");
+    output.lines().find_map(|line| {
+        let (_, value) = line.split_once(&needle)?;
+        let value = value.trim();
+        if value.starts_with("disabled") || value.starts_with("true") {
+            return Some(true);
+        }
+        if value.starts_with("enabled") || value.starts_with("false") {
+            return Some(false);
+        }
+        None
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_launch_agent_disabled(label: &str) -> Result<Option<bool>> {
+    let domain = macos_launchctl_domain();
+    let output = launchctl_output(&["print-disabled", &domain]).await?;
+    if !output.status.success() {
+        bail!(
+            "launchctl print-disabled {domain} failed: {}",
+            command_failure_detail(&output)
+        );
+    }
+    Ok(macos_launch_agent_disabled_from_output(
+        &String::from_utf8_lossy(&output.stdout),
+        label,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn running_under_monitor_launch_agent() -> bool {
+    std::env::var("XPC_SERVICE_NAME").ok().as_deref() == Some(MACOS_LAUNCH_AGENT_LABEL)
 }
 
 #[cfg(target_os = "macos")]
@@ -316,6 +365,44 @@ pub async fn provision_scheduler_for_exe(exe: &Path) -> Result<SchedulerProvisio
         tokio::fs::create_dir_all(&agents_dir).await?;
         let plist = launch_agent_plist(MACOS_LAUNCH_AGENT_LABEL, exe);
         tokio::fs::write(&plist_path, plist).await?;
+        let xpc_service_name = std::env::var("XPC_SERVICE_NAME").ok();
+        let loaded_before = macos_launch_agent_loaded(MACOS_LAUNCH_AGENT_LABEL)
+            .await
+            .ok();
+        let disabled_before = macos_launch_agent_disabled(MACOS_LAUNCH_AGENT_LABEL)
+            .await
+            .ok()
+            .flatten();
+        ::tracing::info!(
+            event = "monitor_scheduler_reconcile_start",
+            pid = std::process::id(),
+            ppid = parent_pid_for_logs(),
+            exe = exe.display().to_string(),
+            plist = plist_path.display().to_string(),
+            xpc_service_name = xpc_service_name.as_deref().unwrap_or(""),
+            loaded_before = ?loaded_before,
+            disabled_before = ?disabled_before
+        );
+
+        if running_under_monitor_launch_agent() {
+            ::tracing::warn!(
+                event = "monitor_scheduler_reconcile_deferred_for_active_job",
+                pid = std::process::id(),
+                ppid = parent_pid_for_logs(),
+                plist = plist_path.display().to_string(),
+                xpc_service_name = xpc_service_name.as_deref().unwrap_or(""),
+                loaded_before = ?loaded_before,
+                disabled_before = ?disabled_before,
+                reason = "running under active monitor LaunchAgent; skipping launchctl unload/load"
+            );
+            return Ok(SchedulerProvisionResult {
+                configured: true,
+                description: format!(
+                    "LaunchAgent {} updated on disk; reload deferred for active monitor job",
+                    plist_path.display()
+                ),
+            });
+        }
 
         if let Ok(output) = launchctl_file_operation("unload", &plist_path).await
             && !output.status.success()
@@ -329,8 +416,27 @@ pub async fn provision_scheduler_for_exe(exe: &Path) -> Result<SchedulerProvisio
                 );
             }
         }
+        let disabled_after_unload = macos_launch_agent_disabled(MACOS_LAUNCH_AGENT_LABEL)
+            .await
+            .ok()
+            .flatten();
+        ::tracing::info!(
+            event = "monitor_scheduler_reconcile_after_unload",
+            pid = std::process::id(),
+            ppid = parent_pid_for_logs(),
+            plist = plist_path.display().to_string(),
+            disabled_after_unload = ?disabled_after_unload
+        );
 
         let load = launchctl_file_operation("load", &plist_path).await?;
+        ::tracing::info!(
+            event = "monitor_scheduler_reconcile_after_load",
+            pid = std::process::id(),
+            ppid = parent_pid_for_logs(),
+            plist = plist_path.display().to_string(),
+            load_status = %load.status,
+            load_detail = command_failure_detail(&load)
+        );
         if !load.status.success() {
             bail!(
                 "launchctl load failed for {}: {}",
@@ -345,6 +451,17 @@ pub async fn provision_scheduler_for_exe(exe: &Path) -> Result<SchedulerProvisio
                 plist_path.display()
             );
         }
+        let disabled_after_load = macos_launch_agent_disabled(MACOS_LAUNCH_AGENT_LABEL)
+            .await
+            .ok()
+            .flatten();
+        ::tracing::info!(
+            event = "monitor_scheduler_reconcile_verified",
+            pid = std::process::id(),
+            ppid = parent_pid_for_logs(),
+            plist = plist_path.display().to_string(),
+            disabled_after_load = ?disabled_after_load
+        );
 
         return Ok(SchedulerProvisionResult {
             configured: true,
@@ -754,6 +871,44 @@ mod tests {
     use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_launch_agent_disabled_from_output_parses_enabled_and_disabled() {
+        assert_eq!(
+            macos_launch_agent_disabled_from_output(
+                "\t\t\"ai.teamcadence.cadence.monitor\" => disabled",
+                MACOS_LAUNCH_AGENT_LABEL,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            macos_launch_agent_disabled_from_output(
+                "\t\t\"ai.teamcadence.cadence.monitor\" => enabled",
+                MACOS_LAUNCH_AGENT_LABEL,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            macos_launch_agent_disabled_from_output(
+                "\t\t\"some.other.label\" => enabled",
+                MACOS_LAUNCH_AGENT_LABEL,
+            ),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn running_under_monitor_launch_agent_detects_matching_xpc_service_name() {
+        let guard = EnvGuard::new("XPC_SERVICE_NAME");
+        guard.set_str(MACOS_LAUNCH_AGENT_LABEL);
+        assert!(running_under_monitor_launch_agent());
+
+        guard.set_str("some.other.label");
+        assert!(!running_under_monitor_launch_agent());
+    }
 
     #[tokio::test]
     #[serial]
