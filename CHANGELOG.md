@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.2...v2.2.3) (2026-03-29)
+
+
+### Bug Fixes
+
+* **backfill:** skip auth-blocked recovery work ([8c6bb5f](https://github.com/TeamCadenceAI/cadence-cli/commit/8c6bb5f4b55d178f7624be007163e4abfc3502a1))
+* skip auth-blocked recovery backfills ([c7cbcbe](https://github.com/TeamCadenceAI/cadence-cli/commit/c7cbcbe603a7a1610189aa2a9f5ba77251abfe71))
+
 ## [2.2.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.1...v2.2.2) (2026-03-29)
 
 
