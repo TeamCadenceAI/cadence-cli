@@ -406,8 +406,19 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
             "Recovery",
             &format!("backfill --since {}", VERSION_BOOTSTRAP_BACKFILL_SINCE),
         );
-        match crate::run_backfill_inner(VERSION_BOOTSTRAP_BACKFILL_SINCE, None).await {
-            Ok(()) => log_bootstrap_stage("automatic recovery backfill finished (success=true)"),
+        match crate::run_backfill_inner_with_invocation(
+            VERSION_BOOTSTRAP_BACKFILL_SINCE,
+            None,
+            crate::BackfillInvocation::RecoveryBootstrap,
+        )
+        .await
+        {
+            Ok(crate::BackfillOutcome::Completed) => {
+                log_bootstrap_stage("automatic recovery backfill finished (success=true)")
+            }
+            Ok(crate::BackfillOutcome::SkippedAuth) => {
+                log_bootstrap_stage("automatic recovery backfill finished (success=skipped_auth)")
+            }
             Err(err) => {
                 output::note(&format!(
                     "Automatic recovery backfill did not complete ({err:#})"
