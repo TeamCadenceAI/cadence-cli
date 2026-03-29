@@ -76,6 +76,8 @@ const UPDATE_RETRY_BASE_SECS: u64 = 60;
 const UPDATE_RETRY_MAX_SECS: u64 = 8 * 60 * 60;
 const UPDATER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UPDATER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(target_os = "linux")]
+const SYSTEMD_HELPER_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActivityLockRecord {
@@ -152,6 +154,8 @@ struct UpdateInstallManifest {
     staged_cadence_path: PathBuf,
     final_cadence_path: PathBuf,
     wait_for_pid: u32,
+    #[serde(default)]
+    wait_for_pid_started_at_epoch: Option<u64>,
     preserve_disable_state: bool,
     mode: InstallMode,
 }
@@ -161,8 +165,36 @@ struct UpdateInProgressRecord {
     target_version: String,
     final_cadence_path: PathBuf,
     initiator_pid: u32,
+    #[serde(default)]
+    initiator_started_at_epoch: Option<u64>,
     helper_pid: Option<u32>,
+    #[serde(default)]
+    helper_started_at_epoch: Option<u64>,
+    #[serde(default)]
+    helper_systemd_unit: Option<String>,
     created_at_epoch: i64,
+}
+
+#[derive(Debug)]
+struct UpdaterHelperLaunch {
+    child: Option<tokio::process::Child>,
+    helper_pid: Option<u32>,
+    helper_started_at_epoch: Option<u64>,
+    helper_systemd_unit: Option<String>,
+}
+
+impl UpdaterHelperLaunch {
+    async fn abort(mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(unit_name) = self.helper_systemd_unit.as_deref() {
+            stop_systemd_user_unit(unit_name).await;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +477,140 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+fn pid_matches_recorded_process_start(pid: u32, expected_start: Option<u64>) -> bool {
+    if !is_pid_alive(pid) {
+        return false;
+    }
+    match expected_start {
+        Some(expected) => process_started_at_epoch(pid) == Some(expected),
+        None => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn running_under_systemd_unit() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn sanitize_systemd_unit_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn updater_systemd_unit_name(target_version: &str) -> String {
+    format!(
+        "cadence-updater-{}-{}-{}.service",
+        sanitize_systemd_unit_component(normalize_version_tag(target_version)),
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_user_unit_property(unit_name: &str, property: &str) -> Result<Option<String>> {
+    let output = tokio::time::timeout(
+        SYSTEMD_HELPER_QUERY_TIMEOUT,
+        Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--value",
+                "--property",
+                property,
+                unit_name,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .with_context(|| {
+        format!("timed out querying systemd user unit property {property} for {unit_name}")
+    })?
+    .with_context(|| format!("failed to query systemd user unit property {property}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(value))
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_user_unit_main_pid(unit_name: &str) -> Result<Option<u32>> {
+    let Some(value) = systemd_user_unit_property(unit_name, "MainPID").await? else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .with_context(|| format!("failed to parse systemd MainPID '{trimmed}' for {unit_name}"))
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_user_unit_is_active(unit_name: &str) -> bool {
+    match systemd_user_unit_property(unit_name, "ActiveState").await {
+        Ok(Some(state)) => matches!(state.as_str(), "active" | "activating" | "reloading"),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_systemd_user_unit_main_pid(
+    unit_name: &str,
+    timeout: Duration,
+) -> Result<Option<u32>> {
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Some(pid) = systemd_user_unit_main_pid(unit_name).await? {
+            return Ok(Some(pid));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        tokio::time::sleep(UPDATER_WAIT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn stop_systemd_user_unit(unit_name: &str) {
+    let _ = tokio::time::timeout(
+        SYSTEMD_HELPER_QUERY_TIMEOUT,
+        Command::new("systemctl")
+            .args(["--user", "stop", unit_name])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+}
+
 fn parent_pid_for_logs() -> u32 {
     #[cfg(unix)]
     {
@@ -526,7 +692,23 @@ async fn current_update_in_progress_record() -> Result<Option<UpdateInProgressRe
     let Some(record) = load_update_in_progress_record(&path).await? else {
         return Ok(None);
     };
-    if is_pid_alive(record.initiator_pid) || record.helper_pid.is_some_and(is_pid_alive) {
+    let initiator_active =
+        pid_matches_recorded_process_start(record.initiator_pid, record.initiator_started_at_epoch);
+    let helper_active = record
+        .helper_pid
+        .is_some_and(|pid| pid_matches_recorded_process_start(pid, record.helper_started_at_epoch));
+    #[cfg(target_os = "linux")]
+    let helper_unit_active = if helper_active {
+        false
+    } else if let Some(unit_name) = record.helper_systemd_unit.as_deref() {
+        systemd_user_unit_is_active(unit_name).await
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "linux"))]
+    let helper_unit_active = false;
+
+    if initiator_active || helper_active || helper_unit_active {
         return Ok(Some(record));
     }
     let _ = tokio::fs::remove_file(&path).await;
@@ -1258,13 +1440,17 @@ async fn maybe_remove_staging_dir(manifest_path: &Path) {
     }
 }
 
-async fn wait_for_pid_to_exit(pid: u32, timeout: Duration) -> Result<()> {
+async fn wait_for_pid_to_exit(
+    pid: u32,
+    expected_start: Option<u64>,
+    timeout: Duration,
+) -> Result<()> {
     if pid == 0 {
         return Ok(());
     }
 
     let started = tokio::time::Instant::now();
-    while is_pid_alive(pid) {
+    while pid_matches_recorded_process_start(pid, expected_start) {
         if started.elapsed() >= timeout {
             bail!("timed out waiting for cadence process {pid} to exit");
         }
@@ -1288,7 +1474,7 @@ fn normalize_process_path_key(path: &Path) -> String {
     }
 }
 
-fn pids_for_executable_path(exe_path: &Path) -> Vec<u32> {
+fn processes_for_executable_path(exe_path: &Path) -> Vec<(u32, Option<u64>)> {
     let expected = normalize_process_path_key(exe_path);
     let mut system = System::new();
     system.refresh_processes();
@@ -1297,29 +1483,41 @@ fn pids_for_executable_path(exe_path: &Path) -> Vec<u32> {
         .iter()
         .filter_map(|(pid, process)| {
             let exe = process.exe()?;
-            (normalize_process_path_key(exe) == expected).then_some(pid.as_u32())
+            (normalize_process_path_key(exe) == expected)
+                .then_some((pid.as_u32(), Some(process.start_time())))
         })
         .collect()
 }
 
 async fn wait_for_executable_path_to_quiesce(
     exe_path: &Path,
-    ignored_pids: &[u32],
+    ignored_processes: &[(u32, Option<u64>)],
     timeout: Duration,
 ) -> Result<()> {
     let exe = exe_path.to_path_buf();
-    let ignored = ignored_pids.to_vec();
+    let ignored = ignored_processes.to_vec();
     let started = tokio::time::Instant::now();
 
     loop {
         let exe_for_scan = exe.clone();
-        let running_pids =
-            tokio::task::spawn_blocking(move || pids_for_executable_path(&exe_for_scan))
+        let running_processes =
+            tokio::task::spawn_blocking(move || processes_for_executable_path(&exe_for_scan))
                 .await
                 .context("failed to inspect running cadence processes")?;
-        let live_matches: Vec<u32> = running_pids
+        let live_matches: Vec<u32> = running_processes
             .into_iter()
-            .filter(|pid| !ignored.contains(pid))
+            .filter(|(pid, started_at_epoch)| {
+                !ignored
+                    .iter()
+                    .any(|(ignored_pid, ignored_started_at_epoch)| {
+                        *pid == *ignored_pid
+                            && match ignored_started_at_epoch {
+                                Some(expected) => *started_at_epoch == Some(*expected),
+                                None => true,
+                            }
+                    })
+            })
+            .map(|(pid, _)| pid)
             .collect();
         if live_matches.is_empty() {
             return Ok(());
@@ -1507,27 +1705,100 @@ async fn prepare_updater_helper_launch_path(
     Ok(helper_path.to_path_buf())
 }
 
-async fn launch_updater_helper(
-    helper_path: &Path,
+#[cfg(unix)]
+fn configure_unix_detached_spawn(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+async fn launch_updater_helper_as_child(
+    launch_path: &Path,
     manifest_path: &Path,
-    target_version: &str,
-) -> Result<tokio::process::Child> {
-    let launch_path = prepare_updater_helper_launch_path(helper_path, target_version).await?;
-    let child = Command::new(&launch_path)
+) -> Result<UpdaterHelperLaunch> {
+    let mut command = Command::new(launch_path);
+    command
         .arg("--manifest")
         .arg(manifest_path)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    configure_unix_detached_spawn(&mut command);
+    let child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch updater helper {} with manifest {}",
+            launch_path.display(),
+            manifest_path.display()
+        )
+    })?;
+    let helper_pid = child.id();
+    Ok(UpdaterHelperLaunch {
+        child: Some(child),
+        helper_pid,
+        helper_started_at_epoch: helper_pid.and_then(process_started_at_epoch),
+        helper_systemd_unit: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn launch_updater_helper_via_systemd(
+    launch_path: &Path,
+    manifest_path: &Path,
+    target_version: &str,
+) -> Result<UpdaterHelperLaunch> {
+    let unit_name = updater_systemd_unit_name(target_version);
+    let output = Command::new("systemd-run")
+        .args(["--user", "--quiet", "--collect", "--unit", &unit_name])
+        .arg(launch_path)
+        .arg("--manifest")
+        .arg(manifest_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
         .with_context(|| {
             format!(
-                "failed to launch updater helper {} with manifest {}",
-                launch_path.display(),
+                "failed to launch detached updater helper via systemd-run for manifest {}",
                 manifest_path.display()
             )
         })?;
-    Ok(child)
+    if !output.status.success() {
+        bail!(
+            "failed to launch detached updater helper via systemd-run: {}",
+            command_failure_detail(&output)
+        );
+    }
+
+    let helper_pid = wait_for_systemd_user_unit_main_pid(&unit_name, UPDATER_WAIT_TIMEOUT).await?;
+    Ok(UpdaterHelperLaunch {
+        child: None,
+        helper_pid,
+        helper_started_at_epoch: helper_pid.and_then(process_started_at_epoch),
+        helper_systemd_unit: Some(unit_name),
+    })
+}
+
+async fn launch_updater_helper(
+    helper_path: &Path,
+    manifest_path: &Path,
+    target_version: &str,
+) -> Result<UpdaterHelperLaunch> {
+    let launch_path = prepare_updater_helper_launch_path(helper_path, target_version).await?;
+
+    #[cfg(target_os = "linux")]
+    if running_under_systemd_unit() {
+        return launch_updater_helper_via_systemd(&launch_path, manifest_path, target_version)
+            .await;
+    }
+
+    launch_updater_helper_as_child(&launch_path, manifest_path).await
 }
 
 #[cfg(windows)]
@@ -1591,11 +1862,19 @@ async fn run_updater_helper_with_manifest(manifest: &UpdateInstallManifest) -> R
         mode = ?manifest.mode
     );
 
-    wait_for_pid_to_exit(manifest.wait_for_pid, UPDATER_WAIT_TIMEOUT).await?;
+    wait_for_pid_to_exit(
+        manifest.wait_for_pid,
+        manifest.wait_for_pid_started_at_epoch,
+        UPDATER_WAIT_TIMEOUT,
+    )
+    .await?;
     let activity_guard = acquire_activity_lock_blocking("update-helper-install").await?;
     wait_for_executable_path_to_quiesce(
         &manifest.final_cadence_path,
-        &[manifest.wait_for_pid],
+        &[(
+            manifest.wait_for_pid,
+            manifest.wait_for_pid_started_at_epoch,
+        )],
         UPDATER_WAIT_TIMEOUT,
     )
     .await?;
@@ -1851,7 +2130,10 @@ async fn run_update_install_from_url_mode(
         target_version: remote_display.to_string(),
         final_cadence_path: current_exe.clone(),
         initiator_pid: std::process::id(),
+        initiator_started_at_epoch: current_process_started_at_epoch(),
         helper_pid: None,
+        helper_started_at_epoch: None,
+        helper_systemd_unit: None,
         created_at_epoch: now_epoch(),
     };
     write_update_in_progress_record(&update_record).await?;
@@ -1898,6 +2180,7 @@ async fn run_update_install_from_url_mode(
             staged_cadence_path: payload.cadence_binary.clone(),
             final_cadence_path: current_exe.clone(),
             wait_for_pid: std::process::id(),
+            wait_for_pid_started_at_epoch: current_process_started_at_epoch(),
             preserve_disable_state: true,
             mode,
         };
@@ -1920,26 +2203,25 @@ async fn run_update_install_from_url_mode(
                 .as_deref()
                 .unwrap_or("")
         );
-        let mut helper_child =
+        let helper_launch =
             match launch_updater_helper(&payload.updater_binary, &manifest_path, remote_display).await {
-                Ok(child) => child,
+                Ok(launch) => launch,
                 Err(err) => {
                     maybe_remove_staging_dir(&manifest_path).await;
                     return Err(err);
                 }
             };
-        let helper_pid = helper_child.id().unwrap_or_default();
         let helper_record = UpdateInProgressRecord {
-            helper_pid: Some(helper_pid),
+            helper_pid: helper_launch.helper_pid,
+            helper_started_at_epoch: helper_launch.helper_started_at_epoch,
+            helper_systemd_unit: helper_launch.helper_systemd_unit.clone(),
             ..update_record.clone()
         };
         if let Err(err) = write_update_in_progress_record(&helper_record).await {
-            let _ = helper_child.kill().await;
-            let _ = helper_child.wait().await;
+            helper_launch.abort().await;
             maybe_remove_staging_dir(&manifest_path).await;
             return Err(err).context("failed to persist updater helper pid");
         }
-        drop(helper_child);
         ::tracing::info!(
             event = "self_update_helper_launch_complete",
             pid = std::process::id(),
@@ -1947,7 +2229,8 @@ async fn run_update_install_from_url_mode(
             local_version = local,
             remote_version = remote_display,
             mode = ?mode,
-            helper_pid,
+            helper_pid = helper_record.helper_pid.unwrap_or_default(),
+            helper_systemd_unit = helper_record.helper_systemd_unit.as_deref().unwrap_or(""),
             manifest = manifest_path.display().to_string(),
             current_exe = current_exe.display().to_string(),
             xpc_service_name = std::env::var("XPC_SERVICE_NAME")
@@ -1958,7 +2241,11 @@ async fn run_update_install_from_url_mode(
 
         if matches!(mode, InstallMode::Interactive) {
             println!(
-                "Staged cadence v{local} → v{remote_display}. cadence-updater (pid {helper_pid}) will finish installation after this process exits."
+                "Staged cadence v{local} → v{remote_display}. cadence-updater{} will finish installation after this process exits.",
+                helper_record
+                    .helper_pid
+                    .map(|pid| format!(" (pid {pid})"))
+                    .unwrap_or_default()
             );
         }
 
@@ -3876,7 +4163,10 @@ mod tests {
                 .join("install")
                 .join(cadence_binary_name(build_target())),
             initiator_pid: 0,
+            initiator_started_at_epoch: None,
             helper_pid: Some(helper_pid),
+            helper_started_at_epoch: process_started_at_epoch(helper_pid),
+            helper_systemd_unit: None,
             created_at_epoch: now_epoch(),
         })
         .await
@@ -3910,7 +4200,10 @@ mod tests {
                 .join("install")
                 .join(cadence_binary_name(build_target())),
             initiator_pid: 0,
+            initiator_started_at_epoch: None,
             helper_pid: Some(0),
+            helper_started_at_epoch: None,
+            helper_systemd_unit: None,
             created_at_epoch: now_epoch(),
         })
         .await
@@ -3926,6 +4219,61 @@ mod tests {
                 .expect("reload update marker")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn update_in_progress_marker_is_reclaimed_on_pid_start_time_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let mut child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn marker child")
+        } else {
+            Command::new("sh")
+                .args(["-c", "sleep 0.4"])
+                .spawn()
+                .expect("spawn marker child")
+        };
+        let helper_pid = child.id().expect("child pid");
+        let mismatched_start = process_started_at_epoch(helper_pid)
+            .map(|value| value.saturating_add(1))
+            .or(Some(1));
+        write_update_in_progress_record(&UpdateInProgressRecord {
+            target_version: "9.9.9".to_string(),
+            final_cadence_path: tmp
+                .path()
+                .join("install")
+                .join(cadence_binary_name(build_target())),
+            initiator_pid: 0,
+            initiator_started_at_epoch: None,
+            helper_pid: Some(helper_pid),
+            helper_started_at_epoch: mismatched_start,
+            helper_systemd_unit: None,
+            created_at_epoch: now_epoch(),
+        })
+        .await
+        .expect("write stale marker");
+
+        let active = current_update_in_progress_record()
+            .await
+            .expect("load update marker");
+        assert!(
+            active.is_none(),
+            "mismatched pid start time should clear marker"
+        );
+        assert!(
+            load_update_in_progress_record(&update_in_progress_path().expect("marker path"))
+                .await
+                .expect("reload update marker")
+                .is_none()
+        );
+
+        child.wait().await.expect("wait marker child");
     }
 
     #[tokio::test]
@@ -3957,6 +4305,182 @@ mod tests {
             launch_path.starts_with(updater_helper_runtime_root()),
             "helper launch path should live under the helper runtime root"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    async fn launch_updater_helper_uses_systemd_run_when_running_inside_systemd_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_guard = EnvGuard::new("PATH");
+        let invocation_guard = EnvGuard::new("INVOCATION_ID");
+        invocation_guard.set("test-invocation");
+
+        let bin_dir = tmp.path().join("bin");
+        let pid_dir = tmp.path().join("pids");
+        tokio::fs::create_dir_all(&bin_dir)
+            .await
+            .expect("create fake bin dir");
+        tokio::fs::create_dir_all(&pid_dir)
+            .await
+            .expect("create pid dir");
+
+        let helper_started = tmp.path().join("helper-started");
+        let helper_path = tmp.path().join("cadence-updater");
+        tokio::fs::write(
+            &helper_path,
+            format!(
+                "#!/bin/sh\n\
+                 touch '{}'\n\
+                 sleep 0.5\n",
+                helper_started.display()
+            ),
+        )
+        .await
+        .expect("write fake helper");
+        set_executable_permissions(&helper_path)
+            .await
+            .expect("chmod fake helper");
+
+        let systemd_run_path = bin_dir.join("systemd-run");
+        tokio::fs::write(
+            &systemd_run_path,
+            format!(
+                "#!/bin/sh\n\
+                 unit=\"\"\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                   case \"$1\" in\n\
+                     --user|--quiet|--collect)\n\
+                       shift\n\
+                       ;;\n\
+                     --unit)\n\
+                       unit=\"$2\"\n\
+                       shift 2\n\
+                       ;;\n\
+                     *)\n\
+                       break\n\
+                       ;;\n\
+                   esac\n\
+                 done\n\
+                 if [ -z \"$unit\" ]; then\n\
+                   echo \"missing unit\" >&2\n\
+                   exit 1\n\
+                 fi\n\
+                 \"$@\" &\n\
+                 pid=$!\n\
+                 printf '%s\\n' \"$pid\" > '{}/'$unit\n",
+                pid_dir.display()
+            ),
+        )
+        .await
+        .expect("write fake systemd-run");
+        set_executable_permissions(&systemd_run_path)
+            .await
+            .expect("chmod fake systemd-run");
+
+        let systemctl_path = bin_dir.join("systemctl");
+        tokio::fs::write(
+            &systemctl_path,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" != \"--user\" ]; then\n\
+                   exit 1\n\
+                 fi\n\
+                 shift\n\
+                 case \"$1\" in\n\
+                   show)\n\
+                     shift\n\
+                     if [ \"$1\" != \"--value\" ] || [ \"$2\" != \"--property\" ]; then\n\
+                       exit 1\n\
+                     fi\n\
+                     prop=\"$3\"\n\
+                     unit=\"$4\"\n\
+                     pid_file='{pid_dir}/'$unit\n\
+                     case \"$prop\" in\n\
+                       MainPID)\n\
+                         if [ -f \"$pid_file\" ]; then\n\
+                           cat \"$pid_file\"\n\
+                         else\n\
+                           echo 0\n\
+                         fi\n\
+                         ;;\n\
+                       ActiveState)\n\
+                         if [ -f \"$pid_file\" ] && kill -0 \"$(cat \"$pid_file\")\" 2>/dev/null; then\n\
+                           echo active\n\
+                         else\n\
+                           echo inactive\n\
+                         fi\n\
+                         ;;\n\
+                       *)\n\
+                         echo \"\"\n\
+                         ;;\n\
+                     esac\n\
+                     ;;\n\
+                   stop)\n\
+                     shift\n\
+                     unit=\"$1\"\n\
+                     pid_file='{pid_dir}/'$unit\n\
+                     if [ -f \"$pid_file\" ]; then\n\
+                       kill \"$(cat \"$pid_file\")\" 2>/dev/null || true\n\
+                     fi\n\
+                     ;;\n\
+                   *)\n\
+                     exit 1\n\
+                     ;;\n\
+                 esac\n",
+                pid_dir = pid_dir.display()
+            ),
+        )
+        .await
+        .expect("write fake systemctl");
+        set_executable_permissions(&systemctl_path)
+            .await
+            .expect("chmod fake systemctl");
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        path_guard.set(&format!("{}:{original_path}", bin_dir.display()));
+
+        let manifest_path = tmp.path().join("install-manifest.json");
+        tokio::fs::write(&manifest_path, b"{}")
+            .await
+            .expect("write fake manifest");
+
+        let launch = launch_updater_helper(&helper_path, &manifest_path, "9.9.9")
+            .await
+            .expect("launch helper via fake systemd");
+        assert!(
+            launch.child.is_none(),
+            "systemd launch should not retain a child handle"
+        );
+        assert!(
+            launch
+                .helper_systemd_unit
+                .as_deref()
+                .is_some_and(|unit| unit.starts_with("cadence-updater-9-9-9-")),
+            "unexpected systemd unit: {:?}",
+            launch.helper_systemd_unit
+        );
+        let helper_pid = launch.helper_pid.expect("helper pid from systemd");
+        assert_eq!(
+            launch.helper_started_at_epoch,
+            process_started_at_epoch(helper_pid)
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !helper_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("helper should start");
+
+        wait_for_pid_to_exit(
+            helper_pid,
+            launch.helper_started_at_epoch,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("wait for fake helper exit");
     }
 
     #[tokio::test]
@@ -4094,6 +4618,7 @@ mod tests {
             staged_cadence_path: tmp.path().join("staged").join("cadence"),
             final_cadence_path: tmp.path().join("install").join("cadence"),
             wait_for_pid: 4242,
+            wait_for_pid_started_at_epoch: Some(123),
             preserve_disable_state: true,
             mode: InstallMode::SilentUnattended,
         };
@@ -4122,9 +4647,10 @@ mod tests {
         };
 
         let pid = child.id().expect("child pid");
+        let pid_started_at = process_started_at_epoch(pid);
         let reap_child =
             tokio::spawn(async move { child.wait().await.expect("wait child status") });
-        wait_for_pid_to_exit(pid, Duration::from_secs(5))
+        wait_for_pid_to_exit(pid, pid_started_at, Duration::from_secs(5))
             .await
             .expect("wait for child exit");
         let status = reap_child.await.expect("join child wait");
@@ -4143,6 +4669,7 @@ mod tests {
             staged_cadence_path: tmp.path().join("staged").join("cadence"),
             final_cadence_path: tmp.path().join("install").join("cadence"),
             wait_for_pid: 0,
+            wait_for_pid_started_at_epoch: None,
             preserve_disable_state: true,
             mode: InstallMode::Interactive,
         };
