@@ -478,43 +478,41 @@ fn advance_cursor_for_disposition(
 fn apply_monitor_incremental_upload_outcome(
     stats: &mut MonitorTickSummary,
     cursor_advance: &mut IncrementalCursor,
-    cursor_blocked: &mut bool,
     log_mtime: Option<i64>,
     log_source_label: &str,
     outcome: UploadFromLogOutcome,
 ) {
-    let maybe_advance = |cursor_advance: &mut IncrementalCursor| {
-        maybe_advance_monitor_cursor(cursor_advance, *cursor_blocked, log_mtime, log_source_label);
+    let advance = |cursor_advance: &mut IncrementalCursor| {
+        *cursor_advance =
+            advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
     };
     match outcome {
         UploadFromLogOutcome::Uploaded => {
             stats.uploaded += 1;
-            maybe_advance(cursor_advance);
+            advance(cursor_advance);
         }
         UploadFromLogOutcome::AlreadyExists => {
             stats.skipped += 1;
-            maybe_advance(cursor_advance);
+            advance(cursor_advance);
         }
         UploadFromLogOutcome::Queued(_) => {
             stats.queued += 1;
-            maybe_advance(cursor_advance);
+            advance(cursor_advance);
         }
         UploadFromLogOutcome::Retryable(_) => {
             stats.issues += 1;
-            *cursor_blocked = true;
+            advance(cursor_advance);
         }
     }
 }
 
-fn maybe_advance_monitor_cursor(
+fn apply_monitor_org_filter_error(
+    stats: &mut MonitorTickSummary,
     cursor_advance: &mut IncrementalCursor,
-    cursor_blocked: bool,
     log_mtime: Option<i64>,
     log_source_label: &str,
 ) {
-    if cursor_blocked {
-        return;
-    }
+    stats.issues += 1;
     *cursor_advance = advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
 }
 
@@ -627,15 +625,6 @@ async fn upload_session_from_log(
         .await
         .ok()
         .flatten();
-    let remote_urls = match git::remote_urls_at(repo_root).await {
-        Ok(urls) => urls,
-        Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
-    };
-    let canonical_remote_url = git::preferred_remote_url_at(repo_root)
-        .await
-        .ok()
-        .flatten()
-        .or_else(|| remote_urls.first().cloned());
     let worktree_roots = git::repo_and_worktree_roots_at(repo_root).await;
     let (git_ref, head_commit_sha) = match mode {
         PublicationMode::Live => (
@@ -644,34 +633,67 @@ async fn upload_session_from_log(
         ),
         PublicationMode::Backfill => (None, None),
     };
-
-    let Some(canonical_remote_url) = canonical_remote_url else {
-        let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
+    let build_observed_upload =
+        |canonical_remote_url: String, remote_urls: Vec<String>| upload::ObservedSessionUpload {
             logical_session: publication::LogicalSessionKey {
                 agent: agent.to_string(),
-                agent_session_id: session_id,
+                agent_session_id: session_id.clone(),
             },
             observations: publication::PublicationObservations {
-                canonical_remote_url: String::new(),
+                canonical_remote_url,
                 remote_urls,
                 canonical_repo_root: repo_root_str.to_string(),
-                worktree_roots,
+                worktree_roots: worktree_roots.clone(),
                 cwd: parsed
                     .metadata
                     .cwd
                     .clone()
                     .or_else(|| Some(repo_root_str.to_string())),
-                git_ref,
-                head_commit_sha,
-                git_user_email,
-                git_user_name,
+                git_ref: git_ref.clone(),
+                head_commit_sha: head_commit_sha.clone(),
+                git_user_email: git_user_email.clone(),
+                git_user_name: git_user_name.clone(),
                 cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             },
             raw_session_content: parsed.session_log.clone(),
-        }) {
-            Ok(prepared) => prepared,
-            Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
         };
+
+    let remote_urls = match git::remote_urls_at(repo_root).await {
+        Ok(urls) => urls,
+        Err(err) => {
+            let prepared = match upload::prepare_session_upload(build_observed_upload(
+                String::new(),
+                Vec::new(),
+            )) {
+                Ok(prepared) => prepared,
+                Err(prepare_err) => {
+                    return UploadFromLogOutcome::Retryable(prepare_err.to_string());
+                }
+            };
+            let reason = err.to_string();
+            if let Err(persist_err) =
+                upload::persist_retryable_prepared_session(&prepared, &reason).await
+            {
+                return UploadFromLogOutcome::Retryable(format!(
+                    "{reason}; failed to persist retryable state: {persist_err}"
+                ));
+            }
+            return UploadFromLogOutcome::Retryable(reason);
+        }
+    };
+    let canonical_remote_url = git::preferred_remote_url_at(repo_root)
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| remote_urls.first().cloned());
+
+    let Some(canonical_remote_url) = canonical_remote_url else {
+        let prepared =
+            match upload::prepare_session_upload(build_observed_upload(String::new(), remote_urls))
+            {
+                Ok(prepared) => prepared,
+                Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
+            };
         return match upload::upload_or_queue_prepared_session(context, &prepared).await {
             Ok(upload::LiveUploadOutcome::Queued { reason }) => {
                 UploadFromLogOutcome::Queued(reason)
@@ -684,29 +706,10 @@ async fn upload_session_from_log(
         };
     };
 
-    let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
-        logical_session: publication::LogicalSessionKey {
-            agent: agent.to_string(),
-            agent_session_id: session_id,
-        },
-        observations: publication::PublicationObservations {
-            canonical_remote_url,
-            remote_urls,
-            canonical_repo_root: repo_root_str.to_string(),
-            worktree_roots,
-            cwd: parsed
-                .metadata
-                .cwd
-                .clone()
-                .or_else(|| Some(repo_root_str.to_string())),
-            git_ref,
-            head_commit_sha,
-            git_user_email,
-            git_user_name,
-            cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        },
-        raw_session_content: parsed.session_log.clone(),
-    }) {
+    let prepared = match upload::prepare_session_upload(build_observed_upload(
+        canonical_remote_url,
+        remote_urls,
+    )) {
         Ok(prepared) => prepared,
         Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
     };
@@ -1569,20 +1572,13 @@ async fn upload_incremental_sessions_globally(
         ..MonitorTickSummary::default()
     };
     let mut cursor_advance = initial_cursor.clone();
-    // Once a session needs retry, keep scanning but stop advancing the global cursor
-    // so the blocked item is retried on the next monitor tick.
-    let mut cursor_blocked = false;
 
     for parsed in parsed_logs {
         let log_mtime = parsed.log.updated_at;
         let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
-            maybe_advance_monitor_cursor(
-                &mut cursor_advance,
-                cursor_blocked,
-                log_mtime,
-                &log_source_label,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -1596,12 +1592,8 @@ async fn upload_incremental_sessions_globally(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
-            maybe_advance_monitor_cursor(
-                &mut cursor_advance,
-                cursor_blocked,
-                log_mtime,
-                &log_source_label,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
 
@@ -1613,12 +1605,8 @@ async fn upload_incremental_sessions_globally(
             enabled
         };
         if !repo_enabled {
-            maybe_advance_monitor_cursor(
-                &mut cursor_advance,
-                cursor_blocked,
-                log_mtime,
-                &log_source_label,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         }
 
@@ -1627,9 +1615,25 @@ async fn upload_incremental_sessions_globally(
         } else {
             let matches = match git::repo_matches_org_filter(&resolved_repo).await {
                 Ok(matches) => matches,
-                Err(_) => {
-                    stats.issues += 1;
-                    cursor_blocked = true;
+                Err(err) => {
+                    output::detail(&format!(
+                        "{}: org filter check failed: {}",
+                        resolved_repo.display(),
+                        err
+                    ));
+                    ::tracing::warn!(
+                        event = "monitor_discovery_skipped",
+                        repo_root = resolved_repo.to_string_lossy().as_ref(),
+                        source_label = log_source_label.as_str(),
+                        stage = "org_filter_check",
+                        error = err.to_string()
+                    );
+                    apply_monitor_org_filter_error(
+                        &mut stats,
+                        &mut cursor_advance,
+                        log_mtime,
+                        &log_source_label,
+                    );
                     continue;
                 }
             };
@@ -1637,12 +1641,8 @@ async fn upload_incremental_sessions_globally(
             matches
         };
         if !repo_matches_org {
-            maybe_advance_monitor_cursor(
-                &mut cursor_advance,
-                cursor_blocked,
-                log_mtime,
-                &log_source_label,
-            );
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         }
 
@@ -1658,7 +1658,6 @@ async fn upload_incremental_sessions_globally(
         apply_monitor_incremental_upload_outcome(
             &mut stats,
             &mut cursor_advance,
-            &mut cursor_blocked,
             log_mtime,
             &log_source_label,
             outcome,
@@ -3524,53 +3523,51 @@ mod tests {
     }
 
     #[test]
-    fn monitor_retryable_incremental_outcome_blocks_future_cursor_advances() {
+    fn monitor_retryable_incremental_outcome_advances_cursor_without_blocking_followups() {
         let mut stats = MonitorTickSummary::default();
         let mut cursor = IncrementalCursor {
             last_scanned_mtime_epoch: 100,
             last_scanned_source_label: Some("a".to_string()),
         };
-        let mut blocked = false;
 
         apply_monitor_incremental_upload_outcome(
             &mut stats,
             &mut cursor,
-            &mut blocked,
             Some(150),
             "b",
             UploadFromLogOutcome::Retryable("git remote failed".to_string()),
         );
 
-        assert!(blocked);
         assert_eq!(stats.issues, 1);
-        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
-        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
+        assert_eq!(cursor.last_scanned_mtime_epoch, 150);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("b"));
 
         apply_monitor_incremental_upload_outcome(
             &mut stats,
             &mut cursor,
-            &mut blocked,
             Some(200),
             "c",
             UploadFromLogOutcome::Uploaded,
         );
 
         assert_eq!(stats.uploaded, 1);
-        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
-        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
+        assert_eq!(cursor.last_scanned_mtime_epoch, 200);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("c"));
     }
 
     #[test]
-    fn monitor_retryable_block_prevents_non_applicable_cursor_advances() {
+    fn monitor_org_filter_error_advances_cursor() {
+        let mut stats = MonitorTickSummary::default();
         let mut cursor = IncrementalCursor {
             last_scanned_mtime_epoch: 100,
             last_scanned_source_label: Some("a".to_string()),
         };
 
-        maybe_advance_monitor_cursor(&mut cursor, true, Some(200), "b");
+        apply_monitor_org_filter_error(&mut stats, &mut cursor, Some(200), "b");
 
-        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
-        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
+        assert_eq!(stats.issues, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 200);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("b"));
     }
 
     #[tokio::test]
