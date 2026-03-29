@@ -15,12 +15,10 @@ mod tracing;
 mod transport;
 mod update;
 mod upload;
-mod upload_cursor;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +27,6 @@ use tokio::task::JoinSet;
 
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
-const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
 const MONITOR_LOG_RETENTION_DAYS: i64 = 14;
 static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
@@ -235,10 +232,6 @@ async fn run_install(org: Option<String>, preserve_disable_state: bool) -> Resul
     bootstrap::run_install(org, preserve_disable_state).await
 }
 
-fn normalized_repo_match_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
 async fn run_refresh_hooks() -> Result<()> {
     output::detail("Git hook refresh is no longer required.");
     output::detail(
@@ -402,43 +395,6 @@ async fn head_sha_for_repo(repo: &std::path::Path) -> Option<String> {
     git::head_sha_at(repo).await.ok().flatten()
 }
 
-fn apply_incremental_upload_outcome(
-    stats: &mut UploadRunStats,
-    cursor_advance: &mut IncrementalCursor,
-    log_mtime: Option<i64>,
-    log_source_label: &str,
-    outcome: UploadFromLogOutcome,
-) -> bool {
-    match outcome {
-        UploadFromLogOutcome::Uploaded => {
-            stats.uploaded += 1;
-            *cursor_advance =
-                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            true
-        }
-        UploadFromLogOutcome::AlreadyExists => {
-            stats.skipped += 1;
-            *cursor_advance =
-                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            true
-        }
-        UploadFromLogOutcome::Queued(_) => {
-            stats.queued += 1;
-            *cursor_advance =
-                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            true
-        }
-        UploadFromLogOutcome::Retryable(message) => {
-            stats.issues += 1;
-            if output::is_verbose() {
-                output::detail(&format!("post-commit upload retryable error: {message}"));
-            }
-            // Stop here so we do not persist a cursor past a failed candidate.
-            false
-        }
-    }
-}
-
 fn hook_discovery_concurrency() -> usize {
     std::env::var("CADENCE_HOOK_DISCOVERY_CONCURRENCY")
         .ok()
@@ -471,19 +427,6 @@ impl IncrementalCursor {
         Self {
             last_scanned_mtime_epoch,
             last_scanned_source_label,
-        }
-    }
-
-    fn from_persisted(
-        record: Option<upload_cursor::UploadCursorRecord>,
-        default_mtime_epoch: i64,
-    ) -> Self {
-        match record {
-            Some(record) => Self::from_position(
-                record.last_scanned_mtime_epoch,
-                record.last_scanned_source_label,
-            ),
-            None => Self::from_position(default_mtime_epoch, None),
         }
     }
 }
@@ -634,14 +577,6 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     out.into_iter().map(|(_, parsed)| parsed).collect()
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct UploadRunStats {
-    uploaded: usize,
-    queued: usize,
-    skipped: usize,
-    issues: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UploadFromLogOutcome {
     Uploaded,
@@ -772,94 +707,6 @@ async fn upload_session_from_log(
         Ok(upload::LiveUploadOutcome::Queued { reason }) => UploadFromLogOutcome::Queued(reason),
         Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
     }
-}
-
-async fn upload_incremental_sessions_for_repo(
-    context: &upload::UploadContext,
-    repo_root: &std::path::Path,
-    repo_root_str: &str,
-) -> Result<UploadRunStats> {
-    let repo_family_roots = git::repo_and_worktree_roots_at(repo_root)
-        .await
-        .into_iter()
-        .map(PathBuf::from)
-        .map(|path| normalized_repo_match_path(&path))
-        .collect::<std::collections::BTreeSet<_>>();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let persisted_cursor = upload_cursor::load_cursor(repo_root_str).await?;
-    let initial_cursor =
-        IncrementalCursor::from_persisted(persisted_cursor, now - POST_COMMIT_FALLBACK_WINDOW_SECS);
-    let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
-    let files = agents::discover_recent_sessions(now, since_secs).await;
-    let candidates =
-        select_incremental_candidates(files, &initial_cursor, POST_COMMIT_MAX_UPLOADS_PER_RUN);
-
-    let parsed_logs = parse_session_logs_bounded(candidates).await;
-    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
-        std::collections::HashMap::new();
-    let mut stats = UploadRunStats::default();
-    let mut cursor_advance = initial_cursor.clone();
-
-    for parsed in parsed_logs {
-        let log_mtime = parsed.log.updated_at;
-        let log_source_label = parsed.log.source_label();
-        let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
-            continue;
-        };
-        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
-            cached.clone()
-        } else {
-            let resolved = git::resolve_repo_root_with_fallbacks(std::path::Path::new(&cwd))
-                .await
-                .ok()
-                .map(|resolution| resolution.repo_root);
-            repo_root_cache.insert(cwd.clone(), resolved.clone());
-            resolved
-        };
-        let Some(resolved_repo) = resolved_repo else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
-            continue;
-        };
-        if !repo_family_roots.contains(&normalized_repo_match_path(&resolved_repo)) {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
-            continue;
-        }
-
-        if !apply_incremental_upload_outcome(
-            &mut stats,
-            &mut cursor_advance,
-            log_mtime,
-            &log_source_label,
-            upload_session_from_log(
-                context,
-                &parsed,
-                repo_root,
-                repo_root_str,
-                PublicationMode::Live,
-            )
-            .await,
-        ) {
-            break;
-        }
-    }
-
-    if cursor_advance != initial_cursor {
-        upload_cursor::upsert_cursor(
-            repo_root_str,
-            cursor_advance.last_scanned_mtime_epoch,
-            cursor_advance.last_scanned_source_label.as_deref(),
-        )
-        .await?;
-    }
-
-    Ok(stats)
 }
 
 async fn session_log_metadata(log: &agents::SessionLog) -> scanner::SessionMetadata {
@@ -2812,6 +2659,7 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::Value;
     use serial_test::serial;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
@@ -3443,11 +3291,6 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_max_uploads_per_run_defaults_are_stable() {
-        assert_eq!(POST_COMMIT_MAX_UPLOADS_PER_RUN, 20);
-    }
-
-    #[test]
     fn anonymized_backfill_fixture_contains_expected_failure_modes() {
         let csv = include_str!("../tests/fixtures/backfill/anonymized_report.csv");
         let mut missing_meta = 0usize;
@@ -3542,122 +3385,6 @@ mod tests {
             .map(|log| log.source_label())
             .collect();
         assert_eq!(labels, vec!["b".to_string(), "c".to_string()]);
-    }
-
-    #[test]
-    fn retryable_incremental_outcome_stops_before_cursor_advances() {
-        let mut stats = UploadRunStats::default();
-        let mut cursor = IncrementalCursor {
-            last_scanned_mtime_epoch: 100,
-            last_scanned_source_label: Some("a".to_string()),
-        };
-
-        let should_continue = apply_incremental_upload_outcome(
-            &mut stats,
-            &mut cursor,
-            Some(200),
-            "z",
-            UploadFromLogOutcome::Retryable("queue write failed".to_string()),
-        );
-
-        assert!(!should_continue);
-        assert_eq!(stats.issues, 1);
-        assert_eq!(
-            cursor,
-            IncrementalCursor {
-                last_scanned_mtime_epoch: 100,
-                last_scanned_source_label: Some("a".to_string()),
-            }
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn incremental_upload_accepts_repo_family_worktree_matches() {
-        let home = TempDir::new().expect("home tempdir");
-        let home_guard = EnvGuard::new("HOME");
-        home_guard.set_path(home.path());
-        let codex_home_guard = EnvGuard::new("CODEX_HOME");
-        codex_home_guard.set_path(&home.path().join(".codex"));
-
-        let global_config = home.path().join("global.gitconfig");
-        tokio::fs::write(&global_config, "")
-            .await
-            .expect("write empty global gitconfig");
-        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
-        global_guard.set_path(&global_config);
-
-        let repo = init_repo().await;
-        run_git(
-            repo.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:test-org/example.git",
-            ],
-        )
-        .await;
-
-        let worktree_root = home.path().join("worktrees").join("feature");
-        run_git(
-            repo.path(),
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                worktree_root.to_str().expect("worktree path utf8"),
-            ],
-        )
-        .await;
-
-        let session_updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("current epoch")
-            .as_secs() as i64;
-        write_codex_session_log(
-            home.path(),
-            "session-worktree-family",
-            repo.path(),
-            session_updated_at,
-        )
-        .await;
-
-        let server = crate::upload::test_support::spawn_test_upload_server(
-            crate::upload::test_support::TestUploadServerConfig::default(),
-        )
-        .await
-        .expect("spawn upload test server");
-        let cfg = config::CliConfig {
-            token: Some("test-token".to_string()),
-            ..config::CliConfig::default()
-        };
-        cfg.save().await.expect("save config");
-
-        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
-            .await
-            .expect("resolve upload context");
-        let stats = upload_incremental_sessions_for_repo(
-            &upload_context,
-            worktree_root.as_path(),
-            &worktree_root.to_string_lossy(),
-        )
-        .await
-        .expect("upload incremental sessions");
-
-        assert_eq!(stats.uploaded, 1);
-        assert_eq!(stats.queued, 0);
-        assert_eq!(stats.issues, 0);
-        assert_eq!(
-            server.counts(),
-            crate::upload::test_support::TestUploadServerCounts {
-                create_requests: 1,
-                uploads: 1,
-                confirms: 1,
-                user_org_requests: 1,
-            }
-        );
     }
 
     #[tokio::test]

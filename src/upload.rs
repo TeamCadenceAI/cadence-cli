@@ -23,8 +23,6 @@ use tokio::sync::Mutex;
 const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
-/// Maximum number of pending publications drained in one run by default.
-pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 
 /// Shared upload context for one CLI invocation.
 #[derive(Debug)]

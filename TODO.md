@@ -14,7 +14,7 @@ This branch needs the following fixes before deployment.
 - [x] Add targeted tests for the monitor runtime core paths:
 - [x] Cover `run_monitor_tick_internal` or equivalent end-to-end monitor tick behavior.
 - [x] Cover `upload_incremental_sessions_globally` cursor advance, retryable blocking, disabled-monitor early exit, and pending-drain behavior.
-- [ ] Clean up the dead-code warnings on this branch, including old hook-era paths, upload-cursor leftovers, and dead constants.
+- [x] Clean up the dead-code warnings on this branch, including old hook-era paths, upload-cursor leftovers, and dead constants.
 - [x] Stop silently swallowing legacy auto-update scheduler teardown failures in monitor scheduler reconciliation; log them clearly.
 - [x] Move monitor logging out of `/tmp/cadence-monitor.log` and into `~/.cadence/cli`.
 - [x] Use daily append logs for monitor runtime diagnostics, for example `~/.cadence/cli/monitor.YYYY-MM-DD.log`.
