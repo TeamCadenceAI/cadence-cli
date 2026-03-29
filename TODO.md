@@ -4,9 +4,9 @@ This branch needs the following fixes before deployment.
 
 - [x] Fix background auto-update success accounting so a failed `cadence install --preserve-disable-state` handoff is not recorded as a successful install/update.
 - [x] Fix background update fallback behavior so a background-only upgrade cannot remain permanently unbootstrapped when the new binary never finishes bootstrap.
-- [ ] Fix `cadence doctor --repair` so an unreadable `monitor-state.json` does not get treated as `enabled = false` and reconciled as disabled.
+- [x] Fix `cadence doctor --repair` so an unreadable `monitor-state.json` does not get treated as `enabled = false` and reconciled as disabled.
 - [x] Fix once-per-version bootstrap marker semantics so one-time recovery work is not retried indefinitely after partial bootstrap failures.
-- [ ] Tighten legacy hook ownership detection so cleanup only removes or restores hook files Cadence can actually prove it owns.
+- [x] Tighten legacy hook ownership detection so cleanup only removes or restores hook files Cadence can actually prove it owns.
 - [x] Add targeted tests for bootstrap/update control flow:
 - [x] Cover `maybe_run_current_version_bootstrap`.
 - [x] Cover failed update handoff followed by first-run fallback bootstrap.

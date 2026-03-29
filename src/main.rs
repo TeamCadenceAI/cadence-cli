@@ -1959,6 +1959,25 @@ async fn run_doctor(repair: bool) -> Result<()> {
     run_doctor_inner(&mut std::io::stderr(), repair).await
 }
 
+fn desired_monitor_enabled_for_repair(
+    configured_enabled_state: Result<Option<bool>>,
+) -> (bool, bool) {
+    match configured_enabled_state {
+        Ok(Some(enabled)) => (enabled, false),
+        Ok(None) => (true, false),
+        Err(_) => (true, true),
+    }
+}
+
+fn repaired_monitor_state_for_enabled(
+    enabled: bool,
+    loaded_state: Result<monitor::MonitorState>,
+) -> monitor::MonitorState {
+    let mut state = loaded_state.unwrap_or_default();
+    state.enabled = enabled;
+    state
+}
+
 async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()> {
     output::action_to_with_tty(w, "Doctor", "", false);
 
@@ -2069,8 +2088,20 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
     );
 
     if repair {
-        let enabled = monitor::load_state().await.unwrap_or_default().enabled;
+        let configured_enabled_state = monitor::configured_enabled_state().await;
+        let (enabled, defaulted_to_enabled) =
+            desired_monitor_enabled_for_repair(configured_enabled_state);
+        let repaired_state =
+            repaired_monitor_state_for_enabled(enabled, monitor::load_state().await);
+        monitor::save_state(&repaired_state).await?;
         let reconcile = monitor::reconcile_scheduler_for_enabled(enabled).await?;
+        if defaulted_to_enabled {
+            output::note_to_with_tty(
+                w,
+                "Monitor state was unreadable; repair recreated it with monitoring enabled.",
+                false,
+            );
+        }
         output::detail_to_with_tty(
             w,
             &format!("Repair applied: {}", reconcile.description),
@@ -3131,6 +3162,22 @@ mod tests {
         assert!(!should_run_automatic_current_version_bootstrap(&disable));
         assert!(!should_run_automatic_current_version_bootstrap(&uninstall));
         assert!(!automatic_bootstrap_includes_recovery_backfill(&backfill));
+    }
+
+    #[test]
+    fn doctor_repair_defaults_to_enabled_when_monitor_state_is_unreadable() {
+        let (enabled, defaulted) =
+            desired_monitor_enabled_for_repair(Err(anyhow::anyhow!("corrupt state")));
+        assert!(enabled);
+        assert!(defaulted);
+    }
+
+    #[test]
+    fn doctor_repair_rewrites_unreadable_state_with_enabled_default() {
+        let repaired =
+            repaired_monitor_state_for_enabled(true, Err(anyhow::anyhow!("corrupt state")));
+        assert!(repaired.enabled);
+        assert_eq!(repaired.last_run_at, None);
     }
 
     #[test]

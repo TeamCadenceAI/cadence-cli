@@ -30,7 +30,23 @@ struct BootstrapOutcome {
 }
 
 fn is_cadence_hook(content: &str) -> bool {
-    content.contains("cadence hook") || content.contains("cadence")
+    content.lines().map(str::trim).any(|line| {
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+
+        let normalized = line.replace(['"', '\''], " ");
+        let targets_cadence_hook =
+            normalized.contains(" hook post-commit") || normalized.contains(" hook pre-push");
+        let invokes_cadence = normalized.contains(" cadence ")
+            || normalized.contains("/cadence ")
+            || normalized.contains("\\cadence ")
+            || normalized.contains(" cadence.exe ")
+            || normalized.contains("/cadence.exe ")
+            || normalized.contains("\\cadence.exe ");
+
+        targets_cadence_hook && invokes_cadence
+    })
 }
 
 pub(crate) fn resolve_hooks_path(repo_root: Option<&Path>, configured_path: &str) -> PathBuf {
@@ -696,5 +712,58 @@ mod tests {
         assert_eq!(invocations.len(), 2);
         assert!(invocations[0].include_recovery_backfill);
         assert!(!invocations[1].include_recovery_backfill);
+    }
+
+    #[test]
+    fn cadence_hook_detection_requires_real_cadence_hook_invocation() {
+        assert!(is_cadence_hook(
+            "#!/bin/sh\nexec cadence hook post-commit \"$@\"\n"
+        ));
+        assert!(is_cadence_hook(
+            "#!/bin/sh\n\"/usr/local/bin/cadence\" hook pre-push \"$@\"\n"
+        ));
+        assert!(!is_cadence_hook(
+            "#!/bin/sh\n# cadence sprint helper\nexec cadence-linter hook post-commit\n"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cleanup_cadence_hook_ownership_preserves_non_cadence_hooks() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let hooks_dir = home.path().join(".git-hooks");
+        tokio::fs::create_dir_all(&hooks_dir)
+            .await
+            .expect("create hooks dir");
+        crate::git::config_set_global("core.hooksPath", &hooks_dir.to_string_lossy())
+            .await
+            .expect("set core.hooksPath");
+        let hook_path = hooks_dir.join("post-commit");
+        let original_hook =
+            "#!/bin/sh\n# cadence sprint helper\nexec cadence-linter hook post-commit\n";
+        tokio::fs::write(&hook_path, original_hook)
+            .await
+            .expect("write non-cadence hook");
+
+        let had_errors = cleanup_cadence_hook_ownership(Some(home.path()), false)
+            .await
+            .expect("cleanup hook ownership");
+        assert!(!had_errors);
+        assert!(hook_path.exists(), "expected non-cadence hook to remain");
+
+        let preserved = tokio::fs::read_to_string(&hook_path)
+            .await
+            .expect("read preserved hook");
+        assert_eq!(preserved, original_hook);
     }
 }
