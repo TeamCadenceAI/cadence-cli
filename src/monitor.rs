@@ -552,7 +552,9 @@ pub async fn reconcile_scheduler_for_enabled(enabled: bool) -> Result<SchedulerP
         }
     }
 
-    if let Err(err) = crate::update::uninstall_auto_update_scheduler().await {
+    if let Err(err) =
+        crate::update::cleanup_legacy_auto_update_scheduler_for_monitor_runtime().await
+    {
         ::tracing::warn!(
             event = "legacy_auto_update_scheduler_cleanup_failed",
             error = %format!("{err:#}")

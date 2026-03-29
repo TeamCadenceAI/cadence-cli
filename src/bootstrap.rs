@@ -1,6 +1,7 @@
 //! Cadence runtime bootstrap, migration, and legacy hook cleanup helpers.
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::{agents, git, monitor, output, update};
@@ -8,6 +9,8 @@ use crate::{agents, git, monitor, output, update};
 pub(crate) const VERSION_BOOTSTRAP_BACKFILL_SINCE: &str = "7d";
 const VERSION_BOOTSTRAP_MARKER_FILE: &str = "last-version-bootstrap";
 const VERSION_BOOTSTRAP_BACKFILL_MARKER_FILE: &str = "last-version-recovery-backfill";
+const VERSION_BOOTSTRAP_LOCK_FILE: &str = "current-version-bootstrap.lock";
+const VERSION_BOOTSTRAP_LOCK_STALE_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapTrigger {
@@ -27,6 +30,22 @@ struct BootstrapOptions<'a> {
 struct BootstrapOutcome {
     had_runtime_errors: bool,
     performed_recovery_backfill: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BootstrapLockRecord {
+    pid: u32,
+    created_at_epoch: i64,
+}
+
+struct BootstrapExecutionLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for BootstrapExecutionLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn is_cadence_hook(content: &str) -> bool {
@@ -76,6 +95,77 @@ fn version_bootstrap_marker_path() -> Option<PathBuf> {
 
 fn version_bootstrap_backfill_marker_path() -> Option<PathBuf> {
     version_marker_path(VERSION_BOOTSTRAP_BACKFILL_MARKER_FILE)
+}
+
+fn version_bootstrap_lock_path() -> Option<PathBuf> {
+    Some(
+        crate::config::CliConfig::config_dir()?
+            .join("locks")
+            .join(VERSION_BOOTSTRAP_LOCK_FILE),
+    )
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+async fn try_create_bootstrap_lock(path: &Path) -> Result<bool> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    let file = opts.open(path).await;
+    let mut file = match file {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("create lock {}", path.display())),
+    };
+    let payload = serde_json::to_vec_pretty(&BootstrapLockRecord {
+        pid: std::process::id(),
+        created_at_epoch: now_epoch(),
+    })
+    .context("serialize bootstrap lock record")?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &payload).await?;
+    Ok(true)
+}
+
+async fn clear_stale_bootstrap_lock(path: &Path) -> Result<()> {
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(content) => content,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return Ok(());
+        }
+    };
+    let parsed = match serde_json::from_str::<BootstrapLockRecord>(&content) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return Ok(());
+        }
+    };
+    let age = now_epoch().saturating_sub(parsed.created_at_epoch);
+    if age > VERSION_BOOTSTRAP_LOCK_STALE_SECS || !update::is_pid_alive(parsed.pid) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    Ok(())
+}
+
+async fn try_acquire_bootstrap_execution_lock() -> Result<Option<BootstrapExecutionLockGuard>> {
+    let Some(lock_path) = version_bootstrap_lock_path() else {
+        return Ok(None);
+    };
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    clear_stale_bootstrap_lock(&lock_path).await?;
+    if try_create_bootstrap_lock(&lock_path).await? {
+        return Ok(Some(BootstrapExecutionLockGuard { path: lock_path }));
+    }
+    Ok(None)
 }
 
 async fn read_version_bootstrap_marker(path: &Path) -> Result<Option<String>> {
@@ -146,12 +236,27 @@ pub(crate) async fn maybe_run_current_version_bootstrap(
         return Ok(false);
     }
 
+    let Some(_bootstrap_lock) = try_acquire_bootstrap_execution_lock().await? else {
+        log_bootstrap_stage(
+            "another runtime bootstrap is already active; skipping duplicate invocation",
+        );
+        return Ok(false);
+    };
+
+    let last_completed = read_version_bootstrap_marker(&marker_path).await?;
+    if last_completed.as_deref() == Some(current_version) {
+        return Ok(false);
+    }
+
     output::detail(&format!(
         "Reconciling Cadence runtime for v{}.",
         current_version
     ));
     let include_recovery_backfill =
         should_run_current_version_recovery_backfill(include_recovery_backfill).await?;
+    log_bootstrap_stage(format!(
+        "automatic runtime bootstrap start (recovery_backfill={include_recovery_backfill})"
+    ));
     let outcome = execute_bootstrap(BootstrapOptions {
         trigger: BootstrapTrigger::AutomaticFirstRun,
         org: None,
@@ -192,11 +297,22 @@ async fn desired_monitor_enabled(preserve_disable_state: bool) -> Result<bool> {
     Ok(monitor::configured_enabled_state().await?.unwrap_or(true))
 }
 
+fn log_bootstrap_stage(stage: impl std::fmt::Display) {
+    let stage = stage.to_string();
+    output::detail(&format!("Bootstrap stage: {stage}"));
+    ::tracing::info!(event = "runtime_bootstrap_stage", stage = %stage);
+}
+
 async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome> {
+    log_bootstrap_stage("cleaning up legacy Cadence hook ownership");
     let mut had_runtime_errors = cleanup_cadence_hook_ownership(None, true).await?;
+    log_bootstrap_stage(format!(
+        "legacy hook cleanup complete (had_errors={had_runtime_errors})"
+    ));
     let mut performed_recovery_backfill = false;
 
     if let Some(org) = options.org {
+        log_bootstrap_stage(format!("writing org filter ({org})"));
         match git::config_set_global("ai.cadence.org", org).await {
             Ok(()) => output::success("Updated", &format!("org filter = {org}")),
             Err(err) => {
@@ -206,7 +322,14 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
         }
     }
 
+    log_bootstrap_stage(format!(
+        "resolving monitor enabled state (preserve_disable_state={})",
+        options.preserve_disable_state
+    ));
     let monitor_enabled = desired_monitor_enabled(options.preserve_disable_state).await?;
+    log_bootstrap_stage(format!(
+        "persisting monitor enabled state (enabled={monitor_enabled})"
+    ));
     match monitor::set_enabled(monitor_enabled).await {
         Ok(_) => {
             if matches!(options.trigger, BootstrapTrigger::InstallCommand) {
@@ -226,6 +349,9 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
         }
     }
 
+    log_bootstrap_stage(format!(
+        "reconciling monitor scheduler (enabled={monitor_enabled})"
+    ));
     match monitor::reconcile_scheduler_for_enabled(monitor_enabled).await {
         Ok(result) if result.configured => {
             output::success(
@@ -272,22 +398,33 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
     }
 
     if monitor_enabled && options.include_recovery_backfill {
+        log_bootstrap_stage(format!(
+            "starting automatic recovery backfill (since {})",
+            VERSION_BOOTSTRAP_BACKFILL_SINCE
+        ));
         output::action(
             "Recovery",
             &format!("backfill --since {}", VERSION_BOOTSTRAP_BACKFILL_SINCE),
         );
-        if let Err(err) = crate::run_backfill_inner(VERSION_BOOTSTRAP_BACKFILL_SINCE, None).await {
-            output::note(&format!(
-                "Automatic recovery backfill did not complete ({err:#})"
-            ));
-            output::detail(&format!(
-                "Run `cadence backfill --since {}` if you need to recover recent local sessions manually.",
-                VERSION_BOOTSTRAP_BACKFILL_SINCE
-            ));
+        match crate::run_backfill_inner(VERSION_BOOTSTRAP_BACKFILL_SINCE, None).await {
+            Ok(()) => log_bootstrap_stage("automatic recovery backfill finished (success=true)"),
+            Err(err) => {
+                output::note(&format!(
+                    "Automatic recovery backfill did not complete ({err:#})"
+                ));
+                output::detail(&format!(
+                    "Run `cadence backfill --since {}` if you need to recover recent local sessions manually.",
+                    VERSION_BOOTSTRAP_BACKFILL_SINCE
+                ));
+                log_bootstrap_stage("automatic recovery backfill finished (success=false)");
+            }
         }
         performed_recovery_backfill = true;
     }
 
+    log_bootstrap_stage(format!(
+        "runtime bootstrap finished (runtime_errors={had_runtime_errors}, recovery_backfill={performed_recovery_backfill})"
+    ));
     Ok(BootstrapOutcome {
         had_runtime_errors,
         performed_recovery_backfill,
@@ -685,6 +822,30 @@ mod tests {
         assert_eq!(invocations.len(), 2);
         assert!(invocations[0].include_recovery_backfill);
         assert!(!invocations[1].include_recovery_backfill);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn maybe_run_current_version_bootstrap_skips_when_another_bootstrap_is_active() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let _lock = try_acquire_bootstrap_execution_lock()
+            .await
+            .expect("acquire bootstrap execution lock")
+            .expect("bootstrap lock should be available");
+        let _hooks = install_bootstrap_test_hooks([Ok(BootstrapOutcome {
+            had_runtime_errors: false,
+            performed_recovery_backfill: true,
+        })]);
+
+        let ran = maybe_run_current_version_bootstrap(true)
+            .await
+            .expect("skip duplicate bootstrap");
+
+        assert!(!ran);
+        assert!(bootstrap_test_invocations().is_empty());
     }
 
     #[test]
