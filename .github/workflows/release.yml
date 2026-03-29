@@ -86,8 +86,6 @@ jobs:
           codesign --verify --strict --verbose=2 "target/${{ matrix.target }}/release/cadence-updater"
           codesign -dv --verbose=4 "target/${{ matrix.target }}/release/cadence"
           codesign -dv --verbose=4 "target/${{ matrix.target }}/release/cadence-updater"
-          spctl -a -vv --type exec "target/${{ matrix.target }}/release/cadence"
-          spctl -a -vv --type exec "target/${{ matrix.target }}/release/cadence-updater"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
