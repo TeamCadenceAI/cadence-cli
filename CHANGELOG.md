@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.5...v2.2.6) (2026-03-29)
+
+
+### Bug Fixes
+
+* **update:** avoid self-disabling monitor during self-update handoff ([98057c1](https://github.com/TeamCadenceAI/cadence-cli/commit/98057c17e0c7c005dd19e1eece492086deaf03d6))
+* **update:** avoid self-disabling monitor during self-update handoff ([d031b36](https://github.com/TeamCadenceAI/cadence-cli/commit/d031b36c12799d6ab26cf811752ced92ba0c7b10))
+
 ## [2.2.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.4...v2.2.5) (2026-03-29)
 
 
