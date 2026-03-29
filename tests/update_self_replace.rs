@@ -331,14 +331,14 @@ async fn update_check_flag_still_works() {
 
 #[tokio::test]
 async fn confirm_update_yes_flag_bypasses_prompt() {
-    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true, None).unwrap();
+    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true).unwrap();
     assert!(result, "--yes should always confirm");
 }
 
 #[tokio::test]
-async fn confirm_update_with_auto_override() {
-    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
-    assert!(result, "--yes with auto_update should confirm");
+async fn confirm_update_yes_flag_remains_sufficient() {
+    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true).unwrap();
+    assert!(result, "--yes should remain sufficient");
 }
 
 // ---------------------------------------------------------------------------

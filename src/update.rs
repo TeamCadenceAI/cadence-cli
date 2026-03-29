@@ -63,12 +63,6 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const AUTO_UPDATE_INTERVAL_SECS: u64 = 60 * 60;
 const AUTO_UPDATE_JITTER_SECS: u64 = 5 * 60;
 
-/// File recording the last version whose automatic recovery completed locally.
-const VERSION_RECOVERY_MARKER_FILE: &str = "last-version-recovery";
-
-/// Automatic recovery backfill window to run on every first run of a new version.
-pub(crate) const VERSION_RECOVERY_BACKFILL_SINCE: &str = "7d";
-
 /// Retry backoff defaults.
 const UPDATE_RETRY_BASE_SECS: u64 = 60;
 const UPDATE_RETRY_MAX_SECS: u64 = 8 * 60 * 60;
@@ -207,34 +201,8 @@ fn cadence_dir() -> Result<PathBuf> {
     })
 }
 
-pub async fn persist_auto_update_enabled() -> Result<bool> {
-    let mut cfg = CliConfig::load().await?;
-    if cfg.auto_update == Some(true) {
-        return Ok(false);
-    }
-    cfg.auto_update = Some(true);
-    cfg.save().await?;
-    Ok(true)
-}
-
-pub async fn ensure_auto_update_enabled_and_reconciled() -> Result<SchedulerProvisionResult> {
-    let _ = persist_auto_update_enabled().await?;
-    reconcile_scheduler_for_auto_update_enabled(true).await
-}
-
-fn update_confirmation_config(mode: InstallMode, config: Option<&CliConfig>) -> Option<bool> {
-    if matches!(mode, InstallMode::Interactive) {
-        return config.map(CliConfig::auto_update_enabled);
-    }
-    None
-}
-
 fn updater_state_path() -> Result<PathBuf> {
     Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
-}
-
-fn version_recovery_marker_path() -> Option<PathBuf> {
-    Some(CliConfig::config_dir()?.join(VERSION_RECOVERY_MARKER_FILE))
 }
 
 fn activity_lock_path() -> Result<PathBuf> {
@@ -276,39 +244,6 @@ async fn load_updater_state() -> Result<UpdaterState> {
 async fn save_updater_state(state: &UpdaterState) -> Result<()> {
     let path = updater_state_path()?;
     write_json_atomic(&path, state).await
-}
-
-async fn read_version_recovery_marker(path: &Path) -> Result<Option<String>> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => Ok(match content.trim() {
-            "" => None,
-            value => Some(value.to_string()),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e)
-            .with_context(|| format!("failed to read version recovery marker {}", path.display())),
-    }
-}
-
-async fn write_version_recovery_marker(path: &Path, version: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    tokio::fs::write(path, format!("{version}\n"))
-        .await
-        .with_context(|| format!("failed to write version recovery marker {}", path.display()))
-}
-
-fn version_recovery_is_due(last_completed_version: Option<&str>, target_version: &str) -> bool {
-    match last_completed_version
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(version) => version != target_version,
-        None => true,
-    }
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -987,23 +922,11 @@ pub fn self_replace_binary(replacement_path: &Path) -> Result<()> {
 
 /// Asks the user to confirm the update. Returns `true` if they accept.
 ///
-/// Precedence (highest wins):
-/// 1. `yes` (`--yes` CLI flag) — always skips prompt
-/// 2. `auto_update_config` — if `Some(true)`, skips prompt (from config `auto_update = true`)
-/// 3. Interactive prompt — asks user with [y/N] default No
-pub fn confirm_update(
-    local_version: &str,
-    remote_version: &str,
-    yes: bool,
-    auto_update_config: Option<bool>,
-) -> Result<bool> {
+/// `--yes` always skips the prompt. Otherwise this falls back to the
+/// interactive confirmation prompt with [y/N] default No.
+pub fn confirm_update(local_version: &str, remote_version: &str, yes: bool) -> Result<bool> {
     // --yes flag always wins
     if yes {
-        return Ok(true);
-    }
-
-    // Config-driven auto-update skips prompt when true
-    if auto_update_config.unwrap_or(false) {
         return Ok(true);
     }
 
@@ -1083,35 +1006,36 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
     Ok(())
 }
 
-async fn refresh_git_hooks_with_updated_binary() -> Result<()> {
+async fn run_install_with_updated_binary(preserve_disable_state: bool) -> Result<()> {
     let current_exe = std::env::current_exe()
         .context("failed to resolve current cadence executable path after self-update")?;
-    refresh_git_hooks_with_exe(&current_exe).await
+    run_install_with_exe(&current_exe, preserve_disable_state).await
 }
 
-async fn refresh_git_hooks_with_exe(exe_path: &Path) -> Result<()> {
-    let output = Command::new(exe_path)
-        .args(["hook", "refresh-hooks"])
-        .output()
+async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> Result<()> {
+    let mut command = Command::new(exe_path);
+    command.arg("install");
+    if preserve_disable_state {
+        command.arg("--preserve-disable-state");
+    }
+    let status = command
+        .env(PASSIVE_CHECK_ENV_VAR, "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .await
         .with_context(|| {
             format!(
-                "failed to launch refreshed cadence binary at {}",
+                "failed to launch bootstrap install with {}",
                 exe_path.display()
             )
         })?;
 
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let detail = [stderr, stdout]
-        .into_iter()
-        .find(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("exit status {}", output.status));
-    bail!("hook refresh command failed: {detail}");
+    bail!("bootstrap install command failed with exit status {status}");
 }
 
 async fn run_update_install_from_url_mode(
@@ -1120,15 +1044,6 @@ async fn run_update_install_from_url_mode(
     mode: InstallMode,
 ) -> Result<AttemptOutcome> {
     let local = current_version();
-
-    let config = if matches!(mode, InstallMode::Interactive) {
-        // Manual update keeps config load strict to preserve existing UX.
-        Some(CliConfig::load().await.context(
-            "Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.",
-        )?)
-    } else {
-        None
-    };
 
     // Step 1: Fetch release metadata
     let release = check_latest_version_from_url(release_url)
@@ -1162,15 +1077,7 @@ async fn run_update_install_from_url_mode(
     let checksums_asset = pick_checksums_asset(&release.assets)?;
 
     // Step 4: Prompt for confirmation
-    // Precedence: --yes > config auto_update > interactive prompt
-    if matches!(mode, InstallMode::Interactive)
-        && !confirm_update(
-            local,
-            remote_display,
-            yes,
-            update_confirmation_config(mode, config.as_ref()),
-        )?
-    {
+    if matches!(mode, InstallMode::Interactive) && !confirm_update(local, remote_display, yes)? {
         println!("Update cancelled.");
         return Ok(AttemptOutcome::NoUpdate);
     }
@@ -1235,42 +1142,11 @@ async fn run_update_install_from_url_mode(
     // Step 9: Replace running binary
     self_replace_binary(&new_binary)?;
 
-    if should_reconcile_auto_update_after_install(mode) {
-        if let Err(err) = persist_auto_update_enabled().await {
-            report_best_effort_post_upgrade_failure(
-                mode,
-                "unattended auto-update policy could not be enabled automatically",
-                "Run `cadence auto-update enable` to re-enable unattended update checks.",
-                &err,
-            );
-        }
-        let monitor_enabled = crate::monitor::monitor_enabled().await;
-        if let Err(err) = crate::monitor::reconcile_scheduler_for_enabled(monitor_enabled).await {
-            report_best_effort_post_upgrade_failure(
-                mode,
-                "background monitor scheduler could not be reconciled automatically",
-                "Run `cadence monitor enable` or `cadence install` to repair background monitoring.",
-                &err,
-            );
-        }
-    }
-
-    let current_exe = std::env::current_exe()
-        .context("failed to resolve current cadence executable path after self-update")?;
-    if let Err(err) =
-        run_version_recovery_backfill_with_exe(&current_exe, remote_display, "after upgrade").await
-    {
+    if let Err(err) = run_install_with_updated_binary(true).await {
         report_best_effort_post_upgrade_failure(
             mode,
-            "automatic 7d recovery backfill did not complete",
-            "Run `cadence backfill --since 7d` if you need to recover recent local sessions manually.",
-            &err,
-        );
-    } else if let Err(err) = mark_version_recovery_complete(remote_display).await {
-        report_best_effort_post_upgrade_failure(
-            mode,
-            "cadence could not record completed version recovery",
-            "A later command may rerun the automatic recovery backfill for this version.",
+            "the new version could not finish runtime bootstrap automatically",
+            "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership.",
             &err,
         );
     }
@@ -1293,25 +1169,12 @@ fn retry_delay_from_state(state: &UpdaterState) -> u64 {
     retry_delay_secs(state.consecutive_failures.max(1))
 }
 
-fn should_reconcile_auto_update_after_install(mode: InstallMode) -> bool {
-    !matches!(mode, InstallMode::SilentUnattended)
-}
-
 pub async fn run_background_auto_update() -> Result<()> {
     apply_auto_update_jitter().await;
 
     let mut state = load_updater_state().await.unwrap_or_default();
     let now = now_rfc3339();
     state.last_attempt_at = Some(now.clone());
-
-    let config = CliConfig::load().await.unwrap_or_default();
-    if !config.auto_update_enabled() {
-        state.last_error = None;
-        state.consecutive_failures = 0;
-        state.next_retry_after = None;
-        save_updater_state(&state).await?;
-        return Ok(());
-    }
 
     if !update_due_for_retry(&state, now_epoch()) {
         return Ok(());
@@ -1436,81 +1299,6 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
-}
-
-async fn run_version_recovery_backfill_with_exe(
-    exe_path: &Path,
-    target_version: &str,
-    trigger: &str,
-) -> Result<()> {
-    eprintln!(
-        "Running automatic session recovery for cadence v{target_version} ({trigger}; backfill --since {VERSION_RECOVERY_BACKFILL_SINCE})..."
-    );
-
-    let status = Command::new(exe_path)
-        .args(["backfill", "--since", VERSION_RECOVERY_BACKFILL_SINCE])
-        .env(PASSIVE_CHECK_ENV_VAR, "1")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .with_context(|| {
-            format!(
-                "failed to launch automatic recovery backfill with {}",
-                exe_path.display()
-            )
-        })?;
-
-    if status.success() {
-        eprintln!("Automatic session recovery for cadence v{target_version} completed.");
-        return Ok(());
-    }
-
-    bail!("automatic recovery backfill failed with exit status {status}");
-}
-
-async fn mark_version_recovery_complete(version: &str) -> Result<()> {
-    let Some(path) = version_recovery_marker_path() else {
-        return Ok(());
-    };
-    write_version_recovery_marker(&path, version).await
-}
-
-pub async fn mark_current_version_recovery_complete() -> Result<()> {
-    mark_version_recovery_complete(current_version()).await
-}
-
-async fn maybe_run_version_recovery_with_exe_and_marker(
-    exe_path: &Path,
-    marker_path: Option<&Path>,
-    target_version: &str,
-    trigger: &str,
-) -> Result<bool> {
-    let Some(marker_path) = marker_path else {
-        return Ok(false);
-    };
-
-    let last_completed = read_version_recovery_marker(marker_path).await?;
-    if !version_recovery_is_due(last_completed.as_deref(), target_version) {
-        return Ok(false);
-    }
-
-    run_version_recovery_backfill_with_exe(exe_path, target_version, trigger).await?;
-    write_version_recovery_marker(marker_path, target_version).await?;
-    Ok(true)
-}
-
-pub async fn maybe_run_current_version_recovery() -> Result<bool> {
-    let exe_path = std::env::current_exe()
-        .context("failed to resolve current cadence executable path for version recovery")?;
-    let marker_path = version_recovery_marker_path();
-    maybe_run_version_recovery_with_exe_and_marker(
-        &exe_path,
-        marker_path.as_deref(),
-        current_version(),
-        "on first run",
-    )
-    .await
 }
 
 fn report_best_effort_post_upgrade_failure(
@@ -2033,12 +1821,11 @@ async fn scheduler_health_macos() -> SchedulerHealth {
 }
 
 pub fn auto_update_policy_summary() -> &'static str {
-    "hourly checks; stable channel only; prereleases are excluded by default"
+    "monitor-driven; stable channel only; no separate auto-update toggle"
 }
 
 pub async fn updater_health() -> UpdaterHealth {
-    let cfg = CliConfig::load().await.unwrap_or_default();
-    let enabled = cfg.auto_update_enabled();
+    let enabled = crate::monitor::monitor_enabled().await;
     let state = load_updater_state().await.unwrap_or_default();
     derive_updater_health(enabled, &state)
 }
@@ -2048,7 +1835,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
         return UpdaterHealth {
             enabled,
             state: UpdaterHealthState::Disabled,
-            last_result: "disabled".to_string(),
+            last_result: "monitor disabled".to_string(),
             last_attempt_at: state.last_attempt_at.clone(),
             next_retry_after: None,
             last_error: None,
@@ -3017,103 +2804,26 @@ mod tests {
         );
     }
 
-    // -- confirm_update (precedence matrix) ----------------------------------
+    // -- confirm_update ------------------------------------------------------
 
     #[tokio::test]
     async fn confirm_update_yes_bypass() {
-        // --yes flag should skip prompt and return true
-        let result = confirm_update("0.2.1", "0.3.0", true, None).unwrap();
+        let result = confirm_update("0.2.1", "0.3.0", true).unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn confirm_update_yes_overrides_config_false() {
-        // --yes wins even when config says auto_update=false
-        let result = confirm_update("0.2.1", "0.3.0", true, Some(false)).unwrap();
+    async fn confirm_update_yes_is_idempotent() {
+        let result = confirm_update("0.2.1", "0.3.0", true).unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn confirm_update_yes_overrides_config_true() {
-        // --yes wins over config=true (both are "yes", should still bypass)
-        let result = confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn confirm_update_auto_config_true_skips_prompt() {
-        // auto_update=true should skip prompt without --yes
-        let result = confirm_update("0.2.1", "0.3.0", false, Some(true)).unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn persist_auto_update_enabled_overrides_explicit_disable() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = EnvGuard::new("HOME");
-        home.set(tmp.path().to_str().expect("home path utf8"));
-
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..CliConfig::default()
-        };
-        cfg.save().await.expect("save config");
-
-        let changed = persist_auto_update_enabled()
-            .await
-            .expect("persist auto-update enabled");
-        assert!(changed);
-
-        let saved = CliConfig::load().await.expect("load config");
-        assert_eq!(saved.auto_update, Some(true));
-    }
-
-    #[tokio::test]
-    async fn update_confirmation_config_preserves_manual_auto_update_preference() {
-        let cfg = CliConfig {
-            auto_update: Some(true),
-            ..CliConfig::default()
-        };
-        assert_eq!(
-            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
-            Some(true)
-        );
-        assert_eq!(
-            update_confirmation_config(InstallMode::SilentUnattended, Some(&cfg)),
-            None
-        );
-
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..CliConfig::default()
-        };
-        assert_eq!(
-            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
-            Some(false)
-        );
-    }
-
-    #[tokio::test]
-    async fn confirm_update_auto_config_false_no_yes_would_prompt() {
-        // auto_update=false, no --yes: would go to interactive prompt.
-        // We can't test the actual prompt here without a TTY,
-        // but we verify the None/false config path doesn't auto-accept.
-        // The dialoguer prompt will fail or return None in non-interactive.
-        // Skip this test in CI — just verify the yes/auto paths cover all branches.
-    }
-
-    #[tokio::test]
-    async fn confirm_update_config_none_no_yes_would_prompt() {
-        // No config, no --yes: same as auto_update=false — would prompt.
-        // Confirm that None acts like false.
-        let result = confirm_update("0.2.1", "0.3.0", false, None);
-        // In a non-interactive test, this either fails or returns false.
-        // The key assertion is that it does NOT return Ok(true).
+    async fn confirm_update_without_yes_does_not_auto_accept() {
+        let result = confirm_update("0.2.1", "0.3.0", false);
         if let Ok(val) = result {
-            assert!(!val, "should not auto-accept without --yes or config");
+            assert!(!val, "should not auto-accept without --yes");
         }
-        // Err is acceptable in non-interactive environments
     }
 
     // -- parse_timestamp_string -----------------------------------------------
@@ -3533,16 +3243,6 @@ mod tests {
     }
 
     #[test]
-    fn should_reconcile_auto_update_after_interactive_install_only() {
-        assert!(should_reconcile_auto_update_after_install(
-            InstallMode::Interactive
-        ));
-        assert!(!should_reconcile_auto_update_after_install(
-            InstallMode::SilentUnattended
-        ));
-    }
-
-    #[test]
     #[cfg(target_os = "linux")]
     fn systemd_timer_and_service_include_expected_schedule_and_command() {
         let exe = PathBuf::from("/usr/local/bin/cadence");
@@ -3555,8 +3255,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn run_version_recovery_backfill_with_exe_invokes_seven_day_backfill_and_skips_passive_check()
-     {
+    async fn run_install_with_exe_invokes_install_with_preserved_disable_state() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("cadence");
         let args_log = tmp.path().join("args.log");
@@ -3575,14 +3274,14 @@ mod tests {
             .await
             .expect("chmod script");
 
-        run_version_recovery_backfill_with_exe(&script, "9.9.9", "test")
+        run_install_with_exe(&script, true)
             .await
-            .expect("run version recovery backfill");
+            .expect("run install with exe");
 
         let args = tokio::fs::read_to_string(&args_log)
             .await
             .expect("read args log");
-        assert_eq!(args, "backfill\n--since\n7d\n");
+        assert_eq!(args, "install\n--preserve-disable-state\n");
 
         let env = tokio::fs::read_to_string(&env_log)
             .await
@@ -3592,18 +3291,10 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn maybe_run_version_recovery_with_exe_and_marker_runs_once_per_version() {
+    async fn run_install_with_exe_surfaces_command_failure() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("cadence");
-        let args_log = tmp.path().join("args.log");
-        let env_log = tmp.path().join("env.log");
-        let marker = tmp.path().join("last-version-recovery");
-        let script_contents = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nprintf '%s\\n' \"$CADENCE_NO_UPDATE_CHECK\" >> \"{}\"\n",
-            args_log.display(),
-            env_log.display()
-        );
-        tokio::fs::write(&script, script_contents)
+        tokio::fs::write(&script, "#!/bin/sh\nexit 7\n")
             .await
             .expect("write script");
 
@@ -3612,69 +3303,13 @@ mod tests {
             .await
             .expect("chmod script");
 
-        let ran = maybe_run_version_recovery_with_exe_and_marker(
-            &script,
-            Some(&marker),
-            "2.1.7",
-            "test first run",
-        )
-        .await
-        .expect("run first recovery");
-        assert!(ran, "expected recovery to run when marker is missing");
-
-        let args = tokio::fs::read_to_string(&args_log)
+        let err = run_install_with_exe(&script, true)
             .await
-            .expect("read args after first run");
-        assert_eq!(args, "backfill\n--since\n7d\n");
-
-        let marker_contents = tokio::fs::read_to_string(&marker)
-            .await
-            .expect("read marker after first run");
-        assert_eq!(marker_contents.trim(), "2.1.7");
-
-        let ran_again = maybe_run_version_recovery_with_exe_and_marker(
-            &script,
-            Some(&marker),
-            "2.1.7",
-            "test second run",
-        )
-        .await
-        .expect("rerun same version");
+            .expect_err("expected install handoff failure");
         assert!(
-            !ran_again,
-            "expected recovery to be skipped when marker matches current version"
+            err.to_string().contains("bootstrap install command failed"),
+            "unexpected error: {err:#}"
         );
-
-        let args_after_skip = tokio::fs::read_to_string(&args_log)
-            .await
-            .expect("read args after skip");
-        assert_eq!(args_after_skip, "backfill\n--since\n7d\n");
-
-        let ran_new_version = maybe_run_version_recovery_with_exe_and_marker(
-            &script,
-            Some(&marker),
-            "2.1.8",
-            "test next version",
-        )
-        .await
-        .expect("run next version recovery");
-        assert!(
-            ran_new_version,
-            "expected recovery to rerun for a new version"
-        );
-
-        let args_after_new_version = tokio::fs::read_to_string(&args_log)
-            .await
-            .expect("read args after next version");
-        assert_eq!(
-            args_after_new_version,
-            "backfill\n--since\n7d\nbackfill\n--since\n7d\n"
-        );
-
-        let env = tokio::fs::read_to_string(&env_log)
-            .await
-            .expect("read env log");
-        assert_eq!(env, "1\n1\n");
     }
 
     // -- check_latest_version_from_url_with_timeout ---------------------------
@@ -3687,57 +3322,5 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn refresh_git_hooks_with_exe_invokes_hidden_hook_command() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let script = tmp.path().join("cadence");
-        let args_log = tmp.path().join("args.log");
-        let script_contents = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
-            args_log.display()
-        );
-        tokio::fs::write(&script, script_contents)
-            .await
-            .expect("write script");
-
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("chmod script");
-
-        refresh_git_hooks_with_exe(&script)
-            .await
-            .expect("refresh hooks command");
-
-        let args = tokio::fs::read_to_string(&args_log)
-            .await
-            .expect("read args log");
-        assert_eq!(args, "hook\nrefresh-hooks\n");
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn refresh_git_hooks_with_exe_surfaces_command_failure() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let script = tmp.path().join("cadence");
-        tokio::fs::write(&script, "#!/bin/sh\necho broken >&2\nexit 7\n")
-            .await
-            .expect("write script");
-
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("chmod script");
-
-        let err = refresh_git_hooks_with_exe(&script)
-            .await
-            .expect_err("expected hook refresh failure");
-        assert!(
-            err.to_string().contains("broken"),
-            "unexpected error: {err:#}"
-        );
     }
 }

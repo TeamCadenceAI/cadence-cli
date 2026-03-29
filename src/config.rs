@@ -58,8 +58,11 @@ pub struct CliConfig {
     pub github_login: Option<String>,
     /// Token expiry timestamp (ISO 8601 string).
     pub expires_at: Option<String>,
-    /// When true, unattended background updates are enabled and
-    /// interactive `cadence update` skips the confirmation prompt.
+    /// Legacy auto-update preference retained only for config compatibility.
+    ///
+    /// This field is no longer user-controlled. Installed Cadence always runs
+    /// unattended updates while background monitoring is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<bool>,
     /// How often the passive background version check runs (e.g., "8h", "24h", "1d").
     pub update_check_interval: Option<String>,
@@ -143,13 +146,6 @@ impl CliConfig {
     /// Returns the persisted auth token when present and non-empty.
     pub fn auth_token(&self) -> Option<String> {
         non_empty_trimmed(self.token.clone())
-    }
-
-    /// Returns whether auto-update is enabled.
-    ///
-    /// Defaults to `false` when `auto_update` is absent from config.
-    pub fn auto_update_enabled(&self) -> bool {
-        self.auto_update.unwrap_or(false)
     }
 
     /// Resolves the update check interval as a `Duration`.
@@ -324,17 +320,12 @@ pub async fn write_cached_latest_version_to_dir(version: &str, dir: &Path) -> Re
 /// excluded — they are managed by the auth flow and should not be hand-edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {
-    AutoUpdate,
     UpdateCheckInterval,
     ApiUrl,
 }
 
 /// All user-settable configuration keys, in display order.
-pub const ALL_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::AutoUpdate,
-    ConfigKey::UpdateCheckInterval,
-    ConfigKey::ApiUrl,
-];
+pub const ALL_CONFIG_KEYS: &[ConfigKey] = &[ConfigKey::UpdateCheckInterval, ConfigKey::ApiUrl];
 
 /// Keys that are managed by the auth flow and cannot be set via `cadence config`.
 const AUTH_MANAGED_KEYS: &[&str] = &[
@@ -349,7 +340,6 @@ impl ConfigKey {
     /// The canonical snake_case name used in config files and display.
     pub fn name(&self) -> &'static str {
         match self {
-            ConfigKey::AutoUpdate => "auto_update",
             ConfigKey::UpdateCheckInterval => "update_check_interval",
             ConfigKey::ApiUrl => "api_url",
         }
@@ -379,7 +369,6 @@ impl std::str::FromStr for ConfigKey {
         }
 
         match normalized.as_str() {
-            "auto_update" => Ok(ConfigKey::AutoUpdate),
             "update_check_interval" => Ok(ConfigKey::UpdateCheckInterval),
             "api_url" => Ok(ConfigKey::ApiUrl),
             _ => bail!(
@@ -401,30 +390,12 @@ impl std::fmt::Display for ConfigKey {
     }
 }
 
-/// Parse a boolean value from user input, accepting common variants.
-///
-/// Accepted: `true`, `false`, `yes`, `no`, `1`, `0` (case-insensitive).
-pub fn parse_bool_value(s: &str) -> Result<bool> {
-    match s.trim().to_lowercase().as_str() {
-        "true" | "yes" | "1" => Ok(true),
-        "false" | "no" | "0" => Ok(false),
-        _ => bail!(
-            "invalid boolean value '{}'. Expected: true/false, yes/no, or 1/0",
-            s
-        ),
-    }
-}
-
 impl CliConfig {
     /// Get the value of a user-settable config key as a display string.
     ///
     /// Returns `"(not set)"` for unset optional fields.
     pub fn get_key(&self, key: ConfigKey) -> String {
         match key {
-            ConfigKey::AutoUpdate => match self.auto_update {
-                Some(v) => v.to_string(),
-                None => "(not set)".to_string(),
-            },
             ConfigKey::UpdateCheckInterval => match &self.update_check_interval {
                 Some(v) => v.clone(),
                 None => "(not set)".to_string(),
@@ -438,15 +409,10 @@ impl CliConfig {
 
     /// Set a user-settable config key, validating the value before storing.
     ///
-    /// For `AutoUpdate`, the value is parsed as a boolean.
     /// For `UpdateCheckInterval`, the value is validated as a duration string.
     /// For `ApiUrl`, the value is stored as-is (trimmed).
     pub fn set_key(&mut self, key: ConfigKey, value: &str) -> Result<()> {
         match key {
-            ConfigKey::AutoUpdate => {
-                let b = parse_bool_value(value)?;
-                self.auto_update = Some(b);
-            }
             ConfigKey::UpdateCheckInterval => {
                 let trimmed = value.trim().to_string();
                 // Validate the duration is parseable before storing
@@ -1081,37 +1047,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // auto_update defaults and resolver
+    // legacy auto_update compatibility
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_auto_update_default_is_none() {
         let cfg = CliConfig::default();
         assert_eq!(cfg.auto_update, None);
-    }
-
-    #[tokio::test]
-    async fn test_auto_update_enabled_defaults_false() {
-        let cfg = CliConfig::default();
-        assert!(!cfg.auto_update_enabled());
-    }
-
-    #[tokio::test]
-    async fn test_auto_update_enabled_explicit_true() {
-        let cfg = CliConfig {
-            auto_update: Some(true),
-            ..Default::default()
-        };
-        assert!(cfg.auto_update_enabled());
-    }
-
-    #[tokio::test]
-    async fn test_auto_update_enabled_explicit_false() {
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..Default::default()
-        };
-        assert!(!cfg.auto_update_enabled());
     }
 
     #[tokio::test]
@@ -1145,7 +1087,6 @@ mod tests {
         let loaded = CliConfig::load_from(&path).await.unwrap();
         assert_eq!(loaded.auto_update, None);
         assert_eq!(loaded.update_check_interval, None);
-        assert!(!loaded.auto_update_enabled());
     }
 
     // -----------------------------------------------------------------------
@@ -1476,10 +1417,6 @@ mod tests {
     #[tokio::test]
     async fn test_config_key_from_str_snake_case() {
         assert_eq!(
-            "auto_update".parse::<ConfigKey>().unwrap(),
-            ConfigKey::AutoUpdate
-        );
-        assert_eq!(
             "update_check_interval".parse::<ConfigKey>().unwrap(),
             ConfigKey::UpdateCheckInterval
         );
@@ -1489,10 +1426,6 @@ mod tests {
     #[tokio::test]
     async fn test_config_key_from_str_kebab_case() {
         assert_eq!(
-            "auto-update".parse::<ConfigKey>().unwrap(),
-            ConfigKey::AutoUpdate
-        );
-        assert_eq!(
             "update-check-interval".parse::<ConfigKey>().unwrap(),
             ConfigKey::UpdateCheckInterval
         );
@@ -1501,18 +1434,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_key_from_str_case_insensitive() {
-        assert_eq!(
-            "AUTO_UPDATE".parse::<ConfigKey>().unwrap(),
-            ConfigKey::AutoUpdate
-        );
         assert_eq!("Api-Url".parse::<ConfigKey>().unwrap(), ConfigKey::ApiUrl);
     }
 
     #[tokio::test]
     async fn test_config_key_from_str_with_whitespace() {
         assert_eq!(
-            "  auto_update  ".parse::<ConfigKey>().unwrap(),
-            ConfigKey::AutoUpdate
+            "  update_check_interval  ".parse::<ConfigKey>().unwrap(),
+            ConfigKey::UpdateCheckInterval
         );
     }
 
@@ -1523,7 +1452,7 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unknown config key"), "got: {msg}");
         assert!(
-            msg.contains("auto_update"),
+            msg.contains("update_check_interval"),
             "should list valid keys, got: {msg}"
         );
     }
@@ -1558,58 +1487,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_bool_value
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_parse_bool_value_true_variants() {
-        assert!(parse_bool_value("true").unwrap());
-        assert!(parse_bool_value("True").unwrap());
-        assert!(parse_bool_value("TRUE").unwrap());
-        assert!(parse_bool_value("yes").unwrap());
-        assert!(parse_bool_value("Yes").unwrap());
-        assert!(parse_bool_value("1").unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_parse_bool_value_false_variants() {
-        assert!(!parse_bool_value("false").unwrap());
-        assert!(!parse_bool_value("False").unwrap());
-        assert!(!parse_bool_value("FALSE").unwrap());
-        assert!(!parse_bool_value("no").unwrap());
-        assert!(!parse_bool_value("No").unwrap());
-        assert!(!parse_bool_value("0").unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_parse_bool_value_with_whitespace() {
-        assert!(parse_bool_value("  true  ").unwrap());
-        assert!(!parse_bool_value("  false  ").unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_parse_bool_value_invalid() {
-        let result = parse_bool_value("maybe");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("invalid boolean"), "got: {msg}");
-    }
-
-    // -----------------------------------------------------------------------
     // set_key / get_key roundtrips
     // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_set_get_auto_update() {
-        let mut cfg = CliConfig::default();
-        cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
-        assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "true");
-        assert_eq!(cfg.auto_update, Some(true));
-
-        cfg.set_key(ConfigKey::AutoUpdate, "no").unwrap();
-        assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "false");
-        assert_eq!(cfg.auto_update, Some(false));
-    }
 
     #[tokio::test]
     async fn test_set_get_update_check_interval() {
@@ -1650,16 +1529,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_key_unset_returns_not_set() {
         let cfg = CliConfig::default();
-        assert_eq!(cfg.get_key(ConfigKey::AutoUpdate), "(not set)");
         assert_eq!(cfg.get_key(ConfigKey::UpdateCheckInterval), "(not set)");
         assert_eq!(cfg.get_key(ConfigKey::ApiUrl), "(not set)");
-    }
-
-    #[tokio::test]
-    async fn test_set_key_auto_update_invalid_value() {
-        let mut cfg = CliConfig::default();
-        let result = cfg.set_key(ConfigKey::AutoUpdate, "maybe");
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1668,14 +1539,12 @@ mod tests {
         let path = config_path_in(tmp.path());
 
         let mut cfg = CliConfig::default();
-        cfg.set_key(ConfigKey::AutoUpdate, "true").unwrap();
         cfg.set_key(ConfigKey::UpdateCheckInterval, "12h").unwrap();
         cfg.set_key(ConfigKey::ApiUrl, "https://test.example.com")
             .unwrap();
         cfg.save_to(&path).await.unwrap();
 
         let loaded = CliConfig::load_from(&path).await.unwrap();
-        assert_eq!(loaded.auto_update, Some(true));
         assert_eq!(loaded.update_check_interval, Some("12h".to_string()));
         assert_eq!(loaded.api_url, Some("https://test.example.com".to_string()));
     }
@@ -1686,7 +1555,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_key_display() {
-        assert_eq!(ConfigKey::AutoUpdate.to_string(), "auto_update");
         assert_eq!(
             ConfigKey::UpdateCheckInterval.to_string(),
             "update_check_interval"
@@ -1696,6 +1564,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_config_keys_count() {
-        assert_eq!(ALL_CONFIG_KEYS.len(), 3);
+        assert_eq!(ALL_CONFIG_KEYS.len(), 2);
     }
 }
