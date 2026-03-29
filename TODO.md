@@ -34,7 +34,7 @@ Before deployment, rerun:
 
 - [x] Prevent the global discovery cursor from advancing after a retryable failure when later sessions are skipped as non-applicable.
 - [x] Remove the stray stdout newline emitted before automatic recovery backfill status output.
-- [ ] Add a monitor enable/disable round-trip test that exercises the command paths without invoking real system schedulers.
-- [ ] Extract shared Cadence state-file helpers for `cadence_dir`, `now_rfc3339`, and atomic JSON writes.
-- [ ] Rename monitor runtime leftovers that still refer to `post-commit` or `hook` semantics.
-- [ ] Extract a shared test `EnvGuard` used by the monitor/bootstrap runtime tests.
+- [x] Add a monitor enable/disable round-trip test that exercises the command paths without invoking real system schedulers.
+- [x] Extract shared Cadence state-file helpers for `cadence_dir`, `now_rfc3339`, and atomic JSON writes.
+- [x] Rename monitor runtime leftovers that still refer to `post-commit` or `hook` semantics.
+- [x] Extract a shared test `EnvGuard` used by the monitor/bootstrap runtime tests.

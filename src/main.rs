@@ -11,10 +11,14 @@ mod output;
 mod publication;
 mod publication_state;
 mod scanner;
+mod state_files;
 mod tracing;
 mod transport;
 mod update;
 mod upload;
+
+#[cfg(test)]
+mod test_support;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -384,7 +388,7 @@ async fn run_hook_post_commit() -> Result<()> {
     Ok(())
 }
 
-const POST_COMMIT_FALLBACK_WINDOW_SECS: i64 = 30 * 86_400;
+const MONITOR_DEFAULT_CURSOR_WINDOW_SECS: i64 = 30 * 86_400;
 
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
@@ -395,7 +399,7 @@ async fn head_sha_for_repo(repo: &std::path::Path) -> Option<String> {
     git::head_sha_at(repo).await.ok().flatten()
 }
 
-fn hook_discovery_concurrency() -> usize {
+fn monitor_discovery_concurrency() -> usize {
     std::env::var("CADENCE_HOOK_DISCOVERY_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -561,7 +565,7 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     if logs.is_empty() {
         return Vec::new();
     }
-    let semaphore = Arc::new(Semaphore::new(hook_discovery_concurrency()));
+    let semaphore = Arc::new(Semaphore::new(monitor_discovery_concurrency()));
     let mut set = JoinSet::new();
     for (idx, log) in logs.into_iter().enumerate() {
         let semaphore = Arc::clone(&semaphore);
@@ -1547,7 +1551,7 @@ async fn upload_incremental_sessions_globally(
             record.last_scanned_mtime_epoch,
             record.last_scanned_source_label,
         ),
-        None => IncrementalCursor::from_position(now - POST_COMMIT_FALLBACK_WINDOW_SECS, None),
+        None => IncrementalCursor::from_position(now - MONITOR_DEFAULT_CURSOR_WINDOW_SECS, None),
     };
     let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
     let files = agents::discover_recent_sessions(now, since_secs).await;
@@ -2678,6 +2682,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvGuard;
     use anyhow::anyhow;
     use serde_json::Value;
     use serial_test::serial;
@@ -2710,37 +2715,6 @@ mod tests {
         run_git(dir.path(), &["add", "README.md"]).await;
         run_git(dir.path(), &["commit", "-m", "init"]).await;
         dir
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn new(key: &'static str) -> Self {
-            Self {
-                key,
-                original: std::env::var(key).ok(),
-            }
-        }
-
-        fn set_str(&self, value: &str) {
-            unsafe { std::env::set_var(self.key, value) };
-        }
-
-        fn set_path(&self, value: &std::path::Path) {
-            self.set_str(&value.to_string_lossy());
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
     }
 
     async fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
@@ -3311,8 +3285,8 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_fallback_window_defaults_are_stable() {
-        assert_eq!(POST_COMMIT_FALLBACK_WINDOW_SECS, 30 * 86_400);
+    fn monitor_default_cursor_window_defaults_are_stable() {
+        assert_eq!(MONITOR_DEFAULT_CURSOR_WINDOW_SECS, 30 * 86_400);
     }
 
     #[test]
@@ -3651,6 +3625,47 @@ mod tests {
                 confirms: 1,
                 user_org_requests: 1,
             }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_enable_disable_round_trip_updates_runtime_intent() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+        let _hook =
+            monitor::install_reconcile_scheduler_test_hook(monitor::SchedulerProvisionResult {
+                configured: true,
+                description: "test scheduler".to_string(),
+            });
+
+        run_monitor_enable().await.expect("enable monitor");
+        assert!(
+            monitor::load_state()
+                .await
+                .expect("load enabled state")
+                .enabled
+        );
+
+        run_monitor_disable().await.expect("disable monitor");
+        assert!(
+            !monitor::load_state()
+                .await
+                .expect("load disabled state")
+                .enabled
+        );
+
+        run_monitor_enable().await.expect("re-enable monitor");
+        assert!(
+            monitor::load_state()
+                .await
+                .expect("load re-enabled state")
+                .enabled
+        );
+        assert_eq!(
+            monitor::reconcile_scheduler_test_hook_calls(),
+            vec![true, true]
         );
     }
 

@@ -1,12 +1,10 @@
 //! Durable publication state and payload storage.
 
-use crate::config::CliConfig;
 use crate::publication::{LogicalSessionKey, PublicationObservations, sha256_hex};
+use crate::state_files;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 /// Current durable status for a publication attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,16 +180,12 @@ pub fn storage_key(logical_session: &LogicalSessionKey, target_org_id: Option<&s
 
 /// Returns the current UTC timestamp formatted as RFC 3339.
 pub fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string())
+    state_files::now_rfc3339()
 }
 
 /// Resolves the directory used to persist publication state.
 fn state_dir() -> Result<PathBuf> {
-    CliConfig::config_dir()
-        .map(|dir| dir.join("publication-state"))
-        .ok_or_else(|| anyhow::anyhow!("cannot determine Cadence config directory"))
+    Ok(state_files::cadence_dir()?.join("publication-state"))
 }
 
 /// Returns the JSON record path for a storage key.

@@ -1,6 +1,6 @@
 //! Background monitor state and scheduler management.
 
-use crate::config::CliConfig;
+use crate::state_files;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -71,41 +71,12 @@ pub struct SchedulerHealth {
     pub remediation: String,
 }
 
-fn cadence_dir() -> Result<PathBuf> {
-    CliConfig::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine Cadence config directory"))
-}
-
-fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
 fn monitor_state_path() -> Result<PathBuf> {
-    Ok(cadence_dir()?.join(MONITOR_STATE_FILE))
+    Ok(state_files::cadence_dir()?.join(MONITOR_STATE_FILE))
 }
 
 fn discovery_cursor_path() -> Result<PathBuf> {
-    Ok(cadence_dir()?.join(MONITOR_DISCOVERY_CURSOR_FILE))
-}
-
-async fn write_json_atomic<T: ?Sized + Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    let tmp = path.with_extension("tmp");
-    let payload = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
-    tokio::fs::write(&tmp, payload)
-        .await
-        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
-    Ok(())
+    Ok(state_files::cadence_dir()?.join(MONITOR_DISCOVERY_CURSOR_FILE))
 }
 
 pub async fn load_state() -> Result<MonitorState> {
@@ -122,7 +93,7 @@ pub async fn load_state() -> Result<MonitorState> {
 
 pub async fn save_state(state: &MonitorState) -> Result<()> {
     let path = monitor_state_path()?;
-    write_json_atomic(&path, state).await
+    state_files::write_json_atomic(&path, state).await
 }
 
 pub async fn set_enabled(enabled: bool) -> Result<MonitorState> {
@@ -181,9 +152,9 @@ pub async fn upsert_discovery_cursor(
     let record = DiscoveryCursorRecord {
         last_scanned_mtime_epoch,
         last_scanned_source_label: last_scanned_source_label.map(str::to_string),
-        updated_at: now_rfc3339(),
+        updated_at: state_files::now_rfc3339(),
     };
-    write_json_atomic(&path, &record).await
+    state_files::write_json_atomic(&path, &record).await
 }
 
 pub fn cadence_secs() -> u64 {
@@ -515,7 +486,72 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     })
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct ReconcileSchedulerTestHook {
+    result: SchedulerProvisionResult,
+    calls: Vec<bool>,
+}
+
+#[cfg(test)]
+fn reconcile_scheduler_test_hook() -> &'static std::sync::Mutex<Option<ReconcileSchedulerTestHook>>
+{
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ReconcileSchedulerTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct InstalledReconcileSchedulerTestHook;
+
+#[cfg(test)]
+impl Drop for InstalledReconcileSchedulerTestHook {
+    fn drop(&mut self) {
+        if let Ok(mut hook) = reconcile_scheduler_test_hook().lock() {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn install_reconcile_scheduler_test_hook(
+    result: SchedulerProvisionResult,
+) -> InstalledReconcileSchedulerTestHook {
+    let mut hook = reconcile_scheduler_test_hook()
+        .lock()
+        .expect("reconcile scheduler test hook lock");
+    *hook = Some(ReconcileSchedulerTestHook {
+        result,
+        calls: Vec::new(),
+    });
+    InstalledReconcileSchedulerTestHook
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn reconcile_scheduler_test_hook_calls() -> Vec<bool> {
+    reconcile_scheduler_test_hook()
+        .lock()
+        .expect("reconcile scheduler test hook lock")
+        .as_ref()
+        .map(|hook| hook.calls.clone())
+        .unwrap_or_default()
+}
+
 pub async fn reconcile_scheduler_for_enabled(enabled: bool) -> Result<SchedulerProvisionResult> {
+    #[cfg(test)]
+    {
+        let mut hook = reconcile_scheduler_test_hook()
+            .lock()
+            .expect("reconcile scheduler test hook lock");
+        if let Some(hook) = hook.as_mut() {
+            hook.calls.push(enabled);
+            return Ok(hook.result.clone());
+        }
+    }
+
     if let Err(err) = crate::update::uninstall_auto_update_scheduler().await {
         ::tracing::warn!(
             event = "legacy_auto_update_scheduler_cleanup_failed",
@@ -713,35 +749,9 @@ async fn scheduler_health_macos() -> SchedulerHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn new(key: &'static str) -> Self {
-            Self {
-                key,
-                original: std::env::var(key).ok(),
-            }
-        }
-
-        fn set_path(&self, path: &Path) {
-            unsafe { std::env::set_var(self.key, path) };
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     #[tokio::test]
     #[serial]

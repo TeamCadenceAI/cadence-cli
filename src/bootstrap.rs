@@ -623,35 +623,9 @@ pub(crate) async fn cleanup_cadence_hook_ownership(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn new(key: &'static str) -> Self {
-            Self {
-                key,
-                original: std::env::var_os(key),
-            }
-        }
-
-        fn set_path(&self, path: &Path) {
-            unsafe { std::env::set_var(self.key, path) };
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     #[tokio::test]
     #[serial]

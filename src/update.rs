@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::CliConfig;
+use crate::state_files;
 use crate::transport;
 
 #[cfg(not(any(unix, windows)))]
@@ -169,12 +170,6 @@ fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
-fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
 fn host_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -196,38 +191,14 @@ fn format_epoch_rfc3339(epoch: i64) -> Option<String> {
         })
 }
 
-fn cadence_dir() -> Result<PathBuf> {
-    CliConfig::config_dir().ok_or_else(|| {
-        anyhow::anyhow!("cannot determine cadence config directory: $HOME is not set")
-    })
-}
-
 fn updater_state_path() -> Result<PathBuf> {
-    Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
+    Ok(state_files::cadence_dir()?.join(UPDATER_STATE_FILE))
 }
 
 fn activity_lock_path() -> Result<PathBuf> {
-    Ok(cadence_dir()?
+    Ok(state_files::cadence_dir()?
         .join(ACTIVITY_LOCKS_DIR)
         .join(ACTIVITY_LOCK_FILE))
-}
-
-async fn write_json_atomic<T: ?Sized + Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    let tmp = path.with_extension("tmp");
-    let payload = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
-    tokio::fs::write(&tmp, payload)
-        .await
-        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
-    Ok(())
 }
 
 async fn load_updater_state() -> Result<UpdaterState> {
@@ -244,7 +215,7 @@ async fn load_updater_state() -> Result<UpdaterState> {
 
 async fn save_updater_state(state: &UpdaterState) -> Result<()> {
     let path = updater_state_path()?;
-    write_json_atomic(&path, state).await
+    state_files::write_json_atomic(&path, state).await
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -1177,7 +1148,7 @@ pub async fn run_background_auto_update() -> Result<()> {
     apply_auto_update_jitter().await;
 
     let mut state = load_updater_state().await.unwrap_or_default();
-    let now = now_rfc3339();
+    let now = state_files::now_rfc3339();
     state.last_attempt_at = Some(now.clone());
 
     if !update_due_for_retry(&state, now_epoch()) {
@@ -2698,9 +2669,9 @@ mod tests {
         let retrying = derive_updater_health(
             true,
             &UpdaterState {
-                last_attempt_at: Some(now_rfc3339()),
+                last_attempt_at: Some(state_files::now_rfc3339()),
                 consecutive_failures: 2,
-                next_retry_after: Some(now_rfc3339()),
+                next_retry_after: Some(state_files::now_rfc3339()),
                 last_error: Some("network".to_string()),
                 ..UpdaterState::default()
             },
