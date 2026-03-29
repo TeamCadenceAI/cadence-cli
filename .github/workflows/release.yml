@@ -97,19 +97,6 @@ jobs:
           cp "target/${{ matrix.target }}/release/cadence-updater" "$STAGE_DIR/"
           /usr/bin/ditto -c -k --keepParent "$STAGE_DIR" "cadence-cli-${{ matrix.target }}.zip"
 
-      - name: Notarize macOS archive
-        if: runner.os == 'macOS'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          xcrun notarytool submit "cadence-cli-${{ matrix.target }}.zip" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait
-
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
