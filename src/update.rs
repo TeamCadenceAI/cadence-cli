@@ -14,7 +14,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Output;
+use std::process::Stdio;
 use std::time::Duration;
 use sysinfo::{Pid, System};
 use tokio::io::AsyncReadExt;
@@ -466,14 +468,14 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
         unsafe {
             CloseHandle(handle);
         }
-        return alive;
+        alive
     }
 
     #[cfg(not(any(unix, windows)))]
     {
         let mut system = System::new();
         system.refresh_processes();
-        return system.process(Pid::from_u32(pid)).is_some();
+        system.process(Pid::from_u32(pid)).is_some()
     }
 }
 
@@ -2478,6 +2480,7 @@ const MACOS_LAUNCH_AGENT_LABEL: &str = "ai.teamcadence.cadence.autoupdate";
 #[cfg(target_os = "windows")]
 const WINDOWS_TASK_NAME: &str = "Cadence CLI Auto Update";
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
