@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.0...v2.3.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* **release:** stop checking notarization before submit ([2999c24](https://github.com/TeamCadenceAI/cadence-cli/commit/2999c24c6b98e643a9f511be9316f81ae5254dd7))
+* **release:** stop checking notarization before submit ([eb27a76](https://github.com/TeamCadenceAI/cadence-cli/commit/eb27a76eb9a775d093542d40a7672073b228d92c))
+
 ## [2.3.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.6...v2.3.0) (2026-03-29)
 
 
