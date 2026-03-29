@@ -14,6 +14,7 @@ mod scanner;
 mod state_files;
 mod tracing;
 mod transport;
+#[allow(dead_code)]
 mod update;
 mod upload;
 

@@ -1303,15 +1303,6 @@ fn extract_tar_gz_payload_from_file(
     })
 }
 
-fn extract_tar_gz_from_file(
-    file: std::fs::File,
-    archive_path: &Path,
-    dest_dir: &Path,
-) -> Result<PathBuf> {
-    extract_tar_gz_payload_from_file(file, archive_path, dest_dir, build_target())
-        .map(|payload| payload.cadence_binary)
-}
-
 fn extract_zip_payload_from_file(
     file: std::fs::File,
     archive_path: &Path,
@@ -1367,17 +1358,6 @@ fn extract_zip_payload_from_file(
         cadence_binary,
         updater_binary,
     })
-}
-
-/// Extracts the cadence binary from a zip archive into `dest_dir`.
-/// Returns the path to the extracted binary.
-fn extract_zip_from_file(
-    file: std::fs::File,
-    archive_path: &Path,
-    dest_dir: &Path,
-) -> Result<PathBuf> {
-    extract_zip_payload_from_file(file, archive_path, dest_dir, build_target())
-        .map(|payload| payload.cadence_binary)
 }
 
 async fn extract_release_payload(
@@ -2505,28 +2485,6 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
-}
-
-fn report_best_effort_post_upgrade_failure(
-    mode: InstallMode,
-    what: &str,
-    remediation: &str,
-    err: &anyhow::Error,
-) {
-    if matches!(mode, InstallMode::Interactive) {
-        eprintln!("Warning: cadence updated, but {what}: {err:#}");
-        if !remediation.is_empty() {
-            eprintln!("{remediation}");
-        }
-        return;
-    }
-
-    ::tracing::warn!(
-        event = "post_upgrade_followup_failed",
-        task = what,
-        remediation,
-        error = %format!("{err:#}")
-    );
 }
 
 fn install_handoff_error(err: anyhow::Error) -> anyhow::Error {
