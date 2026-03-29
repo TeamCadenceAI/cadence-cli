@@ -62,9 +62,6 @@ const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
-/// Scheduler cadence and jitter defaults.
-const AUTO_UPDATE_JITTER_SECS: u64 = 5 * 60;
-
 /// Retry backoff defaults.
 const UPDATE_RETRY_BASE_SECS: u64 = 60;
 const UPDATE_RETRY_MAX_SECS: u64 = 8 * 60 * 60;
@@ -975,14 +972,20 @@ async fn run_update_check() -> Result<()> {
 
 /// Full install path: download, verify, extract, confirm, replace.
 async fn run_update_install(yes: bool) -> Result<AttemptOutcome> {
-    run_update_install_from_url_mode(GITHUB_RELEASES_LATEST_URL, yes, InstallMode::Interactive)
-        .await
+    run_update_install_from_url_mode(
+        GITHUB_RELEASES_LATEST_URL,
+        yes,
+        InstallMode::Interactive,
+        false,
+    )
+    .await
 }
 
 /// Install path with injectable URL for testing.
 #[allow(dead_code)]
 pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
-    let _ = run_update_install_from_url_mode(release_url, yes, InstallMode::Interactive).await?;
+    let _ =
+        run_update_install_from_url_mode(release_url, yes, InstallMode::Interactive, false).await?;
     Ok(())
 }
 
@@ -1022,6 +1025,7 @@ async fn run_update_install_from_url_mode(
     release_url: &str,
     yes: bool,
     mode: InstallMode,
+    acquire_activity_lock: bool,
 ) -> Result<AttemptOutcome> {
     let local = current_version();
 
@@ -1062,7 +1066,8 @@ async fn run_update_install_from_url_mode(
         return Ok(AttemptOutcome::NoUpdate);
     }
 
-    let _activity_guard = if matches!(mode, InstallMode::SilentUnattended) {
+    let _activity_guard = if matches!(mode, InstallMode::SilentUnattended) && acquire_activity_lock
+    {
         Some(
             try_acquire_activity_lock_nonblocking("auto-update")
                 .await?
@@ -1139,27 +1144,39 @@ async fn run_update_install_from_url_mode(
     Ok(AttemptOutcome::Installed)
 }
 
-async fn apply_auto_update_jitter() {
-    let jitter = rand08::Rng::gen_range(&mut rand08::thread_rng(), 0..=AUTO_UPDATE_JITTER_SECS);
-    if jitter > 0 {
-        tokio::time::sleep(Duration::from_secs(jitter)).await;
-    }
-}
-
 fn retry_delay_from_state(state: &UpdaterState) -> u64 {
     retry_delay_secs(state.consecutive_failures.max(1))
 }
 
-pub async fn run_background_auto_update() -> Result<()> {
-    apply_auto_update_jitter().await;
+#[doc(hidden)]
+pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
+    #[cfg(test)]
+    {
+        let test_hook = {
+            let mut hook = background_auto_update_test_hook()
+                .lock()
+                .expect("background auto-update test hook lock");
+            hook.as_mut().map(|hook| {
+                hook.calls += 1;
+                (hook.result.clone(), hook.delay_ms)
+            })
+        };
+
+        if let Some((result, delay_ms)) = test_hook {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            return result.map_err(anyhow::Error::msg);
+        }
+    }
 
     let mut state = load_updater_state().await.unwrap_or_default();
-    let now = state_files::now_rfc3339();
-    state.last_attempt_at = Some(now.clone());
-
     if !update_due_for_retry(&state, now_epoch()) {
         return Ok(());
     }
+
+    let now = state_files::now_rfc3339();
+    state.last_attempt_at = Some(now.clone());
 
     let release = match check_latest_version().await {
         Ok(r) => r,
@@ -1191,6 +1208,7 @@ pub async fn run_background_auto_update() -> Result<()> {
         GITHUB_RELEASES_LATEST_URL,
         true,
         InstallMode::SilentUnattended,
+        false,
     )
     .await;
     apply_background_update_attempt_result(&mut state, &now, attempt_result, now_epoch());
@@ -1281,6 +1299,60 @@ pub(crate) fn legacy_cleanup_test_hook_calls() -> usize {
     legacy_cleanup_test_hook()
         .lock()
         .expect("legacy cleanup test hook lock")
+        .as_ref()
+        .map(|hook| hook.calls)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundAutoUpdateTestHook {
+    result: std::result::Result<(), String>,
+    delay_ms: u64,
+    calls: usize,
+}
+
+#[cfg(test)]
+fn background_auto_update_test_hook()
+-> &'static std::sync::Mutex<Option<BackgroundAutoUpdateTestHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<BackgroundAutoUpdateTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) struct BackgroundAutoUpdateTestHookGuard;
+
+#[cfg(test)]
+impl Drop for BackgroundAutoUpdateTestHookGuard {
+    fn drop(&mut self) {
+        if let Ok(mut hook) = background_auto_update_test_hook().lock() {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_background_auto_update_test_hook(
+    result: std::result::Result<(), &'static str>,
+    delay_ms: u64,
+) -> BackgroundAutoUpdateTestHookGuard {
+    let mut hook = background_auto_update_test_hook()
+        .lock()
+        .expect("background auto-update test hook lock");
+    *hook = Some(BackgroundAutoUpdateTestHook {
+        result: result.map_err(|message| message.to_string()),
+        delay_ms,
+        calls: 0,
+    });
+    BackgroundAutoUpdateTestHookGuard
+}
+
+#[cfg(test)]
+pub(crate) fn background_auto_update_test_hook_calls() -> usize {
+    background_auto_update_test_hook()
+        .lock()
+        .expect("background auto-update test hook lock")
         .as_ref()
         .map(|hook| hook.calls)
         .unwrap_or_default()
@@ -1808,6 +1880,18 @@ mod tests {
 
         assert_eq!(disposition, LegacyAutoUpdateCleanupDisposition::Deferred);
         assert_eq!(legacy_cleanup_test_hook_calls(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_background_auto_update_hook_short_circuits_runtime_path() {
+        let _hook = install_background_auto_update_test_hook(Ok(()), 0);
+
+        run_background_auto_update_for_monitor_tick()
+            .await
+            .expect("monitor background update");
+
+        assert_eq!(background_auto_update_test_hook_calls(), 1);
     }
 
     #[tokio::test]

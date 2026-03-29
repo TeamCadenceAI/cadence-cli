@@ -1840,7 +1840,7 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
                 reason = skip_message
             );
             if options.run_auto_update {
-                update::run_background_auto_update().await?;
+                update::run_background_auto_update_for_monitor_tick().await?;
             }
             return Ok(MonitorTickOutcome {
                 summary: MonitorTickSummary::default(),
@@ -1857,7 +1857,7 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
         summary.pending_attempted = pending_summary.attempted;
         summary.pending_uploaded = pending_summary.uploaded + pending_summary.already_existed;
         if options.run_auto_update {
-            update::run_background_auto_update().await?;
+            update::run_background_auto_update_for_monitor_tick().await?;
         }
         Ok(MonitorTickOutcome {
             summary,
@@ -1868,7 +1868,7 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
 
     match run_result {
         Ok(outcome) => {
-            state.last_success_at = Some(now);
+            state.last_success_at = Some(publication_state::now_rfc3339());
             state.last_error = outcome.state_error;
             let summary = outcome.summary;
             state.last_discovered = summary.discovered;
@@ -2871,6 +2871,7 @@ mod tests {
     use serial_test::serial;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
         let out = crate::git::run_git_output_at(Some(repo), args, &[])
@@ -3978,6 +3979,56 @@ mod tests {
                 confirms: 0,
                 user_org_requests: 1,
             }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_records_completion_timestamp_after_background_update() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+        let _update_hook = update::install_background_auto_update_test_hook(Ok(()), 75);
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        run_monitor_tick_internal(MonitorTickOptions {
+            force: true,
+            drain_pending: true,
+            run_auto_update: true,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(update::background_auto_update_test_hook_calls(), 1);
+
+        let state = monitor::load_state().await.expect("load monitor state");
+        let last_run =
+            OffsetDateTime::parse(state.last_run_at.as_deref().expect("last_run_at"), &Rfc3339)
+                .expect("parse last_run_at");
+        let last_success = OffsetDateTime::parse(
+            state.last_success_at.as_deref().expect("last_success_at"),
+            &Rfc3339,
+        )
+        .expect("parse last_success_at");
+
+        assert!(
+            last_success > last_run,
+            "expected completion timestamp after run start: run={last_run}, success={last_success}"
         );
     }
 
