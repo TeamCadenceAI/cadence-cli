@@ -4554,14 +4554,12 @@ mod tests {
         .await
         .expect("helper should start");
 
-        let helper_pid = launch.helper_pid.expect("helper pid");
-        wait_for_pid_to_exit(
-            helper_pid,
-            launch.helper_started_at_epoch,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("wait for fake helper exit");
+        let mut child = launch.child.expect("child-process fallback handle");
+        let status = child.wait().await.expect("wait for fake helper exit");
+        assert!(
+            status.success(),
+            "unexpected fallback helper status: {status}"
+        );
     }
 
     #[tokio::test]
