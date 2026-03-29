@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.0...v2.2.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* harden runtime bootstrap handoff for monitor migration ([2c5058e](https://github.com/TeamCadenceAI/cadence-cli/commit/2c5058e00ace9b9eb85aeeabfc19d043a6dac45c))
+* **monitor:** harden runtime bootstrap handoff ([d72c85e](https://github.com/TeamCadenceAI/cadence-cli/commit/d72c85e4ccc212c8a62607a373e858f2893051be))
+
 ## [2.2.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.7...v2.2.0) (2026-03-29)
 
 
