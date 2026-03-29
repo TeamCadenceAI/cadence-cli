@@ -1534,11 +1534,55 @@ struct MonitorTickSummary {
     pending_uploaded: usize,
 }
 
+#[derive(Debug)]
+struct MonitorTickOutcome {
+    summary: MonitorTickSummary,
+    state_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MonitorTickOptions {
     force: bool,
     drain_pending: bool,
     run_auto_update: bool,
+}
+
+fn publication_auth_skip_message(state: &upload::PublicationAuthState) -> Option<String> {
+    match state {
+        upload::PublicationAuthState::Ready => None,
+        upload::PublicationAuthState::MissingToken => Some(
+            "Cadence login is missing; background publishing is paused until you run `cadence login`."
+                .to_string(),
+        ),
+        upload::PublicationAuthState::Rejected => Some(
+            "Cadence login was rejected by the server; background publishing is paused until you run `cadence login`."
+                .to_string(),
+        ),
+        upload::PublicationAuthState::CheckFailed(message) => Some(format!(
+            "Cadence publication auth check failed; background publishing is paused ({message})."
+        )),
+    }
+}
+
+async fn current_publication_auth_state() -> upload::PublicationAuthState {
+    match upload::resolve_upload_context(api_url_override()).await {
+        Ok(context) => upload::publication_auth_state(&context).await,
+        Err(err) => upload::PublicationAuthState::CheckFailed(format!(
+            "failed to initialize upload context ({err:#})"
+        )),
+    }
+}
+
+async fn write_publication_auth_status_line(w: &mut dyn std::io::Write) {
+    let state = current_publication_auth_state().await;
+    output::detail_to_with_tty(w, &format!("Publication auth: {}", state.detail()), false);
+    if let Some(remediation) = state.remediation() {
+        output::detail_to_with_tty(
+            w,
+            &format!("Publication auth remediation: {remediation}"),
+            false,
+        );
+    }
 }
 
 async fn upload_incremental_sessions_globally(
@@ -1698,8 +1742,24 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
     state.last_run_at = Some(now.clone());
     monitor::save_state(&state).await?;
 
-    let run_result: Result<MonitorTickSummary> = async {
+    let run_result: Result<MonitorTickOutcome> = async {
         let upload_context = upload::resolve_upload_context(api_url_override()).await?;
+        let publication_auth = upload::publication_auth_state(&upload_context).await;
+        if publication_auth.blocks_background_publication()
+            && let Some(skip_message) = publication_auth_skip_message(&publication_auth)
+        {
+            ::tracing::warn!(
+                event = "monitor_tick_publication_paused",
+                reason = skip_message
+            );
+            if options.run_auto_update {
+                update::run_background_auto_update().await?;
+            }
+            return Ok(MonitorTickOutcome {
+                summary: MonitorTickSummary::default(),
+                state_error: Some(skip_message),
+            });
+        }
         let pending_summary = if options.drain_pending {
             let pending_to_drain = upload::pending_upload_count().await.unwrap_or(0);
             upload::process_pending_uploads(&upload_context, pending_to_drain).await?
@@ -1712,14 +1772,18 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
         if options.run_auto_update {
             update::run_background_auto_update().await?;
         }
-        Ok(summary)
+        Ok(MonitorTickOutcome {
+            summary,
+            state_error: None,
+        })
     }
     .await;
 
     match run_result {
-        Ok(summary) => {
+        Ok(outcome) => {
             state.last_success_at = Some(now);
-            state.last_error = None;
+            state.last_error = outcome.state_error;
+            let summary = outcome.summary;
             state.last_discovered = summary.discovered;
             state.last_uploaded = summary.uploaded;
             state.last_queued = summary.queued;
@@ -1929,6 +1993,31 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
         }
     }
 
+    let publication_auth = current_publication_auth_state().await;
+    match &publication_auth {
+        upload::PublicationAuthState::Ready => {
+            output::detail_to_with_tty(w, "Publication auth: ready", false);
+        }
+        upload::PublicationAuthState::MissingToken
+        | upload::PublicationAuthState::Rejected
+        | upload::PublicationAuthState::CheckFailed(_) => {
+            output::fail_to_with_tty(
+                w,
+                "Fail",
+                &format!("Publication auth: {}", publication_auth.detail()),
+                false,
+            );
+            if let Some(remediation) = publication_auth.remediation() {
+                output::detail_to_with_tty(
+                    w,
+                    &format!("Publication auth remediation: {remediation}"),
+                    false,
+                );
+            }
+            issues += 1;
+        }
+    }
+
     let updater_health = update::updater_health().await;
     match updater_health.state {
         update::UpdaterHealthState::Disabled => {
@@ -2130,6 +2219,7 @@ async fn write_monitor_status_block(
     );
     let pending_uploads = upload::pending_upload_count().await.unwrap_or(0);
     output::detail_to_with_tty(w, &format!("Pending uploads: {}", pending_uploads), false);
+    write_publication_auth_status_line(w).await;
     if include_controls {
         output::detail_to_with_tty(
             w,
@@ -2785,6 +2875,14 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).expect("json row"))
             .collect()
+    }
+
+    fn output_string(buf: Vec<u8>) -> String {
+        String::from_utf8(buf).expect("utf8 output")
+    }
+
+    fn occurrence_count(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
     }
 
     fn event_names(rows: &[Value]) -> Vec<String> {
@@ -3709,6 +3807,206 @@ mod tests {
                 user_org_requests: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_pauses_publication_when_auth_is_rejected() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let prepared = upload::prepare_session_upload(sample_observed_upload(
+            Path::new("/tmp/repo"),
+            "session-monitor-auth-paused",
+            "hello",
+        ))
+        .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let summary = run_monitor_tick_internal(MonitorTickOptions {
+            force: true,
+            drain_pending: true,
+            run_auto_update: false,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.issues, 0);
+        assert_eq!(summary.pending_attempted, 0);
+        assert_eq!(summary.pending_uploaded, 0);
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            1
+        );
+
+        let state = monitor::load_state().await.expect("load monitor state");
+        assert!(state.last_run_at.is_some());
+        assert!(state.last_success_at.is_some());
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some(
+                "Cadence login was rejected by the server; background publishing is paused until you run `cadence login`."
+            )
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 0,
+                uploads: 0,
+                confirms: 0,
+                user_org_requests: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn status_reports_publication_auth_rejection_once() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let mut output = Vec::new();
+        run_status_inner(&mut output).await.expect("run status");
+        let rendered = output_string(output);
+
+        assert_eq!(
+            occurrence_count(
+                &rendered,
+                "Publication auth: CLI auth token was rejected by the server"
+            ),
+            1
+        );
+        assert!(rendered.contains(
+            "Publication auth remediation: Run `cadence login` to restore background publishing."
+        ));
+        assert_eq!(server.counts().user_org_requests, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_status_reports_publication_auth_rejection() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let mut output = Vec::new();
+        write_monitor_status_block(&mut output, true)
+            .await
+            .expect("write monitor status");
+        let rendered = output_string(output);
+
+        assert!(rendered.contains("Publication auth: CLI auth token was rejected by the server"));
+        assert!(rendered.contains(
+            "Publication auth remediation: Run `cadence login` to restore background publishing."
+        ));
+        assert_eq!(server.counts().user_org_requests, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn doctor_fails_when_publication_auth_is_rejected() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let mut output = Vec::new();
+        let err = run_doctor_inner(&mut output, false)
+            .await
+            .expect_err("doctor should fail");
+        let rendered = output_string(output);
+
+        assert!(err.to_string().contains("doctor found"));
+        assert!(
+            rendered.contains("Fail Publication auth: CLI auth token was rejected by the server")
+        );
+        assert!(rendered.contains(
+            "Publication auth remediation: Run `cadence login` to restore background publishing."
+        ));
+        assert_eq!(server.counts().user_org_requests, 1);
     }
 
     #[tokio::test]
