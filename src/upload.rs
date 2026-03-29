@@ -32,10 +32,45 @@ pub struct UploadContext {
     user_orgs: Mutex<Option<Vec<UserOrgInfo>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationAuthState {
+    Ready,
+    MissingToken,
+    Rejected,
+    CheckFailed(String),
+}
+
 impl UploadContext {
     /// Returns whether the current context has an auth token available.
     pub fn has_token(&self) -> bool {
         self.token.is_some()
+    }
+}
+
+impl PublicationAuthState {
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Ready => "ready".to_string(),
+            Self::MissingToken => "missing CLI auth token".to_string(),
+            Self::Rejected => "CLI auth token was rejected by the server".to_string(),
+            Self::CheckFailed(message) => format!("check failed ({message})"),
+        }
+    }
+
+    pub fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::MissingToken | Self::Rejected => {
+                Some("Run `cadence login` to restore background publishing.")
+            }
+            Self::CheckFailed(_) => {
+                Some("Background publishing will retry after the next successful auth check.")
+            }
+        }
+    }
+
+    pub fn blocks_background_publication(&self) -> bool {
+        !matches!(self, Self::Ready)
     }
 }
 
@@ -88,6 +123,18 @@ pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<Up
         token,
         user_orgs: Mutex::new(None),
     })
+}
+
+pub async fn publication_auth_state(context: &UploadContext) -> PublicationAuthState {
+    if context.token.is_none() {
+        return PublicationAuthState::MissingToken;
+    }
+
+    match fetch_user_orgs_authenticated(context).await {
+        Ok(_) => PublicationAuthState::Ready,
+        Err(AuthenticatedRequestError::Unauthorized) => PublicationAuthState::Rejected,
+        Err(err) => PublicationAuthState::CheckFailed(err.to_string()),
+    }
 }
 
 /// Converts observed session data into a prepared publication.
@@ -604,19 +651,25 @@ async fn resolve_target_org(
 }
 
 async fn fetch_user_orgs(context: &UploadContext) -> Result<Vec<UserOrgInfo>> {
+    fetch_user_orgs_authenticated(context)
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+}
+
+async fn fetch_user_orgs_authenticated(
+    context: &UploadContext,
+) -> std::result::Result<Vec<UserOrgInfo>, AuthenticatedRequestError> {
     let mut guard = context.user_orgs.lock().await;
     if let Some(cached) = guard.as_ref() {
         return Ok(cached.clone());
     }
-    let token = context
-        .token
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("missing Cadence CLI auth token"))?;
+    let token = context.token.as_deref().ok_or_else(|| {
+        AuthenticatedRequestError::Unexpected("missing Cadence CLI auth token".to_string())
+    })?;
     let response = context
         .client
         .list_user_orgs(token, Duration::from_secs(API_TIMEOUT_SECS))
-        .await
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        .await?;
     *guard = Some(response.orgs.clone());
     Ok(response.orgs)
 }
@@ -710,6 +763,7 @@ pub(crate) mod test_support {
         pub create_statuses: Vec<u16>,
         pub upload_statuses: Vec<u16>,
         pub confirm_statuses: Vec<u16>,
+        pub user_org_statuses: Vec<u16>,
         pub user_orgs: Vec<Value>,
         pub upload_response_delay_ms: u64,
     }
@@ -742,6 +796,7 @@ pub(crate) mod test_support {
         create_statuses: VecDeque<u16>,
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
+        user_org_statuses: VecDeque<u16>,
         user_orgs: Vec<Value>,
         upload_response_delay_ms: u64,
     }
@@ -784,6 +839,7 @@ pub(crate) mod test_support {
             create_statuses: config.create_statuses.into(),
             upload_statuses: config.upload_statuses.into(),
             confirm_statuses: config.confirm_statuses.into(),
+            user_org_statuses: config.user_org_statuses.into(),
             user_orgs: if config.user_orgs.is_empty() {
                 vec![serde_json::json!({
                     "github_org_id": 1,
@@ -830,11 +886,27 @@ pub(crate) mod test_support {
                         ("GET", "/api/user/orgs") => {
                             let mut guard = state.lock().expect("server state");
                             guard.counts.user_org_requests += 1;
-                            (
-                                200,
-                                serde_json::json!({ "data": { "orgs": guard.user_orgs } })
+                            let status = guard.user_org_statuses.pop_front().unwrap_or(200);
+                            if status == 200 {
+                                (
+                                    200,
+                                    serde_json::json!({ "data": { "orgs": guard.user_orgs } })
+                                        .to_string(),
+                                )
+                            } else {
+                                (
+                                    status,
+                                    serde_json::json!({
+                                        "error": if status == 401 { "unauthorized" } else { "request_failed" },
+                                        "message": if status == 401 {
+                                            "Authentication required"
+                                        } else {
+                                            "user org request failed"
+                                        }
+                                    })
                                     .to_string(),
-                            )
+                                )
+                            }
                         }
                         ("POST", "/api/v2/session-publications") => {
                             let mut guard = state.lock().expect("server state");
@@ -1076,6 +1148,41 @@ mod tests {
             }
         );
         assert_eq!(pending_upload_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn publication_auth_state_reports_missing_token() {
+        let context = UploadContext {
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
+            token: None,
+            user_orgs: Mutex::new(None),
+        };
+
+        let state = publication_auth_state(&context).await;
+
+        assert_eq!(state, PublicationAuthState::MissingToken);
+        assert!(state.blocks_background_publication());
+    }
+
+    #[tokio::test]
+    async fn publication_auth_state_reports_rejected_token() {
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            user_org_statuses: vec![401],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+
+        let state = publication_auth_state(&context).await;
+
+        assert_eq!(state, PublicationAuthState::Rejected);
+        assert!(state.blocks_background_publication());
+        assert_eq!(server.counts().user_org_requests, 1);
     }
 
     #[tokio::test]
