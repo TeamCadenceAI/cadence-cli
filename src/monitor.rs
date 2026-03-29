@@ -283,8 +283,6 @@ fn launch_agent_plist(label: &str, exe_path: &Path) -> String {
   </array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>{interval}</integer>
-  <key>StandardOutPath</key><string>/tmp/cadence-monitor.log</string>
-  <key>StandardErrorPath</key><string>/tmp/cadence-monitor.log</string>
 </dict>
 </plist>
 "#,
@@ -518,7 +516,12 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
 }
 
 pub async fn reconcile_scheduler_for_enabled(enabled: bool) -> Result<SchedulerProvisionResult> {
-    let _ = crate::update::uninstall_auto_update_scheduler().await;
+    if let Err(err) = crate::update::uninstall_auto_update_scheduler().await {
+        ::tracing::warn!(
+            event = "legacy_auto_update_scheduler_cleanup_failed",
+            error = %format!("{err:#}")
+        );
+    }
     if enabled {
         return provision_scheduler().await;
     }
@@ -812,5 +815,17 @@ mod tests {
             Ok(true),
         );
         assert_eq!(health.state, SchedulerHealthState::Installed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_agent_plist_does_not_write_monitor_logs_to_tmp() {
+        let plist = launch_agent_plist(
+            "ai.teamcadence.cadence.monitor",
+            Path::new("/usr/local/bin/cadence"),
+        );
+        assert!(!plist.contains("/tmp/cadence-monitor.log"));
+        assert!(plist.contains("<string>monitor</string>"));
+        assert!(plist.contains("<string>tick</string>"));
     }
 }

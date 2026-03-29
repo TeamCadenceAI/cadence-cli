@@ -15,12 +15,12 @@ This branch needs the following fixes before deployment.
 - [ ] Cover `run_monitor_tick_internal` or equivalent end-to-end monitor tick behavior.
 - [ ] Cover `upload_incremental_sessions_globally` cursor advance, retryable blocking, disabled-monitor early exit, and pending-drain behavior.
 - [ ] Clean up the dead-code warnings on this branch, including old hook-era paths, upload-cursor leftovers, and dead constants.
-- [ ] Stop silently swallowing legacy auto-update scheduler teardown failures in monitor scheduler reconciliation; at minimum log them clearly.
-- [ ] Move monitor logging out of `/tmp/cadence-monitor.log` and into `~/.cadence/cli`.
-- [ ] Use daily append logs for monitor runtime diagnostics, for example `~/.cadence/cli/monitor.YYYY-MM-DD.log`.
-- [ ] Retain only 14 days of monitor log history; do not add a size cap for this branch.
-- [ ] Ensure monitor log parent directories are created automatically and cleanup paths are updated for the new durable log location.
-- [ ] Remove any active monitor log dependence on `/tmp`; do not leave the scheduler writing the primary monitor log there.
+- [x] Stop silently swallowing legacy auto-update scheduler teardown failures in monitor scheduler reconciliation; log them clearly.
+- [x] Move monitor logging out of `/tmp/cadence-monitor.log` and into `~/.cadence/cli`.
+- [x] Use daily append logs for monitor runtime diagnostics, for example `~/.cadence/cli/monitor.YYYY-MM-DD.log`.
+- [x] Retain only 14 days of monitor log history; do not add a size cap for this branch.
+- [x] Ensure monitor log parent directories are created automatically and cleanup paths are updated for the new durable log location.
+- [x] Remove any active monitor log dependence on `/tmp`; do not leave the scheduler writing the primary monitor log there.
 - [ ] Fix the stale `run_status_inner` docstring/help text that still describes removed hook-era status checks.
 - [ ] Investigate and resolve the observed `cargo test --no-fail-fast` instability before deploy, including the intermittent `activity_lock_blocking_times_out_when_held` failure.
 

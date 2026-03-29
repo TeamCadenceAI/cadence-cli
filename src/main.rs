@@ -30,6 +30,7 @@ use tokio::task::JoinSet;
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
 const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
+const MONITOR_LOG_RETENTION_DAYS: i64 = 14;
 static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
 fn error_chain_messages(err: &anyhow::Error) -> Vec<String> {
@@ -2680,6 +2681,33 @@ fn automatic_bootstrap_includes_recovery_backfill(command: &Command) -> bool {
     !matches!(command, Command::Backfill { .. })
 }
 
+fn uses_monitor_diagnostics_session(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Monitor {
+            command: Some(MonitorCommand::Tick)
+        } | Command::Hook {
+            hook_command: HookCommand::AutoUpdate
+        }
+    )
+}
+
+async fn install_monitor_diagnostics_session(
+    command: &Command,
+) -> Option<tracing::DiagnosticsSessionGuard> {
+    if !uses_monitor_diagnostics_session(command) {
+        return None;
+    }
+
+    match tracing::DiagnosticsLogger::new_daily("monitor", MONITOR_LOG_RETENTION_DAYS).await {
+        Ok(logger) => Some(tracing::install_global(logger)),
+        Err(err) => {
+            eprintln!("Warning: monitor diagnostics unavailable: {err:#}");
+            None
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -2687,6 +2715,13 @@ async fn main() {
     if let Some(url) = cli.api_url.clone() {
         let _ = API_URL_OVERRIDE.set(url);
     }
+    let use_monitor_diagnostics = uses_monitor_diagnostics_session(&cli.command);
+    let monitor_diagnostics_command = if use_monitor_diagnostics {
+        Some(format!("{:?}", &cli.command))
+    } else {
+        None
+    };
+    let _monitor_diagnostics = install_monitor_diagnostics_session(&cli.command).await;
 
     let is_update_command = matches!(&cli.command, Command::Update { .. });
     let is_hook_command = matches!(&cli.command, Command::Hook { .. });
@@ -2702,6 +2737,12 @@ async fn main() {
         )
         .await
     {
+        if use_monitor_diagnostics {
+            ::tracing::warn!(
+                event = "automatic_runtime_bootstrap_failed",
+                error = %format!("{err:#}")
+            );
+        }
         eprintln!("Warning: automatic runtime bootstrap did not complete: {err:#}");
         eprintln!(
             "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership."
@@ -2741,6 +2782,13 @@ async fn main() {
     }
 
     if let Err(e) = result {
+        if use_monitor_diagnostics {
+            ::tracing::error!(
+                event = "background_command_failed",
+                command = monitor_diagnostics_command.as_deref().unwrap_or("unknown"),
+                error = %format!("{e:#}")
+            );
+        }
         report_error(&e);
         process::exit(1);
     }
@@ -3178,6 +3226,23 @@ mod tests {
             repaired_monitor_state_for_enabled(true, Err(anyhow::anyhow!("corrupt state")));
         assert!(repaired.enabled);
         assert_eq!(repaired.last_run_at, None);
+    }
+
+    #[test]
+    fn monitor_diagnostics_sessions_only_wrap_hidden_runtime_commands() {
+        let tick = Command::Monitor {
+            command: Some(MonitorCommand::Tick),
+        };
+        let compatibility = Command::Hook {
+            hook_command: HookCommand::AutoUpdate,
+        };
+        let status = Command::Monitor {
+            command: Some(MonitorCommand::Status),
+        };
+
+        assert!(uses_monitor_diagnostics_session(&tick));
+        assert!(uses_monitor_diagnostics_session(&compatibility));
+        assert!(!uses_monitor_diagnostics_session(&status));
     }
 
     #[test]
