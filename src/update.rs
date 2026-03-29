@@ -16,6 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
+use sysinfo::{Pid, System};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -23,11 +24,10 @@ use crate::config::CliConfig;
 use crate::state_files;
 use crate::transport;
 
-#[cfg(not(any(unix, windows)))]
-use sysinfo::{Pid, System};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{CloseHandle, WAIT_TIMEOUT},
+    Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
     System::Threading::{OpenProcess, WaitForSingleObject},
 };
 
@@ -53,15 +53,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATER_STATE_FILE: &str = "updater-state.json";
 const UPDATE_STAGING_DIR: &str = "update-staging";
 const UPDATE_MANIFEST_FILE: &str = "install-manifest.json";
+const UPDATE_IN_PROGRESS_FILE: &str = "update-in-progress.json";
+#[cfg(windows)]
+const UPDATE_HELPER_RUNTIME_DIR: &str = "update-helper-runtime";
 
 /// Shared activity lock directory/file for hook + deferred sync + updater coordination.
 const ACTIVITY_LOCKS_DIR: &str = "locks";
 const ACTIVITY_LOCK_FILE: &str = "global-activity.lock";
-const ACTIVITY_LOCK_STALE_SECS: i64 = 15 * 60;
-#[cfg(test)]
-const ACTIVITY_LOCK_POLL_INTERVAL_MS: u64 = 20;
 #[cfg(test)]
 const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const ACTIVITY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
+const ACTIVITY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(windows)]
 const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
@@ -74,6 +80,8 @@ const UPDATER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActivityLockRecord {
     pid: u32,
+    #[serde(default)]
+    process_started_at_epoch: Option<u64>,
     created_at_epoch: i64,
     hostname: String,
     purpose: String,
@@ -86,7 +94,9 @@ pub struct ActivityLockGuard {
 
 impl Drop for ActivityLockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if release_process_local_activity_lock(&self.path) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -146,11 +156,28 @@ struct UpdateInstallManifest {
     mode: InstallMode,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct UpdateInProgressRecord {
+    target_version: String,
+    final_cadence_path: PathBuf,
+    initiator_pid: u32,
+    helper_pid: Option<u32>,
+    created_at_epoch: i64,
+}
+
 #[derive(Debug, Clone)]
 struct ExtractedReleasePayload {
     cadence_binary: PathBuf,
     updater_binary: PathBuf,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateCommandStatus {
+    Completed,
+    HandoffPending,
+}
+
+pub const UPDATE_HELPER_PENDING_EXIT_CODE: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyAutoUpdateCleanupDisposition {
@@ -221,6 +248,10 @@ fn updater_state_path() -> Result<PathBuf> {
     Ok(state_files::cadence_dir()?.join(UPDATER_STATE_FILE))
 }
 
+fn update_in_progress_path() -> Result<PathBuf> {
+    Ok(state_files::cadence_dir()?.join(UPDATE_IN_PROGRESS_FILE))
+}
+
 fn activity_lock_path() -> Result<PathBuf> {
     Ok(state_files::cadence_dir()?
         .join(ACTIVITY_LOCKS_DIR)
@@ -233,6 +264,48 @@ fn updater_staging_root() -> PathBuf {
         Err(_) => std::env::temp_dir()
             .join("cadence-cli")
             .join(UPDATE_STAGING_DIR),
+    }
+}
+
+#[cfg(windows)]
+fn updater_helper_runtime_root() -> PathBuf {
+    match state_files::cadence_dir() {
+        Ok(path) => path.join(UPDATE_HELPER_RUNTIME_DIR),
+        Err(_) => std::env::temp_dir()
+            .join("cadence-cli")
+            .join(UPDATE_HELPER_RUNTIME_DIR),
+    }
+}
+
+fn process_local_activity_lock_counts()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
+    static COUNTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn retain_process_local_activity_lock(path: &Path) {
+    let mut counts = process_local_activity_lock_counts()
+        .lock()
+        .expect("activity lock state");
+    *counts.entry(path.to_path_buf()).or_insert(0) += 1;
+}
+
+fn release_process_local_activity_lock(path: &Path) -> bool {
+    let mut counts = process_local_activity_lock_counts()
+        .lock()
+        .expect("activity lock state");
+    match counts.get_mut(path) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        Some(_) => {
+            counts.remove(path);
+            true
+        }
+        None => false,
     }
 }
 
@@ -281,6 +354,58 @@ async fn load_updater_state() -> Result<UpdaterState> {
 async fn save_updater_state(state: &UpdaterState) -> Result<()> {
     let path = updater_state_path()?;
     state_files::write_json_atomic(&path, state).await
+}
+
+async fn load_update_in_progress_record(path: &Path) -> Result<Option<UpdateInProgressRecord>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => serde_json::from_str::<UpdateInProgressRecord>(&content)
+            .map(Some)
+            .with_context(|| {
+                format!(
+                    "failed to parse update in-progress marker {}",
+                    path.display()
+                )
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to read update in-progress marker {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+async fn write_update_in_progress_record(record: &UpdateInProgressRecord) -> Result<()> {
+    let path = update_in_progress_path()?;
+    state_files::write_json_atomic(&path, record).await
+}
+
+async fn clear_update_in_progress_record() -> Result<()> {
+    let path = update_in_progress_path()?;
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to remove update marker {}", path.display()))
+        }
+    }
+}
+
+fn current_process_started_at_epoch() -> Option<u64> {
+    process_started_at_epoch(std::process::id())
+}
+
+fn process_started_at_epoch(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+
+    let mut system = System::new();
+    system.refresh_processes();
+    system
+        .process(Pid::from_u32(pid))
+        .map(|process| process.start_time())
 }
 
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
@@ -346,52 +471,116 @@ async fn try_create_activity_lock(path: &Path, record: &ActivityLockRecord) -> R
     Ok(true)
 }
 
-async fn clear_stale_activity_lock(path: &Path) -> Result<()> {
+async fn read_activity_lock_record(path: &Path) -> Result<Option<ActivityLockRecord>> {
     let content = match tokio::fs::read_to_string(path).await {
-        Ok(v) => v,
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read lock {}", path.display()));
+        }
+    };
+
+    serde_json::from_str::<ActivityLockRecord>(&content)
+        .map(Some)
+        .with_context(|| format!("parse lock {}", path.display()))
+}
+
+async fn activity_lock_owned_by_current_process(path: &Path) -> Result<bool> {
+    let Some(record) = read_activity_lock_record(path).await? else {
+        return Ok(false);
+    };
+    if record.pid != std::process::id() {
+        return Ok(false);
+    }
+    if let Some(expected_start) = record.process_started_at_epoch
+        && current_process_started_at_epoch() != Some(expected_start)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn clear_stale_activity_lock(path: &Path) -> Result<()> {
+    let parsed = match read_activity_lock_record(path).await {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => return Ok(()),
         Err(_) => {
             let _ = tokio::fs::remove_file(path).await;
             return Ok(());
         }
     };
-    let parsed = match serde_json::from_str::<ActivityLockRecord>(&content) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = tokio::fs::remove_file(path).await;
-            return Ok(());
-        }
-    };
-    let age = now_epoch().saturating_sub(parsed.created_at_epoch);
-    // If owner process is gone or lock is stale, reclaim it.
-    if age > ACTIVITY_LOCK_STALE_SECS || !is_pid_alive(parsed.pid) {
+    if !is_pid_alive(parsed.pid) {
+        let _ = tokio::fs::remove_file(path).await;
+        return Ok(());
+    }
+    if let Some(expected_start) = parsed.process_started_at_epoch
+        && process_started_at_epoch(parsed.pid) != Some(expected_start)
+    {
         let _ = tokio::fs::remove_file(path).await;
     }
     Ok(())
 }
 
-#[cfg(test)]
-pub async fn acquire_activity_lock_blocking(purpose: &str) -> Result<ActivityLockGuard> {
-    acquire_activity_lock_blocking_with_timeout(purpose, ACTIVITY_LOCK_BLOCKING_TIMEOUT).await
+async fn current_update_in_progress_record() -> Result<Option<UpdateInProgressRecord>> {
+    let path = update_in_progress_path()?;
+    let Some(record) = load_update_in_progress_record(&path).await? else {
+        return Ok(None);
+    };
+    if is_pid_alive(record.initiator_pid) || record.helper_pid.is_some_and(is_pid_alive) {
+        return Ok(Some(record));
+    }
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(None)
 }
 
-#[cfg(test)]
+fn update_in_progress_error(record: &UpdateInProgressRecord) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cadence update to v{} is in progress; retry shortly",
+        record.target_version
+    )
+}
+
+fn update_in_progress_bypass_enabled() -> bool {
+    std::env::var("CADENCE_INTERNAL_ALLOW_UPDATE_IN_PROGRESS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn activity_lock_record(purpose: &str) -> ActivityLockRecord {
+    ActivityLockRecord {
+        pid: std::process::id(),
+        process_started_at_epoch: current_process_started_at_epoch(),
+        created_at_epoch: now_epoch(),
+        hostname: host_name(),
+        purpose: purpose.to_string(),
+    }
+}
+
 async fn acquire_activity_lock_blocking_with_timeout(
     purpose: &str,
     timeout: Duration,
+    fail_if_update_in_progress: bool,
 ) -> Result<ActivityLockGuard> {
     let lock_path = activity_lock_path()?;
     if let Some(parent) = lock_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let record = ActivityLockRecord {
-        pid: std::process::id(),
-        created_at_epoch: now_epoch(),
-        hostname: host_name(),
-        purpose: purpose.to_string(),
-    };
+    let record = activity_lock_record(purpose);
     let started_at = tokio::time::Instant::now();
     loop {
+        if fail_if_update_in_progress
+            && !update_in_progress_bypass_enabled()
+            && let Some(record) = current_update_in_progress_record().await?
+        {
+            return Err(update_in_progress_error(&record));
+        }
         if try_create_activity_lock(&lock_path, &record).await? {
+            retain_process_local_activity_lock(&lock_path);
+            return Ok(ActivityLockGuard { path: lock_path });
+        }
+        if activity_lock_owned_by_current_process(&lock_path).await? {
+            retain_process_local_activity_lock(&lock_path);
             return Ok(ActivityLockGuard { path: lock_path });
         }
         clear_stale_activity_lock(&lock_path).await?;
@@ -403,9 +592,17 @@ async fn acquire_activity_lock_blocking_with_timeout(
             );
         }
         let remaining = timeout.saturating_sub(elapsed);
-        tokio::time::sleep(remaining.min(Duration::from_millis(ACTIVITY_LOCK_POLL_INTERVAL_MS)))
-            .await;
+        tokio::time::sleep(remaining.min(ACTIVITY_LOCK_POLL_INTERVAL)).await;
     }
+}
+
+pub async fn acquire_command_activity_lock(purpose: &str) -> Result<ActivityLockGuard> {
+    acquire_activity_lock_blocking_with_timeout(purpose, ACTIVITY_LOCK_BLOCKING_TIMEOUT, true).await
+}
+
+pub async fn acquire_activity_lock_blocking(purpose: &str) -> Result<ActivityLockGuard> {
+    acquire_activity_lock_blocking_with_timeout(purpose, ACTIVITY_LOCK_BLOCKING_TIMEOUT, false)
+        .await
 }
 
 pub async fn try_acquire_activity_lock_nonblocking(
@@ -416,13 +613,13 @@ pub async fn try_acquire_activity_lock_nonblocking(
         tokio::fs::create_dir_all(parent).await?;
     }
     clear_stale_activity_lock(&lock_path).await?;
-    let record = ActivityLockRecord {
-        pid: std::process::id(),
-        created_at_epoch: now_epoch(),
-        hostname: host_name(),
-        purpose: purpose.to_string(),
-    };
+    let record = activity_lock_record(purpose);
     if try_create_activity_lock(&lock_path, &record).await? {
+        retain_process_local_activity_lock(&lock_path);
+        return Ok(Some(ActivityLockGuard { path: lock_path }));
+    }
+    if activity_lock_owned_by_current_process(&lock_path).await? {
+        retain_process_local_activity_lock(&lock_path);
         return Ok(Some(ActivityLockGuard { path: lock_path }));
     }
     Ok(None)
@@ -1076,6 +1273,68 @@ async fn wait_for_pid_to_exit(pid: u32, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
+fn normalize_process_path_key(path: &Path) -> String {
+    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        normalized
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized.to_string_lossy().into_owned()
+    }
+}
+
+fn pids_for_executable_path(exe_path: &Path) -> Vec<u32> {
+    let expected = normalize_process_path_key(exe_path);
+    let mut system = System::new();
+    system.refresh_processes();
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let exe = process.exe()?;
+            (normalize_process_path_key(exe) == expected).then_some(pid.as_u32())
+        })
+        .collect()
+}
+
+async fn wait_for_executable_path_to_quiesce(
+    exe_path: &Path,
+    ignored_pids: &[u32],
+    timeout: Duration,
+) -> Result<()> {
+    let exe = exe_path.to_path_buf();
+    let ignored = ignored_pids.to_vec();
+    let started = tokio::time::Instant::now();
+
+    loop {
+        let exe_for_scan = exe.clone();
+        let running_pids =
+            tokio::task::spawn_blocking(move || pids_for_executable_path(&exe_for_scan))
+                .await
+                .context("failed to inspect running cadence processes")?;
+        let live_matches: Vec<u32> = running_pids
+            .into_iter()
+            .filter(|pid| !ignored.contains(pid))
+            .collect();
+        if live_matches.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out waiting for exclusive ownership of {} (pids: {:?})",
+                exe.display(),
+                live_matches
+            );
+        }
+        tokio::time::sleep(UPDATER_WAIT_POLL_INTERVAL).await;
+    }
+}
+
 async fn set_executable_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1093,6 +1352,37 @@ async fn set_executable_permissions(path: &Path) -> Result<()> {
         let _ = path;
     }
 
+    Ok(())
+}
+
+#[cfg(windows)]
+fn move_file_replace_existing(from: &Path, to: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let from_wide = wide(from);
+    let to_wide = wide(to);
+    let result = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        bail!(
+            "failed to replace {} with {}: {}",
+            to.display(),
+            from.display(),
+            io::Error::last_os_error()
+        );
+    }
     Ok(())
 }
 
@@ -1139,12 +1429,30 @@ async fn install_staged_binary(staged_path: &Path, final_path: &Path) -> Result<
     set_executable_permissions(&temp_path).await?;
 
     #[cfg(windows)]
-    if tokio::fs::try_exists(final_path).await.unwrap_or(false) {
-        tokio::fs::remove_file(final_path).await.with_context(|| {
-            format!("failed to remove existing install {}", final_path.display())
-        })?;
+    {
+        let temp = temp_path.clone();
+        let final_dest = final_path.to_path_buf();
+        let replace_result = tokio::task::spawn_blocking(move || {
+            if final_dest.exists() {
+                move_file_replace_existing(&temp, &final_dest)
+            } else {
+                std::fs::rename(&temp, &final_dest).with_context(|| {
+                    format!(
+                        "failed to move replacement binary into final install location {}",
+                        final_dest.display()
+                    )
+                })
+            }
+        })
+        .await
+        .context("replacement move task failed")?;
+        if let Err(err) = replace_result {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err);
+        }
     }
 
+    #[cfg(not(windows))]
     tokio::fs::rename(&temp_path, final_path)
         .await
         .with_context(|| {
@@ -1157,8 +1465,55 @@ async fn install_staged_binary(staged_path: &Path, final_path: &Path) -> Result<
     Ok(())
 }
 
-async fn launch_updater_helper(helper_path: &Path, manifest_path: &Path) -> Result<u32> {
-    let child = Command::new(helper_path)
+#[cfg(windows)]
+async fn prepare_updater_helper_launch_path(
+    helper_path: &Path,
+    target_version: &str,
+) -> Result<PathBuf> {
+    let root = updater_helper_runtime_root();
+    tokio::fs::create_dir_all(&root)
+        .await
+        .with_context(|| format!("failed to create helper runtime root {}", root.display()))?;
+    let dir = root.join(format!(
+        "{}-{}-{}",
+        normalize_version_tag(target_version),
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed to create helper runtime dir {}", dir.display()))?;
+    let launch_path = dir.join(helper_path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("helper path has no filename: {}", helper_path.display())
+    })?);
+    tokio::fs::copy(helper_path, &launch_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to copy updater helper from {} to {}",
+                helper_path.display(),
+                launch_path.display()
+            )
+        })?;
+    set_executable_permissions(&launch_path).await?;
+    Ok(launch_path)
+}
+
+#[cfg(not(windows))]
+async fn prepare_updater_helper_launch_path(
+    helper_path: &Path,
+    _target_version: &str,
+) -> Result<PathBuf> {
+    Ok(helper_path.to_path_buf())
+}
+
+async fn launch_updater_helper(
+    helper_path: &Path,
+    manifest_path: &Path,
+    target_version: &str,
+) -> Result<tokio::process::Child> {
+    let launch_path = prepare_updater_helper_launch_path(helper_path, target_version).await?;
+    let child = Command::new(&launch_path)
         .arg("--manifest")
         .arg(manifest_path)
         .stdin(Stdio::null())
@@ -1168,13 +1523,47 @@ async fn launch_updater_helper(helper_path: &Path, manifest_path: &Path) -> Resu
         .with_context(|| {
             format!(
                 "failed to launch updater helper {} with manifest {}",
-                helper_path.display(),
+                launch_path.display(),
                 manifest_path.display()
             )
         })?;
-
-    Ok(child.id().unwrap_or_default())
+    Ok(child)
 }
+
+#[cfg(windows)]
+async fn maybe_cleanup_updater_helper_runtime_dir() {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(runtime_dir) = current_exe.parent() else {
+        return;
+    };
+    let runtime_root = updater_helper_runtime_root();
+    if runtime_dir.parent() != Some(runtime_root.as_path()) {
+        return;
+    }
+
+    let cleanup_command = format!(
+        "ping -n 3 127.0.0.1 >NUL && rmdir /s /q \"{}\"",
+        runtime_dir.display()
+    );
+    if let Err(err) = Command::new("cmd")
+        .args(["/C", &cleanup_command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        ::tracing::warn!(
+            event = "updater_helper_runtime_cleanup_failed",
+            runtime_dir = runtime_dir.display().to_string(),
+            error = %format!("{err:#}")
+        );
+    }
+}
+
+#[cfg(not(windows))]
+async fn maybe_cleanup_updater_helper_runtime_dir() {}
 
 async fn record_helper_result(manifest: &UpdateInstallManifest, result: &Result<()>) -> Result<()> {
     let now = state_files::now_rfc3339();
@@ -1203,7 +1592,15 @@ async fn run_updater_helper_with_manifest(manifest: &UpdateInstallManifest) -> R
     );
 
     wait_for_pid_to_exit(manifest.wait_for_pid, UPDATER_WAIT_TIMEOUT).await?;
+    let activity_guard = acquire_activity_lock_blocking("update-helper-install").await?;
+    wait_for_executable_path_to_quiesce(
+        &manifest.final_cadence_path,
+        &[manifest.wait_for_pid],
+        UPDATER_WAIT_TIMEOUT,
+    )
+    .await?;
     install_staged_binary(&manifest.staged_cadence_path, &manifest.final_cadence_path).await?;
+    drop(activity_guard);
 
     if let Err(err) = run_install_with_exe(
         &manifest.final_cadence_path,
@@ -1239,7 +1636,11 @@ pub async fn run_updater_helper_from_manifest_path(manifest_path: &Path) -> Resu
     if let Err(err) = record_helper_result(&manifest, &result).await {
         eprintln!("Warning: could not record updater result: {err:#}");
     }
+    if let Err(err) = clear_update_in_progress_record().await {
+        eprintln!("Warning: could not clear update-in-progress marker: {err:#}");
+    }
     maybe_remove_staging_dir(manifest_path).await;
+    maybe_cleanup_updater_helper_runtime_dir().await;
 
     result
 }
@@ -1280,16 +1681,18 @@ pub fn confirm_update(local_version: &str, remote_version: &str, yes: bool) -> R
 /// If `check` is true, only checks and prints whether an update is available.
 /// Otherwise, downloads, verifies, extracts, and hands installation off to a
 /// detached updater helper.
-pub async fn run_update(check: bool, yes: bool) -> Result<bool> {
+pub async fn run_update(check: bool, yes: bool) -> Result<UpdateCommandStatus> {
     if check {
         run_update_check().await?;
-        return Ok(false);
+        return Ok(UpdateCommandStatus::Completed);
     }
 
-    Ok(matches!(
-        run_update_install(yes).await?,
-        AttemptOutcome::HelperLaunched | AttemptOutcome::Installed
-    ))
+    match run_update_install(yes).await? {
+        AttemptOutcome::HelperLaunched => Ok(UpdateCommandStatus::HandoffPending),
+        AttemptOutcome::Installed | AttemptOutcome::NoUpdate | AttemptOutcome::SkippedUnstable => {
+            Ok(UpdateCommandStatus::Completed)
+        }
+    }
 }
 
 /// Check-only path: prints whether an update is available.
@@ -1328,7 +1731,6 @@ async fn run_update_install(yes: bool) -> Result<AttemptOutcome> {
         &effective_latest_release_url(),
         yes,
         InstallMode::Interactive,
-        false,
     )
     .await
 }
@@ -1336,8 +1738,7 @@ async fn run_update_install(yes: bool) -> Result<AttemptOutcome> {
 /// Install path with injectable URL for testing.
 #[allow(dead_code)]
 pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result<()> {
-    let _ =
-        run_update_install_from_url_mode(release_url, yes, InstallMode::Interactive, false).await?;
+    let _ = run_update_install_from_url_mode(release_url, yes, InstallMode::Interactive).await?;
     Ok(())
 }
 
@@ -1358,6 +1759,7 @@ async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> 
     }
     let mut child = command
         .env(PASSIVE_CHECK_ENV_VAR, "1")
+        .env("CADENCE_INTERNAL_ALLOW_UPDATE_IN_PROGRESS", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -1402,7 +1804,6 @@ async fn run_update_install_from_url_mode(
     release_url: &str,
     yes: bool,
     mode: InstallMode,
-    acquire_activity_lock: bool,
 ) -> Result<AttemptOutcome> {
     let local = current_version();
 
@@ -1443,112 +1844,133 @@ async fn run_update_install_from_url_mode(
         return Ok(AttemptOutcome::NoUpdate);
     }
 
-    let _activity_guard = if matches!(mode, InstallMode::SilentUnattended) && acquire_activity_lock
-    {
-        Some(
-            try_acquire_activity_lock_nonblocking("auto-update")
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("global activity lock is busy"))?,
-        )
-    } else {
-        None
-    };
-
-    // Step 5: Download to a temporary workspace.
-    let tmp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
-
-    if matches!(mode, InstallMode::Interactive) {
-        println!("Downloading cadence v{remote_display}...");
-    }
-
-    let checksums_path = download_to_file(
-        &checksums_asset.browser_download_url,
-        tmp_dir.path(),
-        CHECKSUMS_FILENAME,
-    )
-    .await
-    .context("Failed to download checksums file")?;
-
-    let artifact_path = download_to_file(
-        &artifact_asset.browser_download_url,
-        tmp_dir.path(),
-        &artifact_asset.name,
-    )
-    .await
-    .context("Failed to download release archive")?;
-
-    // Step 6: Verify checksum
-    let checksums_content = tokio::fs::read_to_string(&checksums_path)
-        .await
-        .context("Failed to read downloaded checksums file")?;
-    let checksums = parse_checksums(&checksums_content)?;
-    verify_checksum(&checksums, &artifact_asset.name, &artifact_path).await?;
-
-    // Step 7: Extract the release payload into a persistent staging directory.
-    let staging_dir = create_update_staging_dir(remote_display).await?;
-    let payload = extract_release_payload(&artifact_path, &staging_dir, target).await?;
-    set_executable_permissions(&payload.cadence_binary).await?;
-    set_executable_permissions(&payload.updater_binary).await?;
-
+    let _activity_guard = acquire_command_activity_lock("self-update").await?;
     let current_exe =
         std::env::current_exe().context("failed to resolve current cadence executable path")?;
-    let manifest = UpdateInstallManifest {
+    let update_record = UpdateInProgressRecord {
         target_version: remote_display.to_string(),
-        staged_cadence_path: payload.cadence_binary.clone(),
         final_cadence_path: current_exe.clone(),
-        wait_for_pid: std::process::id(),
-        preserve_disable_state: true,
-        mode,
+        initiator_pid: std::process::id(),
+        helper_pid: None,
+        created_at_epoch: now_epoch(),
     };
-    let manifest_path = staging_dir.join(UPDATE_MANIFEST_FILE);
-    write_install_manifest(&manifest_path, &manifest).await?;
+    write_update_in_progress_record(&update_record).await?;
 
-    // Step 8: Launch the updater helper and exit cleanly so it can finish the swap.
-    ::tracing::info!(
-        event = "self_update_helper_launch_start",
-        pid = std::process::id(),
-        ppid = parent_pid_for_logs(),
-        local_version = local,
-        remote_version = remote_display,
-        helper = payload.updater_binary.display().to_string(),
-        manifest = manifest_path.display().to_string(),
-        target_install = current_exe.display().to_string(),
-        mode = ?mode,
-        xpc_service_name = std::env::var("XPC_SERVICE_NAME")
-            .ok()
-            .as_deref()
-            .unwrap_or("")
-    );
-    let helper_pid = match launch_updater_helper(&payload.updater_binary, &manifest_path).await {
-        Ok(pid) => pid,
-        Err(err) => {
-            maybe_remove_staging_dir(&manifest_path).await;
-            return Err(err);
+    let attempt = async {
+        // Step 5: Download to a temporary workspace.
+        let tmp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
+
+        if matches!(mode, InstallMode::Interactive) {
+            println!("Downloading cadence v{remote_display}...");
         }
-    };
-    ::tracing::info!(
-        event = "self_update_helper_launch_complete",
-        pid = std::process::id(),
-        ppid = parent_pid_for_logs(),
-        local_version = local,
-        remote_version = remote_display,
-        mode = ?mode,
-        helper_pid,
-        manifest = manifest_path.display().to_string(),
-        current_exe = current_exe.display().to_string(),
-        xpc_service_name = std::env::var("XPC_SERVICE_NAME")
-            .ok()
-            .as_deref()
-            .unwrap_or("")
-    );
 
-    if matches!(mode, InstallMode::Interactive) {
-        println!(
-            "Staged cadence v{local} → v{remote_display}. cadence-updater (pid {helper_pid}) will finish installation after this process exits."
+        let checksums_path = download_to_file(
+            &checksums_asset.browser_download_url,
+            tmp_dir.path(),
+            CHECKSUMS_FILENAME,
+        )
+        .await
+        .context("Failed to download checksums file")?;
+
+        let artifact_path = download_to_file(
+            &artifact_asset.browser_download_url,
+            tmp_dir.path(),
+            &artifact_asset.name,
+        )
+        .await
+        .context("Failed to download release archive")?;
+
+        // Step 6: Verify checksum
+        let checksums_content = tokio::fs::read_to_string(&checksums_path)
+            .await
+            .context("Failed to read downloaded checksums file")?;
+        let checksums = parse_checksums(&checksums_content)?;
+        verify_checksum(&checksums, &artifact_asset.name, &artifact_path).await?;
+
+        // Step 7: Extract the release payload into a persistent staging directory.
+        let staging_dir = create_update_staging_dir(remote_display).await?;
+        let payload = extract_release_payload(&artifact_path, &staging_dir, target).await?;
+        set_executable_permissions(&payload.cadence_binary).await?;
+        set_executable_permissions(&payload.updater_binary).await?;
+
+        let manifest = UpdateInstallManifest {
+            target_version: remote_display.to_string(),
+            staged_cadence_path: payload.cadence_binary.clone(),
+            final_cadence_path: current_exe.clone(),
+            wait_for_pid: std::process::id(),
+            preserve_disable_state: true,
+            mode,
+        };
+        let manifest_path = staging_dir.join(UPDATE_MANIFEST_FILE);
+        write_install_manifest(&manifest_path, &manifest).await?;
+
+        // Step 8: Launch the updater helper and exit cleanly so it can finish the swap.
+        ::tracing::info!(
+            event = "self_update_helper_launch_start",
+            pid = std::process::id(),
+            ppid = parent_pid_for_logs(),
+            local_version = local,
+            remote_version = remote_display,
+            helper = payload.updater_binary.display().to_string(),
+            manifest = manifest_path.display().to_string(),
+            target_install = current_exe.display().to_string(),
+            mode = ?mode,
+            xpc_service_name = std::env::var("XPC_SERVICE_NAME")
+                .ok()
+                .as_deref()
+                .unwrap_or("")
         );
+        let mut helper_child =
+            match launch_updater_helper(&payload.updater_binary, &manifest_path, remote_display).await {
+                Ok(child) => child,
+                Err(err) => {
+                    maybe_remove_staging_dir(&manifest_path).await;
+                    return Err(err);
+                }
+            };
+        let helper_pid = helper_child.id().unwrap_or_default();
+        let helper_record = UpdateInProgressRecord {
+            helper_pid: Some(helper_pid),
+            ..update_record.clone()
+        };
+        if let Err(err) = write_update_in_progress_record(&helper_record).await {
+            let _ = helper_child.kill().await;
+            let _ = helper_child.wait().await;
+            maybe_remove_staging_dir(&manifest_path).await;
+            return Err(err).context("failed to persist updater helper pid");
+        }
+        drop(helper_child);
+        ::tracing::info!(
+            event = "self_update_helper_launch_complete",
+            pid = std::process::id(),
+            ppid = parent_pid_for_logs(),
+            local_version = local,
+            remote_version = remote_display,
+            mode = ?mode,
+            helper_pid,
+            manifest = manifest_path.display().to_string(),
+            current_exe = current_exe.display().to_string(),
+            xpc_service_name = std::env::var("XPC_SERVICE_NAME")
+                .ok()
+                .as_deref()
+                .unwrap_or("")
+        );
+
+        if matches!(mode, InstallMode::Interactive) {
+            println!(
+                "Staged cadence v{local} → v{remote_display}. cadence-updater (pid {helper_pid}) will finish installation after this process exits."
+            );
+        }
+
+        Ok(AttemptOutcome::HelperLaunched)
+    }
+    .await;
+
+    if attempt.is_err() {
+        let _ = clear_update_in_progress_record().await;
     }
 
-    Ok(AttemptOutcome::HelperLaunched)
+    attempt
 }
 
 fn retry_delay_from_state(state: &UpdaterState) -> u64 {
@@ -1617,7 +2039,6 @@ pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
         &effective_latest_release_url(),
         true,
         InstallMode::SilentUnattended,
-        false,
     )
     .await;
     match attempt_result {
@@ -3353,14 +3774,42 @@ mod tests {
         let home = EnvGuard::new("HOME");
         home.set(tmp.path().to_str().unwrap());
 
-        let lock = acquire_activity_lock_blocking("test-holder")
+        let mut child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn holder child")
+        } else {
+            Command::new("sh")
+                .args(["-c", "sleep 0.4"])
+                .spawn()
+                .expect("spawn holder child")
+        };
+        let holder_pid = child.id().expect("holder pid");
+        let lock_path = activity_lock_path().expect("activity lock path");
+        tokio::fs::create_dir_all(lock_path.parent().expect("lock parent"))
             .await
-            .expect("acquire lock");
+            .expect("create lock dir");
+        state_files::write_json_atomic(
+            &lock_path,
+            &ActivityLockRecord {
+                pid: holder_pid,
+                process_started_at_epoch: process_started_at_epoch(holder_pid),
+                created_at_epoch: now_epoch(),
+                hostname: host_name(),
+                purpose: "test-holder".to_string(),
+            },
+        )
+        .await
+        .expect("seed foreign lock");
         let other = try_acquire_activity_lock_nonblocking("test-other")
             .await
             .expect("try lock");
         assert!(other.is_none());
-        drop(lock);
+        child.wait().await.expect("wait holder child");
+        clear_stale_activity_lock(&lock_path)
+            .await
+            .expect("clear stale foreign lock");
 
         let reacquired = try_acquire_activity_lock_nonblocking("test-after-drop")
             .await
@@ -3370,23 +3819,195 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn activity_lock_reentrant_for_current_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let first = acquire_command_activity_lock("test-first")
+            .await
+            .expect("acquire first lock");
+        let second = try_acquire_activity_lock_nonblocking("test-second")
+            .await
+            .expect("reacquire lock")
+            .expect("same-process reacquire should succeed");
+        let lock_path = activity_lock_path().expect("activity lock path");
+        assert!(
+            lock_path.exists(),
+            "lock file should exist while guards are held"
+        );
+
+        drop(first);
+        assert!(
+            lock_path.exists(),
+            "dropping one guard should not release a reentrant lock"
+        );
+
+        drop(second);
+        assert!(
+            !lock_path.exists(),
+            "dropping the final guard should remove the lock file"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn command_activity_lock_rejects_active_update_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let mut child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn marker child")
+        } else {
+            Command::new("sh")
+                .args(["-c", "sleep 0.4"])
+                .spawn()
+                .expect("spawn marker child")
+        };
+        let helper_pid = child.id().expect("child pid");
+        write_update_in_progress_record(&UpdateInProgressRecord {
+            target_version: "9.9.9".to_string(),
+            final_cadence_path: tmp
+                .path()
+                .join("install")
+                .join(cadence_binary_name(build_target())),
+            initiator_pid: 0,
+            helper_pid: Some(helper_pid),
+            created_at_epoch: now_epoch(),
+        })
+        .await
+        .expect("write update marker");
+
+        let err = acquire_command_activity_lock("test-command")
+            .await
+            .expect_err("update marker should block new commands");
+        assert!(
+            err.to_string().contains("update to v9.9.9 is in progress"),
+            "unexpected error: {err:#}"
+        );
+
+        child.wait().await.expect("wait marker child");
+        clear_update_in_progress_record()
+            .await
+            .expect("clear update marker");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_update_in_progress_marker_is_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        write_update_in_progress_record(&UpdateInProgressRecord {
+            target_version: "9.9.9".to_string(),
+            final_cadence_path: tmp
+                .path()
+                .join("install")
+                .join(cadence_binary_name(build_target())),
+            initiator_pid: 0,
+            helper_pid: Some(0),
+            created_at_epoch: now_epoch(),
+        })
+        .await
+        .expect("write stale marker");
+
+        let active = current_update_in_progress_record()
+            .await
+            .expect("load update marker");
+        assert!(active.is_none(), "stale marker should be cleared");
+        assert!(
+            load_update_in_progress_record(&update_in_progress_path().expect("marker path"))
+                .await
+                .expect("reload update marker")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(windows)]
+    async fn prepare_updater_helper_launch_path_moves_helper_out_of_staging_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let staging_dir = tmp.path().join("staging");
+        tokio::fs::create_dir_all(&staging_dir)
+            .await
+            .expect("create staging dir");
+        let helper_path = staging_dir.join("cadence-updater.exe");
+        tokio::fs::write(&helper_path, b"MZ")
+            .await
+            .expect("write staged helper");
+
+        let launch_path = prepare_updater_helper_launch_path(&helper_path, "9.9.9")
+            .await
+            .expect("prepare helper launch path");
+        assert!(launch_path.exists(), "launch helper should exist");
+        assert!(
+            !launch_path.starts_with(&staging_dir),
+            "windows helper should not run from the staging directory"
+        );
+        assert!(
+            launch_path.starts_with(updater_helper_runtime_root()),
+            "helper launch path should live under the helper runtime root"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn activity_lock_blocking_times_out_when_held() {
         let tmp = tempfile::tempdir().unwrap();
         let home = EnvGuard::new("HOME");
         home.set(tmp.path().to_str().unwrap());
 
-        let _lock = acquire_activity_lock_blocking("test-holder")
+        let mut child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn holder child")
+        } else {
+            Command::new("sh")
+                .args(["-c", "sleep 0.4"])
+                .spawn()
+                .expect("spawn holder child")
+        };
+        let holder_pid = child.id().expect("holder pid");
+        let lock_path = activity_lock_path().expect("activity lock path");
+        tokio::fs::create_dir_all(lock_path.parent().expect("lock parent"))
             .await
-            .expect("acquire lock");
-        let err =
-            acquire_activity_lock_blocking_with_timeout("test-waiter", Duration::from_millis(75))
-                .await
-                .expect_err("timeout");
+            .expect("create lock dir");
+        state_files::write_json_atomic(
+            &lock_path,
+            &ActivityLockRecord {
+                pid: holder_pid,
+                process_started_at_epoch: process_started_at_epoch(holder_pid),
+                created_at_epoch: now_epoch(),
+                hostname: host_name(),
+                purpose: "test-holder".to_string(),
+            },
+        )
+        .await
+        .expect("seed foreign lock");
+        let err = acquire_activity_lock_blocking_with_timeout(
+            "test-waiter",
+            Duration::from_millis(75),
+            false,
+        )
+        .await
+        .expect_err("timeout");
         assert!(
             err.to_string()
                 .contains("timed out waiting for global activity lock"),
             "unexpected error: {err:#}"
         );
+
+        child.wait().await.expect("wait holder child");
     }
 
     #[tokio::test]

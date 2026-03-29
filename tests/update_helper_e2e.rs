@@ -208,9 +208,10 @@ async fn update_hands_off_to_helper_and_runs_bootstrap() {
         .await
         .expect("run cadence update");
 
-    assert!(
-        output.status.success(),
-        "update command failed: stdout={}\nstderr={}",
+    assert_eq!(
+        output.status.code(),
+        Some(cadence_cli::update::UPDATE_HELPER_PENDING_EXIT_CODE),
+        "unexpected update exit code: stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
