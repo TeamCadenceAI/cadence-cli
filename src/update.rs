@@ -493,6 +493,19 @@ fn running_under_systemd_unit() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn systemd_user_manager_available() -> bool {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        return false;
+    };
+    runtime_dir.join("bus").exists() || runtime_dir.join("systemd").join("private").exists()
+}
+
+#[cfg(target_os = "linux")]
+fn should_launch_helper_via_systemd_run() -> bool {
+    running_under_systemd_unit() && systemd_user_manager_available()
+}
+
+#[cfg(target_os = "linux")]
 fn sanitize_systemd_unit_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -1793,7 +1806,7 @@ async fn launch_updater_helper(
     let launch_path = prepare_updater_helper_launch_path(helper_path, target_version).await?;
 
     #[cfg(target_os = "linux")]
-    if running_under_systemd_unit() {
+    if should_launch_helper_via_systemd_run() {
         return launch_updater_helper_via_systemd(&launch_path, manifest_path, target_version)
             .await;
     }
@@ -4314,16 +4327,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path_guard = EnvGuard::new("PATH");
         let invocation_guard = EnvGuard::new("INVOCATION_ID");
+        let runtime_guard = EnvGuard::new("XDG_RUNTIME_DIR");
         invocation_guard.set("test-invocation");
 
         let bin_dir = tmp.path().join("bin");
         let pid_dir = tmp.path().join("pids");
+        let runtime_dir = tmp.path().join("runtime");
         tokio::fs::create_dir_all(&bin_dir)
             .await
             .expect("create fake bin dir");
         tokio::fs::create_dir_all(&pid_dir)
             .await
             .expect("create pid dir");
+        tokio::fs::create_dir_all(&runtime_dir)
+            .await
+            .expect("create runtime dir");
+        tokio::fs::write(runtime_dir.join("bus"), b"")
+            .await
+            .expect("write fake runtime bus");
+        runtime_guard.set(runtime_dir.to_str().expect("runtime dir utf-8"));
 
         let helper_started = tmp.path().join("helper-started");
         let helper_path = tmp.path().join("cadence-updater");
@@ -4474,6 +4496,65 @@ mod tests {
         .await
         .expect("helper should start");
 
+        wait_for_pid_to_exit(
+            helper_pid,
+            launch.helper_started_at_epoch,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("wait for fake helper exit");
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    async fn launch_updater_helper_falls_back_without_systemd_user_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let invocation_guard = EnvGuard::new("INVOCATION_ID");
+        let runtime_guard = EnvGuard::new("XDG_RUNTIME_DIR");
+        invocation_guard.set("test-invocation");
+        runtime_guard.set(tmp.path().to_str().expect("tmp path utf-8"));
+
+        let helper_started = tmp.path().join("helper-started");
+        let helper_path = tmp.path().join("cadence-updater");
+        tokio::fs::write(
+            &helper_path,
+            format!(
+                "#!/bin/sh\n\
+                 touch '{}'\n\
+                 sleep 0.2\n",
+                helper_started.display()
+            ),
+        )
+        .await
+        .expect("write fake helper");
+        set_executable_permissions(&helper_path)
+            .await
+            .expect("chmod fake helper");
+
+        let manifest_path = tmp.path().join("install-manifest.json");
+        tokio::fs::write(&manifest_path, b"{}")
+            .await
+            .expect("write fake manifest");
+
+        let launch = launch_updater_helper(&helper_path, &manifest_path, "9.9.9")
+            .await
+            .expect("launch helper without systemd user manager");
+        assert!(launch.child.is_some(), "expected child-process fallback");
+        assert!(
+            launch.helper_systemd_unit.is_none(),
+            "systemd unit should not be recorded when no user manager is reachable"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !helper_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("helper should start");
+
+        let helper_pid = launch.helper_pid.expect("helper pid");
         wait_for_pid_to_exit(
             helper_pid,
             launch.helper_started_at_epoch,
