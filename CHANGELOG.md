@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.1...v2.3.2) (2026-03-29)
+
+
+### Bug Fixes
+
+* **release:** remove macos notarization ([e000326](https://github.com/TeamCadenceAI/cadence-cli/commit/e000326d9dd102a071cfeb0a5eb4f72f8cd78d53))
+* **release:** remove macos notarization from releases ([4b2a160](https://github.com/TeamCadenceAI/cadence-cli/commit/4b2a16015047734b685a8066774e9b448f6cee0c))
+
 ## [2.3.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.0...v2.3.1) (2026-03-29)
 
 
