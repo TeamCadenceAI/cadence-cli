@@ -272,7 +272,6 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
     }
 
     if monitor_enabled && options.include_recovery_backfill {
-        println!();
         output::action(
             "Recovery",
             &format!("backfill --since {}", VERSION_BOOTSTRAP_BACKFILL_SINCE),

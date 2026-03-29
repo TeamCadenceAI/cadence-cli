@@ -479,33 +479,39 @@ fn apply_monitor_incremental_upload_outcome(
     log_source_label: &str,
     outcome: UploadFromLogOutcome,
 ) {
+    let maybe_advance = |cursor_advance: &mut IncrementalCursor| {
+        maybe_advance_monitor_cursor(cursor_advance, *cursor_blocked, log_mtime, log_source_label);
+    };
     match outcome {
         UploadFromLogOutcome::Uploaded => {
             stats.uploaded += 1;
-            if !*cursor_blocked {
-                *cursor_advance =
-                    advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            }
+            maybe_advance(cursor_advance);
         }
         UploadFromLogOutcome::AlreadyExists => {
             stats.skipped += 1;
-            if !*cursor_blocked {
-                *cursor_advance =
-                    advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            }
+            maybe_advance(cursor_advance);
         }
         UploadFromLogOutcome::Queued(_) => {
             stats.queued += 1;
-            if !*cursor_blocked {
-                *cursor_advance =
-                    advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            }
+            maybe_advance(cursor_advance);
         }
         UploadFromLogOutcome::Retryable(_) => {
             stats.issues += 1;
             *cursor_blocked = true;
         }
     }
+}
+
+fn maybe_advance_monitor_cursor(
+    cursor_advance: &mut IncrementalCursor,
+    cursor_blocked: bool,
+    log_mtime: Option<i64>,
+    log_source_label: &str,
+) {
+    if cursor_blocked {
+        return;
+    }
+    *cursor_advance = advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
 }
 
 fn select_incremental_candidates(
@@ -1567,8 +1573,12 @@ async fn upload_incremental_sessions_globally(
         let log_mtime = parsed.log.updated_at;
         let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            maybe_advance_monitor_cursor(
+                &mut cursor_advance,
+                cursor_blocked,
+                log_mtime,
+                &log_source_label,
+            );
             continue;
         };
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -1582,8 +1592,12 @@ async fn upload_incremental_sessions_globally(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            maybe_advance_monitor_cursor(
+                &mut cursor_advance,
+                cursor_blocked,
+                log_mtime,
+                &log_source_label,
+            );
             continue;
         };
 
@@ -1595,8 +1609,12 @@ async fn upload_incremental_sessions_globally(
             enabled
         };
         if !repo_enabled {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            maybe_advance_monitor_cursor(
+                &mut cursor_advance,
+                cursor_blocked,
+                log_mtime,
+                &log_source_label,
+            );
             continue;
         }
 
@@ -1615,8 +1633,12 @@ async fn upload_incremental_sessions_globally(
             matches
         };
         if !repo_matches_org {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            maybe_advance_monitor_cursor(
+                &mut cursor_advance,
+                cursor_blocked,
+                log_mtime,
+                &log_source_label,
+            );
             continue;
         }
 
@@ -3248,6 +3270,9 @@ mod tests {
             .expect("write empty global gitconfig");
         let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
         global_guard.set_path(&global_config);
+        crate::git::config_set_global("ai.cadence.org", "test-org")
+            .await
+            .expect("set org filter");
 
         let hooks_dir = home.path().join(".git-hooks");
         tokio::fs::create_dir_all(&hooks_dir)
@@ -3504,6 +3529,19 @@ mod tests {
         );
 
         assert_eq!(stats.uploaded, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn monitor_retryable_block_prevents_non_applicable_cursor_advances() {
+        let mut cursor = IncrementalCursor {
+            last_scanned_mtime_epoch: 100,
+            last_scanned_source_label: Some("a".to_string()),
+        };
+
+        maybe_advance_monitor_cursor(&mut cursor, true, Some(200), "b");
+
         assert_eq!(cursor.last_scanned_mtime_epoch, 100);
         assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
     }
