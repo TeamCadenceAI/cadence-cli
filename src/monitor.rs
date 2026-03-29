@@ -1,9 +1,12 @@
 //! Background monitor state and scheduler management.
 
 use crate::state_files;
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Output;
 use tokio::process::Command;
 
@@ -175,6 +178,7 @@ fn scheduler_command_line(exe_path: &Path) -> String {
     format!("\"{}\" monitor tick", exe_path.display())
 }
 
+#[cfg(target_os = "macos")]
 fn parent_pid_for_logs() -> u32 {
     #[cfg(unix)]
     {
@@ -187,6 +191,7 @@ fn parent_pid_for_logs() -> u32 {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
