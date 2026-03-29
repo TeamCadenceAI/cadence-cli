@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.3.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.6...v2.3.0) (2026-03-29)
+
+
+### Features
+
+* **update:** add detached updater helper and macOS signing ([2702319](https://github.com/TeamCadenceAI/cadence-cli/commit/2702319f46bdc90a0947514089117a698b9be762))
+* **update:** add detached updater helper and macOS signing ([567de79](https://github.com/TeamCadenceAI/cadence-cli/commit/567de79c8526ac3b8b8f6c34c0a86c13b0bea938))
+
+
+### Bug Fixes
+
+* **update:** detach linux helper handoff ([073d643](https://github.com/TeamCadenceAI/cadence-cli/commit/073d643198137e665137ed1916ae1a1be3e4a28d))
+* **update:** harden helper handoff semantics ([5fc3842](https://github.com/TeamCadenceAI/cadence-cli/commit/5fc38425f5d40ee7b43342b991b3ac7f229bd6fe))
+* **update:** require reachable user systemd manager ([6085eb1](https://github.com/TeamCadenceAI/cadence-cli/commit/6085eb1a31d25ef8ce11b9dd40d75ce5a945d7e3))
+
 ## [2.2.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.5...v2.2.6) (2026-03-29)
 
 
