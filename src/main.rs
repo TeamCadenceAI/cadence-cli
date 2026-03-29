@@ -2717,6 +2717,61 @@ mod tests {
         dir
     }
 
+    struct DiscoveryTestEnv {
+        _home: EnvGuard,
+        _userprofile: EnvGuard,
+        _homedrive: EnvGuard,
+        _homepath: EnvGuard,
+        _appdata: EnvGuard,
+        _localappdata: EnvGuard,
+        codex_home: EnvGuard,
+        _xdg_config_home: EnvGuard,
+        _xdg_data_home: EnvGuard,
+    }
+
+    impl DiscoveryTestEnv {
+        fn install(home: &Path) -> Self {
+            let home_guard = EnvGuard::new("HOME");
+            home_guard.set_path(home);
+
+            let userprofile_guard = EnvGuard::new("USERPROFILE");
+            userprofile_guard.set_path(home);
+
+            let homedrive_guard = EnvGuard::new("HOMEDRIVE");
+            homedrive_guard.clear();
+
+            let homepath_guard = EnvGuard::new("HOMEPATH");
+            homepath_guard.clear();
+
+            let appdata_guard = EnvGuard::new("APPDATA");
+            appdata_guard.set_path(&home.join("AppData").join("Roaming"));
+
+            let localappdata_guard = EnvGuard::new("LOCALAPPDATA");
+            localappdata_guard.set_path(&home.join("AppData").join("Local"));
+
+            let codex_home_guard = EnvGuard::new("CODEX_HOME");
+            codex_home_guard.clear();
+
+            let xdg_config_home_guard = EnvGuard::new("XDG_CONFIG_HOME");
+            xdg_config_home_guard.set_path(&home.join(".config"));
+
+            let xdg_data_home_guard = EnvGuard::new("XDG_DATA_HOME");
+            xdg_data_home_guard.set_path(&home.join(".local").join("share"));
+
+            Self {
+                _home: home_guard,
+                _userprofile: userprofile_guard,
+                _homedrive: homedrive_guard,
+                _homepath: homepath_guard,
+                _appdata: appdata_guard,
+                _localappdata: localappdata_guard,
+                codex_home: codex_home_guard,
+                _xdg_config_home: xdg_config_home_guard,
+                _xdg_data_home: xdg_data_home_guard,
+            }
+        }
+    }
+
     async fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
         let content = tokio::fs::read_to_string(path).await.expect("read jsonl");
         content
@@ -3390,10 +3445,8 @@ mod tests {
     #[serial]
     async fn upload_incremental_sessions_globally_advances_discovery_cursor_after_success() {
         let home = TempDir::new().expect("home tempdir");
-        let home_guard = EnvGuard::new("HOME");
-        home_guard.set_path(home.path());
-        let codex_home_guard = EnvGuard::new("CODEX_HOME");
-        codex_home_guard.set_path(&home.path().join(".codex"));
+        let env = DiscoveryTestEnv::install(home.path());
+        env.codex_home.set_path(&home.path().join(".codex"));
 
         let global_config = home.path().join("global.gitconfig");
         tokio::fs::write(&global_config, "")
@@ -3556,8 +3609,7 @@ mod tests {
     #[serial]
     async fn monitor_tick_drains_pending_uploads_and_records_runtime_state() {
         let home = TempDir::new().expect("home tempdir");
-        let home_guard = EnvGuard::new("HOME");
-        home_guard.set_path(home.path());
+        let _env = DiscoveryTestEnv::install(home.path());
 
         let global_config = home.path().join("global.gitconfig");
         tokio::fs::write(&global_config, "")

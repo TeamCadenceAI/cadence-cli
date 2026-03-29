@@ -22,6 +22,11 @@ impl EnvGuard {
     pub(crate) fn set_path(&self, value: &Path) {
         self.set_str(&value.to_string_lossy());
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear(&self) {
+        unsafe { std::env::remove_var(&self.key) };
+    }
 }
 
 impl Drop for EnvGuard {
