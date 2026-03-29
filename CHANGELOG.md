@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.1...v2.2.2) (2026-03-29)
+
+
+### Bug Fixes
+
+* **monitor:** pause background publication when auth is invalid ([4431f4b](https://github.com/TeamCadenceAI/cadence-cli/commit/4431f4bc972d3039e1969afe4e0947314f8e9cc6))
+* pause monitor publishing when auth is invalid ([c6fd8f5](https://github.com/TeamCadenceAI/cadence-cli/commit/c6fd8f55c1830e503a84770ad76406ada2bdf6b5))
+
 ## [2.2.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.0...v2.2.1) (2026-03-29)
 
 
