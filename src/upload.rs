@@ -23,8 +23,6 @@ use tokio::sync::Mutex;
 const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
-/// Maximum number of pending publications drained in one run by default.
-pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 
 /// Shared upload context for one CLI invocation.
 #[derive(Debug)]
@@ -109,6 +107,27 @@ pub async fn upload_or_queue_prepared_session(
     prepared: &PreparedSessionUpload,
 ) -> Result<LiveUploadOutcome> {
     prepare_state_and_attempt(context, prepared, None).await
+}
+
+/// Persists a retryable discovery failure before org resolution is possible.
+///
+/// This is used for early monitor failures such as `git remote` lookup errors,
+/// where the session content and repo context are known but a live upload
+/// attempt cannot begin yet.
+pub async fn persist_retryable_prepared_session(
+    prepared: &PreparedSessionUpload,
+    reason: impl Into<String>,
+) -> Result<()> {
+    let existing = load_existing_for_org(&prepared.prepared.logical_session, None).await?;
+    persist_state(
+        existing,
+        &prepared.prepared,
+        None,
+        PublicationStatus::RetryableFailure,
+        None,
+        Some(reason.into()),
+    )
+    .await
 }
 
 /// Drains due pending publication records.
@@ -1056,6 +1075,51 @@ mod tests {
                 reason: "repo has no remote URL observations".to_string(),
             }
         );
+        assert_eq!(pending_upload_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn persist_retryable_prepared_session_records_retryable_failure() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let prepared = prepare_session_upload(ObservedSessionUpload {
+            observations: PublicationObservations {
+                canonical_remote_url: String::new(),
+                remote_urls: Vec::new(),
+                canonical_repo_root: "/tmp/repo".to_string(),
+                worktree_roots: vec!["/tmp/repo".to_string()],
+                cwd: Some("/tmp/repo".to_string()),
+                git_ref: None,
+                head_commit_sha: None,
+                git_user_email: None,
+                git_user_name: None,
+                cli_version: Some("1.0.0".to_string()),
+            },
+            ..sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git")
+        })
+        .unwrap();
+
+        persist_retryable_prepared_session(&prepared, "git remote failed")
+            .await
+            .unwrap();
+
+        let records = load_all_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].record.status,
+            PublicationStatus::RetryableFailure
+        );
+        assert_eq!(records[0].record.target_org_id, None);
+        assert_eq!(
+            records[0].record.last_error.as_deref(),
+            Some("git remote failed")
+        );
+        assert_eq!(
+            records[0].record.observations.remote_urls,
+            Vec::<String>::new()
+        );
+        assert_eq!(records[0].record.observations.canonical_remote_url, "");
         assert_eq!(pending_upload_count().await.unwrap(), 1);
     }
 

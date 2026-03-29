@@ -58,6 +58,12 @@ impl DiagnosticsLogger {
         Self::new_in_dir(&dir, prefix, OffsetDateTime::now_utc()).await
     }
 
+    pub async fn new_daily(prefix: &str, retention_days: i64) -> Result<Self> {
+        let dir = crate::config::CliConfig::config_dir()
+            .ok_or_else(|| anyhow!("cannot determine config directory: $HOME is not set"))?;
+        Self::new_daily_in_dir(&dir, prefix, retention_days, OffsetDateTime::now_utc()).await
+    }
+
     pub(crate) async fn new_in_dir(dir: &Path, prefix: &str, now: OffsetDateTime) -> Result<Self> {
         ensure_tracing_initialized()?;
 
@@ -81,12 +87,48 @@ impl DiagnosticsLogger {
             .into_std()
             .await;
 
-        Ok(Self {
+        Ok(Self::from_file(path, file))
+    }
+
+    pub(crate) async fn new_daily_in_dir(
+        dir: &Path,
+        prefix: &str,
+        retention_days: i64,
+        now: OffsetDateTime,
+    ) -> Result<Self> {
+        ensure_tracing_initialized()?;
+
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("failed to create config directory at {}", dir.display()))?;
+        prune_daily_logs(dir, prefix, retention_days, now).await?;
+
+        let file_name = daily_log_file_name(prefix, now);
+        let path = dir.join(file_name);
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open daily diagnostics log file at {}",
+                    path.display()
+                )
+            })?
+            .into_std()
+            .await;
+
+        Ok(Self::from_file(path, file))
+    }
+
+    fn from_file(path: PathBuf, file: File) -> Self {
+        Self {
             inner: Some(Arc::new(TraceSink {
                 path,
                 writer: Mutex::new(LineWriter::new(file)),
             })),
-        })
+        }
     }
 
     pub fn path(&self) -> Option<PathBuf> {
@@ -275,6 +317,72 @@ fn filename_timestamp(now: OffsetDateTime) -> String {
     )
 }
 
+fn filename_day(now: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day()
+    )
+}
+
+fn daily_log_file_name(prefix: &str, now: OffsetDateTime) -> String {
+    format!("{prefix}.{}.log", filename_day(now))
+}
+
+fn parse_daily_log_day<'a>(prefix: &str, file_name: &'a str) -> Option<&'a str> {
+    let suffix = file_name.strip_prefix(&format!("{prefix}."))?;
+    let day = suffix.strip_suffix(".log")?;
+    if day.len() != 10 {
+        return None;
+    }
+    let bytes = day.as_bytes();
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(day)
+}
+
+async fn prune_daily_logs(
+    dir: &Path,
+    prefix: &str,
+    retention_days: i64,
+    now: OffsetDateTime,
+) -> Result<()> {
+    if retention_days <= 0 {
+        return Ok(());
+    }
+
+    let cutoff = now - time::Duration::days(retention_days.saturating_sub(1));
+    let cutoff_day = filename_day(cutoff);
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .with_context(|| format!("failed to scan diagnostics directory {}", dir.display()))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("failed to read diagnostics entry from {}", dir.display()))?
+    {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(day) = parse_daily_log_day(prefix, &file_name) else {
+            continue;
+        };
+        if day >= cutoff_day.as_str() {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(entry.path()).await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +464,59 @@ mod tests {
         assert!(first_content.contains("\"event\":\"outer_again\""));
         assert!(!first_content.contains("\"event\":\"inner\""));
         assert!(second_content.contains("\"event\":\"inner\""));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daily_logger_appends_and_prunes_old_history() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        tokio::fs::write(tmp.path().join("monitor.2026-03-10.log"), "old\n")
+            .await
+            .expect("write old log");
+        tokio::fs::write(tmp.path().join("monitor.2026-03-16.log"), "keep\n")
+            .await
+            .expect("write retained log");
+
+        let now = OffsetDateTime::parse(
+            "2026-03-29T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse timestamp");
+        let first = DiagnosticsLogger::new_daily_in_dir(tmp.path(), "monitor", 14, now)
+            .await
+            .expect("create daily logger");
+        let path = first.path().expect("daily path");
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("monitor.2026-03-29.log")
+        );
+
+        let first_session = install_global(first.clone());
+        ::tracing::info!(event = "first_daily");
+        drop(first_session);
+        first.flush().await;
+
+        let second = DiagnosticsLogger::new_daily_in_dir(tmp.path(), "monitor", 14, now)
+            .await
+            .expect("create second daily logger");
+        let second_session = install_global(second.clone());
+        ::tracing::info!(event = "second_daily");
+        drop(second_session);
+        second.flush().await;
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read daily log");
+        assert!(content.contains("\"event\":\"first_daily\""));
+        assert!(content.contains("\"event\":\"second_daily\""));
+        assert!(
+            !tmp.path().join("monitor.2026-03-10.log").exists(),
+            "expected logs older than retention to be pruned"
+        );
+        assert!(
+            tmp.path().join("monitor.2026-03-16.log").exists(),
+            "expected logs inside retention window to remain"
+        );
     }
 
     #[test]

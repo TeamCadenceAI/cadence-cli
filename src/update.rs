@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::CliConfig;
+use crate::state_files;
 use crate::transport;
 
 #[cfg(not(any(unix, windows)))]
@@ -54,20 +55,15 @@ const UPDATER_STATE_FILE: &str = "updater-state.json";
 const ACTIVITY_LOCKS_DIR: &str = "locks";
 const ACTIVITY_LOCK_FILE: &str = "global-activity.lock";
 const ACTIVITY_LOCK_STALE_SECS: i64 = 15 * 60;
+#[cfg(test)]
 const ACTIVITY_LOCK_POLL_INTERVAL_MS: u64 = 20;
+#[cfg(test)]
 const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 /// Scheduler cadence and jitter defaults.
-const AUTO_UPDATE_INTERVAL_SECS: u64 = 60 * 60;
 const AUTO_UPDATE_JITTER_SECS: u64 = 5 * 60;
-
-/// File recording the last version whose automatic recovery completed locally.
-const VERSION_RECOVERY_MARKER_FILE: &str = "last-version-recovery";
-
-/// Automatic recovery backfill window to run on every first run of a new version.
-pub(crate) const VERSION_RECOVERY_BACKFILL_SINCE: &str = "7d";
 
 /// Retry backoff defaults.
 const UPDATE_RETRY_BASE_SECS: u64 = 60;
@@ -174,12 +170,6 @@ fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
-fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
 fn host_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -201,64 +191,14 @@ fn format_epoch_rfc3339(epoch: i64) -> Option<String> {
         })
 }
 
-fn cadence_dir() -> Result<PathBuf> {
-    CliConfig::config_dir().ok_or_else(|| {
-        anyhow::anyhow!("cannot determine cadence config directory: $HOME is not set")
-    })
-}
-
-pub async fn persist_auto_update_enabled() -> Result<bool> {
-    let mut cfg = CliConfig::load().await?;
-    if cfg.auto_update == Some(true) {
-        return Ok(false);
-    }
-    cfg.auto_update = Some(true);
-    cfg.save().await?;
-    Ok(true)
-}
-
-pub async fn ensure_auto_update_enabled_and_reconciled() -> Result<SchedulerProvisionResult> {
-    let _ = persist_auto_update_enabled().await?;
-    reconcile_scheduler_for_auto_update_enabled(true).await
-}
-
-fn update_confirmation_config(mode: InstallMode, config: Option<&CliConfig>) -> Option<bool> {
-    if matches!(mode, InstallMode::Interactive) {
-        return config.map(CliConfig::auto_update_enabled);
-    }
-    None
-}
-
 fn updater_state_path() -> Result<PathBuf> {
-    Ok(cadence_dir()?.join(UPDATER_STATE_FILE))
-}
-
-fn version_recovery_marker_path() -> Option<PathBuf> {
-    Some(CliConfig::config_dir()?.join(VERSION_RECOVERY_MARKER_FILE))
+    Ok(state_files::cadence_dir()?.join(UPDATER_STATE_FILE))
 }
 
 fn activity_lock_path() -> Result<PathBuf> {
-    Ok(cadence_dir()?
+    Ok(state_files::cadence_dir()?
         .join(ACTIVITY_LOCKS_DIR)
         .join(ACTIVITY_LOCK_FILE))
-}
-
-async fn write_json_atomic<T: ?Sized + Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    let tmp = path.with_extension("tmp");
-    let payload = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
-    tokio::fs::write(&tmp, payload)
-        .await
-        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
-    Ok(())
 }
 
 async fn load_updater_state() -> Result<UpdaterState> {
@@ -275,40 +215,7 @@ async fn load_updater_state() -> Result<UpdaterState> {
 
 async fn save_updater_state(state: &UpdaterState) -> Result<()> {
     let path = updater_state_path()?;
-    write_json_atomic(&path, state).await
-}
-
-async fn read_version_recovery_marker(path: &Path) -> Result<Option<String>> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => Ok(match content.trim() {
-            "" => None,
-            value => Some(value.to_string()),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e)
-            .with_context(|| format!("failed to read version recovery marker {}", path.display())),
-    }
-}
-
-async fn write_version_recovery_marker(path: &Path, version: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    tokio::fs::write(path, format!("{version}\n"))
-        .await
-        .with_context(|| format!("failed to write version recovery marker {}", path.display()))
-}
-
-fn version_recovery_is_due(last_completed_version: Option<&str>, target_version: &str) -> bool {
-    match last_completed_version
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(version) => version != target_version,
-        None => true,
-    }
+    state_files::write_json_atomic(&path, state).await
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -385,10 +292,12 @@ async fn clear_stale_activity_lock(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn acquire_activity_lock_blocking(purpose: &str) -> Result<ActivityLockGuard> {
     acquire_activity_lock_blocking_with_timeout(purpose, ACTIVITY_LOCK_BLOCKING_TIMEOUT).await
 }
 
+#[cfg(test)]
 async fn acquire_activity_lock_blocking_with_timeout(
     purpose: &str,
     timeout: Duration,
@@ -987,23 +896,11 @@ pub fn self_replace_binary(replacement_path: &Path) -> Result<()> {
 
 /// Asks the user to confirm the update. Returns `true` if they accept.
 ///
-/// Precedence (highest wins):
-/// 1. `yes` (`--yes` CLI flag) — always skips prompt
-/// 2. `auto_update_config` — if `Some(true)`, skips prompt (from config `auto_update = true`)
-/// 3. Interactive prompt — asks user with [y/N] default No
-pub fn confirm_update(
-    local_version: &str,
-    remote_version: &str,
-    yes: bool,
-    auto_update_config: Option<bool>,
-) -> Result<bool> {
+/// `--yes` always skips the prompt. Otherwise this falls back to the
+/// interactive confirmation prompt with [y/N] default No.
+pub fn confirm_update(local_version: &str, remote_version: &str, yes: bool) -> Result<bool> {
     // --yes flag always wins
     if yes {
-        return Ok(true);
-    }
-
-    // Config-driven auto-update skips prompt when true
-    if auto_update_config.unwrap_or(false) {
         return Ok(true);
     }
 
@@ -1083,35 +980,36 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
     Ok(())
 }
 
-async fn refresh_git_hooks_with_updated_binary() -> Result<()> {
+async fn run_install_with_updated_binary(preserve_disable_state: bool) -> Result<()> {
     let current_exe = std::env::current_exe()
         .context("failed to resolve current cadence executable path after self-update")?;
-    refresh_git_hooks_with_exe(&current_exe).await
+    run_install_with_exe(&current_exe, preserve_disable_state).await
 }
 
-async fn refresh_git_hooks_with_exe(exe_path: &Path) -> Result<()> {
-    let output = Command::new(exe_path)
-        .args(["hook", "refresh-hooks"])
-        .output()
+async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> Result<()> {
+    let mut command = Command::new(exe_path);
+    command.arg("install");
+    if preserve_disable_state {
+        command.arg("--preserve-disable-state");
+    }
+    let status = command
+        .env(PASSIVE_CHECK_ENV_VAR, "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .await
         .with_context(|| {
             format!(
-                "failed to launch refreshed cadence binary at {}",
+                "failed to launch bootstrap install with {}",
                 exe_path.display()
             )
         })?;
 
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let detail = [stderr, stdout]
-        .into_iter()
-        .find(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("exit status {}", output.status));
-    bail!("hook refresh command failed: {detail}");
+    bail!("bootstrap install command failed with exit status {status}");
 }
 
 async fn run_update_install_from_url_mode(
@@ -1120,15 +1018,6 @@ async fn run_update_install_from_url_mode(
     mode: InstallMode,
 ) -> Result<AttemptOutcome> {
     let local = current_version();
-
-    let config = if matches!(mode, InstallMode::Interactive) {
-        // Manual update keeps config load strict to preserve existing UX.
-        Some(CliConfig::load().await.context(
-            "Failed to load config. Check ~/.cadence/cli/config.toml for syntax errors.",
-        )?)
-    } else {
-        None
-    };
 
     // Step 1: Fetch release metadata
     let release = check_latest_version_from_url(release_url)
@@ -1162,15 +1051,7 @@ async fn run_update_install_from_url_mode(
     let checksums_asset = pick_checksums_asset(&release.assets)?;
 
     // Step 4: Prompt for confirmation
-    // Precedence: --yes > config auto_update > interactive prompt
-    if matches!(mode, InstallMode::Interactive)
-        && !confirm_update(
-            local,
-            remote_display,
-            yes,
-            update_confirmation_config(mode, config.as_ref()),
-        )?
-    {
+    if matches!(mode, InstallMode::Interactive) && !confirm_update(local, remote_display, yes)? {
         println!("Update cancelled.");
         return Ok(AttemptOutcome::NoUpdate);
     }
@@ -1235,46 +1116,14 @@ async fn run_update_install_from_url_mode(
     // Step 9: Replace running binary
     self_replace_binary(&new_binary)?;
 
-    match refresh_git_hooks_with_updated_binary().await {
-        Ok(()) => {}
-        Err(e) if matches!(mode, InstallMode::Interactive) => {
-            eprintln!(
-                "Warning: cadence updated, but Git hooks were not refreshed automatically: {e}"
-            );
-            eprintln!("Run `cadence install` to repair hooks.");
-        }
-        Err(e) => return Err(e.context("updated cadence, but failed to refresh Git hooks")),
-    }
-
-    if should_reconcile_auto_update_after_install(mode)
-        && let Err(err) = ensure_auto_update_enabled_and_reconciled().await
-    {
+    if let Err(err) = run_install_with_updated_binary(true).await {
         report_best_effort_post_upgrade_failure(
             mode,
-            "unattended auto-update could not be enabled automatically",
-            "Run `cadence auto-update enable` to repair scheduler setup.",
+            "the new version could not finish runtime bootstrap automatically",
+            "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership.",
             &err,
         );
-    }
-
-    let current_exe = std::env::current_exe()
-        .context("failed to resolve current cadence executable path after self-update")?;
-    if let Err(err) =
-        run_version_recovery_backfill_with_exe(&current_exe, remote_display, "after upgrade").await
-    {
-        report_best_effort_post_upgrade_failure(
-            mode,
-            "automatic 7d recovery backfill did not complete",
-            "Run `cadence backfill --since 7d` if you need to recover recent local sessions manually.",
-            &err,
-        );
-    } else if let Err(err) = mark_version_recovery_complete(remote_display).await {
-        report_best_effort_post_upgrade_failure(
-            mode,
-            "cadence could not record completed version recovery",
-            "A later command may rerun the automatic recovery backfill for this version.",
-            &err,
-        );
+        return Err(install_handoff_error(err));
     }
 
     if matches!(mode, InstallMode::Interactive) {
@@ -1295,25 +1144,12 @@ fn retry_delay_from_state(state: &UpdaterState) -> u64 {
     retry_delay_secs(state.consecutive_failures.max(1))
 }
 
-fn should_reconcile_auto_update_after_install(mode: InstallMode) -> bool {
-    !matches!(mode, InstallMode::SilentUnattended)
-}
-
 pub async fn run_background_auto_update() -> Result<()> {
     apply_auto_update_jitter().await;
 
     let mut state = load_updater_state().await.unwrap_or_default();
-    let now = now_rfc3339();
+    let now = state_files::now_rfc3339();
     state.last_attempt_at = Some(now.clone());
-
-    let config = CliConfig::load().await.unwrap_or_default();
-    if !config.auto_update_enabled() {
-        state.last_error = None;
-        state.consecutive_failures = 0;
-        state.next_retry_after = None;
-        save_updater_state(&state).await?;
-        return Ok(());
-    }
 
     if !update_due_for_retry(&state, now_epoch()) {
         return Ok(());
@@ -1345,91 +1181,22 @@ pub async fn run_background_auto_update() -> Result<()> {
         return Ok(());
     }
 
-    match run_update_install_from_url_mode(
+    let attempt_result = run_update_install_from_url_mode(
         GITHUB_RELEASES_LATEST_URL,
         true,
         InstallMode::SilentUnattended,
     )
-    .await
-    {
-        Ok(AttemptOutcome::Installed) => {
-            state.last_success_at = Some(now.clone());
-            state.last_installed_version = state.last_seen_version.clone();
-            state.consecutive_failures = 0;
-            state.last_error = None;
-            state.next_retry_after = None;
-            save_updater_state(&state).await?;
-        }
-        Ok(AttemptOutcome::NoUpdate | AttemptOutcome::SkippedUnstable) => {
-            state.last_success_at = Some(now.clone());
-            state.consecutive_failures = 0;
-            state.last_error = None;
-            state.next_retry_after = None;
-            save_updater_state(&state).await?;
-        }
-        Err(e) => {
-            let err = format!("{e:#}");
-            if err.contains("global activity lock is busy") {
-                // Lock contention is expected when hooks/sync are active; retry soon.
-                state.last_error = Some("activity lock busy; updater skipped".to_string());
-                let delay = rand08::Rng::gen_range(&mut rand08::thread_rng(), 60..=300);
-                state.next_retry_after =
-                    format_epoch_rfc3339(now_epoch().saturating_add(delay as i64));
-                save_updater_state(&state).await?;
-                return Ok(());
-            }
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            state.last_error = Some(err);
-            let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
-            state.next_retry_after = format_epoch_rfc3339(retry_at);
-            save_updater_state(&state).await?;
-        }
-    }
+    .await;
+    apply_background_update_attempt_result(&mut state, &now, attempt_result, now_epoch());
+    save_updater_state(&state).await?;
 
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub struct SchedulerProvisionResult {
-    pub configured: bool,
-    pub description: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SchedulerUninstallResult {
-    pub removed: bool,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SchedulerHealthState {
-    Installed,
-    Missing,
-    Broken,
-    Unsupported,
-}
-
-#[derive(Debug, Clone)]
-pub struct SchedulerHealth {
-    pub state: SchedulerHealthState,
-    pub details: String,
-    pub remediation: String,
 }
 
 #[cfg(target_os = "macos")]
 const MACOS_LAUNCH_AGENT_LABEL: &str = "ai.teamcadence.cadence.autoupdate";
 #[cfg(target_os = "windows")]
 const WINDOWS_TASK_NAME: &str = "Cadence CLI Auto Update";
-
-#[cfg(target_os = "windows")]
-fn auto_update_interval_hours() -> u64 {
-    (AUTO_UPDATE_INTERVAL_SECS / 3600).max(1)
-}
-
-#[cfg(target_os = "windows")]
-fn scheduler_command_line(exe_path: &Path) -> String {
-    format!("\"{}\" hook auto-update", exe_path.display())
-}
 
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1438,81 +1205,6 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
-}
-
-async fn run_version_recovery_backfill_with_exe(
-    exe_path: &Path,
-    target_version: &str,
-    trigger: &str,
-) -> Result<()> {
-    eprintln!(
-        "Running automatic session recovery for cadence v{target_version} ({trigger}; backfill --since {VERSION_RECOVERY_BACKFILL_SINCE})..."
-    );
-
-    let status = Command::new(exe_path)
-        .args(["backfill", "--since", VERSION_RECOVERY_BACKFILL_SINCE])
-        .env(PASSIVE_CHECK_ENV_VAR, "1")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .with_context(|| {
-            format!(
-                "failed to launch automatic recovery backfill with {}",
-                exe_path.display()
-            )
-        })?;
-
-    if status.success() {
-        eprintln!("Automatic session recovery for cadence v{target_version} completed.");
-        return Ok(());
-    }
-
-    bail!("automatic recovery backfill failed with exit status {status}");
-}
-
-async fn mark_version_recovery_complete(version: &str) -> Result<()> {
-    let Some(path) = version_recovery_marker_path() else {
-        return Ok(());
-    };
-    write_version_recovery_marker(&path, version).await
-}
-
-pub async fn mark_current_version_recovery_complete() -> Result<()> {
-    mark_version_recovery_complete(current_version()).await
-}
-
-async fn maybe_run_version_recovery_with_exe_and_marker(
-    exe_path: &Path,
-    marker_path: Option<&Path>,
-    target_version: &str,
-    trigger: &str,
-) -> Result<bool> {
-    let Some(marker_path) = marker_path else {
-        return Ok(false);
-    };
-
-    let last_completed = read_version_recovery_marker(marker_path).await?;
-    if !version_recovery_is_due(last_completed.as_deref(), target_version) {
-        return Ok(false);
-    }
-
-    run_version_recovery_backfill_with_exe(exe_path, target_version, trigger).await?;
-    write_version_recovery_marker(marker_path, target_version).await?;
-    Ok(true)
-}
-
-pub async fn maybe_run_current_version_recovery() -> Result<bool> {
-    let exe_path = std::env::current_exe()
-        .context("failed to resolve current cadence executable path for version recovery")?;
-    let marker_path = version_recovery_marker_path();
-    maybe_run_version_recovery_with_exe_and_marker(
-        &exe_path,
-        marker_path.as_deref(),
-        current_version(),
-        "on first run",
-    )
-    .await
 }
 
 fn report_best_effort_post_upgrade_failure(
@@ -1537,18 +1229,47 @@ fn report_best_effort_post_upgrade_failure(
     );
 }
 
-#[cfg(target_os = "macos")]
-fn macos_launchctl_domain() -> String {
-    format!("gui/{}", unsafe { libc::geteuid() })
+fn install_handoff_error(err: anyhow::Error) -> anyhow::Error {
+    err.context(
+        "cadence updated, but the new version could not finish runtime bootstrap automatically",
+    )
 }
 
-#[cfg(target_os = "macos")]
-async fn launchctl_output(args: &[&str]) -> Result<Output> {
-    Command::new("launchctl")
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("failed to execute launchctl {}", args.join(" ")))
+fn apply_background_update_attempt_result(
+    state: &mut UpdaterState,
+    now: &str,
+    attempt_result: Result<AttemptOutcome>,
+    current_epoch: i64,
+) {
+    match attempt_result {
+        Ok(AttemptOutcome::Installed) => {
+            state.last_success_at = Some(now.to_string());
+            state.last_installed_version = state.last_seen_version.clone();
+            state.consecutive_failures = 0;
+            state.last_error = None;
+            state.next_retry_after = None;
+        }
+        Ok(AttemptOutcome::NoUpdate | AttemptOutcome::SkippedUnstable) => {
+            state.last_success_at = Some(now.to_string());
+            state.consecutive_failures = 0;
+            state.last_error = None;
+            state.next_retry_after = None;
+        }
+        Err(err) => {
+            let err = format!("{err:#}");
+            if err.contains("global activity lock is busy") {
+                state.last_error = Some("activity lock busy; updater skipped".to_string());
+                let delay = rand08::Rng::gen_range(&mut rand08::thread_rng(), 60..=300);
+                state.next_retry_after =
+                    format_epoch_rfc3339(current_epoch.saturating_add(delay as i64));
+                return;
+            }
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.last_error = Some(err);
+            let retry_at = current_epoch.saturating_add(retry_delay_from_state(state) as i64);
+            state.next_retry_after = format_epoch_rfc3339(retry_at);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1576,72 +1297,12 @@ fn launchctl_reports_missing_service(detail: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-async fn macos_launch_agent_loaded(label: &str) -> Result<bool> {
-    let service_target = format!("{}/{}", macos_launchctl_domain(), label);
-    let output = launchctl_output(&["print", &service_target]).await?;
-    if output.status.success() {
-        return Ok(true);
-    }
-
-    let detail = command_failure_detail(&output);
-    if launchctl_reports_missing_service(&detail) {
-        return Ok(false);
-    }
-
-    bail!("launchctl print {service_target} failed: {detail}");
-}
-
-#[cfg(target_os = "macos")]
-fn launch_agent_plist(label: &str, exe_path: &Path) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>hook</string>
-    <string>auto-update</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>{interval}</integer>
-  <key>RandomDelay</key><integer>{jitter}</integer>
-  <key>StandardOutPath</key><string>/tmp/cadence-autoupdate.log</string>
-  <key>StandardErrorPath</key><string>/tmp/cadence-autoupdate.log</string>
-</dict>
-</plist>
-"#,
-        exe = exe_path.display(),
-        interval = AUTO_UPDATE_INTERVAL_SECS,
-        jitter = AUTO_UPDATE_JITTER_SECS
-    )
-}
-
-#[cfg(target_os = "macos")]
 fn macos_launch_agent_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is required for LaunchAgent provisioning")?;
     Ok(PathBuf::from(home)
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{MACOS_LAUNCH_AGENT_LABEL}.plist")))
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_service_contents(exe_path: &Path) -> String {
-    format!(
-        "[Unit]\nDescription=Cadence CLI unattended auto-update\n\n[Service]\nType=oneshot\nExecStart={} hook auto-update\n",
-        exe_path.display()
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_timer_contents() -> String {
-    format!(
-        "[Unit]\nDescription=Cadence CLI unattended auto-update timer\n\n[Timer]\nOnBootSec=5m\nOnUnitActiveSec={}s\nRandomizedDelaySec={}s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
-        AUTO_UPDATE_INTERVAL_SECS, AUTO_UPDATE_JITTER_SECS
-    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1657,123 +1318,7 @@ fn linux_systemd_paths() -> Result<(PathBuf, PathBuf)> {
     ))
 }
 
-pub async fn provision_auto_update_scheduler() -> Result<SchedulerProvisionResult> {
-    let exe =
-        std::env::current_exe().context("failed to resolve current cadence executable path")?;
-    provision_auto_update_scheduler_for_exe(&exe).await
-}
-
-pub async fn provision_auto_update_scheduler_for_exe(
-    exe: &Path,
-) -> Result<SchedulerProvisionResult> {
-    #[cfg(target_os = "macos")]
-    {
-        let plist_path = macos_launch_agent_path()?;
-        let agents_dir = plist_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid launch agent path"))?;
-        tokio::fs::create_dir_all(&agents_dir).await?;
-        let plist = launch_agent_plist(MACOS_LAUNCH_AGENT_LABEL, exe);
-        tokio::fs::write(&plist_path, plist).await?;
-
-        // `bootstrap` leaves this user LaunchAgent as a transient partial import on macOS 15,
-        // so the service disappears after the first RunAtLoad execution. Use the documented
-        // `load -w` path here because it leaves the LaunchAgent registered for future intervals.
-        if let Ok(output) = launchctl_file_operation("unload", &plist_path).await
-            && !output.status.success()
-        {
-            let detail = command_failure_detail(&output);
-            if !launchctl_reports_missing_service(&detail) {
-                ::tracing::warn!(
-                    event = "launchctl_unload_failed",
-                    plist = plist_path.display().to_string(),
-                    error = detail
-                );
-            }
-        }
-
-        let load = launchctl_file_operation("load", &plist_path).await?;
-        if !load.status.success() {
-            bail!(
-                "launchctl load failed for {}: {}",
-                plist_path.display(),
-                command_failure_detail(&load)
-            );
-        }
-
-        if !macos_launch_agent_loaded(MACOS_LAUNCH_AGENT_LABEL).await? {
-            bail!(
-                "LaunchAgent {} was written but is not loaded in launchd",
-                plist_path.display()
-            );
-        }
-
-        return Ok(SchedulerProvisionResult {
-            configured: true,
-            description: format!("LaunchAgent {}", plist_path.display()),
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let (service_path, timer_path) = linux_systemd_paths()?;
-        let user_dir = service_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid systemd user service path"))?;
-        tokio::fs::create_dir_all(&user_dir).await?;
-        tokio::fs::write(&service_path, systemd_service_contents(exe)).await?;
-        tokio::fs::write(&timer_path, systemd_timer_contents()).await?;
-
-        let daemon_reload = Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .await;
-        if daemon_reload.as_ref().is_ok_and(|s| s.success()) {
-            let _ = Command::new("systemctl")
-                .args(["--user", "enable", "--now", "cadence-autoupdate.timer"])
-                .status()
-                .await;
-        }
-
-        return Ok(SchedulerProvisionResult {
-            configured: true,
-            description: format!("systemd user timer {}", timer_path.display()),
-        });
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let command = scheduler_command_line(exe);
-        let schedule_hours = auto_update_interval_hours().to_string();
-        let _ = Command::new("schtasks")
-            .args([
-                "/Create",
-                "/F",
-                "/SC",
-                "HOURLY",
-                "/MO",
-                &schedule_hours,
-                "/TN",
-                WINDOWS_TASK_NAME,
-                "/TR",
-                &command,
-            ])
-            .status()
-            .await;
-        return Ok(SchedulerProvisionResult {
-            configured: true,
-            description: WINDOWS_TASK_NAME.to_string(),
-        });
-    }
-
-    #[allow(unreachable_code)]
-    Ok(SchedulerProvisionResult {
-        configured: false,
-        description: "scheduler unsupported on this platform".to_string(),
-    })
-}
-
-pub async fn uninstall_auto_update_scheduler() -> Result<SchedulerUninstallResult> {
+pub async fn uninstall_auto_update_scheduler() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let plist_path = macos_launch_agent_path()?;
@@ -1794,10 +1339,7 @@ pub async fn uninstall_auto_update_scheduler() -> Result<SchedulerUninstallResul
         if existed {
             let _ = tokio::fs::remove_file(&plist_path).await;
         }
-        return Ok(SchedulerUninstallResult {
-            removed: existed,
-            description: format!("LaunchAgent {}", plist_path.display()),
-        });
+        return Ok(());
     }
 
     #[cfg(target_os = "linux")]
@@ -1820,227 +1362,28 @@ pub async fn uninstall_auto_update_scheduler() -> Result<SchedulerUninstallResul
         if timer_exists {
             let _ = tokio::fs::remove_file(&timer_path).await;
         }
-        return Ok(SchedulerUninstallResult {
-            removed: service_exists || timer_exists,
-            description: format!(
-                "systemd user files ({}, {})",
-                service_path.display(),
-                timer_path.display()
-            ),
-        });
+        return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        let out = Command::new("schtasks")
+        let _ = Command::new("schtasks")
             .args(["/Delete", "/F", "/TN", WINDOWS_TASK_NAME])
             .status()
             .await;
-        return Ok(SchedulerUninstallResult {
-            removed: out.as_ref().is_ok_and(|s| s.success()),
-            description: WINDOWS_TASK_NAME.to_string(),
-        });
+        return Ok(());
     }
 
     #[allow(unreachable_code)]
-    Ok(SchedulerUninstallResult {
-        removed: false,
-        description: "scheduler unsupported on this platform".to_string(),
-    })
-}
-
-pub async fn reconcile_scheduler_for_auto_update_enabled(
-    enabled: bool,
-) -> Result<SchedulerProvisionResult> {
-    if enabled {
-        return provision_auto_update_scheduler().await;
-    }
-    let removed = uninstall_auto_update_scheduler().await?;
-    Ok(SchedulerProvisionResult {
-        configured: false,
-        description: format!(
-            "disabled; cleaned scheduler artifacts ({})",
-            removed.description
-        ),
-    })
-}
-
-pub async fn scheduler_health() -> SchedulerHealth {
-    #[cfg(target_os = "macos")]
-    {
-        return scheduler_health_macos().await;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let (service_path, timer_path) = match linux_systemd_paths() {
-            Ok(v) => v,
-            Err(e) => {
-                return SchedulerHealth {
-                    state: SchedulerHealthState::Broken,
-                    details: format!("systemd user path unavailable: {e}"),
-                    remediation: "Run `cadence install` to repair scheduler setup.".to_string(),
-                };
-            }
-        };
-        let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
-        let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
-        if !service_exists && !timer_exists {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Missing,
-                details: format!(
-                    "missing systemd user timer/service ({}, {})",
-                    service_path.display(),
-                    timer_path.display()
-                ),
-                remediation:
-                    "Run `cadence auto-update enable` or `cadence install` to create them."
-                        .to_string(),
-            };
-        }
-        if !service_exists || !timer_exists {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Broken,
-                details: format!(
-                    "partial systemd artifacts present ({}, {})",
-                    service_path.display(),
-                    timer_path.display()
-                ),
-                remediation: "Run `cadence install` to reconcile scheduler artifacts.".to_string(),
-            };
-        }
-        let service_contents = tokio::fs::read_to_string(&service_path)
-            .await
-            .unwrap_or_default();
-        if !service_contents.contains("hook auto-update") {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Broken,
-                details: format!(
-                    "systemd service exists but command is invalid: {}",
-                    service_path.display()
-                ),
-                remediation: "Run `cadence install` to rewrite scheduler artifacts.".to_string(),
-            };
-        }
-        return SchedulerHealth {
-            state: SchedulerHealthState::Installed,
-            details: format!(
-                "systemd user timer/service installed ({}, {})",
-                service_path.display(),
-                timer_path.display()
-            ),
-            remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
-        };
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let queried = Command::new("schtasks")
-            .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-            .status()
-            .await;
-        if queried.as_ref().is_ok_and(|s| s.success()) {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Installed,
-                details: format!("Task Scheduler task installed: {}", WINDOWS_TASK_NAME),
-                remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
-            };
-        }
-        return SchedulerHealth {
-            state: SchedulerHealthState::Missing,
-            details: format!("Task Scheduler task missing: {}", WINDOWS_TASK_NAME),
-            remediation: "Run `cadence auto-update enable` or `cadence install` to create it."
-                .to_string(),
-        };
-    }
-
-    #[allow(unreachable_code)]
-    SchedulerHealth {
-        state: SchedulerHealthState::Unsupported,
-        details: "scheduler unsupported on this platform".to_string(),
-        remediation: "No scheduler action required.".to_string(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_scheduler_health_from_probe(
-    plist_path: &Path,
-    contents: &str,
-    loaded: Result<bool>,
-) -> SchedulerHealth {
-    if !contents.contains("<string>auto-update</string>") {
-        return SchedulerHealth {
-            state: SchedulerHealthState::Broken,
-            details: format!(
-                "LaunchAgent exists but contents look invalid: {}",
-                plist_path.display()
-            ),
-            remediation: "Run `cadence install` to rewrite scheduler artifacts.".to_string(),
-        };
-    }
-
-    match loaded {
-        Ok(true) => SchedulerHealth {
-            state: SchedulerHealthState::Installed,
-            details: format!("LaunchAgent installed and loaded: {}", plist_path.display()),
-            remediation: "Use `cadence auto-update disable` to opt out or `cadence auto-update uninstall` to remove scheduler artifacts.".to_string(),
-        },
-        Ok(false) => SchedulerHealth {
-            state: SchedulerHealthState::Broken,
-            details: format!(
-                "LaunchAgent exists but is not loaded in launchd: {}",
-                plist_path.display()
-            ),
-            remediation: "Run `cadence auto-update enable` or `cadence install` to load it."
-                .to_string(),
-        },
-        Err(err) => SchedulerHealth {
-            state: SchedulerHealthState::Broken,
-            details: format!("LaunchAgent health check failed: {err}"),
-            remediation: "Run `cadence auto-update enable` or `cadence install` to repair it."
-                .to_string(),
-        },
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn scheduler_health_macos() -> SchedulerHealth {
-    let plist_path = match macos_launch_agent_path() {
-        Ok(v) => v,
-        Err(e) => {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Broken,
-                details: format!("LaunchAgent path unavailable: {e}"),
-                remediation: "Run `cadence install` to repair scheduler setup.".to_string(),
-            };
-        }
-    };
-    if !tokio::fs::try_exists(&plist_path).await.unwrap_or(false) {
-        return SchedulerHealth {
-            state: SchedulerHealthState::Missing,
-            details: format!("missing LaunchAgent {}", plist_path.display()),
-            remediation: "Run `cadence auto-update enable` or `cadence install` to create it."
-                .to_string(),
-        };
-    }
-
-    let contents = tokio::fs::read_to_string(&plist_path)
-        .await
-        .unwrap_or_default();
-    macos_scheduler_health_from_probe(
-        &plist_path,
-        &contents,
-        macos_launch_agent_loaded(MACOS_LAUNCH_AGENT_LABEL).await,
-    )
+    Ok(())
 }
 
 pub fn auto_update_policy_summary() -> &'static str {
-    "hourly checks; stable channel only; prereleases are excluded by default"
+    "monitor-driven; stable channel only; no separate auto-update toggle"
 }
 
 pub async fn updater_health() -> UpdaterHealth {
-    let cfg = CliConfig::load().await.unwrap_or_default();
-    let enabled = cfg.auto_update_enabled();
+    let enabled = crate::monitor::monitor_enabled().await;
     let state = load_updater_state().await.unwrap_or_default();
     derive_updater_health(enabled, &state)
 }
@@ -2050,7 +1393,7 @@ fn derive_updater_health(enabled: bool, state: &UpdaterState) -> UpdaterHealth {
         return UpdaterHealth {
             enabled,
             state: UpdaterHealthState::Disabled,
-            last_result: "disabled".to_string(),
+            last_result: "monitor disabled".to_string(),
             last_attempt_at: state.last_attempt_at.clone(),
             next_retry_after: None,
             last_error: None,
@@ -3019,103 +2362,26 @@ mod tests {
         );
     }
 
-    // -- confirm_update (precedence matrix) ----------------------------------
+    // -- confirm_update ------------------------------------------------------
 
     #[tokio::test]
     async fn confirm_update_yes_bypass() {
-        // --yes flag should skip prompt and return true
-        let result = confirm_update("0.2.1", "0.3.0", true, None).unwrap();
+        let result = confirm_update("0.2.1", "0.3.0", true).unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn confirm_update_yes_overrides_config_false() {
-        // --yes wins even when config says auto_update=false
-        let result = confirm_update("0.2.1", "0.3.0", true, Some(false)).unwrap();
+    async fn confirm_update_yes_is_idempotent() {
+        let result = confirm_update("0.2.1", "0.3.0", true).unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn confirm_update_yes_overrides_config_true() {
-        // --yes wins over config=true (both are "yes", should still bypass)
-        let result = confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn confirm_update_auto_config_true_skips_prompt() {
-        // auto_update=true should skip prompt without --yes
-        let result = confirm_update("0.2.1", "0.3.0", false, Some(true)).unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn persist_auto_update_enabled_overrides_explicit_disable() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = EnvGuard::new("HOME");
-        home.set(tmp.path().to_str().expect("home path utf8"));
-
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..CliConfig::default()
-        };
-        cfg.save().await.expect("save config");
-
-        let changed = persist_auto_update_enabled()
-            .await
-            .expect("persist auto-update enabled");
-        assert!(changed);
-
-        let saved = CliConfig::load().await.expect("load config");
-        assert_eq!(saved.auto_update, Some(true));
-    }
-
-    #[tokio::test]
-    async fn update_confirmation_config_preserves_manual_auto_update_preference() {
-        let cfg = CliConfig {
-            auto_update: Some(true),
-            ..CliConfig::default()
-        };
-        assert_eq!(
-            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
-            Some(true)
-        );
-        assert_eq!(
-            update_confirmation_config(InstallMode::SilentUnattended, Some(&cfg)),
-            None
-        );
-
-        let cfg = CliConfig {
-            auto_update: Some(false),
-            ..CliConfig::default()
-        };
-        assert_eq!(
-            update_confirmation_config(InstallMode::Interactive, Some(&cfg)),
-            Some(false)
-        );
-    }
-
-    #[tokio::test]
-    async fn confirm_update_auto_config_false_no_yes_would_prompt() {
-        // auto_update=false, no --yes: would go to interactive prompt.
-        // We can't test the actual prompt here without a TTY,
-        // but we verify the None/false config path doesn't auto-accept.
-        // The dialoguer prompt will fail or return None in non-interactive.
-        // Skip this test in CI — just verify the yes/auto paths cover all branches.
-    }
-
-    #[tokio::test]
-    async fn confirm_update_config_none_no_yes_would_prompt() {
-        // No config, no --yes: same as auto_update=false — would prompt.
-        // Confirm that None acts like false.
-        let result = confirm_update("0.2.1", "0.3.0", false, None);
-        // In a non-interactive test, this either fails or returns false.
-        // The key assertion is that it does NOT return Ok(true).
+    async fn confirm_update_without_yes_does_not_auto_accept() {
+        let result = confirm_update("0.2.1", "0.3.0", false);
         if let Ok(val) = result {
-            assert!(!val, "should not auto-accept without --yes or config");
+            assert!(!val, "should not auto-accept without --yes");
         }
-        // Err is acceptable in non-interactive environments
     }
 
     // -- parse_timestamp_string -----------------------------------------------
@@ -3403,14 +2669,43 @@ mod tests {
         let retrying = derive_updater_health(
             true,
             &UpdaterState {
-                last_attempt_at: Some(now_rfc3339()),
+                last_attempt_at: Some(state_files::now_rfc3339()),
                 consecutive_failures: 2,
-                next_retry_after: Some(now_rfc3339()),
+                next_retry_after: Some(state_files::now_rfc3339()),
                 last_error: Some("network".to_string()),
                 ..UpdaterState::default()
             },
         );
         assert_eq!(retrying.state, UpdaterHealthState::Retrying);
+    }
+
+    #[test]
+    fn background_update_attempt_error_records_failure_instead_of_success() {
+        let now = "2026-03-29T00:00:00Z";
+        let mut state = UpdaterState {
+            last_seen_version: Some("1.2.3".to_string()),
+            ..UpdaterState::default()
+        };
+
+        apply_background_update_attempt_result(
+            &mut state,
+            now,
+            Err(anyhow::anyhow!(
+                "cadence updated, but the new version could not finish runtime bootstrap automatically"
+            )),
+            1_700_000_000,
+        );
+
+        assert_eq!(state.last_success_at, None);
+        assert_eq!(state.last_installed_version, None);
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|value| value.contains("runtime bootstrap automatically"))
+        );
+        assert!(state.next_retry_after.is_some());
     }
 
     #[tokio::test]
@@ -3464,101 +2759,17 @@ mod tests {
         let home = EnvGuard::new("HOME");
         home.set(tmp.path().to_str().unwrap());
 
-        let first = uninstall_auto_update_scheduler()
+        uninstall_auto_update_scheduler()
             .await
             .expect("first uninstall");
-        let second = uninstall_auto_update_scheduler()
+        uninstall_auto_update_scheduler()
             .await
             .expect("second uninstall");
-        assert!(!first.removed);
-        assert!(!second.removed);
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn scheduler_health_reports_missing_without_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = EnvGuard::new("HOME");
-        home.set(tmp.path().to_str().unwrap());
-
-        let health = scheduler_health().await;
-        assert_eq!(health.state, SchedulerHealthState::Missing);
-    }
-
-    #[tokio::test]
-    #[serial]
-    #[cfg(target_os = "linux")]
-    async fn reconcile_enabled_then_disabled_is_consistent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = EnvGuard::new("HOME");
-        home.set(tmp.path().to_str().unwrap());
-
-        let exe = PathBuf::from("/usr/local/bin/cadence");
-        let enabled = provision_auto_update_scheduler_for_exe(&exe)
-            .await
-            .expect("provision scheduler");
-        assert!(enabled.configured);
-
-        let health_after_enable = scheduler_health().await;
-        assert_eq!(health_after_enable.state, SchedulerHealthState::Installed);
-
-        let _ = reconcile_scheduler_for_auto_update_enabled(false)
-            .await
-            .expect("disable reconcile");
-        let health_after_disable = scheduler_health().await;
-        assert_eq!(health_after_disable.state, SchedulerHealthState::Missing);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn launch_agent_plist_points_to_current_executable() {
-        let exe = PathBuf::from("/usr/local/bin/cadence");
-        let plist = launch_agent_plist("ai.teamcadence.cadence.autoupdate", &exe);
-        assert!(plist.contains("/usr/local/bin/cadence"));
-        assert!(plist.contains("<string>auto-update</string>"));
-        assert!(plist.contains("<key>StartInterval</key>"));
-        assert!(plist.contains("<integer>3600</integer>"));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn macos_scheduler_health_reports_installed_when_launch_agent_is_loaded() {
-        let plist_path = PathBuf::from("/tmp/ai.teamcadence.cadence.autoupdate.plist");
-        let health = macos_scheduler_health_from_probe(
-            &plist_path,
-            "<string>auto-update</string>",
-            Ok(true),
-        );
-        assert_eq!(health.state, SchedulerHealthState::Installed);
-        assert!(health.details.contains("installed and loaded"));
-    }
-
-    #[test]
-    fn should_reconcile_auto_update_after_interactive_install_only() {
-        assert!(should_reconcile_auto_update_after_install(
-            InstallMode::Interactive
-        ));
-        assert!(!should_reconcile_auto_update_after_install(
-            InstallMode::SilentUnattended
-        ));
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn systemd_timer_and_service_include_expected_schedule_and_command() {
-        let exe = PathBuf::from("/usr/local/bin/cadence");
-        let service = systemd_service_contents(&exe);
-        let timer = systemd_timer_contents();
-        assert!(service.contains("ExecStart=/usr/local/bin/cadence hook auto-update"));
-        assert!(timer.contains("OnUnitActiveSec=3600s"));
-        assert!(timer.contains("RandomizedDelaySec=300s"));
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn run_version_recovery_backfill_with_exe_invokes_seven_day_backfill_and_skips_passive_check()
-     {
+    async fn run_install_with_exe_invokes_install_with_preserved_disable_state() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("cadence");
         let args_log = tmp.path().join("args.log");
@@ -3577,14 +2788,14 @@ mod tests {
             .await
             .expect("chmod script");
 
-        run_version_recovery_backfill_with_exe(&script, "9.9.9", "test")
+        run_install_with_exe(&script, true)
             .await
-            .expect("run version recovery backfill");
+            .expect("run install with exe");
 
         let args = tokio::fs::read_to_string(&args_log)
             .await
             .expect("read args log");
-        assert_eq!(args, "backfill\n--since\n7d\n");
+        assert_eq!(args, "install\n--preserve-disable-state\n");
 
         let env = tokio::fs::read_to_string(&env_log)
             .await
@@ -3594,18 +2805,10 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn maybe_run_version_recovery_with_exe_and_marker_runs_once_per_version() {
+    async fn run_install_with_exe_surfaces_command_failure() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = tmp.path().join("cadence");
-        let args_log = tmp.path().join("args.log");
-        let env_log = tmp.path().join("env.log");
-        let marker = tmp.path().join("last-version-recovery");
-        let script_contents = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nprintf '%s\\n' \"$CADENCE_NO_UPDATE_CHECK\" >> \"{}\"\n",
-            args_log.display(),
-            env_log.display()
-        );
-        tokio::fs::write(&script, script_contents)
+        tokio::fs::write(&script, "#!/bin/sh\nexit 7\n")
             .await
             .expect("write script");
 
@@ -3614,69 +2817,13 @@ mod tests {
             .await
             .expect("chmod script");
 
-        let ran = maybe_run_version_recovery_with_exe_and_marker(
-            &script,
-            Some(&marker),
-            "2.1.7",
-            "test first run",
-        )
-        .await
-        .expect("run first recovery");
-        assert!(ran, "expected recovery to run when marker is missing");
-
-        let args = tokio::fs::read_to_string(&args_log)
+        let err = run_install_with_exe(&script, true)
             .await
-            .expect("read args after first run");
-        assert_eq!(args, "backfill\n--since\n7d\n");
-
-        let marker_contents = tokio::fs::read_to_string(&marker)
-            .await
-            .expect("read marker after first run");
-        assert_eq!(marker_contents.trim(), "2.1.7");
-
-        let ran_again = maybe_run_version_recovery_with_exe_and_marker(
-            &script,
-            Some(&marker),
-            "2.1.7",
-            "test second run",
-        )
-        .await
-        .expect("rerun same version");
+            .expect_err("expected install handoff failure");
         assert!(
-            !ran_again,
-            "expected recovery to be skipped when marker matches current version"
+            err.to_string().contains("bootstrap install command failed"),
+            "unexpected error: {err:#}"
         );
-
-        let args_after_skip = tokio::fs::read_to_string(&args_log)
-            .await
-            .expect("read args after skip");
-        assert_eq!(args_after_skip, "backfill\n--since\n7d\n");
-
-        let ran_new_version = maybe_run_version_recovery_with_exe_and_marker(
-            &script,
-            Some(&marker),
-            "2.1.8",
-            "test next version",
-        )
-        .await
-        .expect("run next version recovery");
-        assert!(
-            ran_new_version,
-            "expected recovery to rerun for a new version"
-        );
-
-        let args_after_new_version = tokio::fs::read_to_string(&args_log)
-            .await
-            .expect("read args after next version");
-        assert_eq!(
-            args_after_new_version,
-            "backfill\n--since\n7d\nbackfill\n--since\n7d\n"
-        );
-
-        let env = tokio::fs::read_to_string(&env_log)
-            .await
-            .expect("read env log");
-        assert_eq!(env, "1\n1\n");
     }
 
     // -- check_latest_version_from_url_with_timeout ---------------------------
@@ -3689,57 +2836,5 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn refresh_git_hooks_with_exe_invokes_hidden_hook_command() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let script = tmp.path().join("cadence");
-        let args_log = tmp.path().join("args.log");
-        let script_contents = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
-            args_log.display()
-        );
-        tokio::fs::write(&script, script_contents)
-            .await
-            .expect("write script");
-
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("chmod script");
-
-        refresh_git_hooks_with_exe(&script)
-            .await
-            .expect("refresh hooks command");
-
-        let args = tokio::fs::read_to_string(&args_log)
-            .await
-            .expect("read args log");
-        assert_eq!(args, "hook\nrefresh-hooks\n");
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn refresh_git_hooks_with_exe_surfaces_command_failure() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let script = tmp.path().join("cadence");
-        tokio::fs::write(&script, "#!/bin/sh\necho broken >&2\nexit 7\n")
-            .await
-            .expect("write script");
-
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("chmod script");
-
-        let err = refresh_git_hooks_with_exe(&script)
-            .await
-            .expect_err("expected hook refresh failure");
-        assert!(
-            err.to_string().contains("broken"),
-            "unexpected error: {err:#}"
-        );
     }
 }

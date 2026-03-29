@@ -2,24 +2,27 @@
 
 mod agents;
 mod api_client;
+mod bootstrap;
 mod config;
 mod git;
 mod login;
+mod monitor;
 mod output;
 mod publication;
 mod publication_state;
 mod scanner;
+mod state_files;
 mod tracing;
 mod transport;
 mod update;
 mod upload;
-mod upload_cursor;
 
-use anyhow::{Result, bail};
+#[cfg(test)]
+mod test_support;
+
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +31,7 @@ use tokio::task::JoinSet;
 
 const LOGIN_TIMEOUT_SECS: u64 = 120;
 const API_TIMEOUT_SECS: u64 = 5;
-const POST_COMMIT_MAX_UPLOADS_PER_RUN: usize = 20;
+const MONITOR_LOG_RETENTION_DAYS: i64 = 14;
 static API_URL_OVERRIDE: OnceCell<String> = OnceCell::const_new();
 
 fn error_chain_messages(err: &anyhow::Error) -> Vec<String> {
@@ -83,11 +86,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install Cadence CLI: set up git hooks.
+    /// Install Cadence CLI and enable background monitoring.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
         org: Option<String>,
+        /// Internal upgrade/bootstrap path that preserves an explicit disabled runtime.
+        #[arg(long, hide = true)]
+        preserve_disable_state: bool,
     },
 
     /// Git hook entry points.
@@ -112,11 +118,17 @@ enum Command {
     /// Show Cadence CLI status for the current repository.
     Status,
 
-    /// Diagnose hook and upload configuration issues.
+    /// Diagnose monitor and upload configuration issues.
     Doctor {
-        /// Attempt to repair auto-update scheduler artifacts based on config intent.
+        /// Attempt to repair monitor scheduler artifacts based on configured runtime intent.
         #[arg(long)]
         repair: bool,
+    },
+
+    /// Manage Cadence background monitoring.
+    Monitor {
+        #[command(subcommand)]
+        command: Option<MonitorCommand>,
     },
 
     /// Check for and install updates.
@@ -130,7 +142,7 @@ enum Command {
         yes: bool,
     },
 
-    /// Manage unattended auto-update controls and scheduler artifacts.
+    /// Manage unattended auto-update policy.
     AutoUpdate {
         #[command(subcommand)]
         command: Option<AutoUpdateCommand>,
@@ -155,7 +167,7 @@ enum Command {
 enum ConfigCommand {
     /// Set a configuration value.
     Set {
-        /// Configuration key (e.g. auto_update, update_check_interval, api_url).
+        /// Configuration key (e.g. update_check_interval, api_url).
         key: String,
         /// Value to set.
         value: String,
@@ -171,44 +183,44 @@ enum ConfigCommand {
 
 #[derive(Subcommand, Debug)]
 enum AutoUpdateCommand {
-    /// Show auto-update status and scheduler health.
+    /// Show auto-update status and runtime health.
     Status,
-    /// Enable unattended background auto-update and reconcile scheduler artifacts.
+    /// Hidden compatibility command; background updates now follow monitor state.
+    #[command(hide = true)]
     Enable,
-    /// Disable unattended background auto-update (scheduler runs become no-op).
+    /// Hidden compatibility command; background updates now follow monitor state.
+    #[command(hide = true)]
     Disable,
-    /// Remove scheduler artifacts (idempotent and safe to rerun).
+    /// Hidden compatibility command; scheduler lifecycle is monitor-owned.
+    #[command(hide = true)]
     Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
+enum MonitorCommand {
+    /// Show monitor status and scheduler health.
+    Status,
+    /// Enable background monitoring and reconcile scheduler artifacts.
+    Enable,
+    /// Disable background monitoring (scheduled ticks become no-op).
+    Disable,
+    /// Remove background monitor scheduler artifacts.
+    Uninstall,
+    /// Internal background monitor entrypoint (scheduler-only).
+    #[command(hide = true)]
+    Tick,
+}
+
+#[derive(Subcommand, Debug)]
 enum HookCommand {
-    /// Post-commit hook: upload recent AI sessions for the current repository.
+    /// Post-commit hook compatibility shim.
     PostCommit,
-    /// Internal unattended background updater entrypoint (scheduler-only).
+    /// Internal compatibility entrypoint routed to the monitor tick.
     #[command(hide = true)]
     AutoUpdate,
-    /// Internal Git hook refresh entrypoint used after self-update.
+    /// Internal hook-refresh compatibility entrypoint.
     #[command(hide = true)]
     RefreshHooks,
-}
-
-// ---------------------------------------------------------------------------
-// Hook error taxonomy
-// ---------------------------------------------------------------------------
-
-/// Error classification for the post-commit hook.
-///
-/// Direct uploads must never block a commit, so all hook failures are soft.
-enum HookError {
-    /// Any hook failure is logged as a note and the commit proceeds.
-    Soft(anyhow::Error),
-}
-
-impl From<anyhow::Error> for HookError {
-    fn from(e: anyhow::Error) -> Self {
-        HookError::Soft(e)
-    }
 }
 
 fn api_url_override() -> Option<&'static str> {
@@ -219,343 +231,16 @@ fn api_url_override() -> Option<&'static str> {
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-/// The install subcommand: set up global git hooks.
-///
-/// Steps:
-/// 1. Set `git config --global core.hooksPath ~/.git-hooks`
-/// 2. Create `~/.git-hooks/` directory if missing
-/// 3. Write `~/.git-hooks/post-commit` shim script
-/// 4. Make shim executable (chmod +x)
-/// 5. If `--org` provided, persist org filter to global git config
-///
-/// Errors at each step are reported but do not prevent subsequent steps
-/// from being attempted.
-async fn run_install(org: Option<String>) -> Result<()> {
-    run_install_inner(org, None).await
-}
-
-fn is_cadence_hook(content: &str) -> bool {
-    content.contains("cadence hook") || content.contains("cadence")
-}
-
-fn hook_command_exe() -> String {
-    if cfg!(debug_assertions)
-        && let Some(path) = debug_hook_exe_path()
-    {
-        return path;
-    }
-    "cadence".to_string()
-}
-
-fn debug_hook_exe_path() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    if let Some(name) = exe.file_name().and_then(|s| s.to_str())
-        && name.starts_with("cadence")
-    {
-        return Some(exe.display().to_string());
-    }
-
-    let dir = exe.parent()?;
-    if dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
-        let candidate = dir.parent()?.join("cadence");
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-    }
-
-    None
-}
-
-fn post_commit_hook_content() -> String {
-    format!("#!/bin/sh\nexec {} hook post-commit\n", hook_command_exe())
-}
-
-fn resolve_hooks_path(repo_root: Option<&Path>, configured_path: &str) -> PathBuf {
-    let path = Path::new(configured_path);
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    match repo_root {
-        Some(root) => root.join(path),
-        None => path.to_path_buf(),
-    }
-}
-
-fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    let left_norm = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
-    let right_norm = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
-    left_norm == right_norm
-}
-
-fn normalized_repo_match_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-async fn cadence_hooks_installed(hooks_dir: &Path) -> bool {
-    let post_path = hooks_dir.join("post-commit");
-    match tokio::fs::read_to_string(&post_path).await {
-        Ok(content) => is_cadence_hook(&content),
-        Err(_) => false,
-    }
-}
-
-/// Inner implementation of install, accepting an optional home directory override
-/// for testability. If `home_override` is `None`, uses the real home directory.
-async fn run_install_inner(
-    org: Option<String>,
-    home_override: Option<&std::path::Path>,
-) -> Result<()> {
-    println!();
-    output::action("Installing", "hooks");
-    let install_start = std::time::Instant::now();
-    let mut had_errors = refresh_cadence_git_hooks(home_override, true).await?;
-
-    // Step 5: Persist org filter if provided
-    if let Some(ref org_value) = org {
-        match git::config_set_global("ai.cadence.org", org_value).await {
-            Ok(()) => {
-                output::success("Updated", &format!("org filter = {}", org_value));
-            }
-            Err(e) => {
-                output::fail("Failed", &format!("to set org filter ({})", e));
-                had_errors = true;
-            }
-        }
-    }
-
-    // Step 5.5: Force-enable unattended auto-update during install and
-    // reconcile scheduler artifacts immediately.
-    if output::is_stderr_tty() && Term::stdout().is_term() {
-        println!();
-        output::action("Auto-update", "enabled");
-        output::detail(
-            "Cadence runs unattended background update checks hourly and installs stable releases only.",
-        );
-        output::detail("Disable anytime: `cadence auto-update disable`");
-        output::detail("Remove scheduler artifacts: `cadence auto-update uninstall`");
-    }
-
-    match update::ensure_auto_update_enabled_and_reconciled().await {
-        Ok(result) if result.configured => {
-            output::success(
-                "Updated",
-                &format!("auto-update scheduler ({})", result.description),
-            );
-        }
-        Ok(result) => {
-            output::detail(&format!("Auto-update scheduler: {}", result.description));
-        }
-        Err(e) => {
-            output::note(&format!("Could not reconcile auto-update scheduler ({e})"));
-        }
-    }
-
-    println!();
-    if had_errors {
-        output::fail("Install", "completed with issues");
-    } else {
-        output::success("Install", "complete");
-    }
-    output::detail(&format!(
-        "Total time: {} ms",
-        install_start.elapsed().as_millis()
-    ));
-
-    Ok(())
-}
-
-async fn refresh_cadence_git_hooks(
-    home_override: Option<&std::path::Path>,
-    log_progress: bool,
-) -> Result<bool> {
-    let home = match home_override {
-        Some(h) => h.to_path_buf(),
-        None => agents::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?,
-    };
-
-    let hooks_dir = home.join(".git-hooks");
-    let hooks_dir_str = hooks_dir.to_string_lossy().to_string();
-    let mut had_errors = false;
-
-    match git::config_set_global("core.hooksPath", &hooks_dir_str).await {
-        Ok(()) => {
-            if log_progress {
-                output::success("Updated", &format!("core.hooksPath = {}", hooks_dir_str));
-            }
-        }
-        Err(e) => {
-            if log_progress {
-                output::fail("Failed", &format!("to set core.hooksPath ({})", e));
-            }
-            had_errors = true;
-        }
-    }
-
-    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
-        match tokio::fs::create_dir_all(&hooks_dir).await {
-            Ok(()) => {
-                if log_progress {
-                    output::success("Created", &hooks_dir_str);
-                }
-            }
-            Err(e) => {
-                if log_progress {
-                    output::fail("Failed", &format!("to create {} ({})", hooks_dir_str, e));
-                }
-                had_errors = true;
-            }
-        }
-    } else if log_progress {
-        output::detail(&format!(
-            "Hooks directory already exists: {}",
-            hooks_dir_str
-        ));
-    }
-
-    let shim_path = hooks_dir.join("post-commit");
-    let shim_content = post_commit_hook_content();
-
-    let should_write = if tokio::fs::try_exists(&shim_path).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&shim_path).await {
-            Ok(existing) => {
-                if is_cadence_hook(&existing) {
-                    if log_progress {
-                        output::detail("Post-commit hook already installed; updating");
-                    }
-                    true
-                } else {
-                    let backup_path = hooks_dir.join("post-commit.pre-cadence");
-                    match tokio::fs::copy(&shim_path, &backup_path).await {
-                        Ok(_) => {
-                            if log_progress {
-                                output::note(&format!(
-                                    "Existing post-commit hook saved to {}",
-                                    backup_path.display()
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            if log_progress {
-                                output::note(&format!(
-                                    "Could not back up existing post-commit hook ({})",
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                    true
-                }
-            }
-            Err(_) => {
-                if log_progress {
-                    output::note(&format!(
-                        "Could not read existing {}; overwriting",
-                        shim_path.display()
-                    ));
-                }
-                true
-            }
-        }
-    } else {
-        true
-    };
-
-    if should_write {
-        match tokio::fs::write(&shim_path, shim_content).await {
-            Ok(()) => {
-                if log_progress {
-                    output::success(
-                        "Wrote",
-                        &format!("post-commit hook ({})", shim_path.display()),
-                    );
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o755);
-                    match tokio::fs::set_permissions(&shim_path, perms).await {
-                        Ok(()) => {
-                            if log_progress {
-                                output::detail(&format!("Made {} executable", shim_path.display()));
-                            }
-                        }
-                        Err(e) => {
-                            if log_progress {
-                                output::fail(
-                                    "Failed",
-                                    &format!("to make {} executable ({})", shim_path.display(), e),
-                                );
-                            }
-                            had_errors = true;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if log_progress {
-                    output::fail(
-                        "Failed",
-                        &format!("to write {} ({})", shim_path.display(), e),
-                    );
-                }
-                had_errors = true;
-            }
-        }
-    }
-
-    let pre_push_path = hooks_dir.join("pre-push");
-    if tokio::fs::try_exists(&pre_push_path).await.unwrap_or(false) {
-        match tokio::fs::read_to_string(&pre_push_path).await {
-            Ok(existing) if is_cadence_hook(&existing) => {
-                match tokio::fs::remove_file(&pre_push_path).await {
-                    Ok(()) => {
-                        if log_progress {
-                            output::success(
-                                "Removed",
-                                &format!("legacy pre-push hook ({})", pre_push_path.display()),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        if log_progress {
-                            output::fail(
-                                "Failed",
-                                &format!("to remove {} ({})", pre_push_path.display(), e),
-                            );
-                        }
-                        had_errors = true;
-                    }
-                }
-            }
-            Ok(_) => {
-                if log_progress {
-                    output::detail(&format!(
-                        "Leaving non-Cadence pre-push hook untouched: {}",
-                        pre_push_path.display()
-                    ));
-                }
-            }
-            Err(e) => {
-                if log_progress {
-                    output::note(&format!(
-                        "Could not inspect legacy pre-push hook {} ({})",
-                        pre_push_path.display(),
-                        e
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(had_errors)
+/// The install subcommand: enable background monitoring.
+async fn run_install(org: Option<String>, preserve_disable_state: bool) -> Result<()> {
+    bootstrap::run_install(org, preserve_disable_state).await
 }
 
 async fn run_refresh_hooks() -> Result<()> {
-    if refresh_cadence_git_hooks(None, false).await? {
-        bail!("Git hook refresh completed with issues. Run `cadence install` to repair hooks.");
-    }
+    output::detail("Git hook refresh is no longer required.");
+    output::detail(
+        "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership.",
+    );
     Ok(())
 }
 
@@ -694,171 +379,16 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
     }
 }
 
-/// The post-commit hook handler. This is the critical hot path.
+/// Legacy post-commit compatibility hook.
 ///
-/// Direct uploads must never block a commit, so all failures are swallowed
-/// after being surfaced as a note.
+/// Old installs may still invoke `cadence hook post-commit` briefly before the
+/// new runtime bootstrap removes Cadence-owned hook artifacts. This must remain
+/// a silent success no-op during that migration window.
 async fn run_hook_post_commit() -> Result<()> {
-    // Catch-all: catch panics
-    let result = tokio::spawn(async { hook_post_commit_inner().await }).await;
-
-    let final_result = match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(HookError::Soft(e))) => {
-            output::note(&format!("Hook issue: {}", e));
-            Ok(())
-        }
-        Err(e) => {
-            if e.is_panic() {
-                output::note("Hook panicked (please report this issue)");
-            } else {
-                output::note(&format!("Hook task failed: {}", e));
-            }
-            Ok(())
-        }
-    };
-
-    eprintln!();
-    final_result
-}
-
-/// Inner implementation of the post-commit hook.
-async fn hook_post_commit_inner() -> std::result::Result<(), HookError> {
-    // Step 0: Per-repo enabled check — if disabled, skip EVERYTHING
-    if !git::check_enabled().await {
-        return Ok(());
-    }
-    let _activity_lock = update::acquire_activity_lock_blocking("hook-post-commit")
-        .await
-        .map_err(HookError::Soft)?;
-    let _diagnostics_session = match tracing::DiagnosticsLogger::new("hook").await {
-        Ok(logger) => {
-            if let Some(path) = logger.path() {
-                output::detail(&format!("Hook trace: {}", path.display()));
-            }
-            Some(tracing::install_global(logger))
-        }
-        Err(err) => {
-            output::detail(&format!("Hook trace unavailable: {err}"));
-            None
-        }
-    };
-
-    // Step 1: Get repo root
-    let repo_root = git::repo_root().await?;
-    let repo_root_str = repo_root.to_string_lossy().to_string();
-
-    // Step 1.25: Org filter gating — skip session storage if mismatched
-    match git::repo_matches_org_filter(&repo_root).await {
-        Ok(true) => {}
-        Ok(false) => return Ok(()),
-        Err(e) => return Err(HookError::Soft(e)),
-    }
-
-    let upload_context = upload::resolve_upload_context(api_url_override())
-        .await
-        .map_err(HookError::Soft)?;
-    ::tracing::info!(
-        event = "hook_post_commit_started",
-        repo_root = repo_root_str.as_str(),
-        has_token = upload_context.has_token()
-    );
-    let pending_summary =
-        upload::process_pending_uploads(&upload_context, upload::DEFAULT_PENDING_UPLOADS_PER_RUN)
-            .await
-            .map_err(HookError::Soft)?;
-
-    let uploading_progress = hook_status_spinner_start("Uploading AI sessions");
-    let stats =
-        match upload_incremental_sessions_for_repo(&upload_context, &repo_root, &repo_root_str)
-            .await
-        {
-            Ok(stats) => {
-                hook_status_spinner_finish_ok(uploading_progress, "Uploading AI sessions");
-                stats
-            }
-            Err(e) => {
-                hook_status_spinner_finish_err(uploading_progress, "Uploading AI sessions");
-                return Err(HookError::Soft(e));
-            }
-        };
-
-    if (!upload_context.has_token() && stats.queued > 0) || pending_summary.auth_required {
-        output::note("Run `cadence login` to upload queued AI sessions.");
-    }
-    if output::is_verbose() {
-        output::detail(&format!(
-            "uploaded={} queued={} skipped={} issues={} retried_pending={} dropped_pending={}",
-            stats.uploaded,
-            stats.queued,
-            stats.skipped,
-            stats.issues,
-            pending_summary.uploaded + pending_summary.already_existed,
-            pending_summary.dropped_permanent,
-        ));
-    }
-    ::tracing::info!(
-        event = "hook_post_commit_completed",
-        repo_root = repo_root_str.as_str(),
-        uploaded = stats.uploaded,
-        queued = stats.queued,
-        skipped = stats.skipped,
-        issues = stats.issues,
-        pending_attempted = pending_summary.attempted,
-        pending_uploaded = pending_summary.uploaded,
-        pending_already_existed = pending_summary.already_existed,
-        pending_skipped_repo_not_associated = pending_summary.skipped_repo_not_associated,
-        pending_dropped_permanent = pending_summary.dropped_permanent,
-        pending_auth_required = pending_summary.auth_required
-    );
-
     Ok(())
 }
 
-const POST_COMMIT_FALLBACK_WINDOW_SECS: i64 = 30 * 86_400;
-
-fn cadence_hook_label(is_tty: bool) -> String {
-    if is_tty {
-        console::style("[Cadence]")
-            .bold()
-            .fg(console::Color::Cyan)
-            .to_string()
-    } else {
-        "[Cadence]".to_string()
-    }
-}
-
-fn hook_status_spinner_start(task: &str) -> Option<ProgressBar> {
-    if !output::is_stderr_tty() {
-        eprintln!("{} {}", cadence_hook_label(false), task);
-        eprintln!();
-        return None;
-    }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb.set_message(format!("{} {}", cadence_hook_label(true), task));
-    Some(pb)
-}
-
-fn hook_status_spinner_finish_ok(pb: Option<ProgressBar>, task: &str) {
-    if let Some(pb) = pb {
-        let check = console::style("✓").fg(console::Color::Green).to_string();
-        pb.finish_with_message(format!("{} {} {}", check, cadence_hook_label(true), task));
-    } else {
-        eprintln!("✓ {} {}", cadence_hook_label(false), task);
-    }
-}
-
-fn hook_status_spinner_finish_err(pb: Option<ProgressBar>, task: &str) {
-    if let Some(pb) = pb {
-        let cross = console::style("✗").fg(console::Color::Red).to_string();
-        pb.finish_with_message(format!("{} {} {}", cross, cadence_hook_label(true), task));
-    }
-}
+const MONITOR_DEFAULT_CURSOR_WINDOW_SECS: i64 = 30 * 86_400;
 
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
@@ -869,44 +399,7 @@ async fn head_sha_for_repo(repo: &std::path::Path) -> Option<String> {
     git::head_sha_at(repo).await.ok().flatten()
 }
 
-fn apply_incremental_upload_outcome(
-    stats: &mut UploadRunStats,
-    cursor_advance: &mut IncrementalCursor,
-    log_mtime: Option<i64>,
-    log_source_label: &str,
-    outcome: UploadFromLogOutcome,
-) -> bool {
-    match outcome {
-        UploadFromLogOutcome::Uploaded => {
-            stats.uploaded += 1;
-            *cursor_advance =
-                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            true
-        }
-        UploadFromLogOutcome::AlreadyExists => {
-            stats.skipped += 1;
-            *cursor_advance =
-                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            true
-        }
-        UploadFromLogOutcome::Queued(_) => {
-            stats.queued += 1;
-            *cursor_advance =
-                advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
-            true
-        }
-        UploadFromLogOutcome::Retryable(message) => {
-            stats.issues += 1;
-            if output::is_verbose() {
-                output::detail(&format!("post-commit upload retryable error: {message}"));
-            }
-            // Stop here so we do not persist a cursor past a failed candidate.
-            false
-        }
-    }
-}
-
-fn hook_discovery_concurrency() -> usize {
+fn monitor_discovery_concurrency() -> usize {
     std::env::var("CADENCE_HOOK_DISCOVERY_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -931,19 +424,13 @@ struct IncrementalCursor {
 }
 
 impl IncrementalCursor {
-    fn from_persisted(
-        record: Option<upload_cursor::UploadCursorRecord>,
-        default_mtime_epoch: i64,
+    fn from_position(
+        last_scanned_mtime_epoch: i64,
+        last_scanned_source_label: Option<String>,
     ) -> Self {
-        match record {
-            Some(record) => Self {
-                last_scanned_mtime_epoch: record.last_scanned_mtime_epoch,
-                last_scanned_source_label: record.last_scanned_source_label,
-            },
-            None => Self {
-                last_scanned_mtime_epoch: default_mtime_epoch,
-                last_scanned_source_label: None,
-            },
+        Self {
+            last_scanned_mtime_epoch,
+            last_scanned_source_label,
         }
     }
 }
@@ -986,6 +473,47 @@ fn advance_cursor_for_disposition(
         };
     }
     current_cursor.clone()
+}
+
+fn apply_monitor_incremental_upload_outcome(
+    stats: &mut MonitorTickSummary,
+    cursor_advance: &mut IncrementalCursor,
+    log_mtime: Option<i64>,
+    log_source_label: &str,
+    outcome: UploadFromLogOutcome,
+) {
+    let advance = |cursor_advance: &mut IncrementalCursor| {
+        *cursor_advance =
+            advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
+    };
+    match outcome {
+        UploadFromLogOutcome::Uploaded => {
+            stats.uploaded += 1;
+            advance(cursor_advance);
+        }
+        UploadFromLogOutcome::AlreadyExists => {
+            stats.skipped += 1;
+            advance(cursor_advance);
+        }
+        UploadFromLogOutcome::Queued(_) => {
+            stats.queued += 1;
+            advance(cursor_advance);
+        }
+        UploadFromLogOutcome::Retryable(_) => {
+            stats.issues += 1;
+            advance(cursor_advance);
+        }
+    }
+}
+
+fn apply_monitor_org_filter_error(
+    stats: &mut MonitorTickSummary,
+    cursor_advance: &mut IncrementalCursor,
+    log_mtime: Option<i64>,
+    log_source_label: &str,
+) {
+    stats.issues += 1;
+    *cursor_advance = advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
 }
 
 fn select_incremental_candidates(
@@ -1035,7 +563,7 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     if logs.is_empty() {
         return Vec::new();
     }
-    let semaphore = Arc::new(Semaphore::new(hook_discovery_concurrency()));
+    let semaphore = Arc::new(Semaphore::new(monitor_discovery_concurrency()));
     let mut set = JoinSet::new();
     for (idx, log) in logs.into_iter().enumerate() {
         let semaphore = Arc::clone(&semaphore);
@@ -1055,14 +583,6 @@ async fn parse_session_logs_bounded(logs: Vec<agents::SessionLog>) -> Vec<Parsed
     }
     out.sort_by_key(|(idx, _)| *idx);
     out.into_iter().map(|(_, parsed)| parsed).collect()
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct UploadRunStats {
-    uploaded: usize,
-    queued: usize,
-    skipped: usize,
-    issues: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,15 +625,6 @@ async fn upload_session_from_log(
         .await
         .ok()
         .flatten();
-    let remote_urls = match git::remote_urls_at(repo_root).await {
-        Ok(urls) => urls,
-        Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
-    };
-    let canonical_remote_url = git::preferred_remote_url_at(repo_root)
-        .await
-        .ok()
-        .flatten()
-        .or_else(|| remote_urls.first().cloned());
     let worktree_roots = git::repo_and_worktree_roots_at(repo_root).await;
     let (git_ref, head_commit_sha) = match mode {
         PublicationMode::Live => (
@@ -1122,34 +633,67 @@ async fn upload_session_from_log(
         ),
         PublicationMode::Backfill => (None, None),
     };
-
-    let Some(canonical_remote_url) = canonical_remote_url else {
-        let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
+    let build_observed_upload =
+        |canonical_remote_url: String, remote_urls: Vec<String>| upload::ObservedSessionUpload {
             logical_session: publication::LogicalSessionKey {
                 agent: agent.to_string(),
-                agent_session_id: session_id,
+                agent_session_id: session_id.clone(),
             },
             observations: publication::PublicationObservations {
-                canonical_remote_url: String::new(),
+                canonical_remote_url,
                 remote_urls,
                 canonical_repo_root: repo_root_str.to_string(),
-                worktree_roots,
+                worktree_roots: worktree_roots.clone(),
                 cwd: parsed
                     .metadata
                     .cwd
                     .clone()
                     .or_else(|| Some(repo_root_str.to_string())),
-                git_ref,
-                head_commit_sha,
-                git_user_email,
-                git_user_name,
+                git_ref: git_ref.clone(),
+                head_commit_sha: head_commit_sha.clone(),
+                git_user_email: git_user_email.clone(),
+                git_user_name: git_user_name.clone(),
                 cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             },
             raw_session_content: parsed.session_log.clone(),
-        }) {
-            Ok(prepared) => prepared,
-            Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
         };
+
+    let remote_urls = match git::remote_urls_at(repo_root).await {
+        Ok(urls) => urls,
+        Err(err) => {
+            let prepared = match upload::prepare_session_upload(build_observed_upload(
+                String::new(),
+                Vec::new(),
+            )) {
+                Ok(prepared) => prepared,
+                Err(prepare_err) => {
+                    return UploadFromLogOutcome::Retryable(prepare_err.to_string());
+                }
+            };
+            let reason = err.to_string();
+            if let Err(persist_err) =
+                upload::persist_retryable_prepared_session(&prepared, &reason).await
+            {
+                return UploadFromLogOutcome::Retryable(format!(
+                    "{reason}; failed to persist retryable state: {persist_err}"
+                ));
+            }
+            return UploadFromLogOutcome::Retryable(reason);
+        }
+    };
+    let canonical_remote_url = git::preferred_remote_url_at(repo_root)
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| remote_urls.first().cloned());
+
+    let Some(canonical_remote_url) = canonical_remote_url else {
+        let prepared =
+            match upload::prepare_session_upload(build_observed_upload(String::new(), remote_urls))
+            {
+                Ok(prepared) => prepared,
+                Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
+            };
         return match upload::upload_or_queue_prepared_session(context, &prepared).await {
             Ok(upload::LiveUploadOutcome::Queued { reason }) => {
                 UploadFromLogOutcome::Queued(reason)
@@ -1162,29 +706,10 @@ async fn upload_session_from_log(
         };
     };
 
-    let prepared = match upload::prepare_session_upload(upload::ObservedSessionUpload {
-        logical_session: publication::LogicalSessionKey {
-            agent: agent.to_string(),
-            agent_session_id: session_id,
-        },
-        observations: publication::PublicationObservations {
-            canonical_remote_url,
-            remote_urls,
-            canonical_repo_root: repo_root_str.to_string(),
-            worktree_roots,
-            cwd: parsed
-                .metadata
-                .cwd
-                .clone()
-                .or_else(|| Some(repo_root_str.to_string())),
-            git_ref,
-            head_commit_sha,
-            git_user_email,
-            git_user_name,
-            cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        },
-        raw_session_content: parsed.session_log.clone(),
-    }) {
+    let prepared = match upload::prepare_session_upload(build_observed_upload(
+        canonical_remote_url,
+        remote_urls,
+    )) {
         Ok(prepared) => prepared,
         Err(err) => return UploadFromLogOutcome::Retryable(err.to_string()),
     };
@@ -1195,94 +720,6 @@ async fn upload_session_from_log(
         Ok(upload::LiveUploadOutcome::Queued { reason }) => UploadFromLogOutcome::Queued(reason),
         Err(err) => UploadFromLogOutcome::Retryable(err.to_string()),
     }
-}
-
-async fn upload_incremental_sessions_for_repo(
-    context: &upload::UploadContext,
-    repo_root: &std::path::Path,
-    repo_root_str: &str,
-) -> Result<UploadRunStats> {
-    let repo_family_roots = git::repo_and_worktree_roots_at(repo_root)
-        .await
-        .into_iter()
-        .map(PathBuf::from)
-        .map(|path| normalized_repo_match_path(&path))
-        .collect::<std::collections::BTreeSet<_>>();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let persisted_cursor = upload_cursor::load_cursor(repo_root_str).await?;
-    let initial_cursor =
-        IncrementalCursor::from_persisted(persisted_cursor, now - POST_COMMIT_FALLBACK_WINDOW_SECS);
-    let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
-    let files = agents::discover_recent_sessions(now, since_secs).await;
-    let candidates =
-        select_incremental_candidates(files, &initial_cursor, POST_COMMIT_MAX_UPLOADS_PER_RUN);
-
-    let parsed_logs = parse_session_logs_bounded(candidates).await;
-    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
-        std::collections::HashMap::new();
-    let mut stats = UploadRunStats::default();
-    let mut cursor_advance = initial_cursor.clone();
-
-    for parsed in parsed_logs {
-        let log_mtime = parsed.log.updated_at;
-        let log_source_label = parsed.log.source_label();
-        let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
-            continue;
-        };
-        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
-            cached.clone()
-        } else {
-            let resolved = git::resolve_repo_root_with_fallbacks(std::path::Path::new(&cwd))
-                .await
-                .ok()
-                .map(|resolution| resolution.repo_root);
-            repo_root_cache.insert(cwd.clone(), resolved.clone());
-            resolved
-        };
-        let Some(resolved_repo) = resolved_repo else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
-            continue;
-        };
-        if !repo_family_roots.contains(&normalized_repo_match_path(&resolved_repo)) {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
-            continue;
-        }
-
-        if !apply_incremental_upload_outcome(
-            &mut stats,
-            &mut cursor_advance,
-            log_mtime,
-            &log_source_label,
-            upload_session_from_log(
-                context,
-                &parsed,
-                repo_root,
-                repo_root_str,
-                PublicationMode::Live,
-            )
-            .await,
-        ) {
-            break;
-        }
-    }
-
-    if cursor_advance != initial_cursor {
-        upload_cursor::upsert_cursor(
-            repo_root_str,
-            cursor_advance.last_scanned_mtime_epoch,
-            cursor_advance.last_scanned_source_label.as_deref(),
-        )
-        .await?;
-    }
-
-    Ok(stats)
 }
 
 async fn session_log_metadata(log: &agents::SessionLog) -> scanner::SessionMetadata {
@@ -2086,12 +1523,230 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct MonitorTickSummary {
+    discovered: usize,
+    uploaded: usize,
+    queued: usize,
+    skipped: usize,
+    issues: usize,
+    pending_attempted: usize,
+    pending_uploaded: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MonitorTickOptions {
+    force: bool,
+    drain_pending: bool,
+    run_auto_update: bool,
+}
+
+async fn upload_incremental_sessions_globally(
+    context: &upload::UploadContext,
+) -> Result<MonitorTickSummary> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let persisted_cursor = monitor::load_discovery_cursor().await?;
+    let initial_cursor = match persisted_cursor {
+        Some(record) => IncrementalCursor::from_position(
+            record.last_scanned_mtime_epoch,
+            record.last_scanned_source_label,
+        ),
+        None => IncrementalCursor::from_position(now - MONITOR_DEFAULT_CURSOR_WINDOW_SECS, None),
+    };
+    let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
+    let files = agents::discover_recent_sessions(now, since_secs).await;
+    let candidates = select_incremental_candidates(files, &initial_cursor, usize::MAX);
+    let parsed_logs = parse_session_logs_bounded(candidates).await;
+
+    let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    let mut repo_enabled_cache: std::collections::HashMap<std::path::PathBuf, bool> =
+        std::collections::HashMap::new();
+    let mut repo_org_cache: std::collections::HashMap<std::path::PathBuf, bool> =
+        std::collections::HashMap::new();
+    let mut stats = MonitorTickSummary {
+        discovered: parsed_logs.len(),
+        ..MonitorTickSummary::default()
+    };
+    let mut cursor_advance = initial_cursor.clone();
+
+    for parsed in parsed_logs {
+        let log_mtime = parsed.log.updated_at;
+        let log_source_label = parsed.log.source_label();
+        let Some(cwd) = parsed.metadata.cwd.clone() else {
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            continue;
+        };
+        let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
+            cached.clone()
+        } else {
+            let resolved = git::resolve_repo_root_with_fallbacks(std::path::Path::new(&cwd))
+                .await
+                .ok()
+                .map(|resolution| resolution.repo_root);
+            repo_root_cache.insert(cwd.clone(), resolved.clone());
+            resolved
+        };
+        let Some(resolved_repo) = resolved_repo else {
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            continue;
+        };
+
+        let repo_enabled = if let Some(cached) = repo_enabled_cache.get(&resolved_repo) {
+            *cached
+        } else {
+            let enabled = git::check_enabled_at(&resolved_repo).await;
+            repo_enabled_cache.insert(resolved_repo.clone(), enabled);
+            enabled
+        };
+        if !repo_enabled {
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            continue;
+        }
+
+        let repo_matches_org = if let Some(cached) = repo_org_cache.get(&resolved_repo) {
+            *cached
+        } else {
+            let matches = match git::repo_matches_org_filter(&resolved_repo).await {
+                Ok(matches) => matches,
+                Err(err) => {
+                    output::detail(&format!(
+                        "{}: org filter check failed: {}",
+                        resolved_repo.display(),
+                        err
+                    ));
+                    ::tracing::warn!(
+                        event = "monitor_discovery_skipped",
+                        repo_root = resolved_repo.to_string_lossy().as_ref(),
+                        source_label = log_source_label.as_str(),
+                        stage = "org_filter_check",
+                        error = err.to_string()
+                    );
+                    apply_monitor_org_filter_error(
+                        &mut stats,
+                        &mut cursor_advance,
+                        log_mtime,
+                        &log_source_label,
+                    );
+                    continue;
+                }
+            };
+            repo_org_cache.insert(resolved_repo.clone(), matches);
+            matches
+        };
+        if !repo_matches_org {
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            continue;
+        }
+
+        let repo_root_str = resolved_repo.to_string_lossy().to_string();
+        let outcome = upload_session_from_log(
+            context,
+            &parsed,
+            &resolved_repo,
+            &repo_root_str,
+            PublicationMode::Live,
+        )
+        .await;
+        apply_monitor_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor_advance,
+            log_mtime,
+            &log_source_label,
+            outcome,
+        );
+    }
+
+    if cursor_advance != initial_cursor {
+        monitor::upsert_discovery_cursor(
+            cursor_advance.last_scanned_mtime_epoch,
+            cursor_advance.last_scanned_source_label.as_deref(),
+        )
+        .await?;
+    }
+
+    Ok(stats)
+}
+
+async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<MonitorTickSummary> {
+    let mut state = monitor::load_state().await.unwrap_or_default();
+    if !options.force && !state.enabled {
+        return Ok(MonitorTickSummary::default());
+    }
+
+    let Some(_activity_lock) =
+        update::try_acquire_activity_lock_nonblocking("monitor-tick").await?
+    else {
+        return Ok(MonitorTickSummary::default());
+    };
+
+    let now = publication_state::now_rfc3339();
+    state.last_run_at = Some(now.clone());
+    monitor::save_state(&state).await?;
+
+    let run_result: Result<MonitorTickSummary> = async {
+        let upload_context = upload::resolve_upload_context(api_url_override()).await?;
+        let pending_summary = if options.drain_pending {
+            let pending_to_drain = upload::pending_upload_count().await.unwrap_or(0);
+            upload::process_pending_uploads(&upload_context, pending_to_drain).await?
+        } else {
+            upload::PendingUploadSummary::default()
+        };
+        let mut summary = upload_incremental_sessions_globally(&upload_context).await?;
+        summary.pending_attempted = pending_summary.attempted;
+        summary.pending_uploaded = pending_summary.uploaded + pending_summary.already_existed;
+        if options.run_auto_update {
+            update::run_background_auto_update().await?;
+        }
+        Ok(summary)
+    }
+    .await;
+
+    match run_result {
+        Ok(summary) => {
+            state.last_success_at = Some(now);
+            state.last_error = None;
+            state.last_discovered = summary.discovered;
+            state.last_uploaded = summary.uploaded;
+            state.last_queued = summary.queued;
+            state.last_skipped = summary.skipped;
+            state.last_issues = summary.issues;
+            state.last_pending_attempted = summary.pending_attempted;
+            state.last_pending_uploaded = summary.pending_uploaded;
+            monitor::save_state(&state).await?;
+            Ok(summary)
+        }
+        Err(err) => {
+            state.last_error = Some(format!("{err:#}"));
+            monitor::save_state(&state).await?;
+            Err(err)
+        }
+    }
+}
+
+async fn run_monitor_tick(force: bool) -> Result<()> {
+    let _ = run_monitor_tick_internal(MonitorTickOptions {
+        force,
+        drain_pending: true,
+        run_auto_update: true,
+    })
+    .await?;
+    Ok(())
+}
+
 /// The status subcommand: show Cadence CLI configuration and state.
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Effective hooks path and whether the post-commit shim is installed
-/// - Warning when a repo-local hooksPath overrides global Cadence hooks
+/// - Monitor enabled state, scheduler health, and last-run metadata
+/// - Pending upload count and updater health
 /// - Org filter config (if any)
 /// - Per-repo enabled/disabled status
 ///
@@ -2104,7 +1759,6 @@ async fn run_status() -> Result<()> {
 async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
     output::action_to_with_tty(w, "Status", "", false);
 
-    // --- Repo root ---
     let repo_root = match git::repo_root().await {
         Ok(root) => {
             output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
@@ -2116,78 +1770,8 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
     };
 
-    // --- Hooks path and shim status ---
-    let global_hooks_path = git::config_get_global("core.hooksPath")
-        .await
-        .ok()
-        .flatten();
-    if let Some(ref root) = repo_root {
-        match git::config_get_at(root, "core.hooksPath")
-            .await
-            .ok()
-            .flatten()
-        {
-            Some(path) => {
-                let hooks_dir = resolve_hooks_path(Some(root), &path);
-                let post_installed = cadence_hooks_installed(&hooks_dir).await;
-                let post_str = if post_installed { "yes" } else { "no" };
-                output::detail_to_with_tty(
-                    w,
-                    &format!("Hooks path: {} (post-commit: {})", path, post_str),
-                    false,
-                );
+    write_monitor_status_block(w, true).await?;
 
-                if !post_installed {
-                    output::note_to_with_tty(
-                        w,
-                        "Cadence post-commit hook is not installed in the active hooksPath.",
-                        false,
-                    );
-                }
-            }
-            None => {
-                output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
-            }
-        }
-
-        if let Ok(Some(local_hooks_path)) = git::config_get_local_at(root, "core.hooksPath").await
-            && let Some(global_path) = &global_hooks_path
-        {
-            let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
-            let global_resolved = resolve_hooks_path(Some(root), global_path);
-            if !paths_equivalent(&local_resolved, &global_resolved) {
-                output::note_to_with_tty(
-                    w,
-                    &format!(
-                        "Repo-local core.hooksPath overrides global Cadence hooks: {}",
-                        local_hooks_path
-                    ),
-                    false,
-                );
-                output::detail_to_with_tty(
-                    w,
-                    "Run `git config --unset core.hooksPath` in this repo to use global hooks.",
-                    false,
-                );
-            }
-        }
-    } else if let Some(path) = global_hooks_path {
-        let hooks_dir = resolve_hooks_path(None, &path);
-        let post_installed = cadence_hooks_installed(&hooks_dir).await;
-        let post_str = if post_installed { "yes" } else { "no" };
-        output::detail_to_with_tty(
-            w,
-            &format!("Hooks path: {} (post-commit: {})", path, post_str),
-            false,
-        );
-    } else {
-        output::detail_to_with_tty(w, "Hooks path: (not configured)", false);
-    }
-
-    let pending_uploads = upload::pending_upload_count().await.unwrap_or(0);
-    output::detail_to_with_tty(w, &format!("Pending uploads: {}", pending_uploads), false);
-
-    // --- Org filter ---
     match git::config_get_global("ai.cadence.org").await {
         Ok(Some(org)) => {
             output::detail_to_with_tty(w, &format!("Org filter: {}", org), false);
@@ -2197,7 +1781,6 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         }
     }
 
-    // --- Per-repo enabled/disabled ---
     if repo_root.is_some() {
         let enabled = git::check_enabled().await;
         if enabled {
@@ -2248,31 +1831,7 @@ async fn run_status_inner(w: &mut dyn std::io::Write) -> Result<()> {
         ),
         false,
     );
-    let scheduler_health = update::scheduler_health().await;
-    let scheduler_state = match scheduler_health.state {
-        update::SchedulerHealthState::Installed => "installed",
-        update::SchedulerHealthState::Missing => "missing",
-        update::SchedulerHealthState::Broken => "broken",
-        update::SchedulerHealthState::Unsupported => "unsupported",
-    };
-    output::detail_to_with_tty(
-        w,
-        &format!(
-            "Auto-update scheduler: {scheduler_state} ({})",
-            scheduler_health.details
-        ),
-        false,
-    );
-    output::detail_to_with_tty(
-        w,
-        &format!("Auto-update remediation: {}", scheduler_health.remediation),
-        false,
-    );
-    output::detail_to_with_tty(
-        w,
-        "Controls: `cadence auto-update status|enable|disable|uninstall`",
-        false,
-    );
+    output::detail_to_with_tty(w, "Controls: `cadence auto-update status`", false);
 
     Ok(())
 }
@@ -2281,151 +1840,96 @@ async fn run_doctor(repair: bool) -> Result<()> {
     run_doctor_inner(&mut std::io::stderr(), repair).await
 }
 
+fn desired_monitor_enabled_for_repair(
+    configured_enabled_state: Result<Option<bool>>,
+) -> (bool, bool) {
+    match configured_enabled_state {
+        Ok(Some(enabled)) => (enabled, false),
+        Ok(None) => (true, false),
+        Err(_) => (true, true),
+    }
+}
+
+fn repaired_monitor_state_for_enabled(
+    enabled: bool,
+    loaded_state: Result<monitor::MonitorState>,
+) -> monitor::MonitorState {
+    let mut state = loaded_state.unwrap_or_default();
+    state.enabled = enabled;
+    state
+}
+
 async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()> {
     output::action_to_with_tty(w, "Doctor", "", false);
 
     let mut issues = 0usize;
 
-    let repo_root = match git::repo_root().await {
+    match git::repo_root().await {
         Ok(root) => {
             output::detail_to_with_tty(w, &format!("Repo: {}", root.to_string_lossy()), false);
-            Some(root)
         }
         Err(_) => {
             output::detail_to_with_tty(w, "Repo: (not in a git repository)", false);
-            None
         }
     };
 
-    let global_hooks_path = match git::config_get_global("core.hooksPath").await {
-        Ok(path) => path,
-        Err(e) => {
-            output::fail_to_with_tty(
-                w,
-                "Failed",
-                &format!("could not read global core.hooksPath ({e})"),
-                false,
-            );
-            issues += 1;
-            None
-        }
-    };
-
-    match &global_hooks_path {
-        Some(path) => {
-            let hooks_dir = resolve_hooks_path(repo_root.as_deref(), path);
-            let post_installed = cadence_hooks_installed(&hooks_dir).await;
+    match monitor::load_state().await {
+        Ok(state) => {
             output::detail_to_with_tty(
                 w,
                 &format!(
-                    "Global hooks: {} (post-commit: {})",
-                    path,
-                    if post_installed { "yes" } else { "no" }
+                    "Monitor enabled: {}",
+                    if state.enabled { "yes" } else { "no" }
                 ),
                 false,
             );
-            if !post_installed {
-                output::fail_to_with_tty(
-                    w,
-                    "Fail",
-                    "Cadence global post-commit hook is not installed",
-                    false,
-                );
-                output::detail_to_with_tty(w, "Run `cadence install` to repair hooks.", false);
-                issues += 1;
-            }
         }
-        None => {
-            output::fail_to_with_tty(w, "Fail", "Global core.hooksPath is not configured", false);
-            output::detail_to_with_tty(w, "Run `cadence install` to configure hooks.", false);
+        Err(err) => {
+            output::fail_to_with_tty(
+                w,
+                "Fail",
+                &format!("could not read monitor state ({err})"),
+                false,
+            );
             issues += 1;
         }
     }
 
-    if let Some(ref root) = repo_root {
-        match git::config_get_at(root, "core.hooksPath").await {
-            Ok(Some(active_path)) => {
-                let hooks_dir = resolve_hooks_path(Some(root), &active_path);
-                let post_installed = cadence_hooks_installed(&hooks_dir).await;
-                output::detail_to_with_tty(
-                    w,
-                    &format!(
-                        "Active hooks: {} (post-commit: {})",
-                        active_path,
-                        if post_installed { "yes" } else { "no" }
-                    ),
-                    false,
-                );
-                if !post_installed {
-                    output::fail_to_with_tty(
-                        w,
-                        "Fail",
-                        "Active hooksPath does not contain the Cadence post-commit hook",
-                        false,
-                    );
-                    output::detail_to_with_tty(w, "Run `cadence install` or fix hooksPath.", false);
-                    issues += 1;
-                }
-            }
-            Ok(None) => {
-                output::fail_to_with_tty(
-                    w,
-                    "Fail",
-                    "No effective hooksPath found for this repository",
-                    false,
-                );
-                issues += 1;
-            }
-            Err(e) => {
-                output::fail_to_with_tty(
-                    w,
-                    "Fail",
-                    &format!("could not read repo hooksPath ({e})"),
-                    false,
-                );
-                issues += 1;
-            }
-        }
-
-        if let (Ok(Some(local_hooks_path)), Some(global_path)) = (
-            git::config_get_local_at(root, "core.hooksPath").await,
-            global_hooks_path.as_ref(),
-        ) {
-            let local_resolved = resolve_hooks_path(Some(root), &local_hooks_path);
-            let global_resolved = resolve_hooks_path(Some(root), global_path);
-            if !paths_equivalent(&local_resolved, &global_resolved) {
-                output::fail_to_with_tty(
-                    w,
-                    "Fail",
-                    &format!(
-                        "Repo-local core.hooksPath overrides global Cadence hooks: {}",
-                        local_hooks_path
-                    ),
-                    false,
-                );
-                output::detail_to_with_tty(
-                    w,
-                    "Run `git config --unset core.hooksPath` in this repo to use global hooks.",
-                    false,
-                );
-                issues += 1;
-            }
-        }
-    } else {
-        output::note_to_with_tty(
+    if let Err(err) = monitor::load_discovery_cursor().await {
+        output::fail_to_with_tty(
             w,
-            "Skipped repo-local hook checks because current directory is not a git repository.",
+            "Fail",
+            &format!("could not read monitor discovery cursor ({err})"),
             false,
         );
+        issues += 1;
+    } else {
+        output::detail_to_with_tty(w, "Monitor discovery cursor: readable", false);
     }
 
-    let pending_uploads = upload::pending_upload_count().await.unwrap_or(0);
-    output::detail_to_with_tty(w, &format!("Pending uploads: {}", pending_uploads), false);
+    match upload::pending_upload_count().await {
+        Ok(count) => {
+            output::detail_to_with_tty(w, &format!("Pending uploads: {}", count), false);
+        }
+        Err(err) => {
+            output::fail_to_with_tty(
+                w,
+                "Fail",
+                &format!("pending upload state is unreadable ({err})"),
+                false,
+            );
+            issues += 1;
+        }
+    }
 
     let updater_health = update::updater_health().await;
     match updater_health.state {
         update::UpdaterHealthState::Disabled => {
-            output::detail_to_with_tty(w, "Auto-update: disabled", false);
+            output::detail_to_with_tty(
+                w,
+                "Auto-update: disabled because background monitoring is disabled",
+                false,
+            );
         }
         update::UpdaterHealthState::NeverRun => {
             output::detail_to_with_tty(w, "Auto-update: enabled, never run yet", false);
@@ -2465,9 +1969,20 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
     );
 
     if repair {
-        let cfg = config::CliConfig::load().await.unwrap_or_default();
-        let reconcile =
-            update::reconcile_scheduler_for_auto_update_enabled(cfg.auto_update_enabled()).await?;
+        let configured_enabled_state = monitor::configured_enabled_state().await;
+        let (enabled, defaulted_to_enabled) =
+            desired_monitor_enabled_for_repair(configured_enabled_state);
+        let repaired_state =
+            repaired_monitor_state_for_enabled(enabled, monitor::load_state().await);
+        monitor::save_state(&repaired_state).await?;
+        let reconcile = monitor::reconcile_scheduler_for_enabled(enabled).await?;
+        if defaulted_to_enabled {
+            output::note_to_with_tty(
+                w,
+                "Monitor state was unreadable; repair recreated it with monitoring enabled.",
+                false,
+            );
+        }
         output::detail_to_with_tty(
             w,
             &format!("Repair applied: {}", reconcile.description),
@@ -2475,20 +1990,20 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
         );
     }
 
-    let scheduler_health = update::scheduler_health().await;
+    let scheduler_health = monitor::scheduler_health().await;
     match scheduler_health.state {
-        update::SchedulerHealthState::Installed | update::SchedulerHealthState::Unsupported => {
+        monitor::SchedulerHealthState::Installed | monitor::SchedulerHealthState::Unsupported => {
             output::detail_to_with_tty(
                 w,
-                &format!("Auto-update scheduler: {}", scheduler_health.details),
+                &format!("Monitor scheduler: {}", scheduler_health.details),
                 false,
             );
         }
-        update::SchedulerHealthState::Missing | update::SchedulerHealthState::Broken => {
+        monitor::SchedulerHealthState::Missing | monitor::SchedulerHealthState::Broken => {
             output::fail_to_with_tty(
                 w,
                 "Fail",
-                &format!("Auto-update scheduler: {}", scheduler_health.details),
+                &format!("Monitor scheduler: {}", scheduler_health.details),
                 false,
             );
             issues += 1;
@@ -2496,12 +2011,12 @@ async fn run_doctor_inner(w: &mut dyn std::io::Write, repair: bool) -> Result<()
     }
     output::detail_to_with_tty(
         w,
-        &format!("Auto-update remediation: {}", scheduler_health.remediation),
+        &format!("Monitor remediation: {}", scheduler_health.remediation),
         false,
     );
     output::detail_to_with_tty(
         w,
-        "Remediation commands: `cadence auto-update disable`, `cadence auto-update enable`, `cadence auto-update uninstall`, `cadence install`, `cadence doctor --repair`",
+        "Remediation commands: `cadence monitor enable`, `cadence monitor disable`, `cadence monitor uninstall`, `cadence install`, `cadence doctor --repair`",
         false,
     );
 
@@ -2546,17 +2061,132 @@ async fn run_config_list() -> Result<()> {
     Ok(())
 }
 
-async fn set_auto_update_enabled(enabled: bool) -> Result<()> {
-    let mut cfg = config::CliConfig::load().await?;
-    cfg.auto_update = Some(enabled);
-    cfg.save().await?;
+async fn write_monitor_status_block(
+    w: &mut dyn std::io::Write,
+    include_controls: bool,
+) -> Result<()> {
+    let state = monitor::load_state().await.unwrap_or_default();
+    let scheduler = monitor::scheduler_health().await;
+    let scheduler_state = match scheduler.state {
+        monitor::SchedulerHealthState::Installed => "installed",
+        monitor::SchedulerHealthState::Missing => "missing",
+        monitor::SchedulerHealthState::Broken => "broken",
+        monitor::SchedulerHealthState::Unsupported => "unsupported",
+    };
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Monitor enabled: {}",
+            if state.enabled { "yes" } else { "no" }
+        ),
+        false,
+    );
+    output::detail_to_with_tty(
+        w,
+        &format!("Monitor cadence: {}", monitor::cadence_label()),
+        false,
+    );
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Monitor scheduler: {scheduler_state} ({})",
+            scheduler.details
+        ),
+        false,
+    );
+    output::detail_to_with_tty(
+        w,
+        &format!("Monitor remediation: {}", scheduler.remediation),
+        false,
+    );
+    if let Some(last_run) = state.last_run_at {
+        output::detail_to_with_tty(w, &format!("Monitor last run: {last_run}"), false);
+    }
+    if let Some(last_success) = state.last_success_at {
+        output::detail_to_with_tty(w, &format!("Monitor last success: {last_success}"), false);
+    }
+    if let Some(last_error) = state.last_error {
+        output::detail_to_with_tty(w, &format!("Monitor last error: {last_error}"), false);
+    }
+    output::detail_to_with_tty(
+        w,
+        &format!(
+            "Monitor last summary: discovered={}, uploaded={}, queued={}, skipped={}, issues={}, pending_retried={}",
+            state.last_discovered,
+            state.last_uploaded,
+            state.last_queued,
+            state.last_skipped,
+            state.last_issues,
+            state.last_pending_uploaded,
+        ),
+        false,
+    );
+    let pending_uploads = upload::pending_upload_count().await.unwrap_or(0);
+    output::detail_to_with_tty(w, &format!("Pending uploads: {}", pending_uploads), false);
+    if include_controls {
+        output::detail_to_with_tty(
+            w,
+            "Controls: `cadence monitor status|enable|disable|uninstall`",
+            false,
+        );
+    }
     Ok(())
+}
+
+async fn run_monitor_status() -> Result<()> {
+    let mut stderr = std::io::stderr();
+    output::action_to_with_tty(&mut stderr, "Monitor", "status", false);
+    write_monitor_status_block(&mut stderr, true).await
+}
+
+async fn run_monitor_enable() -> Result<()> {
+    let reconcile = monitor::ensure_enabled_and_reconciled().await?;
+    output::success("Monitor", "enabled. Background monitoring is now active.");
+    output::detail(&format!("Cadence: {}", monitor::cadence_label()));
+    output::detail(&format!("Scheduler reconciled: {}", reconcile.description));
+    output::detail("Disable with `cadence monitor disable`.");
+    output::detail("Remove scheduler artifacts with `cadence monitor uninstall`.");
+    Ok(())
+}
+
+async fn run_monitor_disable() -> Result<()> {
+    let _ = monitor::set_enabled(false).await?;
+    output::success(
+        "Monitor",
+        "disabled. Scheduled monitor runs will no-op immediately.",
+    );
+    output::detail("Re-enable with `cadence monitor enable`.");
+    output::detail("Remove scheduler artifacts with `cadence monitor uninstall`.");
+    Ok(())
+}
+
+async fn run_monitor_uninstall() -> Result<()> {
+    let removed = monitor::uninstall_monitor().await?;
+    if removed.removed {
+        output::success("Monitor", "scheduler artifacts removed.");
+    } else {
+        output::detail("Monitor scheduler artifacts were already absent.");
+    }
+    output::detail(&format!("Cleanup target: {}", removed.description));
+    output::detail(
+        "Background monitoring remains disabled until you run `cadence monitor enable`.",
+    );
+    Ok(())
+}
+
+async fn run_monitor(command: Option<MonitorCommand>) -> Result<()> {
+    match command.unwrap_or(MonitorCommand::Status) {
+        MonitorCommand::Status => run_monitor_status().await,
+        MonitorCommand::Enable => run_monitor_enable().await,
+        MonitorCommand::Disable => run_monitor_disable().await,
+        MonitorCommand::Uninstall => run_monitor_uninstall().await,
+        MonitorCommand::Tick => run_monitor_tick(false).await,
+    }
 }
 
 async fn run_auto_update_status() -> Result<()> {
     let mut stderr = std::io::stderr();
     let updater = update::updater_health().await;
-    let scheduler = update::scheduler_health().await;
     output::action_to_with_tty(&mut stderr, "Auto-update", "status", false);
     output::detail_to_with_tty(
         &mut stderr,
@@ -2587,60 +2217,48 @@ async fn run_auto_update_status() -> Result<()> {
             false,
         );
     }
-    let scheduler_state = match scheduler.state {
-        update::SchedulerHealthState::Installed => "installed",
-        update::SchedulerHealthState::Missing => "missing",
-        update::SchedulerHealthState::Broken => "broken",
-        update::SchedulerHealthState::Unsupported => "unsupported",
-    };
     output::detail_to_with_tty(
         &mut stderr,
-        &format!("Scheduler: {scheduler_state} ({})", scheduler.details),
+        "Runtime: monitor-driven; monitor enablement controls unattended updates.",
         false,
     );
     output::detail_to_with_tty(
         &mut stderr,
-        &format!("Remediation: {}", scheduler.remediation),
+        "Use `cadence monitor status` for scheduler visibility.",
         false,
     );
     Ok(())
 }
 
 async fn run_auto_update_enable() -> Result<()> {
-    set_auto_update_enabled(true).await?;
-    let reconcile = update::reconcile_scheduler_for_auto_update_enabled(true).await?;
-    output::success(
-        "Auto-update",
-        "enabled. Background stable-channel updates are now active.",
+    output::note(
+        "`cadence auto-update enable` is now a compatibility command. Unattended updates run automatically whenever background monitoring is enabled.",
     );
-    output::detail(&format!("Scheduler reconciled: {}", reconcile.description));
-    output::detail("Disable with `cadence auto-update disable`.");
-    output::detail("Remove scheduler artifacts with `cadence auto-update uninstall`.");
+    if monitor::monitor_enabled().await {
+        output::detail("Background monitoring is already enabled.");
+    } else {
+        output::detail(
+            "Run `cadence monitor enable` or `cadence install` to turn the runtime back on.",
+        );
+    }
     Ok(())
 }
 
 async fn run_auto_update_disable() -> Result<()> {
-    set_auto_update_enabled(false).await?;
-    output::success(
-        "Auto-update",
-        "disabled. Scheduled updater runs will no-op immediately.",
+    output::note(
+        "`cadence auto-update disable` is no longer supported because Cadence updates now follow monitor state.",
     );
-    output::detail("Re-enable with `cadence auto-update enable`.");
+    output::detail(
+        "Run `cadence monitor disable` if you need to stop all background Cadence work.",
+    );
     Ok(())
 }
 
 async fn run_auto_update_uninstall() -> Result<()> {
-    set_auto_update_enabled(false).await?;
-    let removed = update::uninstall_auto_update_scheduler().await?;
-    if removed.removed {
-        output::success("Auto-update", "scheduler artifacts removed.");
-    } else {
-        output::detail("Auto-update scheduler artifacts were already absent.");
-    }
-    output::detail(&format!("Cleanup target: {}", removed.description));
-    output::detail(
-        "Background updates remain disabled until you run `cadence auto-update enable`.",
+    output::note(
+        "`cadence auto-update uninstall` now maps to `cadence monitor uninstall` because the scheduler is shared with background monitoring.",
     );
+    run_monitor_uninstall().await?;
     Ok(())
 }
 
@@ -2657,16 +2275,17 @@ async fn run_auto_update(command: Option<AutoUpdateCommand>) -> Result<()> {
 // Uninstall
 // ---------------------------------------------------------------------------
 
-/// Completely remove Cadence CLI hooks, configuration, scheduler, and state.
+/// Completely remove Cadence CLI monitor configuration, legacy hook ownership,
+/// scheduler artifacts, and local state.
 ///
 /// Execution order (dependencies noted):
 /// 1. Revoke API token (needs config.toml + network)
-/// 2. Disable auto-update + remove scheduler artifacts
-/// 3. Unset global git config keys
-/// 4. Restore pre-cadence hook backup + remove ~/.git-hooks/ if empty
+/// 2. Disable background monitoring + remove scheduler artifacts
+/// 3. Remove Cadence-managed global git config
+/// 4. Clean up legacy Cadence hook ownership where safe
 /// 5. Clean ai.cadence.enabled from current + sibling repos
 /// 6. Remove ~/.cadence/ directory tree
-/// 7. Remove /tmp/cadence-autoupdate.log
+/// 7. Remove monitor/update compatibility logs
 /// 8. Print summary
 /// 9. Self-delete binary
 async fn run_uninstall(yes: bool) -> Result<()> {
@@ -2682,7 +2301,7 @@ async fn run_uninstall(yes: bool) -> Result<()> {
             "Warning",
             "this will permanently remove all Cadence CLI artifacts:",
         );
-        output::detail("Git config:  core.hooksPath, ai.cadence.org");
+        output::detail("Git config:  ai.cadence.org");
         output::detail(&format!("Hooks dir:   {}", hooks_dir.display()));
         output::detail(&format!("State dir:   {}", state_dir.display()));
         output::detail("Scheduler:   LaunchAgent / systemd / schtasks");
@@ -2712,7 +2331,7 @@ async fn run_uninstall(yes: bool) -> Result<()> {
         }
     }
 
-    // Step 2: Disable auto-update + remove scheduler artifacts
+    // Step 2: Disable monitoring + remove scheduler artifacts
     match uninstall_scheduler().await {
         Ok(()) => {}
         Err(e) => {
@@ -2721,22 +2340,22 @@ async fn run_uninstall(yes: bool) -> Result<()> {
         }
     }
 
-    // Step 3: Unset global git config keys
-    for key in &["core.hooksPath", "ai.cadence.org"] {
-        match git::config_unset_global(key).await {
-            Ok(()) => output::success("Removed", &format!("git config --global {key}")),
-            Err(e) => {
-                output::note(&format!("Could not unset {key} ({e})"));
-                had_errors = true;
-            }
+    // Step 3: Remove Cadence-managed global git config
+    match git::config_unset_global("ai.cadence.org").await {
+        Ok(()) => output::success("Removed", "git config --global ai.cadence.org"),
+        Err(e) => {
+            output::note(&format!("Could not unset ai.cadence.org ({e})"));
+            had_errors = true;
         }
     }
 
-    // Step 4: Restore pre-cadence hook backup + remove ~/.git-hooks/ if empty
-    match uninstall_hooks_dir().await {
-        Ok(()) => {}
+    // Step 4: Clean up legacy Cadence hook ownership where safe
+    match bootstrap::cleanup_cadence_hook_ownership(None, true).await {
+        Ok(had_cleanup_errors) => {
+            had_errors |= had_cleanup_errors;
+        }
         Err(e) => {
-            output::note(&format!("Could not clean hooks directory ({e})"));
+            output::note(&format!("Could not clean legacy hook ownership ({e})"));
             had_errors = true;
         }
     }
@@ -2756,14 +2375,18 @@ async fn run_uninstall(yes: bool) -> Result<()> {
         }
     }
 
-    // Step 7: Remove /tmp/cadence-autoupdate.log
-    let log_path = std::path::Path::new("/tmp/cadence-autoupdate.log");
-    if log_path.exists() {
-        match tokio::fs::remove_file(log_path).await {
-            Ok(()) => output::success("Removed", "/tmp/cadence-autoupdate.log"),
-            Err(e) => {
-                output::note(&format!("Could not remove log file ({e})"));
-                had_errors = true;
+    // Step 7: Remove compatibility logs
+    for log_path in [
+        std::path::Path::new("/tmp/cadence-autoupdate.log"),
+        std::path::Path::new("/tmp/cadence-monitor.log"),
+    ] {
+        if log_path.exists() {
+            match tokio::fs::remove_file(log_path).await {
+                Ok(()) => output::success("Removed", &format!("{}", log_path.display())),
+                Err(e) => {
+                    output::note(&format!("Could not remove log file ({e})"));
+                    had_errors = true;
+                }
             }
         }
     }
@@ -2832,63 +2455,13 @@ async fn revoke_token_for_uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Disable auto-update and remove scheduler artifacts.
+/// Disable background monitoring and remove scheduler artifacts.
 async fn uninstall_scheduler() -> Result<()> {
-    // Best-effort disable in config — config may not exist
-    let _ = set_auto_update_enabled(false).await;
-
-    let removed = update::uninstall_auto_update_scheduler().await?;
+    let removed = monitor::uninstall_monitor().await?;
     if removed.removed {
         output::success("Removed", &format!("scheduler ({})", removed.description));
     } else {
         output::detail("Scheduler artifacts were already absent.");
-    }
-    Ok(())
-}
-
-/// Remove the ~/.git-hooks/ directory, restoring any pre-cadence backup first.
-async fn uninstall_hooks_dir() -> Result<()> {
-    let home =
-        agents::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    let hooks_dir = home.join(".git-hooks");
-
-    if !tokio::fs::try_exists(&hooks_dir).await.unwrap_or(false) {
-        output::detail("Hooks directory already absent.");
-        return Ok(());
-    }
-
-    let post_commit = hooks_dir.join("post-commit");
-    let backup = hooks_dir.join("post-commit.pre-cadence");
-
-    // If there's a pre-cadence backup, restore it
-    if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
-        tokio::fs::rename(&backup, &post_commit).await?;
-        output::success("Restored", "pre-cadence post-commit hook");
-    } else if tokio::fs::try_exists(&post_commit).await.unwrap_or(false) {
-        // Only remove post-commit if it's a cadence hook
-        if let Ok(content) = tokio::fs::read_to_string(&post_commit).await
-            && is_cadence_hook(&content)
-        {
-            tokio::fs::remove_file(&post_commit).await?;
-        }
-    }
-
-    // Check if directory is now empty (or only has cadence files)
-    let mut entries = tokio::fs::read_dir(&hooks_dir).await?;
-    let mut remaining = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        remaining.push(entry.file_name().to_string_lossy().to_string());
-    }
-
-    if remaining.is_empty() {
-        tokio::fs::remove_dir(&hooks_dir).await?;
-        output::success("Removed", &format!("{}", hooks_dir.display()));
-    } else {
-        output::note(&format!(
-            "{} contains non-cadence files ({}), left in place",
-            hooks_dir.display(),
-            remaining.join(", ")
-        ));
     }
     Ok(())
 }
@@ -2972,6 +2545,49 @@ async fn uninstall_state_dir() -> Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
+fn should_run_automatic_current_version_bootstrap(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Hook { .. }
+            | Command::Install { .. }
+            | Command::Uninstall { .. }
+            | Command::Monitor {
+                command: Some(MonitorCommand::Disable | MonitorCommand::Uninstall)
+            }
+    )
+}
+
+fn automatic_bootstrap_includes_recovery_backfill(command: &Command) -> bool {
+    !matches!(command, Command::Backfill { .. })
+}
+
+fn uses_monitor_diagnostics_session(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Monitor {
+            command: Some(MonitorCommand::Tick)
+        } | Command::Hook {
+            hook_command: HookCommand::AutoUpdate
+        }
+    )
+}
+
+async fn install_monitor_diagnostics_session(
+    command: &Command,
+) -> Option<tracing::DiagnosticsSessionGuard> {
+    if !uses_monitor_diagnostics_session(command) {
+        return None;
+    }
+
+    match tracing::DiagnosticsLogger::new_daily("monitor", MONITOR_LOG_RETENTION_DAYS).await {
+        Ok(logger) => Some(tracing::install_global(logger)),
+        Err(err) => {
+            eprintln!("Warning: monitor diagnostics unavailable: {err:#}");
+            None
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -2979,66 +2595,80 @@ async fn main() {
     if let Some(url) = cli.api_url.clone() {
         let _ = API_URL_OVERRIDE.set(url);
     }
+    let use_monitor_diagnostics = uses_monitor_diagnostics_session(&cli.command);
+    let monitor_diagnostics_command = if use_monitor_diagnostics {
+        Some(format!("{:?}", &cli.command))
+    } else {
+        None
+    };
+    let _monitor_diagnostics = install_monitor_diagnostics_session(&cli.command).await;
 
     let is_update_command = matches!(&cli.command, Command::Update { .. });
     let is_hook_command = matches!(&cli.command, Command::Hook { .. });
-    let is_backfill_command = matches!(&cli.command, Command::Backfill { .. });
-    let mut update_installed = false;
+    let is_monitor_tick_command = matches!(
+        &cli.command,
+        Command::Monitor {
+            command: Some(MonitorCommand::Tick)
+        }
+    );
+    if should_run_automatic_current_version_bootstrap(&cli.command)
+        && let Err(err) = bootstrap::maybe_run_current_version_bootstrap(
+            automatic_bootstrap_includes_recovery_backfill(&cli.command),
+        )
+        .await
+    {
+        if use_monitor_diagnostics {
+            ::tracing::warn!(
+                event = "automatic_runtime_bootstrap_failed",
+                error = %format!("{err:#}")
+            );
+        }
+        eprintln!("Warning: automatic runtime bootstrap did not complete: {err:#}");
+        eprintln!(
+            "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership."
+        );
+    }
 
     let result = match cli.command {
-        Command::Install { org } => run_install(org).await,
+        Command::Install {
+            org,
+            preserve_disable_state,
+        } => run_install(org, preserve_disable_state).await,
         Command::Hook { hook_command } => match hook_command {
             HookCommand::PostCommit => run_hook_post_commit().await,
-            HookCommand::AutoUpdate => update::run_background_auto_update().await,
+            HookCommand::AutoUpdate => run_monitor_tick(false).await,
             HookCommand::RefreshHooks => run_refresh_hooks().await,
         },
         Command::Backfill { since } => run_backfill(&since).await,
         Command::Login => run_login().await,
         Command::Logout => run_logout().await,
         Command::Status => run_status().await,
+        Command::Monitor { command } => run_monitor(command).await,
         Command::Config { config_command } => match config_command.unwrap_or(ConfigCommand::List) {
             ConfigCommand::Set { key, value } => run_config_set(&key, &value).await,
             ConfigCommand::Get { key } => run_config_get(&key).await,
             ConfigCommand::List => run_config_list().await,
         },
         Command::Doctor { repair } => run_doctor(repair).await,
-        Command::Update { check, yes } => match update::run_update(check, yes).await {
-            Ok(installed) => {
-                update_installed = installed;
-                Ok(())
-            }
-            Err(err) => Err(err),
-        },
+        Command::Update { check, yes } => update::run_update(check, yes).await.map(|_| ()),
         Command::AutoUpdate { command } => run_auto_update(command).await,
         Command::Uninstall { yes } => run_uninstall(yes).await,
     };
 
-    if result.is_ok() && !is_hook_command && !update_installed {
-        if is_backfill_command {
-            if let Err(err) = update::mark_current_version_recovery_complete().await {
-                eprintln!(
-                    "Warning: cadence backfill succeeded, but recovery state could not be recorded: {err:#}"
-                );
-            }
-        } else if let Err(err) = update::maybe_run_current_version_recovery().await {
-            eprintln!(
-                "Warning: automatic {} recovery backfill did not complete: {err:#}",
-                update::VERSION_RECOVERY_BACKFILL_SINCE
-            );
-            eprintln!(
-                "Run `cadence backfill --since {}` if you need to recover recent local sessions manually.",
-                update::VERSION_RECOVERY_BACKFILL_SINCE
-            );
-        }
-    }
-
     // Passive background version check: run after successful command execution
     // on all non-Update commands. Failures are silently ignored.
-    if result.is_ok() && !is_update_command && !is_hook_command {
+    if result.is_ok() && !is_update_command && !is_hook_command && !is_monitor_tick_command {
         update::passive_version_check().await;
     }
 
     if let Err(e) = result {
+        if use_monitor_diagnostics {
+            ::tracing::error!(
+                event = "background_command_failed",
+                command = monitor_diagnostics_command.as_deref().unwrap_or("unknown"),
+                error = %format!("{e:#}")
+            );
+        }
         report_error(&e);
         process::exit(1);
     }
@@ -3051,9 +2681,11 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvGuard;
     use anyhow::anyhow;
     use serde_json::Value;
     use serial_test::serial;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     async fn run_git(repo: &std::path::Path, args: &[&str]) -> String {
@@ -3084,33 +2716,57 @@ mod tests {
         dir
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
+    struct DiscoveryTestEnv {
+        _home: EnvGuard,
+        _userprofile: EnvGuard,
+        _homedrive: EnvGuard,
+        _homepath: EnvGuard,
+        _appdata: EnvGuard,
+        _localappdata: EnvGuard,
+        codex_home: EnvGuard,
+        _xdg_config_home: EnvGuard,
+        _xdg_data_home: EnvGuard,
     }
 
-    impl EnvGuard {
-        fn new(key: &'static str) -> Self {
+    impl DiscoveryTestEnv {
+        fn install(home: &Path) -> Self {
+            let home_guard = EnvGuard::new("HOME");
+            home_guard.set_path(home);
+
+            let userprofile_guard = EnvGuard::new("USERPROFILE");
+            userprofile_guard.set_path(home);
+
+            let homedrive_guard = EnvGuard::new("HOMEDRIVE");
+            homedrive_guard.clear();
+
+            let homepath_guard = EnvGuard::new("HOMEPATH");
+            homepath_guard.clear();
+
+            let appdata_guard = EnvGuard::new("APPDATA");
+            appdata_guard.set_path(&home.join("AppData").join("Roaming"));
+
+            let localappdata_guard = EnvGuard::new("LOCALAPPDATA");
+            localappdata_guard.set_path(&home.join("AppData").join("Local"));
+
+            let codex_home_guard = EnvGuard::new("CODEX_HOME");
+            codex_home_guard.clear();
+
+            let xdg_config_home_guard = EnvGuard::new("XDG_CONFIG_HOME");
+            xdg_config_home_guard.set_path(&home.join(".config"));
+
+            let xdg_data_home_guard = EnvGuard::new("XDG_DATA_HOME");
+            xdg_data_home_guard.set_path(&home.join(".local").join("share"));
+
             Self {
-                key,
-                original: std::env::var(key).ok(),
-            }
-        }
-
-        fn set_str(&self, value: &str) {
-            unsafe { std::env::set_var(self.key, value) };
-        }
-
-        fn set_path(&self, value: &std::path::Path) {
-            self.set_str(&value.to_string_lossy());
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
+                _home: home_guard,
+                _userprofile: userprofile_guard,
+                _homedrive: homedrive_guard,
+                _homepath: homepath_guard,
+                _appdata: appdata_guard,
+                _localappdata: localappdata_guard,
+                codex_home: codex_home_guard,
+                _xdg_config_home: xdg_config_home_guard,
+                _xdg_data_home: xdg_data_home_guard,
             }
         }
     }
@@ -3330,12 +2986,12 @@ mod tests {
 
     #[test]
     fn cli_parses_config_set() {
-        let cli = Cli::parse_from(["cadence", "config", "set", "auto_update", "true"]);
+        let cli = Cli::parse_from(["cadence", "config", "set", "update_check_interval", "24h"]);
         match cli.command {
             Command::Config { config_command } => match config_command {
                 Some(ConfigCommand::Set { key, value }) => {
-                    assert_eq!(key, "auto_update");
-                    assert_eq!(value, "true");
+                    assert_eq!(key, "update_check_interval");
+                    assert_eq!(value, "24h");
                 }
                 other => panic!("expected Config Set, got {:?}", other),
             },
@@ -3399,6 +3055,103 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_monitor_default_status() {
+        let cli = Cli::parse_from(["cadence", "monitor"]);
+        match cli.command {
+            Command::Monitor { command } => {
+                assert!(command.is_none());
+            }
+            _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_monitor_enable() {
+        let cli = Cli::parse_from(["cadence", "monitor", "enable"]);
+        match cli.command {
+            Command::Monitor { command } => {
+                assert!(matches!(command, Some(MonitorCommand::Enable)));
+            }
+            _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_monitor_uninstall() {
+        let cli = Cli::parse_from(["cadence", "monitor", "uninstall"]);
+        match cli.command {
+            Command::Monitor { command } => {
+                assert!(matches!(command, Some(MonitorCommand::Uninstall)));
+            }
+            _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn automatic_bootstrap_runs_for_monitor_tick_and_status_commands() {
+        let tick = Command::Monitor {
+            command: Some(MonitorCommand::Tick),
+        };
+        let status = Command::Monitor {
+            command: Some(MonitorCommand::Status),
+        };
+
+        assert!(should_run_automatic_current_version_bootstrap(&tick));
+        assert!(should_run_automatic_current_version_bootstrap(&status));
+        assert!(automatic_bootstrap_includes_recovery_backfill(&tick));
+    }
+
+    #[test]
+    fn automatic_bootstrap_skips_disable_uninstall_and_backfill_recovery() {
+        let disable = Command::Monitor {
+            command: Some(MonitorCommand::Disable),
+        };
+        let uninstall = Command::Monitor {
+            command: Some(MonitorCommand::Uninstall),
+        };
+        let backfill = Command::Backfill {
+            since: "7d".to_string(),
+        };
+
+        assert!(!should_run_automatic_current_version_bootstrap(&disable));
+        assert!(!should_run_automatic_current_version_bootstrap(&uninstall));
+        assert!(!automatic_bootstrap_includes_recovery_backfill(&backfill));
+    }
+
+    #[test]
+    fn doctor_repair_defaults_to_enabled_when_monitor_state_is_unreadable() {
+        let (enabled, defaulted) =
+            desired_monitor_enabled_for_repair(Err(anyhow::anyhow!("corrupt state")));
+        assert!(enabled);
+        assert!(defaulted);
+    }
+
+    #[test]
+    fn doctor_repair_rewrites_unreadable_state_with_enabled_default() {
+        let repaired =
+            repaired_monitor_state_for_enabled(true, Err(anyhow::anyhow!("corrupt state")));
+        assert!(repaired.enabled);
+        assert_eq!(repaired.last_run_at, None);
+    }
+
+    #[test]
+    fn monitor_diagnostics_sessions_only_wrap_hidden_runtime_commands() {
+        let tick = Command::Monitor {
+            command: Some(MonitorCommand::Tick),
+        };
+        let compatibility = Command::Hook {
+            hook_command: HookCommand::AutoUpdate,
+        };
+        let status = Command::Monitor {
+            command: Some(MonitorCommand::Status),
+        };
+
+        assert!(uses_monitor_diagnostics_session(&tick));
+        assert!(uses_monitor_diagnostics_session(&compatibility));
+        assert!(!uses_monitor_diagnostics_session(&status));
+    }
+
+    #[test]
     fn cli_parses_hidden_hook_auto_update() {
         let cli = Cli::parse_from(["cadence", "hook", "auto-update"]);
         match cli.command {
@@ -3418,6 +3171,13 @@ mod tests {
             }
             _ => panic!("expected Hook command"),
         }
+    }
+
+    #[tokio::test]
+    async fn hook_post_commit_is_a_success_no_op() {
+        run_hook_post_commit()
+            .await
+            .expect("post-commit compatibility hook should no-op successfully");
     }
 
     #[test]
@@ -3471,11 +3231,11 @@ mod tests {
 
     #[test]
     fn cli_parses_config_get() {
-        let cli = Cli::parse_from(["cadence", "config", "get", "auto_update"]);
+        let cli = Cli::parse_from(["cadence", "config", "get", "update_check_interval"]);
         match cli.command {
             Command::Config { config_command } => match config_command {
                 Some(ConfigCommand::Get { key }) => {
-                    assert_eq!(key, "auto_update");
+                    assert_eq!(key, "update_check_interval");
                 }
                 other => panic!("expected Config Get, got {:?}", other),
             },
@@ -3508,7 +3268,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_hooks_path_uses_repo_root_for_relative_paths() {
         let repo = TempDir::new().expect("tempdir");
-        let resolved = resolve_hooks_path(Some(repo.path()), ".git/hooks");
+        let resolved = bootstrap::resolve_hooks_path(Some(repo.path()), ".git/hooks");
         assert_eq!(resolved, repo.path().join(".git/hooks"));
     }
 
@@ -3522,12 +3282,12 @@ mod tests {
 
         let absolute = hooks_dir.clone();
         let relative = repo.path().join(".git/./hooks");
-        assert!(paths_equivalent(&absolute, &relative));
+        assert!(bootstrap::paths_equivalent(&absolute, &relative));
     }
 
     #[tokio::test]
     #[serial]
-    async fn refresh_cadence_git_hooks_updates_existing_managed_hooks() {
+    async fn cleanup_cadence_hook_ownership_removes_managed_hooks() {
         let home = TempDir::new().expect("home tempdir");
         let home_guard = EnvGuard::new("HOME");
         home_guard.set_path(home.path());
@@ -3538,17 +3298,23 @@ mod tests {
             .expect("write empty global gitconfig");
         let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
         global_guard.set_path(&global_config);
+        crate::git::config_set_global("ai.cadence.org", "test-org")
+            .await
+            .expect("set org filter");
 
         let hooks_dir = home.path().join(".git-hooks");
         tokio::fs::create_dir_all(&hooks_dir)
             .await
             .expect("create hooks dir");
+        crate::git::config_set_global("core.hooksPath", &hooks_dir.to_string_lossy())
+            .await
+            .expect("set core.hooksPath");
         tokio::fs::write(
             hooks_dir.join("post-commit"),
-            "#!/bin/sh\nexec cadence hook pre-push\n",
+            "#!/bin/sh\nexec cadence hook post-commit\n",
         )
         .await
-        .expect("seed stale post-commit hook");
+        .expect("seed cadence post-commit hook");
         tokio::fs::write(
             hooks_dir.join("pre-push"),
             "#!/bin/sh\nexec cadence hook pre-push\n",
@@ -3556,37 +3322,25 @@ mod tests {
         .await
         .expect("seed legacy pre-push hook");
 
-        let had_errors = refresh_cadence_git_hooks(Some(home.path()), false)
+        let had_errors = bootstrap::cleanup_cadence_hook_ownership(Some(home.path()), false)
             .await
-            .expect("refresh hooks");
+            .expect("cleanup hook ownership");
         assert!(!had_errors);
 
-        let post_commit = tokio::fs::read_to_string(hooks_dir.join("post-commit"))
-            .await
-            .expect("read post-commit");
-        assert_eq!(post_commit, post_commit_hook_content());
         assert!(
-            !hooks_dir.join("pre-push").exists(),
-            "expected legacy pre-push hook to be removed"
+            !hooks_dir.exists(),
+            "expected managed hooks directory to be removed"
         );
 
         let configured_hooks_path = crate::git::config_get_global("core.hooksPath")
             .await
             .expect("read core.hooksPath");
-        assert_eq!(
-            configured_hooks_path.as_deref(),
-            Some(hooks_dir.to_string_lossy().as_ref())
-        );
+        assert!(configured_hooks_path.is_none());
     }
 
     #[test]
-    fn post_commit_fallback_window_defaults_are_stable() {
-        assert_eq!(POST_COMMIT_FALLBACK_WINDOW_SECS, 30 * 86_400);
-    }
-
-    #[test]
-    fn post_commit_max_uploads_per_run_defaults_are_stable() {
-        assert_eq!(POST_COMMIT_MAX_UPLOADS_PER_RUN, 20);
+    fn monitor_default_cursor_window_defaults_are_stable() {
+        assert_eq!(MONITOR_DEFAULT_CURSOR_WINDOW_SECS, 30 * 86_400);
     }
 
     #[test]
@@ -3686,41 +3440,12 @@ mod tests {
         assert_eq!(labels, vec!["b".to_string(), "c".to_string()]);
     }
 
-    #[test]
-    fn retryable_incremental_outcome_stops_before_cursor_advances() {
-        let mut stats = UploadRunStats::default();
-        let mut cursor = IncrementalCursor {
-            last_scanned_mtime_epoch: 100,
-            last_scanned_source_label: Some("a".to_string()),
-        };
-
-        let should_continue = apply_incremental_upload_outcome(
-            &mut stats,
-            &mut cursor,
-            Some(200),
-            "z",
-            UploadFromLogOutcome::Retryable("queue write failed".to_string()),
-        );
-
-        assert!(!should_continue);
-        assert_eq!(stats.issues, 1);
-        assert_eq!(
-            cursor,
-            IncrementalCursor {
-                last_scanned_mtime_epoch: 100,
-                last_scanned_source_label: Some("a".to_string()),
-            }
-        );
-    }
-
     #[tokio::test]
     #[serial]
-    async fn incremental_upload_accepts_repo_family_worktree_matches() {
+    async fn upload_incremental_sessions_globally_advances_discovery_cursor_after_success() {
         let home = TempDir::new().expect("home tempdir");
-        let home_guard = EnvGuard::new("HOME");
-        home_guard.set_path(home.path());
-        let codex_home_guard = EnvGuard::new("CODEX_HOME");
-        codex_home_guard.set_path(&home.path().join(".codex"));
+        let env = DiscoveryTestEnv::install(home.path());
+        env.codex_home.set_path(&home.path().join(".codex"));
 
         let global_config = home.path().join("global.gitconfig");
         tokio::fs::write(&global_config, "")
@@ -3741,26 +3466,13 @@ mod tests {
         )
         .await;
 
-        let worktree_root = home.path().join("worktrees").join("feature");
-        run_git(
-            repo.path(),
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                worktree_root.to_str().expect("worktree path utf8"),
-            ],
-        )
-        .await;
-
         let session_updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("current epoch")
             .as_secs() as i64;
-        write_codex_session_log(
+        let session_path = write_codex_session_log(
             home.path(),
-            "session-worktree-family",
+            "session-global-success",
             repo.path(),
             session_updated_at,
         )
@@ -3780,17 +3492,25 @@ mod tests {
         let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
             .await
             .expect("resolve upload context");
-        let stats = upload_incremental_sessions_for_repo(
-            &upload_context,
-            worktree_root.as_path(),
-            &worktree_root.to_string_lossy(),
-        )
-        .await
-        .expect("upload incremental sessions");
+        let summary = upload_incremental_sessions_globally(&upload_context)
+            .await
+            .expect("upload incremental sessions globally");
 
-        assert_eq!(stats.uploaded, 1);
-        assert_eq!(stats.queued, 0);
-        assert_eq!(stats.issues, 0);
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.issues, 0);
+
+        let cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor")
+            .expect("cursor record");
+        assert_eq!(cursor.last_scanned_mtime_epoch, session_updated_at);
+        assert_eq!(
+            cursor.last_scanned_source_label.as_deref(),
+            Some(session_path.to_string_lossy().as_ref())
+        );
         assert_eq!(
             server.counts(),
             crate::upload::test_support::TestUploadServerCounts {
@@ -3799,6 +3519,202 @@ mod tests {
                 confirms: 1,
                 user_org_requests: 1,
             }
+        );
+    }
+
+    #[test]
+    fn monitor_retryable_incremental_outcome_advances_cursor_without_blocking_followups() {
+        let mut stats = MonitorTickSummary::default();
+        let mut cursor = IncrementalCursor {
+            last_scanned_mtime_epoch: 100,
+            last_scanned_source_label: Some("a".to_string()),
+        };
+
+        apply_monitor_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor,
+            Some(150),
+            "b",
+            UploadFromLogOutcome::Retryable("git remote failed".to_string()),
+        );
+
+        assert_eq!(stats.issues, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 150);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("b"));
+
+        apply_monitor_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor,
+            Some(200),
+            "c",
+            UploadFromLogOutcome::Uploaded,
+        );
+
+        assert_eq!(stats.uploaded, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 200);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn monitor_org_filter_error_advances_cursor() {
+        let mut stats = MonitorTickSummary::default();
+        let mut cursor = IncrementalCursor {
+            last_scanned_mtime_epoch: 100,
+            last_scanned_source_label: Some("a".to_string()),
+        };
+
+        apply_monitor_org_filter_error(&mut stats, &mut cursor, Some(200), "b");
+
+        assert_eq!(stats.issues, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 200);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_skips_disabled_runtime_without_writing_state() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let summary = run_monitor_tick_internal(MonitorTickOptions {
+            force: false,
+            drain_pending: true,
+            run_auto_update: false,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.issues, 0);
+        assert_eq!(summary.pending_attempted, 0);
+        assert_eq!(summary.pending_uploaded, 0);
+
+        let monitor_state_path = config::CliConfig::config_dir_with_home(home.path())
+            .expect("config dir")
+            .join("monitor-state.json");
+        assert!(
+            tokio::fs::metadata(&monitor_state_path).await.is_err(),
+            "disabled early exit should not create monitor state"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_drains_pending_uploads_and_records_runtime_state() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let prepared = upload::prepare_session_upload(sample_observed_upload(
+            Path::new("/tmp/repo"),
+            "session-monitor-pending",
+            "hello",
+        ))
+        .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let summary = run_monitor_tick_internal(MonitorTickOptions {
+            force: true,
+            drain_pending: true,
+            run_auto_update: false,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(summary.pending_attempted, 1);
+        assert_eq!(summary.pending_uploaded, 1);
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            0
+        );
+
+        let state = monitor::load_state().await.expect("load monitor state");
+        assert_eq!(state.last_pending_attempted, 1);
+        assert_eq!(state.last_pending_uploaded, 1);
+        assert!(state.last_run_at.is_some());
+        assert!(state.last_success_at.is_some());
+        assert_eq!(state.last_error, None);
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 1,
+                uploads: 1,
+                confirms: 1,
+                user_org_requests: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_enable_disable_round_trip_updates_runtime_intent() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+        let _hook =
+            monitor::install_reconcile_scheduler_test_hook(monitor::SchedulerProvisionResult {
+                configured: true,
+                description: "test scheduler".to_string(),
+            });
+
+        run_monitor_enable().await.expect("enable monitor");
+        assert!(
+            monitor::load_state()
+                .await
+                .expect("load enabled state")
+                .enabled
+        );
+
+        run_monitor_disable().await.expect("disable monitor");
+        assert!(
+            !monitor::load_state()
+                .await
+                .expect("load disabled state")
+                .enabled
+        );
+
+        run_monitor_enable().await.expect("re-enable monitor");
+        assert!(
+            monitor::load_state()
+                .await
+                .expect("load re-enabled state")
+                .enabled
+        );
+        assert_eq!(
+            monitor::reconcile_scheduler_test_hook_calls(),
+            vec![true, true]
         );
     }
 

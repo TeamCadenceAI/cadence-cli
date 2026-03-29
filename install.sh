@@ -9,7 +9,7 @@ OS_NAME="$(uname -s)"
 # --- Main installer ---
 
 main() {
-    # Optional GitHub org to scope tracking (e.g. sh -s MyOrg).
+    # Optional GitHub org to scope Cadence uploads (e.g. sh -s MyOrg).
     # Defaults to empty when omitted — install proceeds without org filtering.
     org="${1:-}" # $org becomes an empty string when $1 is unset
 
@@ -72,7 +72,7 @@ main() {
     echo "Installed ${installed_version}"
 
     echo "Running initial setup..."
-    # Pass --org to scope hook tracking to a specific GitHub org
+    # Pass --org to scope Cadence session uploads to a specific GitHub org.
     if [ -n "$org" ]; then
         echo "Installing for org: $org"
         "${INSTALL_DIR}/cadence" install --org "$org" || {
