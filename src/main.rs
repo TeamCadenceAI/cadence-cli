@@ -1687,6 +1687,13 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
         return Ok(MonitorTickSummary::default());
     };
 
+    if let Err(err) = update::cleanup_legacy_auto_update_scheduler_for_monitor_runtime().await {
+        ::tracing::warn!(
+            event = "legacy_auto_update_scheduler_cleanup_failed",
+            error = %format!("{err:#}")
+        );
+    }
+
     let now = publication_state::now_rfc3339();
     state.last_run_at = Some(now.clone());
     monitor::save_state(&state).await?;
@@ -3600,6 +3607,33 @@ mod tests {
             tokio::fs::metadata(&monitor_state_path).await.is_err(),
             "disabled early exit should not create monitor state"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_attempts_legacy_auto_update_cleanup() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+        let _cleanup_hook = update::install_legacy_cleanup_test_hook(Ok(
+            update::LegacyAutoUpdateCleanupDisposition::Deferred,
+        ));
+
+        let summary = run_monitor_tick_internal(MonitorTickOptions {
+            force: true,
+            drain_pending: false,
+            run_auto_update: false,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.issues, 0);
+        assert_eq!(summary.pending_attempted, 0);
+        assert_eq!(summary.pending_uploaded, 0);
+        assert_eq!(update::legacy_cleanup_test_hook_calls(), 1);
     }
 
     #[tokio::test]

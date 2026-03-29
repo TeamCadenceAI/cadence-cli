@@ -132,6 +132,12 @@ enum AttemptOutcome {
     SkippedUnstable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyAutoUpdateCleanupDisposition {
+    Attempted,
+    Deferred,
+}
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -218,7 +224,7 @@ async fn save_updater_state(state: &UpdaterState) -> Result<()> {
     state_files::write_json_atomic(&path, state).await
 }
 
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         if pid == 0 {
@@ -1193,6 +1199,93 @@ pub async fn run_background_auto_update() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn should_defer_legacy_auto_update_scheduler_cleanup() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var("XPC_SERVICE_NAME").ok().as_deref() == Some(MACOS_LAUNCH_AGENT_LABEL);
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+pub(crate) async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
+-> Result<LegacyAutoUpdateCleanupDisposition> {
+    #[cfg(test)]
+    {
+        let mut hook = legacy_cleanup_test_hook()
+            .lock()
+            .expect("legacy cleanup test hook lock");
+        if let Some(hook) = hook.as_mut() {
+            hook.calls += 1;
+            return match &hook.result {
+                Ok(result) => Ok(*result),
+                Err(message) => Err(anyhow::anyhow!(message.clone())),
+            };
+        }
+    }
+
+    if should_defer_legacy_auto_update_scheduler_cleanup() {
+        ::tracing::info!(
+            event = "legacy_auto_update_scheduler_cleanup_deferred",
+            reason = "running_under_legacy_auto_update_scheduler"
+        );
+        return Ok(LegacyAutoUpdateCleanupDisposition::Deferred);
+    }
+
+    uninstall_auto_update_scheduler().await?;
+    Ok(LegacyAutoUpdateCleanupDisposition::Attempted)
+}
+
+#[cfg(test)]
+pub(crate) struct LegacyCleanupTestHook {
+    result: std::result::Result<LegacyAutoUpdateCleanupDisposition, String>,
+    calls: usize,
+}
+
+#[cfg(test)]
+fn legacy_cleanup_test_hook() -> &'static std::sync::Mutex<Option<LegacyCleanupTestHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LegacyCleanupTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) struct LegacyCleanupTestHookGuard;
+
+#[cfg(test)]
+impl Drop for LegacyCleanupTestHookGuard {
+    fn drop(&mut self) {
+        if let Ok(mut hook) = legacy_cleanup_test_hook().lock() {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_legacy_cleanup_test_hook(
+    result: std::result::Result<LegacyAutoUpdateCleanupDisposition, &'static str>,
+) -> LegacyCleanupTestHookGuard {
+    let mut hook = legacy_cleanup_test_hook()
+        .lock()
+        .expect("legacy cleanup test hook lock");
+    *hook = Some(LegacyCleanupTestHook {
+        result: result.map_err(|message| message.to_string()),
+        calls: 0,
+    });
+    LegacyCleanupTestHookGuard
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_cleanup_test_hook_calls() -> usize {
+    legacy_cleanup_test_hook()
+        .lock()
+        .expect("legacy cleanup test hook lock")
+        .as_ref()
+        .map(|hook| hook.calls)
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "macos")]
 const MACOS_LAUNCH_AGENT_LABEL: &str = "ai.teamcadence.cadence.autoupdate";
 #[cfg(target_os = "windows")]
@@ -1693,6 +1786,28 @@ mod tests {
     #[tokio::test]
     async fn normalize_strips_uppercase_v() {
         assert_eq!(normalize_version_tag("V1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn legacy_auto_update_scheduler_cleanup_defers_for_matching_xpc_service_name() {
+        let guard = EnvGuard::new("XPC_SERVICE_NAME");
+        guard.set(MACOS_LAUNCH_AGENT_LABEL);
+
+        assert!(should_defer_legacy_auto_update_scheduler_cleanup());
+    }
+
+    #[tokio::test]
+    async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime_uses_test_hook() {
+        let _hook =
+            install_legacy_cleanup_test_hook(Ok(LegacyAutoUpdateCleanupDisposition::Deferred));
+
+        let disposition = cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
+            .await
+            .expect("cleanup disposition");
+
+        assert_eq!(disposition, LegacyAutoUpdateCleanupDisposition::Deferred);
+        assert_eq!(legacy_cleanup_test_hook_calls(), 1);
     }
 
     #[tokio::test]
