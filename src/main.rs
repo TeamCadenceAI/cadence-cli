@@ -799,6 +799,18 @@ struct RepoBackfillStats {
     errors: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillInvocation {
+    Manual,
+    RecoveryBootstrap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillOutcome {
+    Completed,
+    SkippedAuth,
+}
+
 fn repo_label_from_display(display: &str) -> String {
     let trimmed = display.trim();
     if trimmed.is_empty() {
@@ -847,6 +859,42 @@ fn backfill_repo_concurrency() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(adaptive)
+}
+
+fn backfill_auth_message(
+    state: &upload::PublicationAuthState,
+    invocation: BackfillInvocation,
+) -> Option<String> {
+    match invocation {
+        BackfillInvocation::Manual => match state {
+            upload::PublicationAuthState::Ready => None,
+            upload::PublicationAuthState::MissingToken => Some(
+                "Cadence login is missing; run `cadence login` before running `cadence backfill`."
+                    .to_string(),
+            ),
+            upload::PublicationAuthState::Rejected => Some(
+                "Cadence login was rejected by the server; run `cadence login` before running `cadence backfill`."
+                    .to_string(),
+            ),
+            upload::PublicationAuthState::CheckFailed(message) => Some(format!(
+                "Cadence publication auth check failed ({message}); backfill did not start."
+            )),
+        },
+        BackfillInvocation::RecoveryBootstrap => match state {
+            upload::PublicationAuthState::Ready => None,
+            upload::PublicationAuthState::MissingToken => Some(
+                "Automatic recovery backfill skipped because Cadence login is missing."
+                    .to_string(),
+            ),
+            upload::PublicationAuthState::Rejected => Some(
+                "Automatic recovery backfill skipped because Cadence login was rejected by the server."
+                    .to_string(),
+            ),
+            upload::PublicationAuthState::CheckFailed(message) => Some(format!(
+                "Automatic recovery backfill skipped because the publication auth check failed ({message})."
+            )),
+        },
+    }
 }
 
 async fn process_repo_backfill(
@@ -1067,6 +1115,17 @@ async fn process_repo_backfill(
 }
 
 async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) -> Result<()> {
+    match run_backfill_inner_with_invocation(since, repo_filter, BackfillInvocation::Manual).await?
+    {
+        BackfillOutcome::Completed | BackfillOutcome::SkippedAuth => Ok(()),
+    }
+}
+
+async fn run_backfill_inner_with_invocation(
+    since: &str,
+    repo_filter: Option<&std::path::Path>,
+    invocation: BackfillInvocation,
+) -> Result<BackfillOutcome> {
     let since_secs = parse_since_duration(since)?;
     let since_days = since_secs / 86_400;
 
@@ -1089,6 +1148,34 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     };
 
     let upload_context = Arc::new(upload::resolve_upload_context(api_url_override()).await?);
+    let publication_auth = upload::publication_auth_state(&upload_context).await;
+    if publication_auth.blocks_background_publication()
+        && let Some(message) = backfill_auth_message(&publication_auth, invocation)
+    {
+        ::tracing::warn!(
+            event = "backfill_skipped_auth",
+            invocation = ?invocation,
+            state = publication_auth.detail(),
+            message
+        );
+        match invocation {
+            BackfillInvocation::Manual => {
+                output::fail("Backfill", &message);
+                if let Some(remediation) = publication_auth.remediation() {
+                    output::detail(remediation);
+                }
+                anyhow::bail!(message);
+            }
+            BackfillInvocation::RecoveryBootstrap => {
+                output::detail(&message);
+                if let Some(remediation) = publication_auth.remediation() {
+                    output::detail(remediation);
+                }
+                return Ok(BackfillOutcome::SkippedAuth);
+            }
+        }
+    }
+
     let pending_to_drain = match repo_filter {
         Some(filter) => upload::pending_upload_count_for_repo(filter)
             .await
@@ -1520,7 +1607,7 @@ async fn run_backfill_inner(since: &str, repo_filter: Option<&std::path::Path>) 
     if !upload_context.has_token() && queued > 0 {
         output::note("Run `cadence login` to upload queued AI sessions.");
     }
-    Ok(())
+    Ok(BackfillOutcome::Completed)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -4291,6 +4378,139 @@ mod tests {
         let names = event_names(&rows);
         assert!(names.contains(&"pending_upload_drain_started".to_string()));
         assert!(names.contains(&"pending_upload_drain_completed".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_fails_fast_when_publication_auth_is_rejected() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let prepared = upload::prepare_session_upload(sample_observed_upload(
+            Path::new("/tmp/repo"),
+            "session-pending-auth-rejected",
+            "hello",
+        ))
+        .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let err = run_backfill_inner("1d", None)
+            .await
+            .expect_err("manual backfill should fail");
+
+        assert!(err.to_string().contains("cadence login"));
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            1
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 0,
+                uploads: 0,
+                confirms: 0,
+                user_org_requests: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovery_backfill_skips_fast_when_publication_auth_is_rejected() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let prepared = upload::prepare_session_upload(sample_observed_upload(
+            Path::new("/tmp/repo"),
+            "session-pending-recovery-auth-rejected",
+            "hello",
+        ))
+        .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                user_org_statuses: vec![401],
+                ..crate::upload::test_support::TestUploadServerConfig::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let outcome =
+            run_backfill_inner_with_invocation("1d", None, BackfillInvocation::RecoveryBootstrap)
+                .await
+                .expect("recovery backfill should skip cleanly");
+
+        assert_eq!(outcome, BackfillOutcome::SkippedAuth);
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            1
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 0,
+                uploads: 0,
+                confirms: 0,
+                user_org_requests: 1,
+            }
+        );
     }
 
     #[tokio::test]
