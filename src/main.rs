@@ -116,7 +116,7 @@ enum Command {
 
     /// Diagnose monitor and upload configuration issues.
     Doctor {
-        /// Attempt to repair auto-update scheduler artifacts based on config intent.
+        /// Attempt to repair monitor scheduler artifacts based on configured runtime intent.
         #[arg(long)]
         repair: bool,
     },
@@ -1720,8 +1720,8 @@ async fn run_monitor_tick(force: bool) -> Result<()> {
 ///
 /// Displays:
 /// - Current repo root (or a message if not in a git repo)
-/// - Effective hooks path and whether the post-commit shim is installed
-/// - Warning when a repo-local hooksPath overrides global Cadence hooks
+/// - Monitor enabled state, scheduler health, and last-run metadata
+/// - Pending upload count and updater health
 /// - Org filter config (if any)
 /// - Per-repo enabled/disabled status
 ///

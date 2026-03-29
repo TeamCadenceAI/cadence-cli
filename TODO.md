@@ -21,11 +21,11 @@ This branch needs the following fixes before deployment.
 - [x] Retain only 14 days of monitor log history; do not add a size cap for this branch.
 - [x] Ensure monitor log parent directories are created automatically and cleanup paths are updated for the new durable log location.
 - [x] Remove any active monitor log dependence on `/tmp`; do not leave the scheduler writing the primary monitor log there.
-- [ ] Fix the stale `run_status_inner` docstring/help text that still describes removed hook-era status checks.
-- [ ] Investigate and resolve the observed `cargo test --no-fail-fast` instability before deploy, including the intermittent `activity_lock_blocking_times_out_when_held` failure.
+- [x] Fix the stale `run_status_inner` docstring/help text that still describes removed hook-era status checks.
+- [x] Investigate and resolve the observed `cargo test --no-fail-fast` instability before deploy, including the intermittent `activity_lock_blocking_times_out_when_held` failure.
 
 Before deployment, rerun:
 
-- [ ] `cargo fmt -- --check`
-- [ ] `cargo clippy --all-targets --all-features`
-- [ ] `cargo test --no-fail-fast`
+- [x] `cargo fmt -- --check`
+- [x] `cargo clippy --all-targets --all-features`
+- [x] `cargo test --no-fail-fast`
