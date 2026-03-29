@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.2.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.7...v2.2.0) (2026-03-29)
+
+
+### Features
+
+* **bootstrap:** finish monitor bootstrap migration ([5af141c](https://github.com/TeamCadenceAI/cadence-cli/commit/5af141cbe0014d746e73f58ab09288af5c0d082f))
+* **bootstrap:** unify install and version migration ([96d7b56](https://github.com/TeamCadenceAI/cadence-cli/commit/96d7b5679410432b3973e10c383bf85f862b5c9d))
+* **monitor:** move live runtime off Git hooks ([c92ca66](https://github.com/TeamCadenceAI/cadence-cli/commit/c92ca66f6ec84413914043392ec5b591ae8ae464))
+* move live ingestion to the background monitor runtime ([fdf5362](https://github.com/TeamCadenceAI/cadence-cli/commit/fdf5362aa5a23f836728f0030198b623943f67c4))
+
+
+### Bug Fixes
+
+* **bootstrap:** harden update handoff and fallback recovery ([3e8b170](https://github.com/TeamCadenceAI/cadence-cli/commit/3e8b170ed3dd2f3b68d94a22f3fa5bf867baed46))
+* **claude:** align desktop manifest tests with platform paths ([cc5a3f4](https://github.com/TeamCadenceAI/cadence-cli/commit/cc5a3f481fcd9f50ad8274af31dc47df372a498f))
+* **claude:** use desktop manifests to surface recent sessions ([d11eae6](https://github.com/TeamCadenceAI/cadence-cli/commit/d11eae6c959b377766c276c32b5a059e344c0f3a))
+* **claude:** use desktop manifests to surface recent sessions ([6507528](https://github.com/TeamCadenceAI/cadence-cli/commit/65075288c8fa21460a1f26a667457f22ec1a8638))
+* **hooks:** make post-commit compatibility path inert ([0fe8577](https://github.com/TeamCadenceAI/cadence-cli/commit/0fe8577ec3e1f735dc4851782249d197731b8b3a))
+* **monitor:** freeze cursor after retryable skips ([d5a8784](https://github.com/TeamCadenceAI/cadence-cli/commit/d5a8784f2d04c1951341dd71092e5aeecd6a3540))
+* **monitor:** keep compatibility ticks lightweight and resilient ([81c3de8](https://github.com/TeamCadenceAI/cadence-cli/commit/81c3de81af00d4b958fa527a2537f4351f1970a2))
+* **monitor:** persist background diagnostics under cadence state ([2cb17ae](https://github.com/TeamCadenceAI/cadence-cli/commit/2cb17aee5c9b4663d9e387587a822efad949e128))
+* **monitor:** remove global cursor blocking on retryable uploads ([2bd0182](https://github.com/TeamCadenceAI/cadence-cli/commit/2bd01823a6ef983f2cfd09e72774f3174bc64fff))
+* **runtime:** repair monitor state and hook ownership cleanup ([7134985](https://github.com/TeamCadenceAI/cadence-cli/commit/7134985ca80d350773e9143cef3564077dc79b1a))
+
 ## [2.1.7](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.6...v2.1.7) (2026-03-25)
 
 
