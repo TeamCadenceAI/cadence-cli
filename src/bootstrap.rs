@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::{agents, git, monitor, output, update};
+use crate::{agents, git, monitor, output, state_files, update};
 
 pub(crate) const VERSION_BOOTSTRAP_BACKFILL_SINCE: &str = "7d";
 const VERSION_BOOTSTRAP_MARKER_FILE: &str = "last-version-bootstrap";
@@ -14,6 +14,7 @@ const VERSION_BOOTSTRAP_LOCK_FILE: &str = "current-version-bootstrap.lock";
 const VERSION_BOOTSTRAP_LOCK_STALE_SECS: i64 = 15 * 60;
 const VERSION_BOOTSTRAP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const VERSION_BOOTSTRAP_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TEST_INSTALL_SENTINEL_ENV: &str = "CADENCE_TEST_INSTALL_SENTINEL_PATH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapTrigger {
@@ -33,6 +34,14 @@ struct BootstrapOptions<'a> {
 struct BootstrapOutcome {
     had_runtime_errors: bool,
     performed_recovery_backfill: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TestInstallSentinel {
+    org: Option<String>,
+    preserve_disable_state: bool,
+    passive_version_check_disabled: bool,
+    pid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +343,30 @@ fn log_bootstrap_stage(stage: impl std::fmt::Display) {
     ::tracing::info!(event = "runtime_bootstrap_stage", stage = %stage);
 }
 
+async fn maybe_write_test_install_sentinel(
+    org: Option<&str>,
+    preserve_disable_state: bool,
+) -> Result<bool> {
+    let Ok(path) = std::env::var(TEST_INSTALL_SENTINEL_ENV) else {
+        return Ok(false);
+    };
+    let path = PathBuf::from(path);
+    state_files::write_json_atomic(
+        &path,
+        &TestInstallSentinel {
+            org: org.map(str::to_string),
+            preserve_disable_state,
+            passive_version_check_disabled: std::env::var("CADENCE_NO_UPDATE_CHECK")
+                .ok()
+                .as_deref()
+                == Some("1"),
+            pid: std::process::id(),
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
 async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome> {
     log_bootstrap_stage("cleaning up legacy Cadence hook ownership");
     let mut had_runtime_errors = cleanup_cadence_hook_ownership(None, true).await?;
@@ -474,6 +507,10 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
 }
 
 pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: bool) -> Result<()> {
+    if maybe_write_test_install_sentinel(org.as_deref(), preserve_disable_state).await? {
+        return Ok(());
+    }
+
     println!();
     output::action("Installing", "background monitor");
     let install_start = std::time::Instant::now();

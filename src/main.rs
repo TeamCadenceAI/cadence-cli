@@ -2772,6 +2772,33 @@ async fn install_monitor_diagnostics_session(
     }
 }
 
+fn activity_lock_purpose_for_command(command: &Command) -> &'static str {
+    match command {
+        Command::Install { .. } => "install",
+        Command::Hook { hook_command } => match hook_command {
+            HookCommand::PostCommit => "hook-post-commit",
+            HookCommand::AutoUpdate => "hook-auto-update",
+            HookCommand::RefreshHooks => "hook-refresh-hooks",
+        },
+        Command::Backfill { .. } => "backfill",
+        Command::Login => "login",
+        Command::Logout => "logout",
+        Command::Status => "status",
+        Command::Monitor { .. } => "monitor",
+        Command::Config { .. } => "config",
+        Command::Doctor { .. } => "doctor",
+        Command::Update { check, .. } => {
+            if *check {
+                "update-check"
+            } else {
+                "update"
+            }
+        }
+        Command::AutoUpdate { .. } => "auto-update",
+        Command::Uninstall { .. } => "uninstall",
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -2779,6 +2806,17 @@ async fn main() {
     if let Some(url) = cli.api_url.clone() {
         let _ = API_URL_OVERRIDE.set(url);
     }
+    let _activity_lock = match update::acquire_command_activity_lock(
+        activity_lock_purpose_for_command(&cli.command),
+    )
+    .await
+    {
+        Ok(lock) => lock,
+        Err(err) => {
+            report_error(&err);
+            process::exit(1);
+        }
+    };
     let use_monitor_diagnostics = uses_monitor_diagnostics_session(&cli.command);
     let monitor_diagnostics_command = if use_monitor_diagnostics {
         Some(format!("{:?}", &cli.command))
@@ -2834,7 +2872,13 @@ async fn main() {
             ConfigCommand::List => run_config_list().await,
         },
         Command::Doctor { repair } => run_doctor(repair).await,
-        Command::Update { check, yes } => update::run_update(check, yes).await.map(|_| ()),
+        Command::Update { check, yes } => match update::run_update(check, yes).await {
+            Ok(update::UpdateCommandStatus::Completed) => Ok(()),
+            Ok(update::UpdateCommandStatus::HandoffPending) => {
+                process::exit(update::UPDATE_HELPER_PENDING_EXIT_CODE);
+            }
+            Err(err) => Err(err),
+        },
         Command::AutoUpdate { command } => run_auto_update(command).await,
         Command::Uninstall { yes } => run_uninstall(yes).await,
     };

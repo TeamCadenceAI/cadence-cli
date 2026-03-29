@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "cadence"
 path = "src/main.rs"
 
+[[bin]]
+name = "cadence-updater"
+path = "src/bin/cadence-updater.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -30,7 +34,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs
 semver = "1"
 toml = "0.8"
 pgp = "0.14"
-self-replace = "1"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -43,7 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "json", "std", "time"
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
 sysinfo = "0.30"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 serial_test = "3"

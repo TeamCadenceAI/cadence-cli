@@ -50,22 +50,89 @@ jobs:
           target: aarch64-unknown-linux-gnu
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --bins
 
-      - name: Package (macOS/Linux)
-        if: matrix.runner != 'windows-latest'
+      - name: Import Apple Developer Certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../cadence-cli-${{ matrix.target }}.tar.gz cadence
-          cd ../../..
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          CERT_IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -n 1 | awk -F'"' '{print $2}')
+          if [ -z "$CERT_IDENTITY" ]; then
+            echo "::error::Developer ID Application identity not found"
+            exit 1
+          fi
+          echo "APPLE_CERT_IDENTITY=$CERT_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Sign macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --options runtime --timestamp --sign "$APPLE_CERT_IDENTITY" "target/${{ matrix.target }}/release/cadence"
+          codesign --force --options runtime --timestamp --sign "$APPLE_CERT_IDENTITY" "target/${{ matrix.target }}/release/cadence-updater"
+
+      - name: Verify macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          codesign --verify --strict --verbose=2 "target/${{ matrix.target }}/release/cadence"
+          codesign --verify --strict --verbose=2 "target/${{ matrix.target }}/release/cadence-updater"
+          codesign -dv --verbose=4 "target/${{ matrix.target }}/release/cadence"
+          codesign -dv --verbose=4 "target/${{ matrix.target }}/release/cadence-updater"
+          spctl -a -vv --type exec "target/${{ matrix.target }}/release/cadence"
+          spctl -a -vv --type exec "target/${{ matrix.target }}/release/cadence-updater"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          STAGE_DIR="cadence-cli-${{ matrix.target }}"
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR"
+          cp "target/${{ matrix.target }}/release/cadence" "$STAGE_DIR/"
+          cp "target/${{ matrix.target }}/release/cadence-updater" "$STAGE_DIR/"
+          /usr/bin/ditto -c -k --keepParent "$STAGE_DIR" "cadence-cli-${{ matrix.target }}.zip"
+
+      - name: Notarize macOS archive
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "cadence-cli-${{ matrix.target }}.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          STAGE_DIR="cadence-cli-${{ matrix.target }}"
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR"
+          cp "target/${{ matrix.target }}/release/cadence" "$STAGE_DIR/"
+          cp "target/${{ matrix.target }}/release/cadence-updater" "$STAGE_DIR/"
+          tar czf "cadence-cli-${{ matrix.target }}.tar.gz" "$STAGE_DIR"
 
       - name: Package (Windows)
-        if: matrix.runner == 'windows-latest'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $archive = "cadence-cli-${{ matrix.target }}.zip"
-          $binary = "target/${{ matrix.target }}/release/cadence.exe"
-          Compress-Archive -Path $binary -DestinationPath $archive
+          $stageDir = "cadence-cli-${{ matrix.target }}"
+          Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stageDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cadence.exe" "$stageDir/cadence.exe"
+          Copy-Item "target/${{ matrix.target }}/release/cadence-updater.exe" "$stageDir/cadence-updater.exe"
+          Compress-Archive -Path $stageDir -DestinationPath $archive
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
