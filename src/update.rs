@@ -1149,6 +1149,7 @@ async fn run_update_install_from_url_mode(
             "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership.",
             &err,
         );
+        return Err(install_handoff_error(err));
     }
 
     if matches!(mode, InstallMode::Interactive) {
@@ -1206,46 +1207,14 @@ pub async fn run_background_auto_update() -> Result<()> {
         return Ok(());
     }
 
-    match run_update_install_from_url_mode(
+    let attempt_result = run_update_install_from_url_mode(
         GITHUB_RELEASES_LATEST_URL,
         true,
         InstallMode::SilentUnattended,
     )
-    .await
-    {
-        Ok(AttemptOutcome::Installed) => {
-            state.last_success_at = Some(now.clone());
-            state.last_installed_version = state.last_seen_version.clone();
-            state.consecutive_failures = 0;
-            state.last_error = None;
-            state.next_retry_after = None;
-            save_updater_state(&state).await?;
-        }
-        Ok(AttemptOutcome::NoUpdate | AttemptOutcome::SkippedUnstable) => {
-            state.last_success_at = Some(now.clone());
-            state.consecutive_failures = 0;
-            state.last_error = None;
-            state.next_retry_after = None;
-            save_updater_state(&state).await?;
-        }
-        Err(e) => {
-            let err = format!("{e:#}");
-            if err.contains("global activity lock is busy") {
-                // Lock contention is expected when hooks/sync are active; retry soon.
-                state.last_error = Some("activity lock busy; updater skipped".to_string());
-                let delay = rand08::Rng::gen_range(&mut rand08::thread_rng(), 60..=300);
-                state.next_retry_after =
-                    format_epoch_rfc3339(now_epoch().saturating_add(delay as i64));
-                save_updater_state(&state).await?;
-                return Ok(());
-            }
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            state.last_error = Some(err);
-            let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
-            state.next_retry_after = format_epoch_rfc3339(retry_at);
-            save_updater_state(&state).await?;
-        }
-    }
+    .await;
+    apply_background_update_attempt_result(&mut state, &now, attempt_result, now_epoch());
+    save_updater_state(&state).await?;
 
     Ok(())
 }
@@ -1321,6 +1290,49 @@ fn report_best_effort_post_upgrade_failure(
         remediation,
         error = %format!("{err:#}")
     );
+}
+
+fn install_handoff_error(err: anyhow::Error) -> anyhow::Error {
+    err.context(
+        "cadence updated, but the new version could not finish runtime bootstrap automatically",
+    )
+}
+
+fn apply_background_update_attempt_result(
+    state: &mut UpdaterState,
+    now: &str,
+    attempt_result: Result<AttemptOutcome>,
+    current_epoch: i64,
+) {
+    match attempt_result {
+        Ok(AttemptOutcome::Installed) => {
+            state.last_success_at = Some(now.to_string());
+            state.last_installed_version = state.last_seen_version.clone();
+            state.consecutive_failures = 0;
+            state.last_error = None;
+            state.next_retry_after = None;
+        }
+        Ok(AttemptOutcome::NoUpdate | AttemptOutcome::SkippedUnstable) => {
+            state.last_success_at = Some(now.to_string());
+            state.consecutive_failures = 0;
+            state.last_error = None;
+            state.next_retry_after = None;
+        }
+        Err(err) => {
+            let err = format!("{err:#}");
+            if err.contains("global activity lock is busy") {
+                state.last_error = Some("activity lock busy; updater skipped".to_string());
+                let delay = rand08::Rng::gen_range(&mut rand08::thread_rng(), 60..=300);
+                state.next_retry_after =
+                    format_epoch_rfc3339(current_epoch.saturating_add(delay as i64));
+                return;
+            }
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.last_error = Some(err);
+            let retry_at = current_epoch.saturating_add(retry_delay_from_state(state) as i64);
+            state.next_retry_after = format_epoch_rfc3339(retry_at);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3119,6 +3131,35 @@ mod tests {
             },
         );
         assert_eq!(retrying.state, UpdaterHealthState::Retrying);
+    }
+
+    #[test]
+    fn background_update_attempt_error_records_failure_instead_of_success() {
+        let now = "2026-03-29T00:00:00Z";
+        let mut state = UpdaterState {
+            last_seen_version: Some("1.2.3".to_string()),
+            ..UpdaterState::default()
+        };
+
+        apply_background_update_attempt_result(
+            &mut state,
+            now,
+            Err(anyhow::anyhow!(
+                "cadence updated, but the new version could not finish runtime bootstrap automatically"
+            )),
+            1_700_000_000,
+        );
+
+        assert_eq!(state.last_success_at, None);
+        assert_eq!(state.last_installed_version, None);
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|value| value.contains("runtime bootstrap automatically"))
+        );
+        assert!(state.next_retry_after.is_some());
     }
 
     #[tokio::test]

@@ -7,8 +7,9 @@ use crate::{agents, git, monitor, output, update};
 
 pub(crate) const VERSION_BOOTSTRAP_BACKFILL_SINCE: &str = "7d";
 const VERSION_BOOTSTRAP_MARKER_FILE: &str = "last-version-bootstrap";
+const VERSION_BOOTSTRAP_BACKFILL_MARKER_FILE: &str = "last-version-recovery-backfill";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapTrigger {
     InstallCommand,
     AutomaticFirstRun,
@@ -24,7 +25,8 @@ struct BootstrapOptions<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct BootstrapOutcome {
-    monitor_enabled: bool,
+    had_runtime_errors: bool,
+    performed_recovery_backfill: bool,
 }
 
 fn is_cadence_hook(content: &str) -> bool {
@@ -48,8 +50,16 @@ pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
     left_norm == right_norm
 }
 
+fn version_marker_path(file_name: &str) -> Option<PathBuf> {
+    Some(crate::config::CliConfig::config_dir()?.join(file_name))
+}
+
 fn version_bootstrap_marker_path() -> Option<PathBuf> {
-    Some(crate::config::CliConfig::config_dir()?.join(VERSION_BOOTSTRAP_MARKER_FILE))
+    version_marker_path(VERSION_BOOTSTRAP_MARKER_FILE)
+}
+
+fn version_bootstrap_backfill_marker_path() -> Option<PathBuf> {
+    version_marker_path(VERSION_BOOTSTRAP_BACKFILL_MARKER_FILE)
 }
 
 async fn read_version_bootstrap_marker(path: &Path) -> Result<Option<String>> {
@@ -87,6 +97,26 @@ pub(crate) async fn mark_current_version_bootstrap_complete() -> Result<()> {
     write_version_bootstrap_marker(&path, update::current_version()).await
 }
 
+async fn mark_current_version_recovery_backfill_complete() -> Result<()> {
+    let Some(path) = version_bootstrap_backfill_marker_path() else {
+        return Ok(());
+    };
+    write_version_bootstrap_marker(&path, update::current_version()).await
+}
+
+async fn should_run_current_version_recovery_backfill(requested: bool) -> Result<bool> {
+    if !requested {
+        return Ok(false);
+    }
+
+    let Some(path) = version_bootstrap_backfill_marker_path() else {
+        return Ok(true);
+    };
+    let current_version = update::current_version();
+    let last_completed = read_version_bootstrap_marker(&path).await?;
+    Ok(last_completed.as_deref() != Some(current_version))
+}
+
 pub(crate) async fn maybe_run_current_version_bootstrap(
     include_recovery_backfill: bool,
 ) -> Result<bool> {
@@ -104,7 +134,9 @@ pub(crate) async fn maybe_run_current_version_bootstrap(
         "Reconciling Cadence runtime for v{}.",
         current_version
     ));
-    let outcome = run_bootstrap(BootstrapOptions {
+    let include_recovery_backfill =
+        should_run_current_version_recovery_backfill(include_recovery_backfill).await?;
+    let outcome = execute_bootstrap(BootstrapOptions {
         trigger: BootstrapTrigger::AutomaticFirstRun,
         org: None,
         preserve_disable_state: true,
@@ -112,9 +144,16 @@ pub(crate) async fn maybe_run_current_version_bootstrap(
     })
     .await?;
 
+    if outcome.performed_recovery_backfill {
+        mark_current_version_recovery_backfill_complete().await?;
+    }
+    if outcome.had_runtime_errors {
+        bail!("bootstrap completed with issues");
+    }
+
     write_version_bootstrap_marker(&marker_path, current_version).await?;
 
-    if outcome.monitor_enabled && include_recovery_backfill {
+    if outcome.performed_recovery_backfill {
         output::detail(&format!(
             "Current-version bootstrap completed for v{}.",
             current_version
@@ -139,6 +178,7 @@ async fn desired_monitor_enabled(preserve_disable_state: bool) -> Result<bool> {
 
 async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome> {
     let mut had_runtime_errors = cleanup_cadence_hook_ownership(None, true).await?;
+    let mut performed_recovery_backfill = false;
 
     if let Some(org) = options.org {
         match git::config_set_global("ai.cadence.org", org).await {
@@ -230,13 +270,13 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
                 VERSION_BOOTSTRAP_BACKFILL_SINCE
             ));
         }
+        performed_recovery_backfill = true;
     }
 
-    if had_runtime_errors {
-        bail!("bootstrap completed with issues")
-    }
-
-    Ok(BootstrapOutcome { monitor_enabled })
+    Ok(BootstrapOutcome {
+        had_runtime_errors,
+        performed_recovery_backfill,
+    })
 }
 
 pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: bool) -> Result<()> {
@@ -244,13 +284,21 @@ pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: boo
     output::action("Installing", "background monitor");
     let install_start = std::time::Instant::now();
 
-    run_bootstrap(BootstrapOptions {
+    let include_recovery_backfill = should_run_current_version_recovery_backfill(true).await?;
+    let outcome = execute_bootstrap(BootstrapOptions {
         trigger: BootstrapTrigger::InstallCommand,
         org: org.as_deref(),
         preserve_disable_state,
-        include_recovery_backfill: true,
+        include_recovery_backfill,
     })
     .await?;
+
+    if outcome.performed_recovery_backfill {
+        mark_current_version_recovery_backfill_complete().await?;
+    }
+    if outcome.had_runtime_errors {
+        bail!("bootstrap completed with issues");
+    }
 
     mark_current_version_bootstrap_complete().await?;
 
@@ -262,6 +310,95 @@ pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: boo
     ));
 
     Ok(())
+}
+
+async fn execute_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome> {
+    #[cfg(test)]
+    if let Some(result) = take_bootstrap_test_result(options) {
+        return result;
+    }
+
+    run_bootstrap(options).await
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootstrapTestInvocation {
+    trigger: BootstrapTrigger,
+    preserve_disable_state: bool,
+    include_recovery_backfill: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BootstrapTestHooks {
+    outcomes: std::collections::VecDeque<std::result::Result<BootstrapOutcome, String>>,
+    invocations: Vec<BootstrapTestInvocation>,
+}
+
+#[cfg(test)]
+fn bootstrap_test_hooks() -> &'static std::sync::Mutex<Option<BootstrapTestHooks>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<Option<BootstrapTestHooks>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn take_bootstrap_test_result(options: BootstrapOptions<'_>) -> Option<Result<BootstrapOutcome>> {
+    let mut hooks = bootstrap_test_hooks().lock().ok()?;
+    let state = hooks.as_mut()?;
+    state.invocations.push(BootstrapTestInvocation {
+        trigger: options.trigger,
+        preserve_disable_state: options.preserve_disable_state,
+        include_recovery_backfill: options.include_recovery_backfill,
+    });
+    let next = state
+        .outcomes
+        .pop_front()
+        .unwrap_or_else(|| panic!("missing bootstrap test outcome"));
+    Some(match next {
+        Ok(outcome) => Ok(outcome),
+        Err(message) => Err(anyhow::anyhow!(message)),
+    })
+}
+
+#[cfg(test)]
+struct BootstrapTestHooksGuard;
+
+#[cfg(test)]
+impl Drop for BootstrapTestHooksGuard {
+    fn drop(&mut self) {
+        if let Ok(mut hooks) = bootstrap_test_hooks().lock() {
+            *hooks = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_bootstrap_test_hooks(
+    outcomes: impl IntoIterator<Item = std::result::Result<BootstrapOutcome, &'static str>>,
+) -> BootstrapTestHooksGuard {
+    let mut hooks = bootstrap_test_hooks()
+        .lock()
+        .expect("bootstrap test hooks lock");
+    *hooks = Some(BootstrapTestHooks {
+        outcomes: outcomes
+            .into_iter()
+            .map(|outcome| outcome.map_err(|message| message.to_string()))
+            .collect(),
+        invocations: Vec::new(),
+    });
+    BootstrapTestHooksGuard
+}
+
+#[cfg(test)]
+fn bootstrap_test_invocations() -> Vec<BootstrapTestInvocation> {
+    bootstrap_test_hooks()
+        .lock()
+        .expect("bootstrap test hooks lock")
+        .as_ref()
+        .map(|hooks| hooks.invocations.clone())
+        .unwrap_or_default()
 }
 
 pub(crate) async fn cleanup_cadence_hook_ownership(
@@ -466,4 +603,98 @@ pub(crate) async fn cleanup_cadence_hook_ownership(
     }
 
     Ok(had_errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                original: std::env::var_os(key),
+            }
+        }
+
+        fn set_path(&self, path: &Path) {
+            unsafe { std::env::set_var(self.key, path) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn maybe_run_current_version_bootstrap_skips_when_version_marker_is_current() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        mark_current_version_bootstrap_complete()
+            .await
+            .expect("mark version bootstrap");
+
+        let ran = maybe_run_current_version_bootstrap(true)
+            .await
+            .expect("skip bootstrap");
+        assert!(!ran);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn maybe_run_current_version_bootstrap_records_backfill_once_even_after_partial_failure()
+    {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let _hooks = install_bootstrap_test_hooks([
+            Ok(BootstrapOutcome {
+                had_runtime_errors: true,
+                performed_recovery_backfill: true,
+            }),
+            Ok(BootstrapOutcome {
+                had_runtime_errors: false,
+                performed_recovery_backfill: false,
+            }),
+        ]);
+
+        let err = maybe_run_current_version_bootstrap(true)
+            .await
+            .expect_err("expected partial bootstrap failure");
+        assert!(
+            err.to_string().contains("bootstrap completed with issues"),
+            "unexpected error: {err:#}"
+        );
+
+        let ran = maybe_run_current_version_bootstrap(true)
+            .await
+            .expect("retry bootstrap after partial failure");
+        assert!(ran);
+
+        let skipped = maybe_run_current_version_bootstrap(true)
+            .await
+            .expect("skip once version marker recorded");
+        assert!(!skipped);
+
+        let invocations = bootstrap_test_invocations();
+        assert_eq!(invocations.len(), 2);
+        assert!(invocations[0].include_recovery_backfill);
+        assert!(!invocations[1].include_recovery_backfill);
+    }
 }

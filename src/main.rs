@@ -2633,6 +2633,22 @@ async fn uninstall_state_dir() -> Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
+fn should_run_automatic_current_version_bootstrap(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Hook { .. }
+            | Command::Install { .. }
+            | Command::Uninstall { .. }
+            | Command::Monitor {
+                command: Some(MonitorCommand::Disable | MonitorCommand::Uninstall)
+            }
+    )
+}
+
+fn automatic_bootstrap_includes_recovery_backfill(command: &Command) -> bool {
+    !matches!(command, Command::Backfill { .. })
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -2649,17 +2665,11 @@ async fn main() {
             command: Some(MonitorCommand::Tick)
         }
     );
-    let is_install_command = matches!(&cli.command, Command::Install { .. });
-    let is_monitor_command = matches!(&cli.command, Command::Monitor { .. });
-    let is_uninstall_command = matches!(&cli.command, Command::Uninstall { .. });
-    let is_backfill_command = matches!(&cli.command, Command::Backfill { .. });
-
-    if !is_hook_command
-        && !is_monitor_tick_command
-        && !is_install_command
-        && !is_monitor_command
-        && !is_uninstall_command
-        && let Err(err) = bootstrap::maybe_run_current_version_bootstrap(!is_backfill_command).await
+    if should_run_automatic_current_version_bootstrap(&cli.command)
+        && let Err(err) = bootstrap::maybe_run_current_version_bootstrap(
+            automatic_bootstrap_includes_recovery_backfill(&cli.command),
+        )
+        .await
     {
         eprintln!("Warning: automatic runtime bootstrap did not complete: {err:#}");
         eprintln!(
@@ -3090,6 +3100,37 @@ mod tests {
             }
             _ => panic!("expected Monitor command"),
         }
+    }
+
+    #[test]
+    fn automatic_bootstrap_runs_for_monitor_tick_and_status_commands() {
+        let tick = Command::Monitor {
+            command: Some(MonitorCommand::Tick),
+        };
+        let status = Command::Monitor {
+            command: Some(MonitorCommand::Status),
+        };
+
+        assert!(should_run_automatic_current_version_bootstrap(&tick));
+        assert!(should_run_automatic_current_version_bootstrap(&status));
+        assert!(automatic_bootstrap_includes_recovery_backfill(&tick));
+    }
+
+    #[test]
+    fn automatic_bootstrap_skips_disable_uninstall_and_backfill_recovery() {
+        let disable = Command::Monitor {
+            command: Some(MonitorCommand::Disable),
+        };
+        let uninstall = Command::Monitor {
+            command: Some(MonitorCommand::Uninstall),
+        };
+        let backfill = Command::Backfill {
+            since: "7d".to_string(),
+        };
+
+        assert!(!should_run_automatic_current_version_bootstrap(&disable));
+        assert!(!should_run_automatic_current_version_bootstrap(&uninstall));
+        assert!(!automatic_bootstrap_includes_recovery_backfill(&backfill));
     }
 
     #[test]
