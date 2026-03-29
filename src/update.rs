@@ -1,8 +1,8 @@
-//! Self-update version checking and self-replace for cadence-cli.
+//! Self-update version checking and helper-driven installation for cadence-cli.
 //!
 //! Queries the GitHub Releases API to determine if a newer version is available,
 //! and provides a full self-update flow: download, checksum verification,
-//! archive extraction, and in-place binary replacement.
+//! archive extraction, and manifest-driven installation via `cadence-updater`.
 //!
 //! The production endpoint is `GITHUB_RELEASES_LATEST_URL`. Tests inject a
 //! local HTTP server URL via `check_latest_version_from_url()`.
@@ -41,6 +41,7 @@ use windows_sys::Win32::{
 /// can be followed without hitting GitHub API rate limits.
 pub const GITHUB_RELEASES_LATEST_URL: &str =
     "https://github.com/TeamCadenceAI/cadence-cli/releases/latest";
+const TEST_RELEASE_URL_ENV: &str = "CADENCE_TEST_RELEASE_URL";
 
 /// User-Agent header sent with GitHub API requests.
 const USER_AGENT: &str = "cadence-cli";
@@ -50,6 +51,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Updater state file name under `~/.cadence/cli/`.
 const UPDATER_STATE_FILE: &str = "updater-state.json";
+const UPDATE_STAGING_DIR: &str = "update-staging";
+const UPDATE_MANIFEST_FILE: &str = "install-manifest.json";
 
 /// Shared activity lock directory/file for hook + deferred sync + updater coordination.
 const ACTIVITY_LOCKS_DIR: &str = "locks";
@@ -65,6 +68,8 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 /// Retry backoff defaults.
 const UPDATE_RETRY_BASE_SECS: u64 = 60;
 const UPDATE_RETRY_MAX_SECS: u64 = 8 * 60 * 60;
+const UPDATER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const UPDATER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActivityLockRecord {
@@ -116,7 +121,8 @@ pub struct UpdaterHealth {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum InstallMode {
     Interactive,
     SilentUnattended,
@@ -125,8 +131,25 @@ enum InstallMode {
 #[derive(Debug, Clone, Copy)]
 enum AttemptOutcome {
     NoUpdate,
+    HelperLaunched,
     Installed,
     SkippedUnstable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct UpdateInstallManifest {
+    target_version: String,
+    staged_cadence_path: PathBuf,
+    final_cadence_path: PathBuf,
+    wait_for_pid: u32,
+    preserve_disable_state: bool,
+    mode: InstallMode,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedReleasePayload {
+    cadence_binary: PathBuf,
+    updater_binary: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +225,45 @@ fn activity_lock_path() -> Result<PathBuf> {
     Ok(state_files::cadence_dir()?
         .join(ACTIVITY_LOCKS_DIR)
         .join(ACTIVITY_LOCK_FILE))
+}
+
+fn updater_staging_root() -> PathBuf {
+    match state_files::cadence_dir() {
+        Ok(path) => path.join(UPDATE_STAGING_DIR),
+        Err(_) => std::env::temp_dir()
+            .join("cadence-cli")
+            .join(UPDATE_STAGING_DIR),
+    }
+}
+
+async fn create_update_staging_dir(target_version: &str) -> Result<PathBuf> {
+    let root = updater_staging_root();
+    let version = normalize_version_tag(target_version);
+    let dir = root.join(format!(
+        "{}-{}-{}",
+        version,
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::create_dir_all(&dir).await.with_context(|| {
+        format!(
+            "failed to create update staging directory {}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+async fn load_install_manifest(path: &Path) -> Result<UpdateInstallManifest> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read install manifest {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse install manifest {}", path.display()))
+}
+
+async fn write_install_manifest(path: &Path, manifest: &UpdateInstallManifest) -> Result<()> {
+    state_files::write_json_atomic(path, manifest).await
 }
 
 async fn load_updater_state() -> Result<UpdaterState> {
@@ -437,7 +499,8 @@ pub fn compare_versions(local: &str, remote: &str) -> Result<Ordering> {
 
 /// Fetches the latest release metadata from the production GitHub endpoint.
 pub async fn check_latest_version() -> Result<LatestRelease> {
-    check_latest_version_from_url(GITHUB_RELEASES_LATEST_URL).await
+    let release_url = effective_latest_release_url();
+    check_latest_version_from_url(&release_url).await
 }
 
 /// Fetches the latest release metadata from a given URL.
@@ -545,6 +608,13 @@ fn repo_base_from_releases_url(url: &str) -> &str {
     url.strip_suffix("/releases/latest").unwrap_or(url)
 }
 
+fn effective_latest_release_url() -> String {
+    std::env::var(TEST_RELEASE_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| GITHUB_RELEASES_LATEST_URL.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Artifact selection
 // ---------------------------------------------------------------------------
@@ -554,10 +624,26 @@ pub fn build_target() -> &'static str {
     env!("TARGET")
 }
 
-/// Determines the expected archive extension for a given target triple.
-/// Windows targets use `.zip`, all others use `.tar.gz`.
-pub fn archive_extension_for_target(target: &str) -> &'static str {
+fn cadence_binary_name(target: &str) -> &'static str {
     if target.contains("windows") {
+        "cadence.exe"
+    } else {
+        BINARY_NAME
+    }
+}
+
+fn updater_binary_name(target: &str) -> &'static str {
+    if target.contains("windows") {
+        "cadence-updater.exe"
+    } else {
+        "cadence-updater"
+    }
+}
+
+/// Determines the expected archive extension for a given target triple.
+/// Windows and macOS targets use `.zip`, Linux targets use `.tar.gz`.
+pub fn archive_extension_for_target(target: &str) -> &'static str {
+    if target.contains("windows") || target.contains("apple-darwin") {
         ".zip"
     } else {
         ".tar.gz"
@@ -765,55 +851,86 @@ pub async fn verify_checksum(
 /// Binary name inside release archives (without extension).
 const BINARY_NAME: &str = "cadence";
 
-/// Extracts the cadence binary from a tar.gz archive into `dest_dir`.
-/// Returns the path to the extracted binary.
+fn extract_tar_gz_payload_from_file(
+    file: std::fs::File,
+    archive_path: &Path,
+    dest_dir: &Path,
+    target: &str,
+) -> Result<ExtractedReleasePayload> {
+    let expected_cadence = cadence_binary_name(target);
+    let expected_updater = updater_binary_name(target);
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+
+    let mut cadence = None;
+    let mut updater = None;
+
+    for entry_result in archive.entries().context("Failed to read tar entries")? {
+        let mut entry = entry_result.context("Failed to read tar entry")?;
+        let file_name = entry
+            .path()
+            .context("Failed to read tar entry path")?
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        if file_name == expected_cadence || file_name == expected_updater {
+            let dest = dest_dir.join(&file_name);
+            entry
+                .unpack(&dest)
+                .with_context(|| format!("Failed to extract '{file_name}' from archive"))?;
+            if file_name == expected_cadence {
+                cadence = Some(dest);
+            } else {
+                updater = Some(dest);
+            }
+        }
+
+        if cadence.is_some() && updater.is_some() {
+            break;
+        }
+    }
+
+    let cadence_binary = cadence.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Archive does not contain '{expected_cadence}' binary: {}",
+            archive_path.display()
+        )
+    })?;
+    let updater_binary = updater.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Archive does not contain '{expected_updater}' binary: {}",
+            archive_path.display()
+        )
+    })?;
+
+    Ok(ExtractedReleasePayload {
+        cadence_binary,
+        updater_binary,
+    })
+}
+
 fn extract_tar_gz_from_file(
     file: std::fs::File,
     archive_path: &Path,
     dest_dir: &Path,
 ) -> Result<PathBuf> {
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    let mut found = None;
-    for entry_result in archive.entries().context("Failed to read tar entries")? {
-        let mut entry = entry_result.context("Failed to read tar entry")?;
-        let entry_path = entry.path().context("Failed to read tar entry path")?;
-
-        // Match the binary name at any nesting depth
-        let file_name = entry_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-
-        if file_name == BINARY_NAME {
-            let dest = dest_dir.join(BINARY_NAME);
-            entry
-                .unpack(&dest)
-                .with_context(|| format!("Failed to extract '{BINARY_NAME}' from archive"))?;
-            found = Some(dest);
-            break;
-        }
-    }
-
-    found.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Archive does not contain '{BINARY_NAME}' binary: {}",
-            archive_path.display()
-        )
-    })
+    extract_tar_gz_payload_from_file(file, archive_path, dest_dir, build_target())
+        .map(|payload| payload.cadence_binary)
 }
 
-/// Extracts the cadence binary from a zip archive into `dest_dir`.
-/// Returns the path to the extracted binary.
-fn extract_zip_from_file(
+fn extract_zip_payload_from_file(
     file: std::fs::File,
     archive_path: &Path,
     dest_dir: &Path,
-) -> Result<PathBuf> {
+    target: &str,
+) -> Result<ExtractedReleasePayload> {
     let mut archive = zip::ZipArchive::new(file).context("Failed to read zip archive")?;
-
-    let binary_name_exe = format!("{BINARY_NAME}.exe");
+    let expected_cadence = cadence_binary_name(target);
+    let expected_updater = updater_binary_name(target);
+    let mut cadence = None;
+    let mut updater = None;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).context("Failed to read zip entry")?;
@@ -824,25 +941,58 @@ fn extract_zip_from_file(
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
-        if file_name == BINARY_NAME || file_name == binary_name_exe {
+        if file_name == expected_cadence || file_name == expected_updater {
             let dest = dest_dir.join(file_name);
             let mut out_file = std::fs::File::create(&dest)
                 .with_context(|| format!("Failed to create extracted file: {}", dest.display()))?;
             io::copy(&mut entry, &mut out_file).context("Failed to write extracted binary")?;
-            return Ok(dest);
+            if file_name == expected_cadence {
+                cadence = Some(dest);
+            } else {
+                updater = Some(dest);
+            }
+        }
+
+        if cadence.is_some() && updater.is_some() {
+            break;
         }
     }
 
-    bail!(
-        "Archive does not contain '{BINARY_NAME}' or '{binary_name_exe}' binary: {}",
-        archive_path.display()
-    )
+    let cadence_binary = cadence.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Archive does not contain '{expected_cadence}' binary: {}",
+            archive_path.display()
+        )
+    })?;
+    let updater_binary = updater.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Archive does not contain '{expected_updater}' binary: {}",
+            archive_path.display()
+        )
+    })?;
+
+    Ok(ExtractedReleasePayload {
+        cadence_binary,
+        updater_binary,
+    })
 }
 
-/// Extracts the cadence binary from a release archive (tar.gz or zip).
-///
-/// Dispatches to the appropriate extractor based on the archive file extension.
-pub async fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+/// Extracts the cadence binary from a zip archive into `dest_dir`.
+/// Returns the path to the extracted binary.
+fn extract_zip_from_file(
+    file: std::fs::File,
+    archive_path: &Path,
+    dest_dir: &Path,
+) -> Result<PathBuf> {
+    extract_zip_payload_from_file(file, archive_path, dest_dir, build_target())
+        .map(|payload| payload.cadence_binary)
+}
+
+async fn extract_release_payload(
+    archive_path: &Path,
+    dest_dir: &Path,
+    target: &str,
+) -> Result<ExtractedReleasePayload> {
     enum ArchiveKind {
         TarGz,
         Zip,
@@ -850,6 +1000,7 @@ pub async fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<Path
 
     let archive_path = archive_path.to_path_buf();
     let dest_dir = dest_dir.to_path_buf();
+    let target = target.to_string();
     let name = archive_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -871,38 +1022,226 @@ pub async fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<Path
     let std_file = file.into_std().await;
 
     tokio::task::spawn_blocking(move || match kind {
-        ArchiveKind::TarGz => extract_tar_gz_from_file(std_file, &archive_path, &dest_dir),
-        ArchiveKind::Zip => extract_zip_from_file(std_file, &archive_path, &dest_dir),
+        ArchiveKind::TarGz => {
+            extract_tar_gz_payload_from_file(std_file, &archive_path, &dest_dir, &target)
+        }
+        ArchiveKind::Zip => {
+            extract_zip_payload_from_file(std_file, &archive_path, &dest_dir, &target)
+        }
     })
     .await
     .context("archive extraction task failed")?
 }
 
-// ---------------------------------------------------------------------------
-// Binary replacement
-// ---------------------------------------------------------------------------
-
-/// Replaces the currently running binary with the file at `replacement_path`.
+/// Extracts the cadence binary from a release archive (tar.gz or zip).
 ///
-/// Uses the `self_replace` crate for cross-platform atomic replacement.
-pub fn self_replace_binary(replacement_path: &Path) -> Result<()> {
-    if !replacement_path.exists() {
-        bail!(
-            "Replacement binary does not exist: {}",
-            replacement_path.display()
+/// Dispatches to the appropriate extractor based on the archive file extension.
+pub async fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    Ok(
+        extract_release_payload(archive_path, dest_dir, build_target())
+            .await?
+            .cadence_binary,
+    )
+}
+
+fn staging_cleanup_path(manifest_path: &Path) -> Option<PathBuf> {
+    manifest_path.parent().map(Path::to_path_buf)
+}
+
+async fn maybe_remove_staging_dir(manifest_path: &Path) {
+    let Some(dir) = staging_cleanup_path(manifest_path) else {
+        return;
+    };
+    if let Err(err) = tokio::fs::remove_dir_all(&dir).await {
+        ::tracing::warn!(
+            event = "updater_staging_cleanup_failed",
+            staging_dir = dir.display().to_string(),
+            error = %format!("{err:#}")
+        );
+    }
+}
+
+async fn wait_for_pid_to_exit(pid: u32, timeout: Duration) -> Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+
+    let started = tokio::time::Instant::now();
+    while is_pid_alive(pid) {
+        if started.elapsed() >= timeout {
+            bail!("timed out waiting for cadence process {pid} to exit");
+        }
+        tokio::time::sleep(UPDATER_WAIT_POLL_INTERVAL).await;
+    }
+    Ok(())
+}
+
+async fn set_executable_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        tokio::fs::set_permissions(path, perms)
+            .await
+            .with_context(|| {
+                format!("failed to set executable permissions on {}", path.display())
+            })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+async fn install_staged_binary(staged_path: &Path, final_path: &Path) -> Result<()> {
+    if !tokio::fs::try_exists(staged_path)
+        .await
+        .with_context(|| format!("failed to inspect staged binary {}", staged_path.display()))?
+    {
+        bail!("staged binary does not exist: {}", staged_path.display());
+    }
+
+    let parent = final_path.parent().ok_or_else(|| {
+        anyhow::anyhow!("final install path has no parent: {}", final_path.display())
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create install directory {}", parent.display()))?;
+
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "final install path has no filename: {}",
+                final_path.display()
+            )
+        })?;
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    tokio::fs::copy(staged_path, &temp_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to stage replacement binary from {} to {}",
+                staged_path.display(),
+                temp_path.display()
+            )
+        })?;
+    set_executable_permissions(&temp_path).await?;
+
+    #[cfg(windows)]
+    if tokio::fs::try_exists(final_path).await.unwrap_or(false) {
+        tokio::fs::remove_file(final_path).await.with_context(|| {
+            format!("failed to remove existing install {}", final_path.display())
+        })?;
+    }
+
+    tokio::fs::rename(&temp_path, final_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move replacement binary into final install location {}",
+                final_path.display()
+            )
+        })?;
+
+    Ok(())
+}
+
+async fn launch_updater_helper(helper_path: &Path, manifest_path: &Path) -> Result<u32> {
+    let child = Command::new(helper_path)
+        .arg("--manifest")
+        .arg(manifest_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch updater helper {} with manifest {}",
+                helper_path.display(),
+                manifest_path.display()
+            )
+        })?;
+
+    Ok(child.id().unwrap_or_default())
+}
+
+async fn record_helper_result(manifest: &UpdateInstallManifest, result: &Result<()>) -> Result<()> {
+    let now = state_files::now_rfc3339();
+    let mut state = load_updater_state().await.unwrap_or_default();
+    state.last_attempt_at.get_or_insert_with(|| now.clone());
+    state.last_seen_version = Some(manifest.target_version.clone());
+
+    let mapped = match result {
+        Ok(()) => Ok(AttemptOutcome::Installed),
+        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+    };
+    apply_background_update_attempt_result(&mut state, &now, mapped, now_epoch());
+    save_updater_state(&state).await
+}
+
+async fn run_updater_helper_with_manifest(manifest: &UpdateInstallManifest) -> Result<()> {
+    ::tracing::info!(
+        event = "updater_helper_start",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        target_version = manifest.target_version,
+        staged_binary = manifest.staged_cadence_path.display().to_string(),
+        final_binary = manifest.final_cadence_path.display().to_string(),
+        wait_for_pid = manifest.wait_for_pid,
+        mode = ?manifest.mode
+    );
+
+    wait_for_pid_to_exit(manifest.wait_for_pid, UPDATER_WAIT_TIMEOUT).await?;
+    install_staged_binary(&manifest.staged_cadence_path, &manifest.final_cadence_path).await?;
+
+    if let Err(err) = run_install_with_exe(
+        &manifest.final_cadence_path,
+        manifest.preserve_disable_state,
+    )
+    .await
+    {
+        return Err(install_handoff_error(err));
+    }
+
+    if matches!(manifest.mode, InstallMode::Interactive) {
+        println!(
+            "Successfully updated cadence to v{}",
+            manifest.target_version
         );
     }
 
-    self_replace::self_replace(replacement_path).with_context(|| {
-        format!(
-            "Failed to replace the running binary. \
-             This may be a permissions issue — try running with elevated privileges.\n\
-             Replacement file: {}",
-            replacement_path.display()
-        )
-    })?;
+    ::tracing::info!(
+        event = "updater_helper_finished",
+        pid = std::process::id(),
+        ppid = parent_pid_for_logs(),
+        target_version = manifest.target_version,
+        final_binary = manifest.final_cadence_path.display().to_string()
+    );
 
     Ok(())
+}
+
+pub async fn run_updater_helper_from_manifest_path(manifest_path: &Path) -> Result<()> {
+    let manifest = load_install_manifest(manifest_path).await?;
+    let result = run_updater_helper_with_manifest(&manifest).await;
+
+    if let Err(err) = record_helper_result(&manifest, &result).await {
+        eprintln!("Warning: could not record updater result: {err:#}");
+    }
+    maybe_remove_staging_dir(manifest_path).await;
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -936,10 +1275,11 @@ pub fn confirm_update(local_version: &str, remote_version: &str, yes: bool) -> R
 // Full update orchestration
 // ---------------------------------------------------------------------------
 
-/// Runs the full self-update flow.
+/// Runs the full helper-driven self-update flow.
 ///
 /// If `check` is true, only checks and prints whether an update is available.
-/// Otherwise, downloads, verifies, extracts, and replaces the running binary.
+/// Otherwise, downloads, verifies, extracts, and hands installation off to a
+/// detached updater helper.
 pub async fn run_update(check: bool, yes: bool) -> Result<bool> {
     if check {
         run_update_check().await?;
@@ -948,7 +1288,7 @@ pub async fn run_update(check: bool, yes: bool) -> Result<bool> {
 
     Ok(matches!(
         run_update_install(yes).await?,
-        AttemptOutcome::Installed
+        AttemptOutcome::HelperLaunched | AttemptOutcome::Installed
     ))
 }
 
@@ -985,7 +1325,7 @@ async fn run_update_check() -> Result<()> {
 /// Full install path: download, verify, extract, confirm, replace.
 async fn run_update_install(yes: bool) -> Result<AttemptOutcome> {
     run_update_install_from_url_mode(
-        GITHUB_RELEASES_LATEST_URL,
+        &effective_latest_release_url(),
         yes,
         InstallMode::Interactive,
         false,
@@ -1001,16 +1341,10 @@ pub async fn run_update_install_from_url(release_url: &str, yes: bool) -> Result
     Ok(())
 }
 
-async fn run_install_with_updated_binary(preserve_disable_state: bool) -> Result<()> {
-    let current_exe = std::env::current_exe()
-        .context("failed to resolve current cadence executable path after self-update")?;
-    run_install_with_exe(&current_exe, preserve_disable_state).await
-}
-
 async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> Result<()> {
     let xpc_service_name = std::env::var("XPC_SERVICE_NAME").ok();
     ::tracing::info!(
-        event = "post_self_replace_install_handoff_start",
+        event = "post_update_install_handoff_start",
         pid = std::process::id(),
         ppid = parent_pid_for_logs(),
         exe = exe_path.display().to_string(),
@@ -1034,7 +1368,7 @@ async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> 
             )
         })?;
     ::tracing::info!(
-        event = "post_self_replace_install_handoff_spawned",
+        event = "post_update_install_handoff_spawned",
         pid = std::process::id(),
         ppid = parent_pid_for_logs(),
         child_pid = ?child.id(),
@@ -1048,7 +1382,7 @@ async fn run_install_with_exe(exe_path: &Path, preserve_disable_state: bool) -> 
         )
     })?;
     ::tracing::info!(
-        event = "post_self_replace_install_handoff_finished",
+        event = "post_update_install_handoff_finished",
         pid = std::process::id(),
         ppid = parent_pid_for_logs(),
         child_pid = ?child.id(),
@@ -1120,7 +1454,7 @@ async fn run_update_install_from_url_mode(
         None
     };
 
-    // Step 5: Download to temp directory
+    // Step 5: Download to a temporary workspace.
     let tmp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
 
     if matches!(mode, InstallMode::Interactive) {
@@ -1150,70 +1484,71 @@ async fn run_update_install_from_url_mode(
     let checksums = parse_checksums(&checksums_content)?;
     verify_checksum(&checksums, &artifact_asset.name, &artifact_path).await?;
 
-    // Step 7: Extract binary
-    let extract_dir = tmp_dir.path().join("extracted");
-    tokio::fs::create_dir_all(&extract_dir)
-        .await
-        .context("Failed to create extraction directory")?;
-    let new_binary = extract_binary(&artifact_path, &extract_dir).await?;
+    // Step 7: Extract the release payload into a persistent staging directory.
+    let staging_dir = create_update_staging_dir(remote_display).await?;
+    let payload = extract_release_payload(&artifact_path, &staging_dir, target).await?;
+    set_executable_permissions(&payload.cadence_binary).await?;
+    set_executable_permissions(&payload.updater_binary).await?;
 
-    // Step 8: Set executable permission on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        tokio::fs::set_permissions(&new_binary, perms)
-            .await
-            .context("Failed to set executable permissions on extracted binary")?;
-    }
+    let current_exe =
+        std::env::current_exe().context("failed to resolve current cadence executable path")?;
+    let manifest = UpdateInstallManifest {
+        target_version: remote_display.to_string(),
+        staged_cadence_path: payload.cadence_binary.clone(),
+        final_cadence_path: current_exe.clone(),
+        wait_for_pid: std::process::id(),
+        preserve_disable_state: true,
+        mode,
+    };
+    let manifest_path = staging_dir.join(UPDATE_MANIFEST_FILE);
+    write_install_manifest(&manifest_path, &manifest).await?;
 
-    // Step 9: Replace running binary
+    // Step 8: Launch the updater helper and exit cleanly so it can finish the swap.
     ::tracing::info!(
-        event = "self_update_self_replace_start",
+        event = "self_update_helper_launch_start",
         pid = std::process::id(),
         ppid = parent_pid_for_logs(),
         local_version = local,
         remote_version = remote_display,
-        replacement = new_binary.display().to_string(),
+        helper = payload.updater_binary.display().to_string(),
+        manifest = manifest_path.display().to_string(),
+        target_install = current_exe.display().to_string(),
         mode = ?mode,
         xpc_service_name = std::env::var("XPC_SERVICE_NAME")
             .ok()
             .as_deref()
             .unwrap_or("")
     );
-    self_replace_binary(&new_binary)?;
+    let helper_pid = match launch_updater_helper(&payload.updater_binary, &manifest_path).await {
+        Ok(pid) => pid,
+        Err(err) => {
+            maybe_remove_staging_dir(&manifest_path).await;
+            return Err(err);
+        }
+    };
     ::tracing::info!(
-        event = "self_update_self_replace_complete",
+        event = "self_update_helper_launch_complete",
         pid = std::process::id(),
         ppid = parent_pid_for_logs(),
         local_version = local,
         remote_version = remote_display,
         mode = ?mode,
-        current_exe = std::env::current_exe()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
+        helper_pid,
+        manifest = manifest_path.display().to_string(),
+        current_exe = current_exe.display().to_string(),
         xpc_service_name = std::env::var("XPC_SERVICE_NAME")
             .ok()
             .as_deref()
             .unwrap_or("")
     );
-
-    if let Err(err) = run_install_with_updated_binary(true).await {
-        report_best_effort_post_upgrade_failure(
-            mode,
-            "the new version could not finish runtime bootstrap automatically",
-            "Run `cadence install` to reconcile background monitoring and clean up legacy Cadence hook ownership.",
-            &err,
-        );
-        return Err(install_handoff_error(err));
-    }
 
     if matches!(mode, InstallMode::Interactive) {
-        println!("Successfully updated cadence v{local} → v{remote_display}");
+        println!(
+            "Staged cadence v{local} → v{remote_display}. cadence-updater (pid {helper_pid}) will finish installation after this process exits."
+        );
     }
 
-    Ok(AttemptOutcome::Installed)
+    Ok(AttemptOutcome::HelperLaunched)
 }
 
 fn retry_delay_from_state(state: &UpdaterState) -> u64 {
@@ -1276,15 +1611,22 @@ pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
         return Ok(());
     }
 
+    save_updater_state(&state).await?;
+
     let attempt_result = run_update_install_from_url_mode(
-        GITHUB_RELEASES_LATEST_URL,
+        &effective_latest_release_url(),
         true,
         InstallMode::SilentUnattended,
         false,
     )
     .await;
-    apply_background_update_attempt_result(&mut state, &now, attempt_result, now_epoch());
-    save_updater_state(&state).await?;
+    match attempt_result {
+        Ok(AttemptOutcome::HelperLaunched) => {}
+        other => {
+            apply_background_update_attempt_result(&mut state, &now, other, now_epoch());
+            save_updater_state(&state).await?;
+        }
+    }
 
     Ok(())
 }
@@ -1492,6 +1834,7 @@ fn apply_background_update_attempt_result(
             state.last_error = None;
             state.next_retry_after = None;
         }
+        Ok(AttemptOutcome::HelperLaunched) => {}
         Err(err) => {
             let err = format!("{err:#}");
             if err.contains("global activity lock is busy") {
@@ -1826,7 +2169,7 @@ pub fn format_update_notification(current: &str, latest: &str) -> String {
 ///
 /// All failures are silently ignored to avoid disrupting the user's workflow.
 pub async fn passive_version_check() {
-    passive_version_check_from_url(GITHUB_RELEASES_LATEST_URL).await;
+    passive_version_check_from_url(&effective_latest_release_url()).await;
 }
 
 /// Injectable version for testing — accepts a custom release URL.
@@ -2169,7 +2512,7 @@ mod tests {
     async fn expected_artifact_name_macos() {
         assert_eq!(
             expected_artifact_name("aarch64-apple-darwin"),
-            "cadence-cli-aarch64-apple-darwin.tar.gz"
+            "cadence-cli-aarch64-apple-darwin.zip"
         );
     }
 
@@ -2184,7 +2527,7 @@ mod tests {
     #[tokio::test]
     async fn pick_artifact_exact_match() {
         let assets = vec![
-            make_asset("cadence-cli-aarch64-apple-darwin.tar.gz"),
+            make_asset("cadence-cli-aarch64-apple-darwin.zip"),
             make_asset("cadence-cli-x86_64-unknown-linux-gnu.tar.gz"),
             make_asset("checksums-sha256.txt"),
         ];
@@ -2213,7 +2556,7 @@ mod tests {
             "error should mention target: {err}"
         );
         assert!(
-            err.contains("cadence-cli-aarch64-apple-darwin.tar.gz"),
+            err.contains("cadence-cli-aarch64-apple-darwin.zip"),
             "error should show expected name: {err}"
         );
     }
@@ -2227,7 +2570,7 @@ mod tests {
     #[tokio::test]
     async fn pick_checksums_found() {
         let assets = vec![
-            make_asset("cadence-cli-aarch64-apple-darwin.tar.gz"),
+            make_asset("cadence-cli-aarch64-apple-darwin.zip"),
             make_asset("checksums-sha256.txt"),
         ];
         let result = pick_checksums_asset(&assets).unwrap();
@@ -2236,7 +2579,7 @@ mod tests {
 
     #[tokio::test]
     async fn pick_checksums_missing() {
-        let assets = vec![make_asset("cadence-cli-aarch64-apple-darwin.tar.gz")];
+        let assets = vec![make_asset("cadence-cli-aarch64-apple-darwin.zip")];
         let result = pick_checksums_asset(&assets);
         assert!(result.is_err());
         assert!(
@@ -2400,6 +2743,8 @@ mod tests {
     #[tokio::test]
     async fn extract_tar_gz_binary() {
         let tmp = tempfile::tempdir().unwrap();
+        let cadence_name = cadence_binary_name(build_target()).to_string();
+        let updater_name = updater_binary_name(build_target()).to_string();
 
         // Create a tar.gz archive containing a "cadence" binary
         let archive_path = tmp.path().join("test.tar.gz");
@@ -2417,7 +2762,16 @@ mod tests {
                 header.set_mode(0o755);
                 header.set_cksum();
                 tar_builder
-                    .append_data(&mut header, "cadence", &content[..])
+                    .append_data(&mut header, cadence_name, &content[..])
+                    .unwrap();
+
+                let updater_content = b"#!/bin/sh\necho updater\n";
+                let mut updater_header = tar::Header::new_gnu();
+                updater_header.set_size(updater_content.len() as u64);
+                updater_header.set_mode(0o755);
+                updater_header.set_cksum();
+                tar_builder
+                    .append_data(&mut updater_header, updater_name, &updater_content[..])
                     .unwrap();
                 tar_builder.finish().unwrap();
             })
@@ -2429,7 +2783,10 @@ mod tests {
         tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
         let result = extract_binary(&archive_path, &extract_dir).await.unwrap();
-        assert_eq!(result.file_name().unwrap(), "cadence");
+        assert_eq!(
+            result.file_name().unwrap(),
+            cadence_binary_name(build_target())
+        );
         assert!(result.exists());
 
         let extracted_content = tokio::fs::read(&result).await.unwrap();
@@ -2439,6 +2796,8 @@ mod tests {
     #[tokio::test]
     async fn extract_tar_gz_nested_binary() {
         let tmp = tempfile::tempdir().unwrap();
+        let cadence_name = cadence_binary_name(build_target()).to_string();
+        let updater_name = updater_binary_name(build_target()).to_string();
 
         // Create a tar.gz with cadence nested in a subdirectory
         let archive_path = tmp.path().join("nested.tar.gz");
@@ -2456,7 +2815,20 @@ mod tests {
                 header.set_mode(0o755);
                 header.set_cksum();
                 tar_builder
-                    .append_data(&mut header, "release/cadence", &content[..])
+                    .append_data(&mut header, format!("release/{cadence_name}"), &content[..])
+                    .unwrap();
+
+                let updater_content = b"nested updater";
+                let mut updater_header = tar::Header::new_gnu();
+                updater_header.set_size(updater_content.len() as u64);
+                updater_header.set_mode(0o755);
+                updater_header.set_cksum();
+                tar_builder
+                    .append_data(
+                        &mut updater_header,
+                        format!("release/{updater_name}"),
+                        &updater_content[..],
+                    )
                     .unwrap();
                 tar_builder.finish().unwrap();
             })
@@ -2468,7 +2840,10 @@ mod tests {
         tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
         let result = extract_binary(&archive_path, &extract_dir).await.unwrap();
-        assert_eq!(result.file_name().unwrap(), "cadence");
+        assert_eq!(
+            result.file_name().unwrap(),
+            cadence_binary_name(build_target())
+        );
     }
 
     #[tokio::test]
@@ -2509,6 +2884,8 @@ mod tests {
     #[tokio::test]
     async fn extract_zip_binary() {
         let tmp = tempfile::tempdir().unwrap();
+        let cadence_name = cadence_binary_name(build_target()).to_string();
+        let updater_name = updater_binary_name(build_target()).to_string();
 
         let archive_path = tmp.path().join("test.zip");
         {
@@ -2518,8 +2895,10 @@ mod tests {
                 let mut zip_writer = zip::ZipWriter::new(std_file);
                 let options = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Stored);
-                zip_writer.start_file("cadence.exe", options).unwrap();
+                zip_writer.start_file(cadence_name, options).unwrap();
                 zip_writer.write_all(b"MZ fake exe").unwrap();
+                zip_writer.start_file(updater_name, options).unwrap();
+                zip_writer.write_all(b"MZ fake updater").unwrap();
                 zip_writer.finish().unwrap();
             })
             .await
@@ -2530,7 +2909,10 @@ mod tests {
         tokio::fs::create_dir_all(&extract_dir).await.unwrap();
 
         let result = extract_binary(&archive_path, &extract_dir).await.unwrap();
-        assert_eq!(result.file_name().unwrap(), "cadence.exe");
+        assert_eq!(
+            result.file_name().unwrap(),
+            cadence_binary_name(build_target())
+        );
         assert!(result.exists());
     }
 
@@ -2577,27 +2959,12 @@ mod tests {
         );
     }
 
-    // -- self_replace_binary -------------------------------------------------
-
-    #[tokio::test]
-    async fn self_replace_nonexistent_source() {
-        let result = self_replace_binary(Path::new("/nonexistent/path"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
-    }
-
     // -- archive extension ---------------------------------------------------
 
     #[tokio::test]
     async fn archive_ext_unix_targets() {
-        assert_eq!(
-            archive_extension_for_target("aarch64-apple-darwin"),
-            ".tar.gz"
-        );
-        assert_eq!(
-            archive_extension_for_target("x86_64-apple-darwin"),
-            ".tar.gz"
-        );
+        assert_eq!(archive_extension_for_target("aarch64-apple-darwin"), ".zip");
+        assert_eq!(archive_extension_for_target("x86_64-apple-darwin"), ".zip");
         assert_eq!(
             archive_extension_for_target("x86_64-unknown-linux-gnu"),
             ".tar.gz"
@@ -3095,6 +3462,76 @@ mod tests {
             err.to_string().contains("bootstrap install command failed"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn install_manifest_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("install-manifest.json");
+        let manifest = UpdateInstallManifest {
+            target_version: "9.9.9".to_string(),
+            staged_cadence_path: tmp.path().join("staged").join("cadence"),
+            final_cadence_path: tmp.path().join("install").join("cadence"),
+            wait_for_pid: 4242,
+            preserve_disable_state: true,
+            mode: InstallMode::SilentUnattended,
+        };
+
+        write_install_manifest(&manifest_path, &manifest)
+            .await
+            .expect("write manifest");
+        let loaded = load_install_manifest(&manifest_path)
+            .await
+            .expect("load manifest");
+        assert_eq!(loaded, manifest);
+    }
+
+    #[tokio::test]
+    async fn wait_for_pid_to_exit_observes_short_lived_child() {
+        let mut child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn wait child")
+        } else {
+            Command::new("sh")
+                .args(["-c", "sleep 0.2"])
+                .spawn()
+                .expect("spawn wait child")
+        };
+
+        let pid = child.id().expect("child pid");
+        let reap_child =
+            tokio::spawn(async move { child.wait().await.expect("wait child status") });
+        wait_for_pid_to_exit(pid, Duration::from_secs(5))
+            .await
+            .expect("wait for child exit");
+        let status = reap_child.await.expect("join child wait");
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn record_helper_result_persists_installed_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let manifest = UpdateInstallManifest {
+            target_version: "9.9.9".to_string(),
+            staged_cadence_path: tmp.path().join("staged").join("cadence"),
+            final_cadence_path: tmp.path().join("install").join("cadence"),
+            wait_for_pid: 0,
+            preserve_disable_state: true,
+            mode: InstallMode::Interactive,
+        };
+
+        record_helper_result(&manifest, &Ok(()))
+            .await
+            .expect("record helper result");
+        let state = load_updater_state().await.expect("load updater state");
+        assert_eq!(state.last_installed_version.as_deref(), Some("9.9.9"));
+        assert_eq!(state.consecutive_failures, 0);
     }
 
     // -- check_latest_version_from_url_with_timeout ---------------------------
