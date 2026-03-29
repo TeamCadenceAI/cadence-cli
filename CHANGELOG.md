@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.3...v2.2.4) (2026-03-29)
+
+
+### Bug Fixes
+
+* **update:** unblock monitor-driven auto-upgrades ([be07f49](https://github.com/TeamCadenceAI/cadence-cli/commit/be07f4930f2b6bf476fe7ab54f4af27c21b2f3e4))
+
 ## [2.2.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.2...v2.2.3) (2026-03-29)
 
 
