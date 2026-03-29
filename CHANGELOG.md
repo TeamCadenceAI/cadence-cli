@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.4...v2.2.5) (2026-03-29)
+
+
+### Bug Fixes
+
+* **bootstrap:** serialize install runtime bootstrap ([d9dfc76](https://github.com/TeamCadenceAI/cadence-cli/commit/d9dfc764d80c69f27f9134705a1bdab3b3478c60))
+* **bootstrap:** serialize install runtime bootstrap ([53d6b8c](https://github.com/TeamCadenceAI/cadence-cli/commit/53d6b8c6e15d3973d4bbd58f3d80d1bdc5b1a0d5))
+
 ## [2.2.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.3...v2.2.4) (2026-03-29)
 
 
