@@ -528,6 +528,43 @@ fn advance_cursor_for_disposition(
     current_cursor.clone()
 }
 
+fn apply_monitor_incremental_upload_outcome(
+    stats: &mut MonitorTickSummary,
+    cursor_advance: &mut IncrementalCursor,
+    cursor_blocked: &mut bool,
+    log_mtime: Option<i64>,
+    log_source_label: &str,
+    outcome: UploadFromLogOutcome,
+) {
+    match outcome {
+        UploadFromLogOutcome::Uploaded => {
+            stats.uploaded += 1;
+            if !*cursor_blocked {
+                *cursor_advance =
+                    advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
+            }
+        }
+        UploadFromLogOutcome::AlreadyExists => {
+            stats.skipped += 1;
+            if !*cursor_blocked {
+                *cursor_advance =
+                    advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
+            }
+        }
+        UploadFromLogOutcome::Queued(_) => {
+            stats.queued += 1;
+            if !*cursor_blocked {
+                *cursor_advance =
+                    advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
+            }
+        }
+        UploadFromLogOutcome::Retryable(_) => {
+            stats.issues += 1;
+            *cursor_blocked = true;
+        }
+    }
+}
+
 fn select_incremental_candidates(
     logs: Vec<agents::SessionLog>,
     cursor: &IncrementalCursor,
@@ -1745,43 +1782,14 @@ async fn upload_incremental_sessions_globally(
             PublicationMode::Live,
         )
         .await;
-        match outcome {
-            UploadFromLogOutcome::Uploaded => {
-                stats.uploaded += 1;
-                if !cursor_blocked {
-                    cursor_advance = advance_cursor_for_disposition(
-                        &cursor_advance,
-                        log_mtime,
-                        &log_source_label,
-                    );
-                }
-            }
-            UploadFromLogOutcome::AlreadyExists => {
-                stats.skipped += 1;
-                if !cursor_blocked {
-                    cursor_advance = advance_cursor_for_disposition(
-                        &cursor_advance,
-                        log_mtime,
-                        &log_source_label,
-                    );
-                }
-            }
-            UploadFromLogOutcome::Queued(_) => {
-                stats.queued += 1;
-                if !cursor_blocked {
-                    cursor_advance = advance_cursor_for_disposition(
-                        &cursor_advance,
-                        log_mtime,
-                        &log_source_label,
-                    );
-                }
-            }
-            UploadFromLogOutcome::Retryable(_) => {
-                stats.issues += 1;
-                cursor_blocked = true;
-                continue;
-            }
-        }
+        apply_monitor_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor_advance,
+            &mut cursor_blocked,
+            log_mtime,
+            &log_source_label,
+            outcome,
+        );
     }
 
     if cursor_advance != initial_cursor {
@@ -3641,6 +3649,235 @@ mod tests {
         assert_eq!(stats.uploaded, 1);
         assert_eq!(stats.queued, 0);
         assert_eq!(stats.issues, 0);
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 1,
+                uploads: 1,
+                confirms: 1,
+                user_org_requests: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_incremental_sessions_globally_advances_discovery_cursor_after_success() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+        let codex_home_guard = EnvGuard::new("CODEX_HOME");
+        codex_home_guard.set_path(&home.path().join(".codex"));
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
+        )
+        .await;
+
+        let session_updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current epoch")
+            .as_secs() as i64;
+        let session_path = write_codex_session_log(
+            home.path(),
+            "session-global-success",
+            repo.path(),
+            session_updated_at,
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let summary = upload_incremental_sessions_globally(&upload_context)
+            .await
+            .expect("upload incremental sessions globally");
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.issues, 0);
+
+        let cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor")
+            .expect("cursor record");
+        assert_eq!(cursor.last_scanned_mtime_epoch, session_updated_at);
+        assert_eq!(
+            cursor.last_scanned_source_label.as_deref(),
+            Some(session_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            server.counts(),
+            crate::upload::test_support::TestUploadServerCounts {
+                create_requests: 1,
+                uploads: 1,
+                confirms: 1,
+                user_org_requests: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn monitor_retryable_incremental_outcome_blocks_future_cursor_advances() {
+        let mut stats = MonitorTickSummary::default();
+        let mut cursor = IncrementalCursor {
+            last_scanned_mtime_epoch: 100,
+            last_scanned_source_label: Some("a".to_string()),
+        };
+        let mut blocked = false;
+
+        apply_monitor_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor,
+            &mut blocked,
+            Some(150),
+            "b",
+            UploadFromLogOutcome::Retryable("git remote failed".to_string()),
+        );
+
+        assert!(blocked);
+        assert_eq!(stats.issues, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
+
+        apply_monitor_incremental_upload_outcome(
+            &mut stats,
+            &mut cursor,
+            &mut blocked,
+            Some(200),
+            "c",
+            UploadFromLogOutcome::Uploaded,
+        );
+
+        assert_eq!(stats.uploaded, 1);
+        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_skips_disabled_runtime_without_writing_state() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let summary = run_monitor_tick_internal(MonitorTickOptions {
+            force: false,
+            drain_pending: true,
+            run_auto_update: false,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.issues, 0);
+        assert_eq!(summary.pending_attempted, 0);
+        assert_eq!(summary.pending_uploaded, 0);
+
+        let monitor_state_path = config::CliConfig::config_dir_with_home(home.path())
+            .expect("config dir")
+            .join("monitor-state.json");
+        assert!(
+            tokio::fs::metadata(&monitor_state_path).await.is_err(),
+            "disabled early exit should not create monitor state"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn monitor_tick_drains_pending_uploads_and_records_runtime_state() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let prepared = upload::prepare_session_upload(sample_observed_upload(
+            Path::new("/tmp/repo"),
+            "session-monitor-pending",
+            "hello",
+        ))
+        .expect("prepare session upload");
+        let no_token_context = upload::resolve_upload_context(Some("http://127.0.0.1:9"))
+            .await
+            .expect("context without token");
+        let queued = upload::upload_or_queue_prepared_session(&no_token_context, &prepared)
+            .await
+            .expect("queue upload");
+        assert!(matches!(queued, upload::LiveUploadOutcome::Queued { .. }));
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let summary = run_monitor_tick_internal(MonitorTickOptions {
+            force: true,
+            drain_pending: true,
+            run_auto_update: false,
+        })
+        .await
+        .expect("monitor tick");
+
+        assert_eq!(summary.discovered, 0);
+        assert_eq!(summary.pending_attempted, 1);
+        assert_eq!(summary.pending_uploaded, 1);
+        assert_eq!(
+            upload::pending_upload_count().await.expect("pending count"),
+            0
+        );
+
+        let state = monitor::load_state().await.expect("load monitor state");
+        assert_eq!(state.last_pending_attempted, 1);
+        assert_eq!(state.last_pending_uploaded, 1);
+        assert!(state.last_run_at.is_some());
+        assert!(state.last_success_at.is_some());
+        assert_eq!(state.last_error, None);
         assert_eq!(
             server.counts(),
             crate::upload::test_support::TestUploadServerCounts {
