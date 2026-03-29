@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::{agents, git, monitor, output, update};
 
@@ -11,6 +12,8 @@ const VERSION_BOOTSTRAP_MARKER_FILE: &str = "last-version-bootstrap";
 const VERSION_BOOTSTRAP_BACKFILL_MARKER_FILE: &str = "last-version-recovery-backfill";
 const VERSION_BOOTSTRAP_LOCK_FILE: &str = "current-version-bootstrap.lock";
 const VERSION_BOOTSTRAP_LOCK_STALE_SECS: i64 = 15 * 60;
+const VERSION_BOOTSTRAP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const VERSION_BOOTSTRAP_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapTrigger {
@@ -166,6 +169,34 @@ async fn try_acquire_bootstrap_execution_lock() -> Result<Option<BootstrapExecut
         return Ok(Some(BootstrapExecutionLockGuard { path: lock_path }));
     }
     Ok(None)
+}
+
+async fn acquire_bootstrap_execution_lock_blocking(
+    timeout: Duration,
+) -> Result<Option<BootstrapExecutionLockGuard>> {
+    let Some(lock_path) = version_bootstrap_lock_path() else {
+        return Ok(None);
+    };
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let start = Instant::now();
+    loop {
+        clear_stale_bootstrap_lock(&lock_path).await?;
+        if try_create_bootstrap_lock(&lock_path).await? {
+            return Ok(Some(BootstrapExecutionLockGuard { path: lock_path }));
+        }
+        if start.elapsed() >= timeout {
+            bail!(
+                "timed out waiting for current-version bootstrap lock after {:?}",
+                timeout
+            );
+        }
+        tokio::time::sleep(VERSION_BOOTSTRAP_LOCK_POLL_INTERVAL).await;
+    }
 }
 
 async fn read_version_bootstrap_marker(path: &Path) -> Result<Option<String>> {
@@ -446,6 +477,8 @@ pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: boo
     println!();
     output::action("Installing", "background monitor");
     let install_start = std::time::Instant::now();
+    let _bootstrap_lock =
+        acquire_bootstrap_execution_lock_blocking(VERSION_BOOTSTRAP_LOCK_WAIT_TIMEOUT).await?;
 
     let include_recovery_backfill = should_run_current_version_recovery_backfill(true).await?;
     let outcome = execute_bootstrap(BootstrapOptions {
@@ -857,6 +890,43 @@ mod tests {
 
         assert!(!ran);
         assert!(bootstrap_test_invocations().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_install_waits_for_bootstrap_lock_before_running_bootstrap() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        let lock = try_acquire_bootstrap_execution_lock()
+            .await
+            .expect("acquire bootstrap execution lock")
+            .expect("bootstrap lock should be available");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            drop(lock);
+        });
+        let _hooks = install_bootstrap_test_hooks([Ok(BootstrapOutcome {
+            had_runtime_errors: false,
+            performed_recovery_backfill: false,
+        })]);
+
+        run_install(None, true)
+            .await
+            .expect("install waits for lock");
+        release.await.expect("release bootstrap lock");
+
+        let invocations = bootstrap_test_invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].trigger, BootstrapTrigger::InstallCommand);
+        assert!(
+            read_version_bootstrap_marker(&version_bootstrap_marker_path().unwrap())
+                .await
+                .expect("read version bootstrap marker")
+                .as_deref()
+                == Some(update::current_version())
+        );
     }
 
     #[test]
