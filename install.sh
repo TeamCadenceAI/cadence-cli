@@ -60,7 +60,7 @@ main() {
 
     # Extract and install
     echo "Extracting..."
-    tar xzf "${tmpdir}/${tarball}" -C "$tmpdir"
+    tar xzf "${tmpdir}/${tarball}" -C "$tmpdir" --strip-components=1
 
     mkdir -p "$INSTALL_DIR"
     echo "Installing to ${INSTALL_DIR}/cadence..."
