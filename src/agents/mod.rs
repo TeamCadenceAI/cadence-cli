@@ -222,8 +222,25 @@ pub async fn find_chat_session_dirs(root: &Path) -> Vec<PathBuf> {
     results
 }
 
-/// Collect recent session logs across all supported agents.
-pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionLog> {
+fn collect_discovered_sessions(
+    include_warp: bool,
+    non_warp_logs: Vec<Vec<SessionLog>>,
+    warp_logs: Vec<SessionLog>,
+) -> Vec<SessionLog> {
+    let mut results = Vec::new();
+    for logs in non_warp_logs {
+        results.extend(logs);
+    }
+    if include_warp {
+        results.extend(warp_logs);
+    }
+    results
+}
+
+/// Collect recent session logs for explicit backfill runs.
+///
+/// Backfill is user-initiated, so it includes Warp discovery.
+pub async fn discover_recent_sessions_for_backfill(now: i64, since_secs: i64) -> Vec<SessionLog> {
     let (
         claude_logs,
         codex_logs,
@@ -252,20 +269,74 @@ pub async fn discover_recent_sessions(now: i64, since_secs: i64) -> Vec<SessionL
         warp::WarpExplorer.discover_recent(now, since_secs),
     );
 
-    let mut results = Vec::new();
-    results.extend(claude_logs);
-    results.extend(codex_logs);
-    results.extend(cursor_logs);
-    results.extend(copilot_logs);
-    results.extend(cline_logs);
-    results.extend(roo_logs);
-    results.extend(opencode_logs);
-    results.extend(kiro_logs);
-    results.extend(amp_logs);
-    results.extend(antigravity_logs);
-    results.extend(windsurf_logs);
-    results.extend(warp_logs);
-    results
+    collect_discovered_sessions(
+        true,
+        vec![
+            claude_logs,
+            codex_logs,
+            cursor_logs,
+            copilot_logs,
+            cline_logs,
+            roo_logs,
+            opencode_logs,
+            kiro_logs,
+            amp_logs,
+            antigravity_logs,
+            windsurf_logs,
+        ],
+        warp_logs,
+    )
+}
+
+/// Collect recent session logs for background monitor ticks.
+///
+/// Monitor discovery intentionally skips Warp on macOS to avoid repeatedly
+/// touching protected app-group container data from a short-lived background
+/// process. User-initiated backfill still includes Warp discovery.
+pub async fn discover_recent_sessions_for_monitor(now: i64, since_secs: i64) -> Vec<SessionLog> {
+    let (
+        claude_logs,
+        codex_logs,
+        cursor_logs,
+        copilot_logs,
+        cline_logs,
+        roo_logs,
+        opencode_logs,
+        kiro_logs,
+        amp_logs,
+        antigravity_logs,
+        windsurf_logs,
+    ) = tokio::join!(
+        claude::ClaudeExplorer.discover_recent(now, since_secs),
+        codex::CodexExplorer.discover_recent(now, since_secs),
+        cursor::CursorExplorer.discover_recent(now, since_secs),
+        copilot::CopilotExplorer.discover_recent(now, since_secs),
+        cline::ClineExplorer.discover_recent(now, since_secs),
+        roo_code::RooCodeExplorer.discover_recent(now, since_secs),
+        opencode::OpenCodeExplorer.discover_recent(now, since_secs),
+        kiro::KiroExplorer.discover_recent(now, since_secs),
+        amp_code::AmpCodeExplorer.discover_recent(now, since_secs),
+        antigravity::AntigravityExplorer.discover_recent(now, since_secs),
+        windsurf::WindsurfExplorer.discover_recent(now, since_secs),
+    );
+
+    collect_discovered_sessions(
+        false,
+        vec![
+            claude_logs,
+            codex_logs,
+            cursor_logs,
+            copilot_logs,
+            cline_logs,
+            roo_logs,
+            opencode_logs,
+            kiro_logs,
+            amp_logs,
+            antigravity_logs,
+            windsurf_logs,
+        ],
+        Vec::new(),
+    )
 }
 
 /// Set a file's modification time to a specific Unix epoch timestamp.
@@ -286,6 +357,7 @@ pub(crate) fn set_file_mtime(path: &Path, epoch_secs: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::AgentType;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -436,5 +508,46 @@ mod tests {
         } else {
             assert_eq!(dir, home.join(".config").join("Code"));
         }
+    }
+
+    fn sample_session(agent_type: AgentType, label: &str) -> SessionLog {
+        SessionLog {
+            agent_type,
+            source: SessionSource::Inline {
+                label: label.to_string(),
+                content: "{}".to_string(),
+            },
+            updated_at: Some(1),
+        }
+    }
+
+    #[test]
+    fn collect_discovered_sessions_includes_warp_when_requested() {
+        let results = collect_discovered_sessions(
+            true,
+            vec![vec![sample_session(AgentType::Codex, "codex")]],
+            vec![sample_session(AgentType::Warp, "warp")],
+        );
+
+        let agent_types = results
+            .into_iter()
+            .map(|log| log.agent_type)
+            .collect::<Vec<_>>();
+        assert_eq!(agent_types, vec![AgentType::Codex, AgentType::Warp]);
+    }
+
+    #[test]
+    fn collect_discovered_sessions_omits_warp_when_disabled() {
+        let results = collect_discovered_sessions(
+            false,
+            vec![vec![sample_session(AgentType::Codex, "codex")]],
+            vec![sample_session(AgentType::Warp, "warp")],
+        );
+
+        let agent_types = results
+            .into_iter()
+            .map(|log| log.agent_type)
+            .collect::<Vec<_>>();
+        assert_eq!(agent_types, vec![AgentType::Codex]);
     }
 }

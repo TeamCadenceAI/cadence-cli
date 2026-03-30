@@ -1315,7 +1315,7 @@ async fn run_backfill_inner_with_invocation(
         now_epoch = now,
         since_secs
     );
-    let files = agents::discover_recent_sessions(now, since_secs).await;
+    let files = agents::discover_recent_sessions_for_backfill(now, since_secs).await;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -1744,7 +1744,7 @@ async fn upload_incremental_sessions_globally(
         None => IncrementalCursor::from_position(now - MONITOR_DEFAULT_CURSOR_WINDOW_SECS, None),
     };
     let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
-    let files = agents::discover_recent_sessions(now, since_secs).await;
+    let files = agents::discover_recent_sessions_for_monitor(now, since_secs).await;
     let candidates = select_incremental_candidates(files, &initial_cursor, usize::MAX);
     let parsed_logs = parse_session_logs_bounded(candidates).await;
 
