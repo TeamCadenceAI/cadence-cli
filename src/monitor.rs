@@ -1,9 +1,12 @@
 //! Background monitor state and scheduler management.
 
 use crate::state_files;
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Output;
 use tokio::process::Command;
 
@@ -175,6 +178,7 @@ fn scheduler_command_line(exe_path: &Path) -> String {
     format!("\"{}\" monitor tick", exe_path.display())
 }
 
+#[cfg(target_os = "macos")]
 fn parent_pid_for_logs() -> u32 {
     #[cfg(unix)]
     {
@@ -187,6 +191,7 @@ fn parent_pid_for_logs() -> u32 {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -194,6 +199,15 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_task_query_reports_missing(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("cannot find the file specified")
+        || detail.contains("cannot find the task")
+        || detail.contains("system cannot find")
+        || detail.contains("task does not exist")
 }
 
 #[cfg(target_os = "macos")]
@@ -771,21 +785,48 @@ pub async fn scheduler_health() -> SchedulerHealth {
     {
         let queried = Command::new("schtasks")
             .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-            .status()
+            .output()
             .await;
-        if queried.as_ref().is_ok_and(|status| status.success()) {
-            return SchedulerHealth {
-                state: SchedulerHealthState::Installed,
-                details: format!("Task Scheduler task installed: {}", WINDOWS_TASK_NAME),
-                remediation: "Use `cadence monitor disable` to stop runs or `cadence monitor uninstall` to remove scheduler artifacts.".to_string(),
-            };
+        match queried {
+            Ok(output) if output.status.success() => {
+                return SchedulerHealth {
+                    state: SchedulerHealthState::Installed,
+                    details: format!("Task Scheduler task installed: {}", WINDOWS_TASK_NAME),
+                    remediation: "Use `cadence monitor disable` to stop runs or `cadence monitor uninstall` to remove scheduler artifacts.".to_string(),
+                };
+            }
+            Ok(output) => {
+                let detail = command_failure_detail(&output);
+                if windows_task_query_reports_missing(&detail) {
+                    return SchedulerHealth {
+                        state: SchedulerHealthState::Missing,
+                        details: format!("Task Scheduler task missing: {}", WINDOWS_TASK_NAME),
+                        remediation:
+                            "Run `cadence monitor enable` or `cadence install` to create it."
+                                .to_string(),
+                    };
+                }
+
+                return SchedulerHealth {
+                    state: SchedulerHealthState::Broken,
+                    details: format!(
+                        "Task Scheduler query failed for {}: {}",
+                        WINDOWS_TASK_NAME, detail
+                    ),
+                    remediation: "Run `cadence install` to repair monitor setup.".to_string(),
+                };
+            }
+            Err(err) => {
+                return SchedulerHealth {
+                    state: SchedulerHealthState::Broken,
+                    details: format!(
+                        "Task Scheduler query failed for {}: {}",
+                        WINDOWS_TASK_NAME, err
+                    ),
+                    remediation: "Run `cadence install` to repair monitor setup.".to_string(),
+                };
+            }
         }
-        return SchedulerHealth {
-            state: SchedulerHealthState::Missing,
-            details: format!("Task Scheduler task missing: {}", WINDOWS_TASK_NAME),
-            remediation: "Run `cadence monitor enable` or `cadence install` to create it."
-                .to_string(),
-        };
     }
 
     #[allow(unreachable_code)]
@@ -994,5 +1035,18 @@ mod tests {
         assert!(!plist.contains("/tmp/cadence-monitor.log"));
         assert!(plist.contains("<string>monitor</string>"));
         assert!(plist.contains("<string>tick</string>"));
+    }
+
+    #[test]
+    fn windows_task_query_missing_detection_matches_scheduler_errors() {
+        assert!(windows_task_query_reports_missing(
+            "ERROR: The system cannot find the file specified."
+        ));
+        assert!(windows_task_query_reports_missing(
+            "ERROR: The task does not exist."
+        ));
+        assert!(!windows_task_query_reports_missing(
+            "ERROR: Access is denied."
+        ));
     }
 }

@@ -14,7 +14,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Output;
+use std::process::Stdio;
 use std::time::Duration;
 use sysinfo::{Pid, System};
 use tokio::io::AsyncReadExt;
@@ -212,7 +214,8 @@ pub enum UpdateCommandStatus {
 pub const UPDATE_HELPER_PENDING_EXIT_CODE: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyAutoUpdateCleanupDisposition {
+#[doc(hidden)]
+pub enum LegacyAutoUpdateCleanupDisposition {
     Attempted,
     Deferred,
 }
@@ -440,7 +443,8 @@ fn process_started_at_epoch(pid: u32) -> Option<u64> {
         .map(|process| process.start_time())
 }
 
-pub(crate) fn is_pid_alive(pid: u32) -> bool {
+#[doc(hidden)]
+pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         if pid == 0 {
@@ -466,14 +470,14 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
         unsafe {
             CloseHandle(handle);
         }
-        return alive;
+        alive
     }
 
     #[cfg(not(any(unix, windows)))]
     {
         let mut system = System::new();
         system.refresh_processes();
-        return system.process(Pid::from_u32(pid)).is_some();
+        system.process(Pid::from_u32(pid)).is_some()
     }
 }
 
@@ -1337,15 +1341,6 @@ fn extract_tar_gz_payload_from_file(
     })
 }
 
-fn extract_tar_gz_from_file(
-    file: std::fs::File,
-    archive_path: &Path,
-    dest_dir: &Path,
-) -> Result<PathBuf> {
-    extract_tar_gz_payload_from_file(file, archive_path, dest_dir, build_target())
-        .map(|payload| payload.cadence_binary)
-}
-
 fn extract_zip_payload_from_file(
     file: std::fs::File,
     archive_path: &Path,
@@ -1401,17 +1396,6 @@ fn extract_zip_payload_from_file(
         cadence_binary,
         updater_binary,
     })
-}
-
-/// Extracts the cadence binary from a zip archive into `dest_dir`.
-/// Returns the path to the extracted binary.
-fn extract_zip_from_file(
-    file: std::fs::File,
-    archive_path: &Path,
-    dest_dir: &Path,
-) -> Result<PathBuf> {
-    extract_zip_payload_from_file(file, archive_path, dest_dir, build_target())
-        .map(|payload| payload.cadence_binary)
 }
 
 async fn extract_release_payload(
@@ -2313,7 +2297,7 @@ fn retry_delay_from_state(state: &UpdaterState) -> u64 {
 
 #[doc(hidden)]
 pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     {
         let test_hook = {
             let mut hook = background_auto_update_test_hook()
@@ -2396,9 +2380,10 @@ pub(crate) fn should_defer_legacy_auto_update_scheduler_cleanup() -> bool {
     false
 }
 
-pub(crate) async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
+#[doc(hidden)]
+pub async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
 -> Result<LegacyAutoUpdateCleanupDisposition> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     {
         let mut hook = legacy_cleanup_test_hook()
             .lock()
@@ -2424,23 +2409,24 @@ pub(crate) async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
     Ok(LegacyAutoUpdateCleanupDisposition::Attempted)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) struct LegacyCleanupTestHook {
     result: std::result::Result<LegacyAutoUpdateCleanupDisposition, String>,
     calls: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn legacy_cleanup_test_hook() -> &'static std::sync::Mutex<Option<LegacyCleanupTestHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LegacyCleanupTestHook>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
-pub(crate) struct LegacyCleanupTestHookGuard;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct LegacyCleanupTestHookGuard;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for LegacyCleanupTestHookGuard {
     fn drop(&mut self) {
         if let Ok(mut hook) = legacy_cleanup_test_hook().lock() {
@@ -2449,8 +2435,9 @@ impl Drop for LegacyCleanupTestHookGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn install_legacy_cleanup_test_hook(
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn install_legacy_cleanup_test_hook(
     result: std::result::Result<LegacyAutoUpdateCleanupDisposition, &'static str>,
 ) -> LegacyCleanupTestHookGuard {
     let mut hook = legacy_cleanup_test_hook()
@@ -2463,8 +2450,9 @@ pub(crate) fn install_legacy_cleanup_test_hook(
     LegacyCleanupTestHookGuard
 }
 
-#[cfg(test)]
-pub(crate) fn legacy_cleanup_test_hook_calls() -> usize {
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn legacy_cleanup_test_hook_calls() -> usize {
     legacy_cleanup_test_hook()
         .lock()
         .expect("legacy cleanup test hook lock")
@@ -2473,7 +2461,7 @@ pub(crate) fn legacy_cleanup_test_hook_calls() -> usize {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone)]
 pub(crate) struct BackgroundAutoUpdateTestHook {
     result: std::result::Result<(), String>,
@@ -2481,7 +2469,7 @@ pub(crate) struct BackgroundAutoUpdateTestHook {
     calls: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn background_auto_update_test_hook()
 -> &'static std::sync::Mutex<Option<BackgroundAutoUpdateTestHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<BackgroundAutoUpdateTestHook>>> =
@@ -2489,10 +2477,11 @@ fn background_auto_update_test_hook()
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
-pub(crate) struct BackgroundAutoUpdateTestHookGuard;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct BackgroundAutoUpdateTestHookGuard;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for BackgroundAutoUpdateTestHookGuard {
     fn drop(&mut self) {
         if let Ok(mut hook) = background_auto_update_test_hook().lock() {
@@ -2501,8 +2490,9 @@ impl Drop for BackgroundAutoUpdateTestHookGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn install_background_auto_update_test_hook(
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn install_background_auto_update_test_hook(
     result: std::result::Result<(), &'static str>,
     delay_ms: u64,
 ) -> BackgroundAutoUpdateTestHookGuard {
@@ -2517,8 +2507,9 @@ pub(crate) fn install_background_auto_update_test_hook(
     BackgroundAutoUpdateTestHookGuard
 }
 
-#[cfg(test)]
-pub(crate) fn background_auto_update_test_hook_calls() -> usize {
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn background_auto_update_test_hook_calls() -> usize {
     background_auto_update_test_hook()
         .lock()
         .expect("background auto-update test hook lock")
@@ -2532,6 +2523,7 @@ const MACOS_LAUNCH_AGENT_LABEL: &str = "ai.teamcadence.cadence.autoupdate";
 #[cfg(target_os = "windows")]
 const WINDOWS_TASK_NAME: &str = "Cadence CLI Auto Update";
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2539,28 +2531,6 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
-}
-
-fn report_best_effort_post_upgrade_failure(
-    mode: InstallMode,
-    what: &str,
-    remediation: &str,
-    err: &anyhow::Error,
-) {
-    if matches!(mode, InstallMode::Interactive) {
-        eprintln!("Warning: cadence updated, but {what}: {err:#}");
-        if !remediation.is_empty() {
-            eprintln!("{remediation}");
-        }
-        return;
-    }
-
-    ::tracing::warn!(
-        event = "post_upgrade_followup_failed",
-        task = what,
-        remediation,
-        error = %format!("{err:#}")
-    );
 }
 
 fn install_handoff_error(err: anyhow::Error) -> anyhow::Error {

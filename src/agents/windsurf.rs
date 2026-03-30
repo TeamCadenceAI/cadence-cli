@@ -541,6 +541,7 @@ async fn discover_listening_ports(_pid: u32) -> Vec<u16> {
     Vec::new()
 }
 
+#[cfg(any(unix, test))]
 fn parse_port_from_lsof_line(line: &str) -> Option<u16> {
     for token in line.split_whitespace().rev() {
         if let Some(port) = parse_port_from_lsof_field(token) {
@@ -550,6 +551,7 @@ fn parse_port_from_lsof_line(line: &str) -> Option<u16> {
     None
 }
 
+#[cfg(any(unix, test))]
 fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
     let port_str = match field.rfind(':') {
         Some(idx) => &field[idx + 1..],
