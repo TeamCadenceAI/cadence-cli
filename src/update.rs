@@ -214,7 +214,8 @@ pub enum UpdateCommandStatus {
 pub const UPDATE_HELPER_PENDING_EXIT_CODE: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyAutoUpdateCleanupDisposition {
+#[doc(hidden)]
+pub enum LegacyAutoUpdateCleanupDisposition {
     Attempted,
     Deferred,
 }
@@ -442,7 +443,8 @@ fn process_started_at_epoch(pid: u32) -> Option<u64> {
         .map(|process| process.start_time())
 }
 
-pub(crate) fn is_pid_alive(pid: u32) -> bool {
+#[doc(hidden)]
+pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         if pid == 0 {
@@ -2261,7 +2263,7 @@ fn retry_delay_from_state(state: &UpdaterState) -> u64 {
 
 #[doc(hidden)]
 pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     {
         let test_hook = {
             let mut hook = background_auto_update_test_hook()
@@ -2344,9 +2346,10 @@ pub(crate) fn should_defer_legacy_auto_update_scheduler_cleanup() -> bool {
     false
 }
 
-pub(crate) async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
+#[doc(hidden)]
+pub async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
 -> Result<LegacyAutoUpdateCleanupDisposition> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     {
         let mut hook = legacy_cleanup_test_hook()
             .lock()
@@ -2372,23 +2375,24 @@ pub(crate) async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
     Ok(LegacyAutoUpdateCleanupDisposition::Attempted)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) struct LegacyCleanupTestHook {
     result: std::result::Result<LegacyAutoUpdateCleanupDisposition, String>,
     calls: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn legacy_cleanup_test_hook() -> &'static std::sync::Mutex<Option<LegacyCleanupTestHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LegacyCleanupTestHook>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
-pub(crate) struct LegacyCleanupTestHookGuard;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct LegacyCleanupTestHookGuard;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for LegacyCleanupTestHookGuard {
     fn drop(&mut self) {
         if let Ok(mut hook) = legacy_cleanup_test_hook().lock() {
@@ -2397,8 +2401,9 @@ impl Drop for LegacyCleanupTestHookGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn install_legacy_cleanup_test_hook(
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn install_legacy_cleanup_test_hook(
     result: std::result::Result<LegacyAutoUpdateCleanupDisposition, &'static str>,
 ) -> LegacyCleanupTestHookGuard {
     let mut hook = legacy_cleanup_test_hook()
@@ -2411,8 +2416,9 @@ pub(crate) fn install_legacy_cleanup_test_hook(
     LegacyCleanupTestHookGuard
 }
 
-#[cfg(test)]
-pub(crate) fn legacy_cleanup_test_hook_calls() -> usize {
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn legacy_cleanup_test_hook_calls() -> usize {
     legacy_cleanup_test_hook()
         .lock()
         .expect("legacy cleanup test hook lock")
@@ -2421,7 +2427,7 @@ pub(crate) fn legacy_cleanup_test_hook_calls() -> usize {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone)]
 pub(crate) struct BackgroundAutoUpdateTestHook {
     result: std::result::Result<(), String>,
@@ -2429,7 +2435,7 @@ pub(crate) struct BackgroundAutoUpdateTestHook {
     calls: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn background_auto_update_test_hook()
 -> &'static std::sync::Mutex<Option<BackgroundAutoUpdateTestHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<BackgroundAutoUpdateTestHook>>> =
@@ -2437,10 +2443,11 @@ fn background_auto_update_test_hook()
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
-pub(crate) struct BackgroundAutoUpdateTestHookGuard;
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub struct BackgroundAutoUpdateTestHookGuard;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for BackgroundAutoUpdateTestHookGuard {
     fn drop(&mut self) {
         if let Ok(mut hook) = background_auto_update_test_hook().lock() {
@@ -2449,8 +2456,9 @@ impl Drop for BackgroundAutoUpdateTestHookGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn install_background_auto_update_test_hook(
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn install_background_auto_update_test_hook(
     result: std::result::Result<(), &'static str>,
     delay_ms: u64,
 ) -> BackgroundAutoUpdateTestHookGuard {
@@ -2465,8 +2473,9 @@ pub(crate) fn install_background_auto_update_test_hook(
     BackgroundAutoUpdateTestHookGuard
 }
 
-#[cfg(test)]
-pub(crate) fn background_auto_update_test_hook_calls() -> usize {
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn background_auto_update_test_hook_calls() -> usize {
     background_auto_update_test_hook()
         .lock()
         .expect("background auto-update test hook lock")

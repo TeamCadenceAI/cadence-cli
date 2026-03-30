@@ -3,7 +3,6 @@
 mod agents;
 mod api_client;
 mod bootstrap;
-mod config;
 mod git;
 mod login;
 mod monitor;
@@ -14,14 +13,13 @@ mod scanner;
 mod state_files;
 mod tracing;
 mod transport;
-#[allow(dead_code)]
-mod update;
 mod upload;
 
 #[cfg(test)]
 mod test_support;
 
 use anyhow::Result;
+use cadence_cli::{config, update};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::process;
