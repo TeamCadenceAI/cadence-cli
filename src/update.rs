@@ -971,12 +971,14 @@ pub fn build_release_from_tag(tag: &str, repo_base_url: &str) -> LatestRelease {
 
     let mut assets: Vec<ReleaseAsset> = targets
         .iter()
-        .map(|t| {
-            let name = expected_artifact_name(t);
-            ReleaseAsset {
-                browser_download_url: format!("{download_base}/{name}"),
-                name,
-            }
+        .flat_map(|t| {
+            published_artifact_names_for_target(t)
+                .into_iter()
+                .map(|name| ReleaseAsset {
+                    browser_download_url: format!("{download_base}/{name}"),
+                    name,
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -1032,8 +1034,8 @@ fn updater_binary_name(target: &str) -> &'static str {
     }
 }
 
-/// Determines the expected archive extension for a given target triple.
-/// Windows and macOS targets use `.zip`, Linux targets use `.tar.gz`.
+/// Determines the canonical archive extension for a given target triple.
+/// Windows and macOS targets prefer `.zip`, Linux targets prefer `.tar.gz`.
 pub fn archive_extension_for_target(target: &str) -> &'static str {
     if target.contains("windows") || target.contains("apple-darwin") {
         ".zip"
@@ -1042,10 +1044,37 @@ pub fn archive_extension_for_target(target: &str) -> &'static str {
     }
 }
 
+fn published_artifact_names_for_target(target: &str) -> Vec<String> {
+    let canonical = expected_artifact_name(target);
+    if target.contains("apple-darwin") {
+        return vec![canonical, format!("cadence-cli-{target}.tar.gz")];
+    }
+
+    vec![canonical]
+}
+
+fn candidate_artifact_names_for_target(target: &str) -> Vec<String> {
+    let canonical = expected_artifact_name(target);
+    let mut candidates = vec![canonical];
+
+    if target.contains("windows") {
+        return candidates;
+    }
+
+    let fallback_ext = if archive_extension_for_target(target) == ".zip" {
+        ".tar.gz"
+    } else {
+        ".zip"
+    };
+    candidates.push(format!("cadence-cli-{target}{fallback_ext}"));
+    candidates
+}
+
 /// Constructs the canonical release artifact filename for a target triple.
 ///
 /// Matches the naming convention in the release workflow:
-/// `cadence-cli-{target}.tar.gz` (Unix) or `cadence-cli-{target}.zip` (Windows).
+/// `cadence-cli-{target}.tar.gz` (Linux) or `cadence-cli-{target}.zip`
+/// (Windows and canonical macOS).
 pub fn expected_artifact_name(target: &str) -> String {
     format!(
         "cadence-cli-{target}{}",
@@ -1055,25 +1084,30 @@ pub fn expected_artifact_name(target: &str) -> String {
 
 /// Selects the release asset matching the given target triple.
 ///
-/// Searches the asset list for an exact filename match using the canonical
-/// naming pattern `cadence-cli-{target}.{ext}`.
+/// Searches the asset list for an exact filename match, first using the
+/// canonical naming pattern and then any compatibility fallback names.
 pub fn pick_artifact_for_target(assets: &[ReleaseAsset], target: &str) -> Result<ReleaseAsset> {
-    let expected = expected_artifact_name(target);
-    assets
-        .iter()
-        .find(|a| a.name == expected)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No release asset found for target '{target}' (expected '{expected}'). \
-                 Available assets: [{}]",
-                assets
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })
+    let candidates = candidate_artifact_names_for_target(target);
+    for expected in &candidates {
+        if let Some(asset) = assets.iter().find(|a| a.name == *expected) {
+            return Ok(asset.clone());
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "No release asset found for target '{target}' (expected one of [{}]). \
+         Available assets: [{}]",
+        candidates
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        assets
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// Finds the checksums asset in the release.
@@ -3149,8 +3183,8 @@ mod tests {
     async fn build_release_includes_all_targets_and_checksums() {
         let release = build_release_from_tag("v0.3.0", "https://github.com/Org/Repo");
         assert_eq!(release.tag_name, "v0.3.0");
-        // 6 platform assets + 1 checksums
-        assert_eq!(release.assets.len(), 7);
+        // 6 canonical platform assets + 2 legacy macOS tarballs + 1 checksums
+        assert_eq!(release.assets.len(), 9);
 
         // Checksums asset
         let checksums = release
@@ -3246,6 +3280,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_artifact_names_macos_include_legacy_tarball() {
+        assert_eq!(
+            published_artifact_names_for_target("aarch64-apple-darwin"),
+            vec![
+                "cadence-cli-aarch64-apple-darwin.zip".to_string(),
+                "cadence-cli-aarch64-apple-darwin.tar.gz".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn published_artifact_names_linux_only_publish_tarball() {
+        assert_eq!(
+            published_artifact_names_for_target("x86_64-unknown-linux-gnu"),
+            vec!["cadence-cli-x86_64-unknown-linux-gnu.tar.gz".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_artifact_names_macos_try_zip_then_tarball() {
+        assert_eq!(
+            candidate_artifact_names_for_target("aarch64-apple-darwin"),
+            vec![
+                "cadence-cli-aarch64-apple-darwin.zip".to_string(),
+                "cadence-cli-aarch64-apple-darwin.tar.gz".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_artifact_names_linux_try_tarball_then_zip() {
+        assert_eq!(
+            candidate_artifact_names_for_target("x86_64-unknown-linux-gnu"),
+            vec![
+                "cadence-cli-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                "cadence-cli-x86_64-unknown-linux-gnu.zip".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn pick_artifact_exact_match() {
         let assets = vec![
             make_asset("cadence-cli-aarch64-apple-darwin.zip"),
@@ -3267,6 +3342,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pick_artifact_macos_falls_back_to_legacy_tarball() {
+        let assets = vec![
+            make_asset("cadence-cli-aarch64-apple-darwin.tar.gz"),
+            make_asset("checksums-sha256.txt"),
+        ];
+        let result = pick_artifact_for_target(&assets, "aarch64-apple-darwin").unwrap();
+        assert_eq!(result.name, "cadence-cli-aarch64-apple-darwin.tar.gz");
+    }
+
+    #[tokio::test]
+    async fn pick_artifact_linux_falls_back_to_zip() {
+        let assets = vec![
+            make_asset("cadence-cli-x86_64-unknown-linux-gnu.zip"),
+            make_asset("checksums-sha256.txt"),
+        ];
+        let result = pick_artifact_for_target(&assets, "x86_64-unknown-linux-gnu").unwrap();
+        assert_eq!(result.name, "cadence-cli-x86_64-unknown-linux-gnu.zip");
+    }
+
+    #[tokio::test]
     async fn pick_artifact_no_match() {
         let assets = vec![make_asset("cadence-cli-x86_64-unknown-linux-gnu.tar.gz")];
         let result = pick_artifact_for_target(&assets, "aarch64-apple-darwin");
@@ -3278,7 +3373,11 @@ mod tests {
         );
         assert!(
             err.contains("cadence-cli-aarch64-apple-darwin.zip"),
-            "error should show expected name: {err}"
+            "error should show canonical name: {err}"
+        );
+        assert!(
+            err.contains("cadence-cli-aarch64-apple-darwin.tar.gz"),
+            "error should show fallback name: {err}"
         );
     }
 

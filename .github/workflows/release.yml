@@ -95,6 +95,7 @@ jobs:
           mkdir -p "$STAGE_DIR"
           cp "target/${{ matrix.target }}/release/cadence" "$STAGE_DIR/"
           cp "target/${{ matrix.target }}/release/cadence-updater" "$STAGE_DIR/"
+          tar czf "cadence-cli-${{ matrix.target }}.tar.gz" "$STAGE_DIR"
           /usr/bin/ditto -c -k --keepParent "$STAGE_DIR" "cadence-cli-${{ matrix.target }}.zip"
 
       - name: Package (Linux)
