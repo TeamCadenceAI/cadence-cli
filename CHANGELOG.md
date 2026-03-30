@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.3.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.5...v2.3.6) (2026-03-30)
+
+
+### Bug Fixes
+
+* **locking:** report long waits for activity lock ([b23d46a](https://github.com/TeamCadenceAI/cadence-cli/commit/b23d46a99c7cef0f3e70f98683a8dc5140feb67f))
+* **locking:** report long waits for activity lock ([39848df](https://github.com/TeamCadenceAI/cadence-cli/commit/39848dfed13a0a182d4622064df8f5ecfcfe1cf2))
+* **monitor:** skip Warp discovery during background ticks ([b9d37c8](https://github.com/TeamCadenceAI/cadence-cli/commit/b9d37c811545e4bfba3e52b6477afb1f29b9b8b4))
+* **monitor:** skip Warp discovery during background ticks ([4bc96e1](https://github.com/TeamCadenceAI/cadence-cli/commit/4bc96e17f599cad57d6d063a93aa2b1172a3add6))
+
 ## [2.3.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.4...v2.3.5) (2026-03-30)
 
 
