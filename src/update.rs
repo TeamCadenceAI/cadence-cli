@@ -76,6 +76,7 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 /// Retry backoff defaults.
 const UPDATE_RETRY_BASE_SECS: u64 = 60;
 const UPDATE_RETRY_MAX_SECS: u64 = 8 * 60 * 60;
+const UPDATE_DISCOVERY_RECHECK_SECS: u64 = 5 * 60;
 const UPDATER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UPDATER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
@@ -832,6 +833,16 @@ fn retry_delay_secs(failures: u32) -> u64 {
     capped.saturating_add(jitter)
 }
 
+fn release_discovery_due_while_backing_off(state: &UpdaterState, now_epoch_secs: i64) -> bool {
+    let Some(last_check_at) = state.last_check_at.as_deref() else {
+        return true;
+    };
+    let Some(last_check_epoch) = parse_rfc3339_to_epoch(last_check_at) else {
+        return true;
+    };
+    now_epoch_secs >= last_check_epoch.saturating_add(UPDATE_DISCOVERY_RECHECK_SECS as i64)
+}
+
 fn is_stable_release_tag(tag: &str) -> bool {
     let normalized = normalize_version_tag(tag);
     semver::Version::parse(normalized)
@@ -847,6 +858,19 @@ fn update_due_for_retry(state: &UpdaterState, now_epoch_secs: i64) -> bool {
         return true;
     };
     now_epoch_secs >= retry_epoch
+}
+
+fn should_attempt_background_update_check(state: &UpdaterState, now_epoch_secs: i64) -> bool {
+    update_due_for_retry(state, now_epoch_secs)
+        || release_discovery_due_while_backing_off(state, now_epoch_secs)
+}
+
+fn newly_seen_release_should_bypass_backoff(
+    previous_last_seen_version: Option<&str>,
+    latest_release_version: &str,
+) -> bool {
+    previous_last_seen_version.map(normalize_version_tag)
+        != Some(normalize_version_tag(latest_release_version))
 }
 
 // ---------------------------------------------------------------------------
@@ -1881,6 +1905,54 @@ async fn record_helper_result(manifest: &UpdateInstallManifest, result: &Result<
     save_updater_state(&state).await
 }
 
+pub async fn reconcile_updater_state_with_bootstrapped_version(
+    bootstrapped_version: &str,
+) -> Result<bool> {
+    let mut state = load_updater_state().await.unwrap_or_default();
+    let normalized_current = normalize_version_tag(bootstrapped_version).to_string();
+    let seen_matches_current = state
+        .last_seen_version
+        .as_deref()
+        .map(normalize_version_tag)
+        == Some(normalized_current.as_str());
+    let seen_is_older_or_missing = state
+        .last_seen_version
+        .as_deref()
+        .map(|seen| compare_versions(seen, &normalized_current))
+        .transpose()?
+        .is_none_or(|ordering| ordering != Ordering::Greater);
+    let installed_matches_current = state
+        .last_installed_version
+        .as_deref()
+        .map(normalize_version_tag)
+        == Some(normalized_current.as_str());
+
+    if installed_matches_current
+        && state.consecutive_failures == 0
+        && state.last_error.is_none()
+        && state.next_retry_after.is_none()
+    {
+        return Ok(false);
+    }
+
+    if !seen_matches_current && !seen_is_older_or_missing {
+        return Ok(false);
+    }
+
+    let now = state_files::now_rfc3339();
+    state.last_success_at = Some(now.clone());
+    state.last_installed_version = Some(normalized_current.clone());
+    if seen_is_older_or_missing {
+        state.last_seen_version = Some(normalized_current);
+    }
+    state.consecutive_failures = 0;
+    state.last_error = None;
+    state.next_retry_after = None;
+    state.last_attempt_at.get_or_insert(now);
+    save_updater_state(&state).await?;
+    Ok(true)
+}
+
 async fn run_updater_helper_with_manifest(manifest: &UpdateInstallManifest) -> Result<()> {
     ::tracing::info!(
         event = "updater_helper_start",
@@ -2317,13 +2389,15 @@ pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
         }
     }
 
+    let now_epoch_secs = now_epoch();
     let mut state = load_updater_state().await.unwrap_or_default();
-    if !update_due_for_retry(&state, now_epoch()) {
+    if !should_attempt_background_update_check(&state, now_epoch_secs) {
         return Ok(());
     }
 
     let now = state_files::now_rfc3339();
-    state.last_attempt_at = Some(now.clone());
+    let retry_due = update_due_for_retry(&state, now_epoch_secs);
+    let previous_last_seen_version = state.last_seen_version.clone();
 
     let release = match check_latest_version().await {
         Ok(r) => r,
@@ -2331,7 +2405,7 @@ pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
             state.last_check_at = Some(now.clone());
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             state.last_error = Some(format!("{e:#}"));
-            let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
+            let retry_at = now_epoch_secs.saturating_add(retry_delay_from_state(&state) as i64);
             state.next_retry_after = format_epoch_rfc3339(retry_at);
             save_updater_state(&state).await?;
             return Ok(());
@@ -2339,18 +2413,32 @@ pub async fn run_background_auto_update_for_monitor_tick() -> Result<()> {
     };
 
     state.last_check_at = Some(now.clone());
-    state.last_seen_version = Some(normalize_version_tag(&release.tag_name).to_string());
+    let normalized_release_version = normalize_version_tag(&release.tag_name).to_string();
+    state.last_seen_version = Some(normalized_release_version.clone());
 
     if !is_stable_release_tag(&release.tag_name) {
         state.last_error =
             Some("latest release is not stable; waiting for stable release".to_string());
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        let retry_at = now_epoch().saturating_add(retry_delay_from_state(&state) as i64);
+        let retry_at = now_epoch_secs.saturating_add(retry_delay_from_state(&state) as i64);
         state.next_retry_after = format_epoch_rfc3339(retry_at);
         save_updater_state(&state).await?;
         return Ok(());
     }
 
+    let newer_stable_release_breaks_backoff = !retry_due
+        && compare_versions(current_version(), &normalized_release_version)? == Ordering::Less
+        && newly_seen_release_should_bypass_backoff(
+            previous_last_seen_version.as_deref(),
+            &normalized_release_version,
+        );
+
+    if !retry_due && !newer_stable_release_breaks_backoff {
+        save_updater_state(&state).await?;
+        return Ok(());
+    }
+
+    state.last_attempt_at = Some(now.clone());
     save_updater_state(&state).await?;
 
     let attempt_result = run_update_install_from_url_mode(
@@ -4087,6 +4175,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_discovery_due_while_backing_off_respects_recent_last_check() {
+        let recent = format_epoch_rfc3339(now_epoch() - 60).unwrap();
+        let state = UpdaterState {
+            last_check_at: Some(recent),
+            next_retry_after: format_epoch_rfc3339(now_epoch() + 600),
+            ..UpdaterState::default()
+        };
+        assert!(!release_discovery_due_while_backing_off(
+            &state,
+            now_epoch()
+        ));
+    }
+
+    #[tokio::test]
+    async fn should_attempt_background_update_check_rechecks_latest_before_retry_when_stale() {
+        let stale =
+            format_epoch_rfc3339(now_epoch() - (UPDATE_DISCOVERY_RECHECK_SECS as i64 + 5)).unwrap();
+        let state = UpdaterState {
+            last_check_at: Some(stale),
+            next_retry_after: format_epoch_rfc3339(now_epoch() + 600),
+            ..UpdaterState::default()
+        };
+        assert!(should_attempt_background_update_check(&state, now_epoch()));
+    }
+
+    #[test]
+    fn newly_seen_release_should_bypass_backoff_only_for_changed_latest_version() {
+        assert!(newly_seen_release_should_bypass_backoff(
+            Some("2.3.2"),
+            "2.3.3"
+        ));
+        assert!(!newly_seen_release_should_bypass_backoff(
+            Some("v2.3.3"),
+            "2.3.3"
+        ));
+    }
+
+    #[tokio::test]
     async fn updater_health_covers_never_run_retrying_and_disabled() {
         let disabled = derive_updater_health(false, &UpdaterState::default());
         assert_eq!(disabled.state, UpdaterHealthState::Disabled);
@@ -4134,6 +4260,87 @@ mod tests {
                 .is_some_and(|value| value.contains("runtime bootstrap automatically"))
         );
         assert!(state.next_retry_after.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_updater_state_with_bootstrapped_version_repairs_stale_failed_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        save_updater_state(&UpdaterState {
+            last_check_at: Some("2026-03-30T00:59:12Z".to_string()),
+            last_attempt_at: Some("2026-03-30T00:59:12Z".to_string()),
+            last_seen_version: Some("2.3.3".to_string()),
+            last_installed_version: Some("2.2.6".to_string()),
+            consecutive_failures: 7,
+            next_retry_after: Some("2026-03-30T02:08:56Z".to_string()),
+            last_error: Some(
+                "cadence updated, but the new version could not finish runtime bootstrap automatically"
+                    .to_string(),
+            ),
+            ..UpdaterState::default()
+        })
+        .await
+        .expect("seed updater state");
+
+        let changed = reconcile_updater_state_with_bootstrapped_version("2.3.3")
+            .await
+            .expect("repair updater state");
+        assert!(changed, "expected stale updater state to be repaired");
+
+        let state = load_updater_state()
+            .await
+            .expect("load repaired updater state");
+        assert_eq!(state.last_seen_version.as_deref(), Some("2.3.3"));
+        assert_eq!(state.last_installed_version.as_deref(), Some("2.3.3"));
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.last_error, None);
+        assert_eq!(state.next_retry_after, None);
+        assert!(state.last_success_at.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_updater_state_with_bootstrapped_version_preserves_newer_seen_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+
+        let seeded = UpdaterState {
+            last_check_at: Some("2026-03-30T00:59:12Z".to_string()),
+            last_attempt_at: Some("2026-03-30T00:59:12Z".to_string()),
+            last_seen_version: Some("2.3.4".to_string()),
+            last_installed_version: Some("2.3.3".to_string()),
+            consecutive_failures: 2,
+            next_retry_after: Some("2026-03-30T02:08:56Z".to_string()),
+            last_error: Some("HTTP 404".to_string()),
+            ..UpdaterState::default()
+        };
+        save_updater_state(&seeded)
+            .await
+            .expect("seed updater state");
+
+        let changed = reconcile_updater_state_with_bootstrapped_version("2.3.3")
+            .await
+            .expect("attempt updater-state reconciliation");
+        assert!(
+            !changed,
+            "should not clobber updater state for a newer seen release"
+        );
+
+        let state = load_updater_state()
+            .await
+            .expect("load unreconciled updater state");
+        assert_eq!(state.last_seen_version.as_deref(), Some("2.3.4"));
+        assert_eq!(state.last_installed_version.as_deref(), Some("2.3.3"));
+        assert_eq!(state.consecutive_failures, 2);
+        assert_eq!(
+            state.next_retry_after.as_deref(),
+            Some("2026-03-30T02:08:56Z")
+        );
+        assert_eq!(state.last_error.as_deref(), Some("HTTP 404"));
     }
 
     #[tokio::test]
