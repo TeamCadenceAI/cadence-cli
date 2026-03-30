@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.3...v2.3.4) (2026-03-30)
+
+
+### Bug Fixes
+
+* **update:** heal updater state after successful bootstrap ([7a73045](https://github.com/TeamCadenceAI/cadence-cli/commit/7a73045a4e92caf311556b118a766136920ee4e8))
+* **update:** heal updater state after successful bootstrap ([47058b7](https://github.com/TeamCadenceAI/cadence-cli/commit/47058b75f516254cfbe5ba18907cd1b950a9bb9c))
+
 ## [2.3.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.2...v2.3.3) (2026-03-30)
 
 
