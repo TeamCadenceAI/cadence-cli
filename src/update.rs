@@ -66,6 +66,7 @@ const ACTIVITY_LOCK_FILE: &str = "global-activity.lock";
 const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
 const ACTIVITY_LOCK_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ACTIVITY_LOCK_WAIT_NOTICE_AFTER: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ACTIVITY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
@@ -768,6 +769,7 @@ async fn acquire_activity_lock_blocking_with_timeout(
     }
     let record = activity_lock_record(purpose);
     let started_at = tokio::time::Instant::now();
+    let mut wait_notice_emitted = false;
     loop {
         if fail_if_update_in_progress
             && !update_in_progress_bypass_enabled()
@@ -785,6 +787,11 @@ async fn acquire_activity_lock_blocking_with_timeout(
         }
         clear_stale_activity_lock(&lock_path).await?;
         let elapsed = started_at.elapsed();
+        if !wait_notice_emitted && elapsed >= ACTIVITY_LOCK_WAIT_NOTICE_AFTER {
+            let holder = read_activity_lock_record(&lock_path).await?;
+            emit_activity_lock_wait_notice(purpose, holder.as_ref(), elapsed, timeout);
+            wait_notice_emitted = true;
+        }
         if elapsed >= timeout {
             bail!(
                 "timed out waiting for global activity lock after {:?} ({purpose})",
@@ -794,6 +801,47 @@ async fn acquire_activity_lock_blocking_with_timeout(
         let remaining = timeout.saturating_sub(elapsed);
         tokio::time::sleep(remaining.min(ACTIVITY_LOCK_POLL_INTERVAL)).await;
     }
+}
+
+fn emit_activity_lock_wait_notice(
+    waiting_purpose: &str,
+    holder: Option<&ActivityLockRecord>,
+    waited: Duration,
+    timeout: Duration,
+) {
+    let lines = activity_lock_wait_notice_lines(waiting_purpose, holder, waited, timeout);
+    if let Some((headline, details)) = lines.split_first() {
+        eprintln!("Note {headline}");
+        for detail in details {
+            eprintln!("  {detail}");
+        }
+    }
+}
+
+fn activity_lock_wait_notice_lines(
+    waiting_purpose: &str,
+    holder: Option<&ActivityLockRecord>,
+    waited: Duration,
+    timeout: Duration,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Waiting for the Cadence global activity lock before continuing ({waiting_purpose})."
+    )];
+    if let Some(holder) = holder {
+        let held_for_secs = now_epoch().saturating_sub(holder.created_at_epoch).max(0);
+        lines.push(format!(
+            "Lock owner: purpose={}, pid={}, host={}, held_for={}s",
+            holder.purpose, holder.pid, holder.hostname, held_for_secs
+        ));
+    } else {
+        lines.push("Lock owner: unavailable.".to_string());
+    }
+    lines.push(format!(
+        "Cadence has been waiting for {:.1}s and will keep trying for up to {:.1}s total.",
+        waited.as_secs_f32(),
+        timeout.as_secs_f32()
+    ));
+    lines
 }
 
 pub async fn acquire_command_activity_lock(purpose: &str) -> Result<ActivityLockGuard> {
@@ -4887,6 +4935,73 @@ mod tests {
         );
 
         child.wait().await.expect("wait holder child");
+    }
+
+    #[test]
+    fn activity_lock_wait_notice_lines_include_holder_details() {
+        let holder = ActivityLockRecord {
+            pid: 12345,
+            process_started_at_epoch: Some(42),
+            created_at_epoch: now_epoch() - 12,
+            hostname: "test-host".to_string(),
+            purpose: "monitor".to_string(),
+        };
+
+        let lines = activity_lock_wait_notice_lines(
+            "backfill",
+            Some(&holder),
+            Duration::from_secs(6),
+            Duration::from_secs(300),
+        );
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("Waiting for the Cadence global activity lock before continuing (backfill).")
+        );
+        assert!(
+            lines[1].contains("purpose=monitor"),
+            "missing purpose in holder detail: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("pid=12345"),
+            "missing pid in holder detail: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("host=test-host"),
+            "missing host in holder detail: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("held_for="),
+            "missing held-for detail: {}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[2],
+            "Cadence has been waiting for 6.0s and will keep trying for up to 300.0s total."
+        );
+    }
+
+    #[test]
+    fn activity_lock_wait_notice_lines_handle_missing_holder() {
+        let lines = activity_lock_wait_notice_lines(
+            "status",
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+        );
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("Waiting for the Cadence global activity lock before continuing (status).")
+        );
+        assert_eq!(lines[1], "Lock owner: unavailable.");
+        assert_eq!(
+            lines[2],
+            "Cadence has been waiting for 5.0s and will keep trying for up to 300.0s total."
+        );
     }
 
     #[tokio::test]
