@@ -49,6 +49,9 @@ fn error_chain_messages(err: &anyhow::Error) -> Vec<String> {
 }
 
 fn report_error(err: &anyhow::Error) {
+    if err.downcast_ref::<AlreadyReportedCliError>().is_some() {
+        return;
+    }
     let mut messages = error_chain_messages(err).into_iter();
     match messages.next() {
         Some(first) => {
@@ -63,6 +66,17 @@ fn report_error(err: &anyhow::Error) {
         None => output::fail("Failed", "unknown error"),
     }
 }
+
+#[derive(Debug)]
+struct AlreadyReportedCliError;
+
+impl std::fmt::Display for AlreadyReportedCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("already reported")
+    }
+}
+
+impl std::error::Error for AlreadyReportedCliError {}
 
 /// Cadence CLI: upload AI coding agent sessions directly to Cadence.
 ///
@@ -896,6 +910,42 @@ fn backfill_auth_message(
     }
 }
 
+fn render_boxed_message(lines: &[String]) -> String {
+    let width = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    let border = "*".repeat(width + 4);
+    let mut rendered = String::new();
+    rendered.push_str(&border);
+    rendered.push('\n');
+    for line in lines {
+        rendered.push_str(&format!("* {:width$} *\n", line, width = width));
+    }
+    rendered.push_str(&border);
+    rendered
+}
+
+fn backfill_auth_required_box(state: &upload::PublicationAuthState) -> Option<String> {
+    let auth_line = match state {
+        upload::PublicationAuthState::MissingToken => "Cadence login is missing.",
+        upload::PublicationAuthState::Rejected => "Cadence login was rejected by the server.",
+        _ => return None,
+    };
+
+    Some(render_boxed_message(&[
+        "MANUAL ACTION REQUIRED".to_string(),
+        String::new(),
+        auth_line.to_string(),
+        String::new(),
+        "Cadence cannot publish sessions or finish recovery until".to_string(),
+        "you log in again.".to_string(),
+        String::new(),
+        "Run now:".to_string(),
+        "  cadence login".to_string(),
+        String::new(),
+        "After logging in, recover recent sessions with:".to_string(),
+        "  cadence backfill --since 30d".to_string(),
+    ]))
+}
+
 async fn process_repo_backfill(
     repo_display: String,
     sessions: Vec<SessionInfo>,
@@ -1157,6 +1207,13 @@ async fn run_backfill_inner_with_invocation(
             state = publication_auth.detail(),
             message
         );
+        if let Some(boxed) = backfill_auth_required_box(&publication_auth) {
+            eprintln!("{boxed}");
+            return match invocation {
+                BackfillInvocation::Manual => Err(anyhow::Error::new(AlreadyReportedCliError)),
+                BackfillInvocation::RecoveryBootstrap => Ok(BackfillOutcome::SkippedAuth),
+            };
+        }
         match invocation {
             BackfillInvocation::Manual => {
                 output::fail("Backfill", &message);
@@ -4524,7 +4581,7 @@ mod tests {
             .await
             .expect_err("manual backfill should fail");
 
-        assert!(err.to_string().contains("cadence login"));
+        assert!(err.downcast_ref::<AlreadyReportedCliError>().is_some());
         assert_eq!(
             upload::pending_upload_count().await.expect("pending count"),
             1
@@ -4538,6 +4595,23 @@ mod tests {
                 user_org_requests: 1,
             }
         );
+    }
+
+    #[test]
+    fn backfill_auth_required_box_includes_login_and_30d_recovery_inside_border() {
+        let rendered = backfill_auth_required_box(&upload::PublicationAuthState::Rejected)
+            .expect("rejected auth should render action box");
+
+        assert!(rendered.contains("MANUAL ACTION REQUIRED"));
+        assert!(rendered.contains("Cadence login was rejected by the server."));
+        assert!(rendered.contains("  cadence login"));
+        assert!(rendered.contains("  cadence backfill --since 30d"));
+
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines.len() > 3, "expected multi-line boxed message");
+        let border = lines.first().expect("first border line");
+        assert!(border.chars().all(|ch| ch == '*'));
+        assert_eq!(lines.last().expect("last border line"), border);
     }
 
     #[tokio::test]
