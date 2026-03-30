@@ -71,7 +71,9 @@ async fn pick_artifact_for_all_release_targets() {
 
     let assets: Vec<ReleaseAsset> = [
         "cadence-cli-aarch64-apple-darwin.zip",
+        "cadence-cli-aarch64-apple-darwin.tar.gz",
         "cadence-cli-x86_64-apple-darwin.zip",
+        "cadence-cli-x86_64-apple-darwin.tar.gz",
         "cadence-cli-x86_64-unknown-linux-gnu.tar.gz",
         "cadence-cli-aarch64-unknown-linux-gnu.tar.gz",
         "cadence-cli-x86_64-pc-windows-msvc.zip",
@@ -466,5 +468,26 @@ async fn build_release_from_tag_includes_checksums() {
         result.is_ok(),
         "build_release_from_tag should include checksums asset: {:?}",
         result.err()
+    );
+}
+
+#[tokio::test]
+async fn build_release_from_tag_includes_legacy_macos_tarball_assets() {
+    use cadence_cli::update::build_release_from_tag;
+
+    let release = build_release_from_tag("v1.0.0", "https://github.com/Org/Repo");
+    let asset_names: Vec<_> = release
+        .assets
+        .iter()
+        .map(|asset| asset.name.as_str())
+        .collect();
+
+    assert!(
+        asset_names.contains(&"cadence-cli-aarch64-apple-darwin.tar.gz"),
+        "release should include the legacy macOS arm64 tarball asset"
+    );
+    assert!(
+        asset_names.contains(&"cadence-cli-x86_64-apple-darwin.tar.gz"),
+        "release should include the legacy macOS x86_64 tarball asset"
     );
 }
