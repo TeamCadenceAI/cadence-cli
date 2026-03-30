@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.2...v2.3.3) (2026-03-30)
+
+
+### Bug Fixes
+
+* **update:** support both macos release archive formats ([7b18b3e](https://github.com/TeamCadenceAI/cadence-cli/commit/7b18b3e977b47f7d0667b3a8522ad393e5732a64))
+* **update:** support both macos release archive formats ([5ad817b](https://github.com/TeamCadenceAI/cadence-cli/commit/5ad817b71591041c3f811aed39ca48c6fa8ff573))
+
 ## [2.3.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.1...v2.3.2) (2026-03-29)
 
 
