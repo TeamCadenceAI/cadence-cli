@@ -313,6 +313,7 @@ pub(crate) async fn maybe_run_current_version_bootstrap(
     }
 
     write_version_bootstrap_marker(&marker_path, current_version).await?;
+    let _ = update::reconcile_updater_state_with_bootstrapped_version(current_version).await?;
 
     if outcome.performed_recovery_backfill {
         output::detail(&format!(
@@ -534,6 +535,8 @@ pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: boo
     }
 
     mark_current_version_bootstrap_complete().await?;
+    let _ = update::reconcile_updater_state_with_bootstrapped_version(update::current_version())
+        .await?;
 
     println!();
     output::success("Install", "complete");
