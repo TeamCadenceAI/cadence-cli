@@ -1,4 +1,4 @@
-//! Integration tests for `cadence update` self-replace flow.
+//! Integration tests for `cadence update` archive and helper payload handling.
 //!
 //! These tests exercise artifact selection, checksum verification, archive
 //! extraction, and the full update install flow using local HTTP servers
@@ -70,7 +70,9 @@ async fn pick_artifact_for_all_release_targets() {
     use cadence_cli::update::{ReleaseAsset, pick_artifact_for_target};
 
     let assets: Vec<ReleaseAsset> = [
+        "cadence-cli-aarch64-apple-darwin.zip",
         "cadence-cli-aarch64-apple-darwin.tar.gz",
+        "cadence-cli-x86_64-apple-darwin.zip",
         "cadence-cli-x86_64-apple-darwin.tar.gz",
         "cadence-cli-x86_64-unknown-linux-gnu.tar.gz",
         "cadence-cli-aarch64-unknown-linux-gnu.tar.gz",
@@ -211,6 +213,17 @@ async fn extract_tar_gz_integration() {
     use cadence_cli::update::extract_binary;
 
     let tmp = tempfile::tempdir().unwrap();
+    let target = cadence_cli::update::build_target();
+    let cadence_name = if target.contains("windows") {
+        "cadence.exe"
+    } else {
+        "cadence"
+    };
+    let updater_name = if target.contains("windows") {
+        "cadence-updater.exe"
+    } else {
+        "cadence-updater"
+    };
 
     // Build a tar.gz containing a "cadence" binary
     let archive_path = tmp.path().join("cadence-cli-test.tar.gz");
@@ -227,7 +240,16 @@ async fn extract_tar_gz_integration() {
             header.set_mode(0o755);
             header.set_cksum();
             tar_builder
-                .append_data(&mut header, "cadence", &content[..])
+                .append_data(&mut header, cadence_name, &content[..])
+                .unwrap();
+
+            let updater_content = b"#!/bin/sh\necho updater binary\n";
+            let mut updater_header = tar::Header::new_gnu();
+            updater_header.set_size(updater_content.len() as u64);
+            updater_header.set_mode(0o755);
+            updater_header.set_cksum();
+            tar_builder
+                .append_data(&mut updater_header, updater_name, &updater_content[..])
                 .unwrap();
             tar_builder.finish().unwrap();
         })
@@ -240,7 +262,7 @@ async fn extract_tar_gz_integration() {
 
     let binary_path = extract_binary(&archive_path, &extract_dir).await.unwrap();
     assert!(binary_path.exists());
-    assert_eq!(binary_path.file_name().unwrap(), "cadence");
+    assert_eq!(binary_path.file_name().unwrap(), cadence_name);
 
     let content = tokio::fs::read_to_string(&binary_path).await.unwrap();
     assert!(content.contains("echo test binary"));
@@ -251,6 +273,17 @@ async fn extract_zip_integration() {
     use cadence_cli::update::extract_binary;
 
     let tmp = tempfile::tempdir().unwrap();
+    let target = cadence_cli::update::build_target();
+    let cadence_name = if target.contains("windows") {
+        "cadence.exe"
+    } else {
+        "cadence"
+    };
+    let updater_name = if target.contains("windows") {
+        "cadence-updater.exe"
+    } else {
+        "cadence-updater"
+    };
 
     let archive_path = tmp.path().join("cadence-cli-test.zip");
     {
@@ -260,8 +293,10 @@ async fn extract_zip_integration() {
             let mut zip_writer = zip::ZipWriter::new(std_file);
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            zip_writer.start_file("cadence.exe", options).unwrap();
+            zip_writer.start_file(cadence_name, options).unwrap();
             zip_writer.write_all(b"MZ fake exe content").unwrap();
+            zip_writer.start_file(updater_name, options).unwrap();
+            zip_writer.write_all(b"MZ fake updater content").unwrap();
             zip_writer.finish().unwrap();
         })
         .await
@@ -273,7 +308,7 @@ async fn extract_zip_integration() {
 
     let binary_path = extract_binary(&archive_path, &extract_dir).await.unwrap();
     assert!(binary_path.exists());
-    assert_eq!(binary_path.file_name().unwrap(), "cadence.exe");
+    assert_eq!(binary_path.file_name().unwrap(), cadence_name);
 }
 
 // ---------------------------------------------------------------------------
@@ -331,14 +366,14 @@ async fn update_check_flag_still_works() {
 
 #[tokio::test]
 async fn confirm_update_yes_flag_bypasses_prompt() {
-    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true, None).unwrap();
+    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true).unwrap();
     assert!(result, "--yes should always confirm");
 }
 
 #[tokio::test]
-async fn confirm_update_with_auto_override() {
-    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true, Some(true)).unwrap();
-    assert!(result, "--yes with auto_update should confirm");
+async fn confirm_update_yes_flag_remains_sufficient() {
+    let result = cadence_cli::update::confirm_update("0.2.1", "0.3.0", true).unwrap();
+    assert!(result, "--yes should remain sufficient");
 }
 
 // ---------------------------------------------------------------------------
@@ -433,5 +468,26 @@ async fn build_release_from_tag_includes_checksums() {
         result.is_ok(),
         "build_release_from_tag should include checksums asset: {:?}",
         result.err()
+    );
+}
+
+#[tokio::test]
+async fn build_release_from_tag_includes_legacy_macos_tarball_assets() {
+    use cadence_cli::update::build_release_from_tag;
+
+    let release = build_release_from_tag("v1.0.0", "https://github.com/Org/Repo");
+    let asset_names: Vec<_> = release
+        .assets
+        .iter()
+        .map(|asset| asset.name.as_str())
+        .collect();
+
+    assert!(
+        asset_names.contains(&"cadence-cli-aarch64-apple-darwin.tar.gz"),
+        "release should include the legacy macOS arm64 tarball asset"
+    );
+    assert!(
+        asset_names.contains(&"cadence-cli-x86_64-apple-darwin.tar.gz"),
+        "release should include the legacy macOS x86_64 tarball asset"
     );
 }

@@ -240,8 +240,8 @@ async fn check_constructs_assets_for_all_platforms() {
         .await
         .unwrap();
     assert_eq!(release.tag_name, "v99.0.0");
-    // 6 platform artifacts + 1 checksums file
-    assert_eq!(release.assets.len(), 7);
+    // 6 canonical platform assets + 2 legacy macOS tarballs + 1 checksums file
+    assert_eq!(release.assets.len(), 9);
 
     // Verify download URLs are constructed correctly
     let checksums = release

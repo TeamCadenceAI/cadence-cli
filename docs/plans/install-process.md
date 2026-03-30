@@ -2,228 +2,196 @@
 
 ## Synopsis
 
-```
+```sh
 cadence install [--org <GITHUB_ORG>]
 ```
 
-| Flag    | Description                                          |
-| ------- | ---------------------------------------------------- |
-| `--org` | Optional GitHub org filter; only track repos in this org |
+| Flag | Description |
+| --- | --- |
+| `--org` | Optional GitHub org filter; only upload sessions for repos in this org |
 
-## `install.sh` — Shell wrapper
+## Current Behavior
 
-The `install.sh` script downloads the latest release binary and runs `cadence install`. It accepts an optional org argument:
+`cadence install` is Cadence's idempotent bootstrap command. It enables or
+repairs the background runtime, and it does not install or refresh Git hooks.
+
+High-level responsibilities:
+
+1. clean up legacy Cadence-managed hook ownership where safe
+2. persist the optional org filter
+3. determine the desired monitor state
+4. reconcile the OS-native scheduler that runs `cadence monitor tick`
+5. run a recovery backfill when monitoring is enabled
+6. record that the current Cadence version completed bootstrap
+
+Monitor-state rules:
+
+- normal `cadence install` enables monitoring by default
+- internal post-update bootstrap uses the hidden
+  `--preserve-disable-state` flag so an explicit `cadence monitor disable`
+  choice survives updates
+- unattended updates follow monitor state; there is no separate
+  `auto_update` policy toggle
+
+## `install.sh` Wrapper
+
+The shell installer downloads the latest release and runs `cadence install`.
+An optional org argument is forwarded to `cadence install --org <ORG>`.
+
+Self-update follows the same bootstrap model:
+
+- `cadence update` replaces the binary
+- the updater immediately launches the new version and runs
+  `cadence install --preserve-disable-state`
+- if that handoff does not happen, the next normal CLI invocation performs the
+  same once-per-version bootstrap automatically
 
 ```sh
-# Without org
 curl -sSf https://raw.githubusercontent.com/TeamCadenceAI/cadence-cli/main/install.sh | sh
-
-# With org
 curl -sSf https://raw.githubusercontent.com/TeamCadenceAI/cadence-cli/main/install.sh | sh -s -- MyOrg
 ```
 
-When an org is provided, the script prints a confirmation before running setup:
+## Step-by-step Walkthrough
 
-```
-Installing for org: MyOrg
-```
+### Step 1 — Clean Up Legacy Cadence Hook Ownership
 
-The org argument is forwarded to `cadence install --org <ORG>`.
+Cadence checks `~/.git-hooks` and the global `core.hooksPath` only to clean up
+old Cadence-managed installs. It does not claim hook ownership for new
+installs.
 
-**Source:** [`install.sh:76-85`](../install.sh#L76-L85)
+Cleanup rules:
 
-## Step-by-step walkthrough
+- remove Cadence-managed `post-commit` and legacy `pre-push` hooks
+- restore `post-commit.pre-cadence` when it exists
+- leave non-Cadence hook files untouched
+- unset global `core.hooksPath` only if it still points to the Cadence-owned
+  hooks directory and no preserved user hooks remain there
 
-### Step 1 — Set global `core.hooksPath`
+Repo-local `core.hooksPath` and non-Cadence hook layouts are left alone.
 
-```
-git config --global core.hooksPath ~/.git-hooks
-```
+### Step 2 — Persist Org Filter
 
-Configures Git to look for hooks in `~/.git-hooks/` instead of each repository's `.git/hooks/` directory. This is the mechanism that lets a single hook installation cover every repository on the machine.
-
-**Source:** [`main.rs:332-344`](../src/main.rs#L332-L344)
-
----
-
-### Step 2 — Create `~/.git-hooks/` directory
-
-If `~/.git-hooks/` does not already exist, it is created (including any missing parent directories).
-
-**Source:** [`main.rs:346-365`](../src/main.rs#L346-L365)
-
----
-
-### Step 3 — Write post-commit hook shim
-
-A lightweight shell script is written to `~/.git-hooks/post-commit`:
+If `--org <ORG>` is provided, install writes:
 
 ```sh
-#!/bin/sh
-exec cadence hook post-commit
-```
-
-The shim delegates all work to `cadence hook post-commit`, which scans for AI agent session logs and attaches them to the commit via git notes.
-
-**Existing hook handling:**
-
-| Scenario | Action |
-| --- | --- |
-| No existing hook | Write new shim |
-| Existing hook is a Cadence hook | Overwrite (update in place) |
-| Existing hook is **not** a Cadence hook | Back up to `~/.git-hooks/post-commit.pre-cadence`, then overwrite |
-| Existing hook is unreadable | Overwrite with a warning |
-
-**Source:** [`main.rs:367-457`](../src/main.rs#L367-L457), [`main.rs:226-228`](../src/main.rs#L226-L228)
-
----
-
-### Step 4 — Make hook executable
-
-On Unix systems (macOS / Linux), the shim is set to mode `0755` so Git can execute it.
-
-**Source:** [`main.rs:425-445`](../src/main.rs#L425-L445)
-
----
-
-### Step 5 — Clean up legacy pre-push hook
-
-Cadence previously used a `pre-push` hook. If `~/.git-hooks/pre-push` exists and contains Cadence content, it is removed. Non-Cadence pre-push hooks are left untouched.
-
-**Source:** [`main.rs:459-501`](../src/main.rs#L459-L501)
-
----
-
-### Step 6 — Persist org filter (conditional)
-
-Only runs if `--org <ORG>` was passed:
-
-```
 git config --global ai.cadence.org <ORG>
 ```
 
-The post-commit hook later reads this value to decide whether to process a repository (only repos whose remote matches the configured org are tracked).
+The monitor later uses this global org filter during session eligibility checks.
 
-**Source:** [`main.rs:268-279`](../src/main.rs#L268-L279)
+### Step 3 — Show Monitor / Update Disclosure
 
----
+In interactive terminals, install prints the current product model:
 
-### Step 7 — Auto-update preference (first-time experience)
+- background monitoring runs without owning Git hooks
+- monitor lifecycle lives under `cadence monitor ...`
+- unattended stable-channel updates run inside the monitor runtime whenever
+  monitoring is enabled
 
-Only runs in interactive terminals (both stdout and stderr are TTYs). Skipped silently in CI or piped contexts.
+This is informational only; non-interactive installs skip the disclosure.
 
-| User state | Behavior |
-| --- | --- |
-| First-time user (`auto_update` not set) | Enables auto-update by default; shows disclosure; saves `auto_update = true` to `~/.cadence/cli/config.toml` |
-| `auto_update = true` already set | Shows disclosure message only |
-| `auto_update = false` | Skipped entirely |
+### Step 4 — Determine Monitor State And Reconcile Scheduler
 
-Disclosure message:
+Install determines whether monitoring should be enabled, then provisions or
+removes OS-native scheduler artifacts for `cadence monitor tick`.
 
-> Cadence enables unattended background updates by default (stable channel only, no prompts).
-> Disable anytime: `cadence auto-update disable`
-> Remove scheduler artifacts: `cadence auto-update uninstall`
+State rules:
 
-**Source:** [`main.rs:2567-2664`](../src/main.rs#L2567-L2664)
+- a user-invoked `cadence install` enables monitoring
+- an internal `cadence install --preserve-disable-state` keeps an explicitly
+  disabled monitor disabled
+- if no prior monitor state exists, bootstrap enables monitoring
 
----
+Cadence:
 
-### Step 8 — Reconcile auto-update scheduler
+- runs every 30 seconds on macOS and Linux
+- runs every 60 seconds on Windows
 
-Provisions a platform-specific scheduler so Cadence can self-update in the background (every 8 hours with a 30-minute random delay).
+Platform artifacts:
 
-#### macOS — LaunchAgent
+- macOS: `~/Library/LaunchAgents/ai.teamcadence.cadence.monitor.plist`
+- Linux: `~/.config/systemd/user/cadence-monitor.service` and
+  `~/.config/systemd/user/cadence-monitor.timer`
+- Windows: Task Scheduler task `Cadence CLI Monitor`
 
-Creates `~/Library/LaunchAgents/ai.teamcadence.cadence.autoupdate.plist` and loads it:
+The scheduler is monitor-owned. Auto-update no longer provisions a separate
+scheduler.
 
-```
-launchctl bootout gui/<uid>/ai.teamcadence.cadence.autoupdate   # unload if present
-launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/…plist      # load
-launchctl enable gui/<uid>/ai.teamcadence.cadence.autoupdate     # enable
-```
+### Step 5 — Run Recovery Backfill And Mark Version Bootstrap
 
-Key plist settings:
-- `RunAtLoad: true`
-- `StartInterval: 28800` (8 hours)
-- `RandomDelay: 1800` (30 minutes)
+When monitoring is enabled, install runs a best-effort:
 
-#### Linux — systemd user timer
-
-Creates two files:
-- `~/.config/systemd/user/cadence-autoupdate.service` (oneshot, runs `cadence hook auto-update`)
-- `~/.config/systemd/user/cadence-autoupdate.timer` (`OnBootSec=5m`, `OnUnitActiveSec=8h`, `RandomizedDelaySec=30m`)
-
-Then runs:
-```
-systemctl --user daemon-reload
-systemctl --user enable --now cadence-autoupdate.timer
+```sh
+cadence backfill --since 7d
 ```
 
-#### Windows — Task Scheduler
+This recovers recent local sessions after fresh install or version migration.
 
-```
-schtasks /Create /F /SC HOURLY /MO 8 /TN "Cadence CLI Auto Update" /TR "cadence.exe hook auto-update"
-```
+Install then records the current CLI version in the bootstrap marker so later
+invocations know this version's runtime migration is complete.
 
-If auto-update is **disabled**, the scheduler artifacts are removed instead.
-
-**Source:** `src/update.rs` (scheduler provisioning functions)
-
----
-
-## Files created or modified
+## Files Created Or Modified
 
 | Path | Purpose |
 | --- | --- |
-| `~/.gitconfig` | Sets `core.hooksPath` and optionally `ai.cadence.org` |
-| `~/.git-hooks/` | Hooks directory |
-| `~/.git-hooks/post-commit` | Post-commit hook shim (mode `0755`) |
-| `~/.git-hooks/post-commit.pre-cadence` | Backup of pre-existing non-Cadence hook (if any) |
-| `~/.cadence/cli/config.toml` | Stores `auto_update` preference |
-| `~/Library/LaunchAgents/ai.teamcadence.cadence.autoupdate.plist` | macOS scheduler (if auto-update enabled) |
-| `~/.config/systemd/user/cadence-autoupdate.{service,timer}` | Linux scheduler (if auto-update enabled) |
+| `~/.gitconfig` | May set `ai.cadence.org`; may remove Cadence-owned `core.hooksPath` during cleanup |
+| `~/.git-hooks/post-commit` | Removed only if Cadence can prove it owns the hook |
+| `~/.git-hooks/post-commit.pre-cadence` | Restored when a pre-Cadence hook backup exists |
+| `~/.git-hooks/pre-push` | Removed only if it is a legacy Cadence hook |
+| `~/.cadence/cli/monitor-state.json` | Stores monitor enablement and last-run health |
+| `~/.cadence/cli/last-version-bootstrap` | Records the last Cadence version that completed runtime bootstrap |
+| `~/Library/LaunchAgents/ai.teamcadence.cadence.monitor.plist` | macOS monitor scheduler |
+| `~/.config/systemd/user/cadence-monitor.{service,timer}` | Linux monitor scheduler |
 
-## Error handling
+The global discovery cursor file
+`~/.cadence/cli/monitor-discovery-cursor.json` is typically created on the
+first successful monitor tick, not during install itself. Updater retry state
+is also created lazily when background updates first run.
 
-Each step reports errors but **does not abort** — subsequent steps are always attempted. A `had_errors` flag tracks whether any step failed. At the end:
+## Error Handling
 
-- All steps succeeded → `Install complete`
-- One or more steps failed → `Install completed with issues`
+Install keeps going after individual step failures so it can perform as much
+bootstrap work as possible, but it still exits non-zero if any runtime step
+failed.
 
-Total elapsed time is printed in milliseconds.
+On success it prints `Install complete` and the elapsed time in milliseconds.
+On failure it surfaces the accumulated bootstrap error so the user can rerun
+`cadence install` after fixing the underlying issue.
 
-## Repo-level control
+## Repo-level Control
 
-`cadence install` does **not** offer per-repo selection — the hook applies globally to every repository on the machine. Repos are controlled after install via two opt-out mechanisms:
+`cadence install` is machine-wide monitor enablement, not a per-repo opt-in.
+Repo selection still uses the existing filters:
 
-### Org filter (install-time)
+### Org Filter
 
-Pass `--org <GITHUB_ORG>` during install to restrict tracking to repositories whose remote matches the given org. The hook checks this at commit time and silently skips non-matching repos.
-
-```
+```sh
 cadence install --org my-company
 ```
 
-Stored in: `git config --global ai.cadence.org`
+Stored in global git config as `ai.cadence.org`.
 
-### Per-repo disable (post-install)
+### Per-repo Disable
 
-Disable Cadence for a specific repository by setting a local git config:
-
-```
+```sh
 cd /path/to/repo
 git config ai.cadence.enabled false
 ```
 
-Any value other than `"false"` (including unset) is treated as enabled. This check gates the entire hook lifecycle — when disabled, no session scanning, uploading, or note-writing occurs for that repo.
+Any value other than `false` is treated as enabled.
 
-## What happens after install
+## What Happens After Install
 
-Every `git commit` in any repository triggers the hook chain:
+The scheduler periodically runs `cadence monitor tick`.
 
-1. Git invokes `~/.git-hooks/post-commit`
-2. The shim runs `cadence hook post-commit`
-3. The hook checks `ai.cadence.enabled` git config (default: `true`) and the org filter
-4. If enabled, it scans for AI agent session logs (Claude Code, Codex, etc.)
-5. Discovered sessions are attached to the commit as git notes under `refs/cadence/sessions/data`
-6. Notes are pushed to the remote on the next `git push`
+Each tick:
+
+1. acquires the shared Cadence activity lock
+2. loads monitor state and exits early if monitoring is disabled
+3. drains due pending uploads
+4. incrementally scans supported agent session sources globally
+5. resolves repo roots from session metadata
+6. applies repo-disable and org-filter rules
+7. publishes eligible sessions through the v2 publication pipeline
+8. records monitor health and summary counts
+9. runs unattended stable-channel update checks while monitoring is enabled

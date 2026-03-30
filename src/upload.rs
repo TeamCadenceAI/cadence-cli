@@ -23,8 +23,6 @@ use tokio::sync::Mutex;
 const API_TIMEOUT_SECS: u64 = 15;
 const PRESIGNED_UPLOAD_TIMEOUT_SECS: u64 = 300;
 const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
-/// Maximum number of pending publications drained in one run by default.
-pub const DEFAULT_PENDING_UPLOADS_PER_RUN: usize = 8;
 
 /// Shared upload context for one CLI invocation.
 #[derive(Debug)]
@@ -34,10 +32,45 @@ pub struct UploadContext {
     user_orgs: Mutex<Option<Vec<UserOrgInfo>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationAuthState {
+    Ready,
+    MissingToken,
+    Rejected,
+    CheckFailed(String),
+}
+
 impl UploadContext {
     /// Returns whether the current context has an auth token available.
     pub fn has_token(&self) -> bool {
         self.token.is_some()
+    }
+}
+
+impl PublicationAuthState {
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Ready => "ready".to_string(),
+            Self::MissingToken => "missing CLI auth token".to_string(),
+            Self::Rejected => "CLI auth token was rejected by the server".to_string(),
+            Self::CheckFailed(message) => format!("check failed ({message})"),
+        }
+    }
+
+    pub fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::MissingToken | Self::Rejected => {
+                Some("Run `cadence login` to restore background publishing.")
+            }
+            Self::CheckFailed(_) => {
+                Some("Background publishing will retry after the next successful auth check.")
+            }
+        }
+    }
+
+    pub fn blocks_background_publication(&self) -> bool {
+        !matches!(self, Self::Ready)
     }
 }
 
@@ -92,6 +125,18 @@ pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<Up
     })
 }
 
+pub async fn publication_auth_state(context: &UploadContext) -> PublicationAuthState {
+    if context.token.is_none() {
+        return PublicationAuthState::MissingToken;
+    }
+
+    match fetch_user_orgs_authenticated(context).await {
+        Ok(_) => PublicationAuthState::Ready,
+        Err(AuthenticatedRequestError::Unauthorized) => PublicationAuthState::Rejected,
+        Err(err) => PublicationAuthState::CheckFailed(err.to_string()),
+    }
+}
+
 /// Converts observed session data into a prepared publication.
 pub fn prepare_session_upload(observed: ObservedSessionUpload) -> Result<PreparedSessionUpload> {
     Ok(PreparedSessionUpload {
@@ -109,6 +154,27 @@ pub async fn upload_or_queue_prepared_session(
     prepared: &PreparedSessionUpload,
 ) -> Result<LiveUploadOutcome> {
     prepare_state_and_attempt(context, prepared, None).await
+}
+
+/// Persists a retryable discovery failure before org resolution is possible.
+///
+/// This is used for early monitor failures such as `git remote` lookup errors,
+/// where the session content and repo context are known but a live upload
+/// attempt cannot begin yet.
+pub async fn persist_retryable_prepared_session(
+    prepared: &PreparedSessionUpload,
+    reason: impl Into<String>,
+) -> Result<()> {
+    let existing = load_existing_for_org(&prepared.prepared.logical_session, None).await?;
+    persist_state(
+        existing,
+        &prepared.prepared,
+        None,
+        PublicationStatus::RetryableFailure,
+        None,
+        Some(reason.into()),
+    )
+    .await
 }
 
 /// Drains due pending publication records.
@@ -585,19 +651,25 @@ async fn resolve_target_org(
 }
 
 async fn fetch_user_orgs(context: &UploadContext) -> Result<Vec<UserOrgInfo>> {
+    fetch_user_orgs_authenticated(context)
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+}
+
+async fn fetch_user_orgs_authenticated(
+    context: &UploadContext,
+) -> std::result::Result<Vec<UserOrgInfo>, AuthenticatedRequestError> {
     let mut guard = context.user_orgs.lock().await;
     if let Some(cached) = guard.as_ref() {
         return Ok(cached.clone());
     }
-    let token = context
-        .token
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("missing Cadence CLI auth token"))?;
+    let token = context.token.as_deref().ok_or_else(|| {
+        AuthenticatedRequestError::Unexpected("missing Cadence CLI auth token".to_string())
+    })?;
     let response = context
         .client
         .list_user_orgs(token, Duration::from_secs(API_TIMEOUT_SECS))
-        .await
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        .await?;
     *guard = Some(response.orgs.clone());
     Ok(response.orgs)
 }
@@ -691,6 +763,7 @@ pub(crate) mod test_support {
         pub create_statuses: Vec<u16>,
         pub upload_statuses: Vec<u16>,
         pub confirm_statuses: Vec<u16>,
+        pub user_org_statuses: Vec<u16>,
         pub user_orgs: Vec<Value>,
         pub upload_response_delay_ms: u64,
     }
@@ -723,6 +796,7 @@ pub(crate) mod test_support {
         create_statuses: VecDeque<u16>,
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
+        user_org_statuses: VecDeque<u16>,
         user_orgs: Vec<Value>,
         upload_response_delay_ms: u64,
     }
@@ -765,6 +839,7 @@ pub(crate) mod test_support {
             create_statuses: config.create_statuses.into(),
             upload_statuses: config.upload_statuses.into(),
             confirm_statuses: config.confirm_statuses.into(),
+            user_org_statuses: config.user_org_statuses.into(),
             user_orgs: if config.user_orgs.is_empty() {
                 vec![serde_json::json!({
                     "github_org_id": 1,
@@ -811,11 +886,27 @@ pub(crate) mod test_support {
                         ("GET", "/api/user/orgs") => {
                             let mut guard = state.lock().expect("server state");
                             guard.counts.user_org_requests += 1;
-                            (
-                                200,
-                                serde_json::json!({ "data": { "orgs": guard.user_orgs } })
+                            let status = guard.user_org_statuses.pop_front().unwrap_or(200);
+                            if status == 200 {
+                                (
+                                    200,
+                                    serde_json::json!({ "data": { "orgs": guard.user_orgs } })
+                                        .to_string(),
+                                )
+                            } else {
+                                (
+                                    status,
+                                    serde_json::json!({
+                                        "error": if status == 401 { "unauthorized" } else { "request_failed" },
+                                        "message": if status == 401 {
+                                            "Authentication required"
+                                        } else {
+                                            "user org request failed"
+                                        }
+                                    })
                                     .to_string(),
-                            )
+                                )
+                            }
                         }
                         ("POST", "/api/v2/session-publications") => {
                             let mut guard = state.lock().expect("server state");
@@ -1056,6 +1147,86 @@ mod tests {
                 reason: "repo has no remote URL observations".to_string(),
             }
         );
+        assert_eq!(pending_upload_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn publication_auth_state_reports_missing_token() {
+        let context = UploadContext {
+            client: ApiClient::new_for_test("http://127.0.0.1:9"),
+            token: None,
+            user_orgs: Mutex::new(None),
+        };
+
+        let state = publication_auth_state(&context).await;
+
+        assert_eq!(state, PublicationAuthState::MissingToken);
+        assert!(state.blocks_background_publication());
+    }
+
+    #[tokio::test]
+    async fn publication_auth_state_reports_rejected_token() {
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            user_org_statuses: vec![401],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: Some("token".to_string()),
+            user_orgs: Mutex::new(None),
+        };
+
+        let state = publication_auth_state(&context).await;
+
+        assert_eq!(state, PublicationAuthState::Rejected);
+        assert!(state.blocks_background_publication());
+        assert_eq!(server.counts().user_org_requests, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn persist_retryable_prepared_session_records_retryable_failure() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let prepared = prepare_session_upload(ObservedSessionUpload {
+            observations: PublicationObservations {
+                canonical_remote_url: String::new(),
+                remote_urls: Vec::new(),
+                canonical_repo_root: "/tmp/repo".to_string(),
+                worktree_roots: vec!["/tmp/repo".to_string()],
+                cwd: Some("/tmp/repo".to_string()),
+                git_ref: None,
+                head_commit_sha: None,
+                git_user_email: None,
+                git_user_name: None,
+                cli_version: Some("1.0.0".to_string()),
+            },
+            ..sample_observed(Path::new("/tmp/repo"), "git@github.com:test-org/repo.git")
+        })
+        .unwrap();
+
+        persist_retryable_prepared_session(&prepared, "git remote failed")
+            .await
+            .unwrap();
+
+        let records = load_all_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].record.status,
+            PublicationStatus::RetryableFailure
+        );
+        assert_eq!(records[0].record.target_org_id, None);
+        assert_eq!(
+            records[0].record.last_error.as_deref(),
+            Some("git remote failed")
+        );
+        assert_eq!(
+            records[0].record.observations.remote_urls,
+            Vec::<String>::new()
+        );
+        assert_eq!(records[0].record.observations.canonical_remote_url, "");
         assert_eq!(pending_upload_count().await.unwrap(), 1);
     }
 

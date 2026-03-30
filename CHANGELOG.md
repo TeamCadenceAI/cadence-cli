@@ -1,5 +1,141 @@
 # Changelog
 
+## [2.3.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.5...v2.3.6) (2026-03-30)
+
+
+### Bug Fixes
+
+* **locking:** report long waits for activity lock ([b23d46a](https://github.com/TeamCadenceAI/cadence-cli/commit/b23d46a99c7cef0f3e70f98683a8dc5140feb67f))
+* **locking:** report long waits for activity lock ([39848df](https://github.com/TeamCadenceAI/cadence-cli/commit/39848dfed13a0a182d4622064df8f5ecfcfe1cf2))
+* **monitor:** skip Warp discovery during background ticks ([b9d37c8](https://github.com/TeamCadenceAI/cadence-cli/commit/b9d37c811545e4bfba3e52b6477afb1f29b9b8b4))
+* **monitor:** skip Warp discovery during background ticks ([4bc96e1](https://github.com/TeamCadenceAI/cadence-cli/commit/4bc96e17f599cad57d6d063a93aa2b1172a3add6))
+
+## [2.3.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.4...v2.3.5) (2026-03-30)
+
+
+### Bug Fixes
+
+* **backfill:** add boxed relogin guidance after update ([3b5a3ce](https://github.com/TeamCadenceAI/cadence-cli/commit/3b5a3cea9c435a8fd788812c52064af7ce4fef01))
+* **backfill:** add boxed relogin guidance after update ([1476df9](https://github.com/TeamCadenceAI/cadence-cli/commit/1476df96c4a9a4c12d7e356893e16e7a01c94c83))
+
+## [2.3.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.3...v2.3.4) (2026-03-30)
+
+
+### Bug Fixes
+
+* **update:** heal updater state after successful bootstrap ([7a73045](https://github.com/TeamCadenceAI/cadence-cli/commit/7a73045a4e92caf311556b118a766136920ee4e8))
+* **update:** heal updater state after successful bootstrap ([47058b7](https://github.com/TeamCadenceAI/cadence-cli/commit/47058b75f516254cfbe5ba18907cd1b950a9bb9c))
+
+## [2.3.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.2...v2.3.3) (2026-03-30)
+
+
+### Bug Fixes
+
+* **update:** support both macos release archive formats ([7b18b3e](https://github.com/TeamCadenceAI/cadence-cli/commit/7b18b3e977b47f7d0667b3a8522ad393e5732a64))
+* **update:** support both macos release archive formats ([5ad817b](https://github.com/TeamCadenceAI/cadence-cli/commit/5ad817b71591041c3f811aed39ca48c6fa8ff573))
+
+## [2.3.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.1...v2.3.2) (2026-03-29)
+
+
+### Bug Fixes
+
+* **release:** remove macos notarization ([e000326](https://github.com/TeamCadenceAI/cadence-cli/commit/e000326d9dd102a071cfeb0a5eb4f72f8cd78d53))
+* **release:** remove macos notarization from releases ([4b2a160](https://github.com/TeamCadenceAI/cadence-cli/commit/4b2a16015047734b685a8066774e9b448f6cee0c))
+
+## [2.3.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.0...v2.3.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* **release:** stop checking notarization before submit ([2999c24](https://github.com/TeamCadenceAI/cadence-cli/commit/2999c24c6b98e643a9f511be9316f81ae5254dd7))
+* **release:** stop checking notarization before submit ([eb27a76](https://github.com/TeamCadenceAI/cadence-cli/commit/eb27a76eb9a775d093542d40a7672073b228d92c))
+
+## [2.3.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.6...v2.3.0) (2026-03-29)
+
+
+### Features
+
+* **update:** add detached updater helper and macOS signing ([2702319](https://github.com/TeamCadenceAI/cadence-cli/commit/2702319f46bdc90a0947514089117a698b9be762))
+* **update:** add detached updater helper and macOS signing ([567de79](https://github.com/TeamCadenceAI/cadence-cli/commit/567de79c8526ac3b8b8f6c34c0a86c13b0bea938))
+
+
+### Bug Fixes
+
+* **update:** detach linux helper handoff ([073d643](https://github.com/TeamCadenceAI/cadence-cli/commit/073d643198137e665137ed1916ae1a1be3e4a28d))
+* **update:** harden helper handoff semantics ([5fc3842](https://github.com/TeamCadenceAI/cadence-cli/commit/5fc38425f5d40ee7b43342b991b3ac7f229bd6fe))
+* **update:** require reachable user systemd manager ([6085eb1](https://github.com/TeamCadenceAI/cadence-cli/commit/6085eb1a31d25ef8ce11b9dd40d75ce5a945d7e3))
+
+## [2.2.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.5...v2.2.6) (2026-03-29)
+
+
+### Bug Fixes
+
+* **update:** avoid self-disabling monitor during self-update handoff ([98057c1](https://github.com/TeamCadenceAI/cadence-cli/commit/98057c17e0c7c005dd19e1eece492086deaf03d6))
+* **update:** avoid self-disabling monitor during self-update handoff ([d031b36](https://github.com/TeamCadenceAI/cadence-cli/commit/d031b36c12799d6ab26cf811752ced92ba0c7b10))
+
+## [2.2.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.4...v2.2.5) (2026-03-29)
+
+
+### Bug Fixes
+
+* **bootstrap:** serialize install runtime bootstrap ([d9dfc76](https://github.com/TeamCadenceAI/cadence-cli/commit/d9dfc764d80c69f27f9134705a1bdab3b3478c60))
+* **bootstrap:** serialize install runtime bootstrap ([53d6b8c](https://github.com/TeamCadenceAI/cadence-cli/commit/53d6b8c6e15d3973d4bbd58f3d80d1bdc5b1a0d5))
+
+## [2.2.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.3...v2.2.4) (2026-03-29)
+
+
+### Bug Fixes
+
+* **update:** unblock monitor-driven auto-upgrades ([be07f49](https://github.com/TeamCadenceAI/cadence-cli/commit/be07f4930f2b6bf476fe7ab54f4af27c21b2f3e4))
+
+## [2.2.3](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.2...v2.2.3) (2026-03-29)
+
+
+### Bug Fixes
+
+* **backfill:** skip auth-blocked recovery work ([8c6bb5f](https://github.com/TeamCadenceAI/cadence-cli/commit/8c6bb5f4b55d178f7624be007163e4abfc3502a1))
+* skip auth-blocked recovery backfills ([c7cbcbe](https://github.com/TeamCadenceAI/cadence-cli/commit/c7cbcbe603a7a1610189aa2a9f5ba77251abfe71))
+
+## [2.2.2](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.1...v2.2.2) (2026-03-29)
+
+
+### Bug Fixes
+
+* **monitor:** pause background publication when auth is invalid ([4431f4b](https://github.com/TeamCadenceAI/cadence-cli/commit/4431f4bc972d3039e1969afe4e0947314f8e9cc6))
+* pause monitor publishing when auth is invalid ([c6fd8f5](https://github.com/TeamCadenceAI/cadence-cli/commit/c6fd8f55c1830e503a84770ad76406ada2bdf6b5))
+
+## [2.2.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.2.0...v2.2.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* harden runtime bootstrap handoff for monitor migration ([2c5058e](https://github.com/TeamCadenceAI/cadence-cli/commit/2c5058e00ace9b9eb85aeeabfc19d043a6dac45c))
+* **monitor:** harden runtime bootstrap handoff ([d72c85e](https://github.com/TeamCadenceAI/cadence-cli/commit/d72c85e4ccc212c8a62607a373e858f2893051be))
+
+## [2.2.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.7...v2.2.0) (2026-03-29)
+
+
+### Features
+
+* **bootstrap:** finish monitor bootstrap migration ([5af141c](https://github.com/TeamCadenceAI/cadence-cli/commit/5af141cbe0014d746e73f58ab09288af5c0d082f))
+* **bootstrap:** unify install and version migration ([96d7b56](https://github.com/TeamCadenceAI/cadence-cli/commit/96d7b5679410432b3973e10c383bf85f862b5c9d))
+* **monitor:** move live runtime off Git hooks ([c92ca66](https://github.com/TeamCadenceAI/cadence-cli/commit/c92ca66f6ec84413914043392ec5b591ae8ae464))
+* move live ingestion to the background monitor runtime ([fdf5362](https://github.com/TeamCadenceAI/cadence-cli/commit/fdf5362aa5a23f836728f0030198b623943f67c4))
+
+
+### Bug Fixes
+
+* **bootstrap:** harden update handoff and fallback recovery ([3e8b170](https://github.com/TeamCadenceAI/cadence-cli/commit/3e8b170ed3dd2f3b68d94a22f3fa5bf867baed46))
+* **claude:** align desktop manifest tests with platform paths ([cc5a3f4](https://github.com/TeamCadenceAI/cadence-cli/commit/cc5a3f481fcd9f50ad8274af31dc47df372a498f))
+* **claude:** use desktop manifests to surface recent sessions ([d11eae6](https://github.com/TeamCadenceAI/cadence-cli/commit/d11eae6c959b377766c276c32b5a059e344c0f3a))
+* **claude:** use desktop manifests to surface recent sessions ([6507528](https://github.com/TeamCadenceAI/cadence-cli/commit/65075288c8fa21460a1f26a667457f22ec1a8638))
+* **hooks:** make post-commit compatibility path inert ([0fe8577](https://github.com/TeamCadenceAI/cadence-cli/commit/0fe8577ec3e1f735dc4851782249d197731b8b3a))
+* **monitor:** freeze cursor after retryable skips ([d5a8784](https://github.com/TeamCadenceAI/cadence-cli/commit/d5a8784f2d04c1951341dd71092e5aeecd6a3540))
+* **monitor:** keep compatibility ticks lightweight and resilient ([81c3de8](https://github.com/TeamCadenceAI/cadence-cli/commit/81c3de81af00d4b958fa527a2537f4351f1970a2))
+* **monitor:** persist background diagnostics under cadence state ([2cb17ae](https://github.com/TeamCadenceAI/cadence-cli/commit/2cb17aee5c9b4663d9e387587a822efad949e128))
+* **monitor:** remove global cursor blocking on retryable uploads ([2bd0182](https://github.com/TeamCadenceAI/cadence-cli/commit/2bd01823a6ef983f2cfd09e72774f3174bc64fff))
+* **runtime:** repair monitor state and hook ownership cleanup ([7134985](https://github.com/TeamCadenceAI/cadence-cli/commit/7134985ca80d350773e9143cef3564077dc79b1a))
+
 ## [2.1.7](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.1.6...v2.1.7) (2026-03-25)
 
 
