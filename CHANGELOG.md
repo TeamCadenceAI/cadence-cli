@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.5](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.4...v2.3.5) (2026-03-30)
+
+
+### Bug Fixes
+
+* **backfill:** add boxed relogin guidance after update ([3b5a3ce](https://github.com/TeamCadenceAI/cadence-cli/commit/3b5a3cea9c435a8fd788812c52064af7ce4fef01))
+* **backfill:** add boxed relogin guidance after update ([1476df9](https://github.com/TeamCadenceAI/cadence-cli/commit/1476df96c4a9a4c12d7e356893e16e7a01c94c83))
+
 ## [2.3.4](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.3...v2.3.4) (2026-03-30)
 
 
