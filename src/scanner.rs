@@ -628,6 +628,146 @@ fn looks_like_file(path: &Path) -> bool {
     false
 }
 
+/// Extract candidate working directories from a session transcript.
+///
+/// Scans JSONL content line-by-line for absolute file paths in tool-call
+/// inputs (e.g. `file_path`, `path`, `command` fields). Returns deduplicated
+/// parent directories that could be resolved to git repo roots.
+///
+/// This is used as a fallback when the session's recorded `cwd` doesn't
+/// resolve to a git repository (e.g. Claude desktop app sessions where `cwd`
+/// points to a parent directory like `~/Documents/GitHub`).
+pub fn extract_candidate_cwds_from_transcript(content: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::new();
+
+    for line in content.lines() {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        collect_absolute_paths_from_value(&value, &mut seen, &mut candidates);
+    }
+
+    candidates
+}
+
+/// Maximum recursion depth when walking nested JSON structures.
+/// Prevents stack overflow on pathologically deep transcripts.
+const TRANSCRIPT_PATH_MAX_DEPTH: usize = 16;
+
+/// Collect absolute file paths from a JSON value, resolving them to their
+/// parent directory. Targets tool-call input fields.
+///
+/// Recurses into nested objects and arrays up to `TRANSCRIPT_PATH_MAX_DEPTH`
+/// to handle varied transcript formats.
+fn collect_absolute_paths_from_value(
+    value: &serde_json::Value,
+    seen: &mut std::collections::HashSet<String>,
+    candidates: &mut Vec<String>,
+) {
+    collect_paths_recursive(value, seen, candidates, 0);
+}
+
+fn collect_paths_recursive(
+    value: &serde_json::Value,
+    seen: &mut std::collections::HashSet<String>,
+    candidates: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > TRANSCRIPT_PATH_MAX_DEPTH {
+        return;
+    }
+
+    // Check known path-bearing fields in tool-call inputs.
+    let path_keys = ["file_path", "path", "old_path", "new_path", "directory"];
+    for key in &path_keys {
+        if let Some(path_str) = value.get(key).and_then(|v| v.as_str()) {
+            add_absolute_path_candidate(path_str, seen, candidates);
+        }
+    }
+
+    // Check "command" field for `cd` commands that reveal working directories.
+    if let Some(cmd) = value.get("command").and_then(|v| v.as_str()) {
+        extract_cd_targets(cmd, seen, candidates);
+    }
+
+    // Recurse into nested structures (e.g., content arrays, tool inputs).
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                // Skip large content fields unlikely to contain tool-call paths.
+                if key == "text" || key == "output" || key == "result" || key == "stdout" {
+                    continue;
+                }
+                collect_paths_recursive(val, seen, candidates, depth + 1);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_paths_recursive(item, seen, candidates, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract absolute directory paths from shell command strings.
+///
+/// Splits on `&&` and `;` to isolate individual commands, then looks for
+/// `cd /absolute/path` patterns. Handles quoted paths.
+fn extract_cd_targets(
+    cmd: &str,
+    seen: &mut std::collections::HashSet<String>,
+    candidates: &mut Vec<String>,
+) {
+    // Split on && and ; to get individual command segments.
+    let segments: Vec<&str> = cmd.split("&&").flat_map(|part| part.split(';')).collect();
+
+    for segment in segments {
+        let trimmed = segment.trim();
+        if let Some(rest) = trimmed.strip_prefix("cd ") {
+            let dir = rest.trim().trim_matches('"').trim_matches('\'');
+            // Guard against picking up flags or relative paths.
+            if dir.starts_with('/') || is_windows_drive_path(dir) {
+                add_dir_candidate(dir, seen, candidates);
+            }
+        }
+    }
+}
+
+fn add_absolute_path_candidate(
+    path_str: &str,
+    seen: &mut std::collections::HashSet<String>,
+    candidates: &mut Vec<String>,
+) {
+    if !path_str.starts_with('/') && !is_windows_drive_path(path_str) {
+        return;
+    }
+
+    let path = Path::new(path_str);
+    let dir = if looks_like_file(path) {
+        path.parent().map(|p| p.to_string_lossy().to_string())
+    } else {
+        Some(path_str.to_string())
+    };
+
+    if let Some(dir) = dir {
+        add_dir_candidate(&dir, seen, candidates);
+    }
+}
+
+fn add_dir_candidate(
+    dir: &str,
+    seen: &mut std::collections::HashSet<String>,
+    candidates: &mut Vec<String>,
+) {
+    if !dir.is_empty() && seen.insert(dir.to_string()) {
+        candidates.push(dir.to_string());
+    }
+}
+
 #[cfg(test)]
 fn collect_timestamp_candidates(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
     match value {
@@ -1397,5 +1537,107 @@ also not json {{{{
 
         let range = session_time_range(&file).await;
         assert!(range.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_candidate_cwds_from_transcript
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_candidate_cwds_from_tool_use_file_paths() {
+        let content = [
+            r#"{"type":"tool_use","name":"Read","input":{"file_path":"/Users/foo/code/my-repo/src/main.rs"}}"#,
+            r#"{"type":"tool_use","name":"Write","input":{"file_path":"/Users/foo/code/my-repo/README.md"}}"#,
+            r#"{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/foo/code/other-repo/lib.rs"}}"#,
+        ]
+        .join("\n");
+
+        let candidates = extract_candidate_cwds_from_transcript(&content);
+
+        assert!(candidates.contains(&"/Users/foo/code/my-repo/src".to_string()));
+        assert!(candidates.contains(&"/Users/foo/code/my-repo".to_string()));
+        assert!(candidates.contains(&"/Users/foo/code/other-repo".to_string()));
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_from_cd_commands() {
+        let content = r#"{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/foo/code/my-repo && cargo build"}}"#;
+
+        let candidates = extract_candidate_cwds_from_transcript(content);
+
+        assert!(candidates.contains(&"/Users/foo/code/my-repo".to_string()));
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_deduplicates() {
+        let content = [
+            r#"{"type":"tool_use","name":"Read","input":{"file_path":"/Users/foo/repo/src/a.rs"}}"#,
+            r#"{"type":"tool_use","name":"Read","input":{"file_path":"/Users/foo/repo/src/b.rs"}}"#,
+        ]
+        .join("\n");
+
+        let candidates = extract_candidate_cwds_from_transcript(&content);
+
+        // /Users/foo/repo/src should appear only once.
+        let count = candidates
+            .iter()
+            .filter(|c| *c == "/Users/foo/repo/src")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_ignores_relative_paths() {
+        let content = r#"{"type":"tool_use","name":"Read","input":{"file_path":"src/main.rs"}}"#;
+
+        let candidates = extract_candidate_cwds_from_transcript(content);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_skips_output_fields() {
+        // Paths in "output" or "result" fields should not be extracted.
+        let content =
+            r#"{"type":"tool_result","output":"/Users/foo/code/some-repo/build/output.log"}"#;
+
+        let candidates = extract_candidate_cwds_from_transcript(content);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_handles_directory_paths() {
+        let content =
+            r#"{"type":"tool_use","name":"Glob","input":{"directory":"/Users/foo/code/my-repo"}}"#;
+
+        let candidates = extract_candidate_cwds_from_transcript(content);
+        assert!(candidates.contains(&"/Users/foo/code/my-repo".to_string()));
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_cd_with_semicolons_and_chained_commands() {
+        // Ensure cd targets are extracted cleanly from complex shell commands
+        // without picking up non-path fragments.
+        let content = r#"{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/foo/repo1 && cargo test; cd /Users/foo/repo2 && make"}}"#;
+
+        let candidates = extract_candidate_cwds_from_transcript(content);
+
+        assert!(candidates.contains(&"/Users/foo/repo1".to_string()));
+        assert!(candidates.contains(&"/Users/foo/repo2".to_string()));
+        // Should NOT contain fragments like "/Users/foo/repo1 && cargo test"
+        assert!(!candidates.iter().any(|c| c.contains("&&")));
+        assert!(!candidates.iter().any(|c| c.contains(";")));
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_empty_transcript() {
+        let candidates = extract_candidate_cwds_from_transcript("");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_candidate_cwds_malformed_json_lines() {
+        let content = "not json at all\n{invalid json}\n{\"valid\":\"but no paths\"}";
+        let candidates = extract_candidate_cwds_from_transcript(content);
+        assert!(candidates.is_empty());
     }
 }

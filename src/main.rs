@@ -779,6 +779,43 @@ async fn session_log_content_async(log: &agents::SessionLog) -> Option<String> {
     }
 }
 
+/// Maximum number of candidate directories to try when resolving a repo
+/// from transcript content. Prevents excessive `git rev-parse` calls when
+/// a transcript references many unique directories.
+const TRANSCRIPT_CWD_MAX_CANDIDATES: usize = 20;
+
+/// Attempt to resolve a session's repo root by scanning transcript content
+/// for file paths when the recorded `cwd` doesn't resolve to a git repo.
+///
+/// This is a fallback for sessions (typically Claude desktop app) where the
+/// manifest's `cwd` points to a parent directory rather than a specific repo.
+/// Reads the transcript, extracts absolute file paths from tool-call inputs,
+/// and tries to resolve each to a git repo root.
+///
+/// Caps the number of candidates tried at [`TRANSCRIPT_CWD_MAX_CANDIDATES`]
+/// to bound the cost of git subprocess calls.
+async fn resolve_repo_from_transcript(
+    log: &agents::SessionLog,
+    repo_root_cache: &std::collections::HashMap<String, git::RepoRootResolution>,
+) -> Option<git::RepoRootResolution> {
+    let content = session_log_content_async(log).await?;
+    let candidate_cwds = scanner::extract_candidate_cwds_from_transcript(&content);
+
+    for candidate_cwd in candidate_cwds.iter().take(TRANSCRIPT_CWD_MAX_CANDIDATES) {
+        // Check cache first.
+        if let Some(cached) = repo_root_cache.get(candidate_cwd.as_str()) {
+            return Some(cached.clone());
+        }
+
+        let cwd_path = std::path::Path::new(&candidate_cwd);
+        if let Ok(resolution) = git::resolve_repo_root_with_fallbacks(cwd_path).await {
+            return Some(resolution);
+        }
+    }
+
+    None
+}
+
 /// Parse a duration string like "7d", "30d", "1d" into seconds.
 ///
 /// Currently only supports the `<N>d` format (number of days).
@@ -1437,36 +1474,55 @@ async fn run_backfill_inner_with_invocation(
             let resolved = match git::resolve_repo_root_with_fallbacks(cwd_path).await {
                 Ok(resolution) => resolution,
                 Err(diagnostics) => {
-                    ::tracing::warn!(
-                        event = "session_discovery_skipped",
-                        file = file_path.as_str(),
-                        session_id = ?metadata.session_id,
-                        cwd = cwd.as_str(),
-                        requested_cwd = diagnostics.requested_cwd.to_string_lossy().to_string(),
-                        reason = "repo_root_lookup_failed",
-                        error = ?diagnostics.direct_error,
-                        cwd_exists = diagnostics.cwd_exists,
-                        nearest_existing_ancestor = ?diagnostics
-                            .nearest_existing_ancestor
-                            .map(|path| path.to_string_lossy().to_string()),
-                        ancestor_error = ?diagnostics.ancestor_error,
-                        candidate_repo_names = ?diagnostics.candidate_repo_names,
-                        candidate_owner_repo_roots = ?diagnostics
-                            .candidate_owner_repo_roots
-                            .into_iter()
-                            .map(|path| path.to_string_lossy().to_string())
-                            .collect::<Vec<_>>(),
-                        matched_worktree_owner_repo_root = ?diagnostics
-                            .matched_worktree_owner_repo_root
-                            .map(|path| path.to_string_lossy().to_string()),
-                        matched_worktree_path = ?diagnostics
-                            .matched_worktree_path
-                            .map(|path| path.to_string_lossy().to_string()),
-                    );
-                    if let Some(ref pb) = progress {
-                        pb.inc(1);
+                    // Fallback: scan transcript content for file paths that
+                    // reveal the actual working directory. This handles cases
+                    // like Claude desktop sessions where the manifest's `cwd`
+                    // points to a parent directory (e.g. ~/Documents/GitHub)
+                    // rather than the specific repo.
+                    let transcript_resolution =
+                        resolve_repo_from_transcript(log, &repo_root_cache).await;
+
+                    if let Some(resolution) = transcript_resolution {
+                        ::tracing::info!(
+                            event = "session_cwd_resolved_from_transcript",
+                            file = file_path.as_str(),
+                            session_id = ?metadata.session_id,
+                            original_cwd = cwd.as_str(),
+                            resolved_repo = resolution.repo_root.to_string_lossy().to_string(),
+                        );
+                        resolution
+                    } else {
+                        ::tracing::warn!(
+                            event = "session_discovery_skipped",
+                            file = file_path.as_str(),
+                            session_id = ?metadata.session_id,
+                            cwd = cwd.as_str(),
+                            requested_cwd = diagnostics.requested_cwd.to_string_lossy().to_string(),
+                            reason = "repo_root_lookup_failed",
+                            error = ?diagnostics.direct_error,
+                            cwd_exists = diagnostics.cwd_exists,
+                            nearest_existing_ancestor = ?diagnostics
+                                .nearest_existing_ancestor
+                                .map(|path| path.to_string_lossy().to_string()),
+                            ancestor_error = ?diagnostics.ancestor_error,
+                            candidate_repo_names = ?diagnostics.candidate_repo_names,
+                            candidate_owner_repo_roots = ?diagnostics
+                                .candidate_owner_repo_roots
+                                .into_iter()
+                                .map(|path| path.to_string_lossy().to_string())
+                                .collect::<Vec<_>>(),
+                            matched_worktree_owner_repo_root = ?diagnostics
+                                .matched_worktree_owner_repo_root
+                                .map(|path| path.to_string_lossy().to_string()),
+                            matched_worktree_path = ?diagnostics
+                                .matched_worktree_path
+                                .map(|path| path.to_string_lossy().to_string()),
+                        );
+                        if let Some(ref pb) = progress {
+                            pb.inc(1);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             };
             repo_root_cache.insert(cwd.clone(), resolved.clone());
@@ -1801,10 +1857,26 @@ async fn upload_incremental_sessions_globally(
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
             cached.clone()
         } else {
-            let resolved = git::resolve_repo_root_with_fallbacks(std::path::Path::new(&cwd))
+            let mut resolved = git::resolve_repo_root_with_fallbacks(std::path::Path::new(&cwd))
                 .await
                 .ok()
                 .map(|resolution| resolution.repo_root);
+
+            // Fallback: scan transcript for file paths when CWD doesn't
+            // resolve to a repo (e.g. Claude desktop app parent-dir CWD).
+            if resolved.is_none()
+                && let Some(content) = session_log_content_async(&parsed.log).await
+            {
+                let candidates = scanner::extract_candidate_cwds_from_transcript(&content);
+                for candidate_cwd in candidates.iter().take(TRANSCRIPT_CWD_MAX_CANDIDATES) {
+                    let cwd_path = std::path::Path::new(&candidate_cwd);
+                    if let Ok(resolution) = git::resolve_repo_root_with_fallbacks(cwd_path).await {
+                        resolved = Some(resolution.repo_root);
+                        break;
+                    }
+                }
+            }
+
             repo_root_cache.insert(cwd.clone(), resolved.clone());
             resolved
         };
