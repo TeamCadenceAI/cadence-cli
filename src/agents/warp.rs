@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use protobuf::CodedInputStream;
 use protobuf::rt::WireType;
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Map, Value, json};
 
@@ -344,6 +345,9 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
                     meta.last_modified_at.unwrap_or_default(),
                     "agent_conversations",
                 );
+                if let Some(cwd) = conversation_cwd.as_deref() {
+                    obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
+                }
                 meta.apply_to(&mut obj);
                 if let Some(text) = meta.summary_text.as_deref() {
                     obj.insert("content".to_string(), Value::String(text.to_string()));
@@ -999,10 +1003,7 @@ fn fetch_block_cwds_by_conversation(conn: &Connection) -> HashMap<String, Option
         return out;
     };
     let Ok(rows) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-        ))
+        Ok((row_optional_text(row, 0), row_optional_text(row, 1)))
     }) else {
         return out;
     };
@@ -1028,6 +1029,16 @@ fn fetch_block_cwds_by_conversation(conn: &Connection) -> HashMap<String, Option
     }
 
     out
+}
+
+fn row_optional_text(row: &rusqlite::Row<'_>, idx: usize) -> Option<String> {
+    match row.get_ref(idx).ok()? {
+        ValueRef::Null => None,
+        ValueRef::Text(bytes) => String::from_utf8(bytes.to_vec()).ok(),
+        ValueRef::Blob(bytes) => String::from_utf8(bytes.to_vec()).ok(),
+        ValueRef::Integer(value) => Some(value.to_string()),
+        ValueRef::Real(value) => Some(value.to_string()),
+    }
 }
 
 fn fetch_agent_conversation_meta(conn: &Connection) -> HashMap<String, WarpConversationMeta> {
@@ -1898,6 +1909,76 @@ mod tests {
         assert!(content.contains("/tmp/repo-meta"));
         assert!(content.contains("claude-opus-4.1"));
         assert!(content.contains("token-123"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn warp_meta_only_conversation_still_uses_block_cwd_fallback() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("warp.sqlite");
+        let conn = create_db(&db_path);
+        conn.execute(
+            "INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES (?1, ?2)",
+            (
+                "conv-meta-only",
+                r#"{"server_conversation_token":"token-123","conversation_usage_metadata":{"token_usage":[{"model_id":"Claude Opus 4.6"}]}}"#,
+            ),
+        )
+        .expect("insert agent conversation");
+        conn.execute(
+            "INSERT INTO blocks (ai_metadata, pwd) VALUES (?1, ?2)",
+            (
+                br#"{"conversation_id":"conv-meta-only","requested_command_action_id":"tool-1"}"#
+                    .to_vec(),
+                "/tmp/repo-from-block-fallback",
+            ),
+        )
+        .expect("insert block fallback");
+
+        unsafe {
+            std::env::set_var("WARP_DB_PATH", &db_path);
+        }
+        let logs = WarpExplorer.discover_recent(1_775_089_527, 2_592_000).await;
+        unsafe {
+            std::env::remove_var("WARP_DB_PATH");
+        }
+
+        let log = logs
+            .iter()
+            .find(|log| log.source_label() == "warp:conv-meta-only")
+            .expect("expected warp log to exist");
+        let content = match &log.source {
+            SessionSource::Inline { content, .. } => content,
+            _ => panic!("expected inline warp log"),
+        };
+        let metadata = scanner::parse_session_metadata_str(content);
+        assert_eq!(metadata.session_id.as_deref(), Some("conv-meta-only"));
+        assert_eq!(
+            metadata.cwd.as_deref(),
+            Some("/tmp/repo-from-block-fallback")
+        );
+        assert!(content.contains("token-123"));
+    }
+
+    #[test]
+    fn warp_reads_block_cwd_when_ai_metadata_is_blob() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch("CREATE TABLE blocks (ai_metadata BLOB, pwd TEXT);")
+            .expect("create blocks");
+        conn.execute(
+            "INSERT INTO blocks (ai_metadata, pwd) VALUES (?1, ?2)",
+            (
+                br#"{"conversation_id":"conv-1"}"#.to_vec(),
+                "/tmp/repo-from-blob",
+            ),
+        )
+        .expect("insert block row");
+
+        let by_conversation = fetch_block_cwds_by_conversation(&conn);
+        assert_eq!(
+            by_conversation.get("conv-1").cloned().flatten().as_deref(),
+            Some("/tmp/repo-from-blob")
+        );
     }
 
     #[tokio::test]
