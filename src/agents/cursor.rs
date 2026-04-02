@@ -183,6 +183,7 @@ async fn discover_agent_transcripts(
     let projects_dir = home.join(".cursor").join("projects");
     let transcript_dirs = collect_agent_transcript_dirs(&projects_dir).await;
     let workspace_map = collect_workspace_paths(home).await;
+    let mut workspace_decode_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut out = Vec::new();
 
     for dir in transcript_dirs {
@@ -238,7 +239,14 @@ async fn discover_agent_transcripts(
                     if let Some(path) = workspace_map.get(workspace_key).cloned() {
                         Some(path)
                     } else {
-                        decode_cursor_workspace_path(workspace_key).await
+                        if let Some(cached) = workspace_decode_cache.get(workspace_key) {
+                            cached.clone()
+                        } else {
+                            let decoded = decode_cursor_workspace_path(workspace_key).await;
+                            workspace_decode_cache
+                                .insert(workspace_key.to_string(), decoded.clone());
+                            decoded
+                        }
                     }
                 } else {
                     None
@@ -1201,14 +1209,16 @@ fn sqlite_table_string_rows(conn: &Connection, table: &str) -> Vec<(String, Stri
         let mut value = None;
         for (idx, column) in columns.iter().enumerate() {
             if key.is_none()
+                && (column == "key" || column == "id" || column.ends_with("Id"))
                 && let Ok(text) = row.get::<_, String>(idx)
             {
-                if column == "key" || column == "id" || column.ends_with("Id") {
-                    key = Some(text.clone());
-                }
-                if value.is_none() && looks_like_jsonish(&text) {
-                    value = Some(text);
-                }
+                key = Some(text);
+            }
+            if value.is_none()
+                && let Ok(text) = row.get::<_, String>(idx)
+                && looks_like_jsonish(&text)
+            {
+                value = Some(text);
             }
             if value.is_none()
                 && let Ok(bytes) = row.get::<_, Vec<u8>>(idx)
@@ -1442,7 +1452,7 @@ mod tests {
             .path()
             .join(".cursor")
             .join("projects")
-            .join("Users-zack-dev-cadence-cli")
+            .join(encode_cursor_project_workspace_key(&repo_root))
             .join("agent-transcripts")
             .join("abc")
             .join("abc.jsonl");
@@ -1469,11 +1479,9 @@ mod tests {
         };
         let metadata = scanner::parse_session_metadata_str(content);
         assert_eq!(metadata.session_id.as_deref(), Some("abc"));
-        assert!(
-            metadata
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.ends_with("/Users/zack/dev/cadence-cli"))
+        assert_eq!(
+            metadata.cwd.as_deref(),
+            Some(repo_root.to_string_lossy().as_ref())
         );
     }
 

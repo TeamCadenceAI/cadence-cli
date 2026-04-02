@@ -155,11 +155,11 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
     let cutoff = now - since_secs;
     let rows = fetch_ai_query_rows(&conn, cutoff);
     let tasks_by_conversation = fetch_agent_tasks_by_conversation(&conn, cutoff);
-    let blocks_by_conversation = fetch_block_cwds_by_conversation(&conn);
     let conversation_meta = fetch_agent_conversation_meta(&conn, cutoff);
     if rows.is_empty() && tasks_by_conversation.is_empty() && conversation_meta.is_empty() {
         return out;
     }
+    let blocks_by_conversation = fetch_block_cwds_by_conversation(&conn);
 
     let mut by_conversation: BTreeMap<String, Vec<AiQueryRow>> = BTreeMap::new();
     let mut unknown_idx = 0usize;
