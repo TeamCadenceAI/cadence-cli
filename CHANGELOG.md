@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.4.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.6...v2.4.0) (2026-04-02)
+
+
+### Features
+
+* **discovery:** expand Cursor and Warp session recovery ([ec37e65](https://github.com/TeamCadenceAI/cadence-cli/commit/ec37e65c33d010128ccd3f6f2f55a3349dc0e589))
+* **discovery:** expand Cursor and Warp session recovery ([0d5743f](https://github.com/TeamCadenceAI/cadence-cli/commit/0d5743f1f922acd856d35a78f8bebf1d4ffb7ee7))
+
+
+### Bug Fixes
+
+* **cursor:** make workspace-key tests Windows-safe ([377f4d8](https://github.com/TeamCadenceAI/cadence-cli/commit/377f4d8e6e9a58407eb2ba3a4ea8cb16cc515ecc))
+* **discovery:** address CI and review follow-ups ([18458d5](https://github.com/TeamCadenceAI/cadence-cli/commit/18458d573a1c6e3a56839f00bc13021d774886b5))
+* **discovery:** respect windows and cursor turn order ([e3b9ce8](https://github.com/TeamCadenceAI/cadence-cli/commit/e3b9ce8b79c53d8d02e72b79d92a512eab219e8c))
+* Fix install script for new format ([72a3d0e](https://github.com/TeamCadenceAI/cadence-cli/commit/72a3d0e18ff335d2f5907fa8b5fcea2218f3cc71))
+* **warp:** preserve block cwd in meta-only sessions ([6215d72](https://github.com/TeamCadenceAI/cadence-cli/commit/6215d72994e91f0749db6c3a71af3267d11df587))
+
 ## [2.3.6](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.5...v2.3.6) (2026-03-30)
 
 
