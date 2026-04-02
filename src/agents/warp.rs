@@ -70,14 +70,46 @@ fn warp_db_paths() -> Vec<PathBuf> {
         ] {
             paths.push(base.join(name).join("warp.sqlite"));
         }
+        for legacy in [
+            home.join("Library")
+                .join("Application Support")
+                .join("dev.warp.Warp-Stable")
+                .join("warp.sqlite"),
+            home.join("Library")
+                .join("Application Support")
+                .join("dev.warp.Warp")
+                .join("warp.sqlite"),
+        ] {
+            paths.push(legacy);
+        }
     } else if cfg!(target_os = "windows") {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            paths.push(
+                PathBuf::from(&local)
+                    .join("warp")
+                    .join("Warp")
+                    .join("data")
+                    .join("warp.sqlite"),
+            );
+            paths.push(PathBuf::from(local).join("Warp").join("warp.sqlite"));
+        }
         if let Ok(appdata) = std::env::var("APPDATA") {
             paths.push(PathBuf::from(appdata).join("Warp").join("warp.sqlite"));
         }
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            paths.push(PathBuf::from(local).join("Warp").join("warp.sqlite"));
-        }
     } else {
+        if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+            paths.push(
+                PathBuf::from(xdg_state_home)
+                    .join("warp-terminal")
+                    .join("warp.sqlite"),
+            );
+        }
+        paths.push(
+            home.join(".local")
+                .join("state")
+                .join("warp-terminal")
+                .join("warp.sqlite"),
+        );
         paths.push(
             home.join(".local")
                 .join("share")
@@ -87,7 +119,18 @@ fn warp_db_paths() -> Vec<PathBuf> {
         paths.push(home.join(".config").join("warp").join("warp.sqlite"));
     }
 
-    paths
+    dedupe_paths(paths)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
@@ -101,14 +144,19 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
     };
     let _ = conn.busy_timeout(Duration::from_millis(200));
 
-    if !table_exists(&conn, "ai_queries") {
+    if !table_exists(&conn, "ai_queries")
+        && !table_exists(&conn, "agent_conversations")
+        && !table_exists(&conn, "agent_tasks")
+    {
         return out;
     }
 
     let cutoff = now - since_secs;
     let rows = fetch_ai_query_rows(&conn, cutoff);
     let tasks_by_conversation = fetch_agent_tasks_by_conversation(&conn, cutoff);
-    if rows.is_empty() && tasks_by_conversation.is_empty() {
+    let blocks_by_conversation = fetch_block_cwds_by_conversation(&conn);
+    let conversation_meta = fetch_agent_conversation_meta(&conn);
+    if rows.is_empty() && tasks_by_conversation.is_empty() && conversation_meta.is_empty() {
         return out;
     }
 
@@ -129,10 +177,15 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
     for conversation_id in tasks_by_conversation.keys() {
         by_conversation.entry(conversation_id.clone()).or_default();
     }
+    for conversation_id in conversation_meta.keys() {
+        by_conversation.entry(conversation_id.clone()).or_default();
+    }
 
     for (conversation_id, rows) in by_conversation {
         let mut max_start = 0i64;
-        let mut conversation_cwd: Option<String> = None;
+        let mut conversation_cwd = conversation_meta
+            .get(&conversation_id)
+            .and_then(|meta| meta.cwd.clone());
         let mut events = Vec::new();
         let mut ord = 0usize;
         let task_rows = tasks_by_conversation.get(&conversation_id);
@@ -144,6 +197,11 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
                 && !cwd.is_empty()
             {
                 conversation_cwd = Some(cwd.to_string());
+            }
+            if conversation_cwd.is_none()
+                && let Some(cwd) = row.input.as_deref().and_then(extract_cwd_from_ai_input)
+            {
+                conversation_cwd = Some(cwd);
             }
 
             let prompt = row
@@ -178,10 +236,23 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
             }
         }
 
+        if conversation_cwd.is_none() {
+            conversation_cwd = blocks_by_conversation
+                .get(&conversation_id)
+                .cloned()
+                .flatten();
+        }
+
         if let Some(task_rows) = task_rows {
             for task in task_rows {
                 max_start = max_start.max(task.last_modified_ts);
                 let decoded = decode_warp_task(&task.task_blob);
+                if conversation_cwd.is_none()
+                    && let Some(decoded) = decoded.as_ref()
+                    && let Some(cwd) = extract_cwd_from_decoded_task(decoded)
+                {
+                    conversation_cwd = Some(cwd);
+                }
                 let normalized = normalize_task_events(
                     &conversation_id,
                     task,
@@ -244,6 +315,9 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
                         Value::String(model.to_string()),
                     );
                 }
+                if let Some(meta) = conversation_meta.get(&conversation_id) {
+                    meta.apply_to(&mut obj);
+                }
                 deduped.push(Value::Object(obj));
             } else if let Some(first_task) = task_rows.and_then(|rows| rows.first()) {
                 let mut obj = base_event(
@@ -258,6 +332,21 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
                 );
                 if let Some(cwd) = conversation_cwd.as_deref() {
                     obj.insert("cwd".to_string(), Value::String(cwd.to_string()));
+                }
+                if let Some(meta) = conversation_meta.get(&conversation_id) {
+                    meta.apply_to(&mut obj);
+                }
+                deduped.push(Value::Object(obj));
+            } else if let Some(meta) = conversation_meta.get(&conversation_id) {
+                let mut obj = base_event(
+                    "warp_meta",
+                    &conversation_id,
+                    meta.last_modified_at.unwrap_or_default(),
+                    "agent_conversations",
+                );
+                meta.apply_to(&mut obj);
+                if let Some(text) = meta.summary_text.as_deref() {
+                    obj.insert("content".to_string(), Value::String(text.to_string()));
                 }
                 deduped.push(Value::Object(obj));
             }
@@ -613,6 +702,11 @@ fn extract_prompt_from_ai_input(raw: &str) -> Option<String> {
     None
 }
 
+fn extract_cwd_from_ai_input(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    extract_cwd_from_ai_value(&value)
+}
+
 fn extract_prompt_from_value(value: &Value) -> Option<String> {
     let obj = value.as_object()?;
     for key in [
@@ -630,6 +724,85 @@ fn extract_prompt_from_value(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_cwd_from_ai_value(value: &Value) -> Option<String> {
+    for pointer in [
+        "/cwd",
+        "/working_directory",
+        "/workspacePath",
+        "/Query/context/Directory/pwd",
+        "/Query/context/directory/pwd",
+        "/context/Directory/pwd",
+        "/context/directory/pwd",
+    ] {
+        if let Some(path) = value.pointer(pointer).and_then(Value::as_str)
+            && let Some(path) = non_empty_str(path)
+        {
+            return Some(path.to_string());
+        }
+    }
+
+    if let Value::Array(items) = value {
+        for item in items {
+            if let Some(query) = item.get("Query")
+                && let Some(path) = query
+                    .pointer("/context/Directory/pwd")
+                    .or_else(|| query.pointer("/context/directory/pwd"))
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_str)
+            {
+                return Some(path.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_summary_text(value: &Value) -> Option<String> {
+    for pointer in [
+        "/title",
+        "/summary",
+        "/latest_user_message",
+        "/latest_message",
+    ] {
+        if let Some(text) = value.pointer(pointer).and_then(Value::as_str)
+            && let Some(text) = sanitize_text(text)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn extract_cwd_from_decoded_task(decoded: &WarpDecodedTask) -> Option<String> {
+    for node in &decoded.flat_nodes {
+        let Some(text) = node.string_value.as_deref() else {
+            continue;
+        };
+        let candidate = text.trim();
+        if is_probable_filesystem_path(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn is_probable_filesystem_path(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 2 || trimmed.len() > 1024 {
+        return false;
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return false;
+    }
+    if trimmed.starts_with('/') {
+        return true;
+    }
+    trimmed.len() > 3
+        && trimmed.as_bytes()[1] == b':'
+        && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/')
 }
 
 fn sanitize_text(raw: &str) -> Option<String> {
@@ -706,6 +879,9 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
 }
 
 fn fetch_ai_query_rows(conn: &Connection, cutoff: i64) -> Vec<AiQueryRow> {
+    if !table_exists(conn, "ai_queries") {
+        return Vec::new();
+    }
     let start_ts_expr = normalized_start_ts_sql("start_ts");
     let query_full = format!(
         "SELECT exchange_id, conversation_id, {start_ts_expr} AS start_ts_epoch, input, working_directory, output_status, model_id, planning_model_id, coding_model_id
@@ -813,6 +989,108 @@ fn fetch_agent_tasks_by_conversation(
     out
 }
 
+fn fetch_block_cwds_by_conversation(conn: &Connection) -> HashMap<String, Option<String>> {
+    let mut out = HashMap::new();
+    if !table_exists(conn, "blocks") {
+        return out;
+    }
+
+    let Ok(mut stmt) = conn.prepare("SELECT ai_metadata, pwd FROM blocks") else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    }) else {
+        return out;
+    };
+
+    for row in rows.flatten() {
+        let (Some(ai_metadata), Some(pwd)) = row else {
+            continue;
+        };
+        let Some(cwd) = non_empty_str(&pwd).map(ToOwned::to_owned) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&ai_metadata) else {
+            continue;
+        };
+        let Some(conversation_id) = value
+            .get("conversation_id")
+            .or_else(|| value.pointer("/conversation/id"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        out.entry(conversation_id.to_string()).or_insert(Some(cwd));
+    }
+
+    out
+}
+
+fn fetch_agent_conversation_meta(conn: &Connection) -> HashMap<String, WarpConversationMeta> {
+    let mut out = HashMap::new();
+    if !table_exists(conn, "agent_conversations") {
+        return out;
+    }
+
+    let ts_expr = normalized_start_ts_sql("last_modified_at");
+    let query = format!(
+        "SELECT conversation_id, conversation_data, {ts_expr} AS ts_epoch FROM agent_conversations WHERE conversation_id IS NOT NULL"
+    );
+    if let Ok(mut stmt) = conn.prepare(&query)
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+    {
+        for row in rows.flatten() {
+            let Some(raw) = row.1 else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if let Some(ts) = row.2
+                && let Value::Object(map) = &mut value
+            {
+                map.entry("last_modified_at".to_string())
+                    .or_insert_with(|| Value::Number(ts.into()));
+            }
+            out.insert(row.0, WarpConversationMeta::from_value(&value));
+        }
+        return out;
+    }
+
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT conversation_id, conversation_data FROM agent_conversations WHERE conversation_id IS NOT NULL",
+    ) else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    }) else {
+        return out;
+    };
+
+    for row in rows.flatten() {
+        let Some(raw) = row.1 else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        out.insert(row.0, WarpConversationMeta::from_value(&value));
+    }
+
+    out
+}
+
 #[derive(Debug, Clone)]
 struct EmittedEvent {
     ts: i64,
@@ -840,6 +1118,83 @@ struct AgentTaskRow {
     task_id: String,
     last_modified_ts: i64,
     task_blob: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WarpConversationMeta {
+    cwd: Option<String>,
+    model_id: Option<String>,
+    planning_model_id: Option<String>,
+    coding_model_id: Option<String>,
+    server_conversation_token: Option<String>,
+    last_modified_at: Option<i64>,
+    summary_text: Option<String>,
+}
+
+impl WarpConversationMeta {
+    fn from_value(value: &Value) -> Self {
+        Self {
+            cwd: value
+                .pointer("/working_directory")
+                .or_else(|| value.pointer("/cwd"))
+                .or_else(|| value.pointer("/workspacePath"))
+                .and_then(Value::as_str)
+                .and_then(non_empty_str)
+                .map(ToOwned::to_owned),
+            model_id: value
+                .pointer("/model_id")
+                .or_else(|| value.pointer("/model/name"))
+                .or_else(|| value.pointer("/conversation_usage_metadata/model_id"))
+                .and_then(Value::as_str)
+                .and_then(non_empty_str)
+                .map(ToOwned::to_owned),
+            planning_model_id: value
+                .pointer("/planning_model_id")
+                .and_then(Value::as_str)
+                .and_then(non_empty_str)
+                .map(ToOwned::to_owned),
+            coding_model_id: value
+                .pointer("/coding_model_id")
+                .and_then(Value::as_str)
+                .and_then(non_empty_str)
+                .map(ToOwned::to_owned),
+            server_conversation_token: value
+                .get("server_conversation_token")
+                .and_then(Value::as_str)
+                .and_then(non_empty_str)
+                .map(ToOwned::to_owned),
+            last_modified_at: value
+                .pointer("/last_modified_at")
+                .and_then(Value::as_i64)
+                .or_else(|| value.pointer("/updated_at").and_then(Value::as_i64)),
+            summary_text: extract_prompt_from_value(value).or_else(|| extract_summary_text(value)),
+        }
+    }
+
+    fn apply_to(&self, obj: &mut Map<String, Value>) {
+        if let Some(cwd) = self.cwd.as_deref() {
+            obj.entry("cwd".to_string())
+                .or_insert_with(|| Value::String(cwd.to_string()));
+        }
+        if let Some(model_id) = self.model_id.as_deref() {
+            obj.entry("model_id".to_string())
+                .or_insert_with(|| Value::String(model_id.to_string()));
+        }
+        if let Some(model_id) = self.planning_model_id.as_deref() {
+            obj.entry("planning_model_id".to_string())
+                .or_insert_with(|| Value::String(model_id.to_string()));
+        }
+        if let Some(model_id) = self.coding_model_id.as_deref() {
+            obj.entry("coding_model_id".to_string())
+                .or_insert_with(|| Value::String(model_id.to_string()));
+        }
+        if let Some(token) = self.server_conversation_token.as_deref() {
+            obj.insert(
+                "server_conversation_token".to_string(),
+                Value::String(token.to_string()),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1238,13 +1593,21 @@ mod tests {
                 planning_model_id TEXT,
                 coding_model_id TEXT
             );
-            CREATE TABLE agent_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                task BLOB NOT NULL,
-                last_modified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );",
+             CREATE TABLE agent_tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 conversation_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 task BLOB NOT NULL,
+                 last_modified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE blocks (
+                 ai_metadata TEXT,
+                 pwd TEXT
+             );
+             CREATE TABLE agent_conversations (
+                 conversation_id TEXT,
+                 conversation_data TEXT
+             );",
         )
         .expect("create");
         conn
@@ -1416,6 +1779,125 @@ mod tests {
         };
         let metadata = scanner::parse_session_metadata_str(content);
         assert!(metadata.cwd.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn warp_recovers_cwd_from_ai_query_input_context() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("warp.sqlite");
+        let conn = create_db(&db_path);
+        conn.execute(
+            "INSERT INTO ai_queries (exchange_id, conversation_id, start_ts, input, output_status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                "ex1",
+                "conv-input-cwd",
+                1_700_000_000i64,
+                r#"[{"Query":{"text":"hi","context":{"Directory":{"pwd":"/tmp/repo-from-input"}}}}]"#,
+                "Succeeded",
+            ),
+        )
+        .expect("insert");
+
+        unsafe {
+            std::env::set_var("WARP_DB_PATH", &db_path);
+        }
+        let logs = WarpExplorer.discover_recent(1_700_000_200, 1_000).await;
+        unsafe {
+            std::env::remove_var("WARP_DB_PATH");
+        }
+
+        let log = logs.first().expect("log");
+        let content = match &log.source {
+            SessionSource::Inline { content, .. } => content,
+            _ => panic!("expected inline"),
+        };
+        let metadata = scanner::parse_session_metadata_str(content);
+        assert_eq!(metadata.cwd.as_deref(), Some("/tmp/repo-from-input"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn warp_recovers_cwd_from_blocks_when_queries_lack_it() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("warp.sqlite");
+        let conn = create_db(&db_path);
+        conn.execute(
+            "INSERT INTO ai_queries (exchange_id, conversation_id, start_ts, input, output_status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                "ex1",
+                "conv-block-cwd",
+                1_700_000_000i64,
+                r#"{"prompt":"hi"}"#,
+                "Succeeded",
+            ),
+        )
+        .expect("insert");
+        conn.execute(
+            "INSERT INTO blocks (ai_metadata, pwd) VALUES (?1, ?2)",
+            (
+                r#"{"conversation_id":"conv-block-cwd"}"#,
+                "/tmp/repo-from-blocks",
+            ),
+        )
+        .expect("insert block");
+
+        unsafe {
+            std::env::set_var("WARP_DB_PATH", &db_path);
+        }
+        let logs = WarpExplorer.discover_recent(1_700_000_200, 1_000).await;
+        unsafe {
+            std::env::remove_var("WARP_DB_PATH");
+        }
+
+        let log = logs.first().expect("log");
+        let content = match &log.source {
+            SessionSource::Inline { content, .. } => content,
+            _ => panic!("expected inline"),
+        };
+        let metadata = scanner::parse_session_metadata_str(content);
+        assert_eq!(metadata.cwd.as_deref(), Some("/tmp/repo-from-blocks"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn warp_enriches_meta_from_agent_conversations() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("warp.sqlite");
+        let conn = create_db(&db_path);
+        conn.execute(
+            "INSERT INTO agent_tasks (conversation_id, task_id, task, last_modified_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            ("conv-meta", "task-1", Vec::<u8>::new(), 1_772_582_530i64),
+        )
+        .expect("insert task");
+        conn.execute(
+            "INSERT INTO agent_conversations (conversation_id, conversation_data) VALUES (?1, ?2)",
+            (
+                "conv-meta",
+                r#"{"working_directory":"/tmp/repo-meta","model_id":"claude-opus-4.1","server_conversation_token":"token-123"}"#,
+            ),
+        )
+        .expect("insert conversation meta");
+
+        unsafe {
+            std::env::set_var("WARP_DB_PATH", &db_path);
+        }
+        let logs = WarpExplorer.discover_recent(1_772_583_000, 1_000).await;
+        unsafe {
+            std::env::remove_var("WARP_DB_PATH");
+        }
+
+        let log = logs.first().expect("log");
+        let content = match &log.source {
+            SessionSource::Inline { content, .. } => content,
+            _ => panic!("expected inline"),
+        };
+        assert!(content.contains("/tmp/repo-meta"));
+        assert!(content.contains("claude-opus-4.1"));
+        assert!(content.contains("token-123"));
     }
 
     #[tokio::test]
