@@ -3106,6 +3106,41 @@ mod tests {
             .as_secs() as i64
     }
 
+    fn encode_cursor_workspace_key_for_tests(path: &Path) -> String {
+        use std::path::Component;
+
+        let mut encoded = String::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => {
+                    let raw = prefix.as_os_str().to_string_lossy();
+                    if let Some(drive) = raw.strip_suffix(':') {
+                        encoded.push_str(drive);
+                        encoded.push_str("--");
+                    } else if !raw.is_empty() {
+                        if !encoded.is_empty() && !encoded.ends_with('-') {
+                            encoded.push('-');
+                        }
+                        encoded.push_str(&raw.replace(['/', '\\', ':'], "-"));
+                    }
+                }
+                Component::RootDir => {}
+                Component::Normal(segment) => {
+                    let segment = segment.to_string_lossy();
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    if !encoded.is_empty() && !encoded.ends_with('-') {
+                        encoded.push('-');
+                    }
+                    encoded.push_str(&segment);
+                }
+                Component::CurDir | Component::ParentDir => {}
+            }
+        }
+        encoded
+    }
+
     fn occurrence_count(haystack: &str, needle: &str) -> usize {
         haystack.matches(needle).count()
     }
@@ -5026,7 +5061,7 @@ mod tests {
         )
         .await;
 
-        let workspace_key = repo.path().to_string_lossy().replace(['/', '\\'], "-");
+        let workspace_key = encode_cursor_workspace_key_for_tests(repo.path());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -471,11 +471,38 @@ fn parse_workspace_json_path(content: &str) -> Option<String> {
 }
 
 fn encode_cursor_project_workspace_key(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .filter(|segment| !segment.is_empty() && *segment != "/" && *segment != "\\")
-        .collect::<Vec<_>>()
-        .join("-")
+    use std::path::Component;
+
+    let mut encoded = String::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                let raw = prefix.as_os_str().to_string_lossy();
+                if let Some(drive) = raw.strip_suffix(':') {
+                    encoded.push_str(drive);
+                    encoded.push_str("--");
+                } else if !raw.is_empty() {
+                    if !encoded.is_empty() && !encoded.ends_with('-') {
+                        encoded.push('-');
+                    }
+                    encoded.push_str(&raw.replace(['/', '\\', ':'], "-"));
+                }
+            }
+            Component::RootDir => {}
+            Component::Normal(segment) => {
+                let segment = segment.to_string_lossy();
+                if segment.is_empty() {
+                    continue;
+                }
+                if !encoded.is_empty() && !encoded.ends_with('-') {
+                    encoded.push('-');
+                }
+                encoded.push_str(&segment);
+            }
+            Component::CurDir | Component::ParentDir => {}
+        }
+    }
+    encoded
 }
 
 fn normalize_cursor_workspace_path(path: &str) -> String {
@@ -1500,7 +1527,11 @@ mod tests {
             .join("workspace-1");
         write_workspace(
             &workspace_dir,
-            "file:///Users/zack/dev/cadence-cli",
+            if cfg!(windows) {
+                "file:///C:/cursor-test-workspace"
+            } else {
+                "file:///tmp/cursor-test-workspace"
+            },
             "composer-1",
             1_775_083_382_256i64,
         )
@@ -1514,11 +1545,13 @@ mod tests {
         };
         let metadata = scanner::parse_session_metadata_str(content);
         assert_eq!(metadata.session_id.as_deref(), Some("composer-1"));
-        assert!(
-            metadata
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.ends_with("/Users/zack/dev/cadence-cli"))
+        assert_eq!(
+            metadata.cwd.as_deref(),
+            Some(if cfg!(windows) {
+                "C:/cursor-test-workspace"
+            } else {
+                "/tmp/cursor-test-workspace"
+            })
         );
         assert!(content.contains("Explain the architecture"));
         assert!(content.contains("Here is the architecture."));
@@ -1621,5 +1654,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64
+    }
+
+    #[test]
+    fn test_encode_cursor_project_workspace_key_windows_drive_format() {
+        let encoded =
+            encode_cursor_project_workspace_key(Path::new(r"C:\Users\zack\dev\cadence-cli"));
+
+        if cfg!(windows) {
+            assert_eq!(encoded, "C--Users-zack-dev-cadence-cli");
+        }
     }
 }
