@@ -156,7 +156,7 @@ fn query_warp_db(path: &Path, now: i64, since_secs: i64) -> Vec<SessionLog> {
     let rows = fetch_ai_query_rows(&conn, cutoff);
     let tasks_by_conversation = fetch_agent_tasks_by_conversation(&conn, cutoff);
     let blocks_by_conversation = fetch_block_cwds_by_conversation(&conn);
-    let conversation_meta = fetch_agent_conversation_meta(&conn);
+    let conversation_meta = fetch_agent_conversation_meta(&conn, cutoff);
     if rows.is_empty() && tasks_by_conversation.is_empty() && conversation_meta.is_empty() {
         return out;
     }
@@ -1041,7 +1041,10 @@ fn row_optional_text(row: &rusqlite::Row<'_>, idx: usize) -> Option<String> {
     }
 }
 
-fn fetch_agent_conversation_meta(conn: &Connection) -> HashMap<String, WarpConversationMeta> {
+fn fetch_agent_conversation_meta(
+    conn: &Connection,
+    cutoff: i64,
+) -> HashMap<String, WarpConversationMeta> {
     let mut out = HashMap::new();
     if !table_exists(conn, "agent_conversations") {
         return out;
@@ -1049,10 +1052,10 @@ fn fetch_agent_conversation_meta(conn: &Connection) -> HashMap<String, WarpConve
 
     let ts_expr = normalized_start_ts_sql("last_modified_at");
     let query = format!(
-        "SELECT conversation_id, conversation_data, {ts_expr} AS ts_epoch FROM agent_conversations WHERE conversation_id IS NOT NULL"
+        "SELECT conversation_id, conversation_data, {ts_expr} AS ts_epoch FROM agent_conversations WHERE conversation_id IS NOT NULL AND {ts_expr} >= ?1"
     );
     if let Ok(mut stmt) = conn.prepare(&query)
-        && let Ok(rows) = stmt.query_map([], |row| {
+        && let Ok(rows) = stmt.query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -1979,6 +1982,42 @@ mod tests {
             by_conversation.get("conv-1").cloned().flatten().as_deref(),
             Some("/tmp/repo-from-blob")
         );
+    }
+
+    #[test]
+    fn warp_agent_conversation_meta_respects_cutoff() {
+        let conn = Connection::open_in_memory().expect("mem db");
+        conn.execute_batch(
+            "CREATE TABLE agent_conversations (
+                conversation_id TEXT,
+                conversation_data TEXT,
+                last_modified_at INTEGER
+            );",
+        )
+        .expect("create agent conversations");
+        conn.execute(
+            "INSERT INTO agent_conversations (conversation_id, conversation_data, last_modified_at) VALUES (?1, ?2, ?3)",
+            (
+                "old-conv",
+                r#"{"working_directory":"/tmp/old","summary":"old"}"#,
+                1_700_000_000i64,
+            ),
+        )
+        .expect("insert old conversation");
+        conn.execute(
+            "INSERT INTO agent_conversations (conversation_id, conversation_data, last_modified_at) VALUES (?1, ?2, ?3)",
+            (
+                "new-conv",
+                r#"{"working_directory":"/tmp/new","summary":"new"}"#,
+                1_800_000_000i64,
+            ),
+        )
+        .expect("insert new conversation");
+
+        let by_conversation = fetch_agent_conversation_meta(&conn, 1_750_000_000);
+
+        assert!(!by_conversation.contains_key("old-conv"));
+        assert!(by_conversation.contains_key("new-conv"));
     }
 
     #[tokio::test]

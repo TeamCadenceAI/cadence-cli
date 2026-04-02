@@ -543,8 +543,7 @@ fn build_desktop_cursor_session_content(
     header_ids.extend(extract_bubble_ids_from_value(
         composer.get("conversationMap").unwrap_or(&Value::Null),
     ));
-    header_ids.sort();
-    header_ids.dedup();
+    dedupe_preserving_order(&mut header_ids);
 
     let mut bubbles = query_cursor_bubbles(global, composer_id);
     if header_ids.is_empty() {
@@ -687,6 +686,11 @@ fn extract_bubble_ids_from_value(value: &Value) -> Vec<String> {
     let mut out = Vec::new();
     collect_bubble_ids(value, &mut out);
     out
+}
+
+fn dedupe_preserving_order(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
 }
 
 fn collect_bubble_ids(value: &Value, out: &mut Vec<String>) {
@@ -1510,6 +1514,20 @@ mod tests {
         );
         assert!(content.contains("Explain the architecture"));
         assert!(content.contains("Here is the architecture."));
+    }
+
+    #[test]
+    fn test_cursor_dedupe_preserves_bubble_order() {
+        let mut ids = vec![
+            "bubble-2".to_string(),
+            "bubble-10".to_string(),
+            "bubble-2".to_string(),
+            "bubble-1".to_string(),
+        ];
+
+        dedupe_preserving_order(&mut ids);
+
+        assert_eq!(ids, vec!["bubble-2", "bubble-10", "bubble-1"]);
     }
 
     #[tokio::test]
