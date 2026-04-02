@@ -746,6 +746,32 @@ async fn session_log_metadata(log: &agents::SessionLog) -> scanner::SessionMetad
     metadata
 }
 
+fn discovery_skip_reason_for_missing_metadata(log: &agents::SessionLog) -> &'static str {
+    match log.agent_type {
+        scanner::AgentType::Cursor => {
+            let label = log.source_label();
+            if label.contains("agent-tools")
+                || label.contains("terminals")
+                || label.contains("mcps")
+            {
+                "cursor_non_session_artifact"
+            } else {
+                "cursor_unsupported_storage_shape"
+            }
+        }
+        scanner::AgentType::Warp => "warp_missing_session_id",
+        _ => "missing_session_metadata",
+    }
+}
+
+fn discovery_skip_reason_for_missing_cwd(log: &agents::SessionLog) -> &'static str {
+    match log.agent_type {
+        scanner::AgentType::Cursor => "cursor_workspace_unresolved",
+        scanner::AgentType::Warp => "warp_cwd_unrecoverable_after_fallbacks",
+        _ => "missing_cwd",
+    }
+}
+
 async fn session_log_content_async(log: &agents::SessionLog) -> Option<String> {
     match &log.source {
         agents::SessionSource::File(path) => tokio::fs::read_to_string(path).await.ok(),
@@ -1372,10 +1398,12 @@ async fn run_backfill_inner_with_invocation(
 
         // Skip files with no session metadata (e.g., file-history-snapshot files)
         if metadata.session_id.is_none() && metadata.cwd.is_none() {
+            let reason = discovery_skip_reason_for_missing_metadata(log);
             ::tracing::info!(
                 event = "session_discovery_skipped",
                 file = file_path.as_str(),
-                reason = "missing_session_metadata"
+                agent = log.agent_type.to_string(),
+                reason
             );
             if let Some(ref pb) = progress {
                 pb.inc(1);
@@ -1387,11 +1415,13 @@ async fn run_backfill_inner_with_invocation(
         let cwd = match &metadata.cwd {
             Some(c) => c.clone(),
             None => {
+                let reason = discovery_skip_reason_for_missing_cwd(log);
                 ::tracing::info!(
                     event = "session_discovery_skipped",
                     file = file_path.as_str(),
+                    agent = log.agent_type.to_string(),
                     session_id = ?metadata.session_id,
-                    reason = "missing_cwd"
+                    reason
                 );
                 if let Some(ref pb) = progress {
                     pb.inc(1);
@@ -3069,6 +3099,48 @@ mod tests {
         String::from_utf8(buf).expect("utf8 output")
     }
 
+    fn current_unix_epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current unix epoch")
+            .as_secs() as i64
+    }
+
+    fn encode_cursor_workspace_key_for_tests(path: &Path) -> String {
+        use std::path::Component;
+
+        let mut encoded = String::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => {
+                    let raw = prefix.as_os_str().to_string_lossy();
+                    if let Some(drive) = raw.strip_suffix(':') {
+                        encoded.push_str(drive);
+                        encoded.push_str("--");
+                    } else if !raw.is_empty() {
+                        if !encoded.is_empty() && !encoded.ends_with('-') {
+                            encoded.push('-');
+                        }
+                        encoded.push_str(&raw.replace(['/', '\\', ':'], "-"));
+                    }
+                }
+                Component::RootDir => {}
+                Component::Normal(segment) => {
+                    let segment = segment.to_string_lossy();
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    if !encoded.is_empty() && !encoded.ends_with('-') {
+                        encoded.push('-');
+                    }
+                    encoded.push_str(&segment);
+                }
+                Component::CurDir | Component::ParentDir => {}
+            }
+        }
+        encoded
+    }
+
     fn occurrence_count(haystack: &str, needle: &str) -> usize {
         haystack.matches(needle).count()
     }
@@ -3172,6 +3244,196 @@ mod tests {
         filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(updated_at, 0))
             .expect("set codex session mtime");
         path
+    }
+
+    async fn write_cursor_agent_transcript(
+        home: &Path,
+        workspace_key: &str,
+        session_id: &str,
+        body: &str,
+        updated_at: i64,
+    ) -> PathBuf {
+        let path = home
+            .join(".cursor")
+            .join("projects")
+            .join(workspace_key)
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        tokio::fs::create_dir_all(path.parent().expect("parent"))
+            .await
+            .expect("create cursor transcript dir");
+        tokio::fs::write(&path, body)
+            .await
+            .expect("write cursor transcript");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(updated_at, 0))
+            .expect("set cursor transcript mtime");
+        path
+    }
+
+    async fn write_cursor_project_noise(home: &Path, workspace_key: &str) {
+        for relative in [
+            PathBuf::from("agent-tools/tool-output.txt"),
+            PathBuf::from("terminals/1.txt"),
+            PathBuf::from("mcps/example/tools/tool.json"),
+        ] {
+            let path = home
+                .join(".cursor")
+                .join("projects")
+                .join(workspace_key)
+                .join(relative);
+            tokio::fs::create_dir_all(path.parent().expect("noise parent"))
+                .await
+                .expect("create cursor noise dir");
+            tokio::fs::write(&path, "noise")
+                .await
+                .expect("write cursor noise file");
+        }
+    }
+
+    fn create_cursor_state_db(path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).expect("open cursor state db");
+        conn.execute_batch(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);",
+        )
+        .expect("create cursor state schema");
+        conn
+    }
+
+    async fn write_cursor_desktop_session(
+        home: &Path,
+        workspace_id: &str,
+        composer_id: &str,
+        repo_root: &Path,
+        updated_at_ms: i64,
+        user_text: &str,
+        assistant_text: &str,
+    ) {
+        let global_dir = agents::app_config_dir_in("Cursor", home)
+            .join("User")
+            .join("globalStorage");
+        tokio::fs::create_dir_all(&global_dir)
+            .await
+            .expect("create cursor global storage dir");
+        let global_db_path = global_dir.join("state.vscdb");
+        let global = create_cursor_state_db(&global_db_path);
+        global
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("composerData:{composer_id}"),
+                    serde_json::json!({
+                        "composerId": composer_id,
+                        "createdAt": updated_at_ms - 5_000,
+                        "lastUpdatedAt": updated_at_ms,
+                        "modelConfig": { "modelName": "claude-opus-4.1" },
+                        "fullConversationHeadersOnly": [
+                            { "bubbleId": "bubble-user", "type": 1 },
+                            { "bubbleId": "bubble-assistant", "type": 2 }
+                        ]
+                    })
+                    .to_string()
+                ],
+            )
+            .expect("insert cursor composer");
+        global
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("bubbleId:{composer_id}:bubble-user"),
+                    serde_json::json!({
+                        "type": 1,
+                        "text": user_text,
+                        "createdAt": "2026-04-01T22:42:55.658Z",
+                        "modelInfo": { "modelName": "claude-opus-4.1" }
+                    })
+                    .to_string()
+                ],
+            )
+            .expect("insert cursor user bubble");
+        global
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("bubbleId:{composer_id}:bubble-assistant"),
+                    serde_json::json!({
+                        "type": 2,
+                        "markdown": assistant_text,
+                        "createdAt": "2026-04-01T22:42:57.468Z"
+                    })
+                    .to_string()
+                ],
+            )
+            .expect("insert cursor assistant bubble");
+
+        let workspace_dir = agents::app_config_dir_in("Cursor", home)
+            .join("User")
+            .join("workspaceStorage")
+            .join(workspace_id);
+        tokio::fs::create_dir_all(&workspace_dir)
+            .await
+            .expect("create cursor workspace dir");
+        tokio::fs::write(
+            workspace_dir.join("workspace.json"),
+            serde_json::json!({
+                "folder": format!("file://{}", repo_root.to_string_lossy())
+            })
+            .to_string(),
+        )
+        .await
+        .expect("write cursor workspace json");
+        let workspace = create_cursor_state_db(&workspace_dir.join("state.vscdb"));
+        workspace
+            .execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    "composer.composerData",
+                    serde_json::json!({
+                        "allComposers": [{
+                            "composerId": composer_id,
+                            "lastUpdatedAt": updated_at_ms,
+                            "createdAt": updated_at_ms - 5_000,
+                        }]
+                    })
+                    .to_string()
+                ],
+            )
+            .expect("insert cursor workspace composer");
+    }
+
+    fn create_warp_fixture_db(path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).expect("open warp fixture db");
+        conn.execute_batch(
+            "CREATE TABLE ai_queries (
+                exchange_id TEXT,
+                conversation_id TEXT,
+                start_ts INTEGER,
+                input TEXT,
+                working_directory TEXT,
+                output_status TEXT,
+                model_id TEXT,
+                planning_model_id TEXT,
+                coding_model_id TEXT
+            );
+            CREATE TABLE agent_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task BLOB NOT NULL,
+                last_modified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE blocks (
+                ai_metadata TEXT,
+                pwd TEXT
+            );
+            CREATE TABLE agent_conversations (
+                conversation_id TEXT,
+                conversation_data TEXT
+            );",
+        )
+        .expect("create warp fixture schema");
+        conn
     }
 
     #[test]
@@ -4770,6 +5032,339 @@ mod tests {
         let requests = server.create_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].canonical_repo_root, repo_a.to_string_lossy());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_discovers_real_world_cursor_sessions_and_ignores_noise() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
+        )
+        .await;
+
+        let workspace_key = encode_cursor_workspace_key_for_tests(repo.path());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        write_cursor_agent_transcript(
+            home.path(),
+            &workspace_key,
+            "cursor-transcript-session",
+            concat!(
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Explain the architecture of the project\"}]}}\n",
+                "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Here is the project architecture.\"}]}}\n"
+            ),
+            now,
+        )
+        .await;
+        write_cursor_project_noise(home.path(), &workspace_key).await;
+        write_cursor_desktop_session(
+            home.path(),
+            "workspace-abc",
+            "cursor-desktop-session",
+            repo.path(),
+            now * 1000,
+            "Review the deployment flow",
+            "Deployment flow summary",
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let files =
+            agents::discover_recent_sessions_for_backfill(current_unix_epoch(), 86_400).await;
+        let cursor_files = files
+            .into_iter()
+            .filter(|log| log.agent_type == scanner::AgentType::Cursor)
+            .collect::<Vec<_>>();
+        assert_eq!(cursor_files.len(), 2);
+
+        let parsed_logs = parse_session_logs_bounded(cursor_files).await;
+        assert_eq!(parsed_logs.len(), 2);
+        for parsed in &parsed_logs {
+            assert_eq!(parsed.metadata.agent_type, Some(scanner::AgentType::Cursor));
+        }
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        for parsed in &parsed_logs {
+            let outcome = upload_session_from_log(
+                &upload_context,
+                parsed,
+                repo.path(),
+                &repo.path().to_string_lossy(),
+                PublicationMode::Backfill,
+            )
+            .await;
+            assert!(matches!(outcome, UploadFromLogOutcome::Uploaded));
+        }
+
+        let upload_bodies = server
+            .upload_requests()
+            .into_iter()
+            .map(|request| request.body)
+            .collect::<Vec<_>>();
+        assert_eq!(upload_bodies.len(), 2);
+        assert!(
+            upload_bodies
+                .iter()
+                .any(|body| body.contains("Explain the architecture of the project"))
+        );
+        assert!(
+            upload_bodies
+                .iter()
+                .any(|body| body.contains("Deployment flow summary"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_uploads_warp_session_with_cwd_from_query_context() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+        let warp_db_guard = EnvGuard::new("WARP_DB_PATH");
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
+        )
+        .await;
+
+        let warp_db_path = home.path().join("warp.sqlite");
+        let conn = create_warp_fixture_db(&warp_db_path);
+        conn.execute(
+            "INSERT INTO ai_queries (exchange_id, conversation_id, start_ts, input, output_status, model_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "ex1",
+                "warp-query-context",
+                current_unix_epoch(),
+                serde_json::json!([
+                    {"Query": {
+                        "text": "Explain the service boundaries",
+                        "context": {"Directory": {"pwd": repo.path().to_string_lossy().to_string()}}
+                    }}
+                ])
+                .to_string(),
+                "Succeeded",
+                "claude-opus-4.1"
+            ],
+        )
+        .expect("insert warp query row");
+        warp_db_guard.set_path(&warp_db_path);
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let files =
+            agents::discover_recent_sessions_for_backfill(current_unix_epoch(), 86_400).await;
+        let warp_files = files
+            .into_iter()
+            .filter(|log| log.agent_type == scanner::AgentType::Warp)
+            .collect::<Vec<_>>();
+        assert_eq!(warp_files.len(), 1);
+        let parsed_logs = parse_session_logs_bounded(warp_files).await;
+        assert_eq!(parsed_logs.len(), 1);
+        assert_eq!(
+            parsed_logs[0].metadata.session_id.as_deref(),
+            Some("warp-query-context")
+        );
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let outcome = upload_session_from_log(
+            &upload_context,
+            &parsed_logs[0],
+            repo.path(),
+            &repo.path().to_string_lossy(),
+            PublicationMode::Backfill,
+        )
+        .await;
+        assert!(matches!(outcome, UploadFromLogOutcome::Uploaded));
+
+        let uploads = server.upload_requests();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].body.contains("Explain the service boundaries"));
+        let create_requests = server.create_requests();
+        assert_eq!(create_requests.len(), 1);
+        assert_eq!(
+            create_requests[0].canonical_repo_root,
+            repo.path().to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_backfill_inner_skips_only_truly_unrecoverable_warp_sessions() {
+        let home = TempDir::new().expect("home tempdir");
+        let _env = DiscoveryTestEnv::install(home.path());
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+        let api_url_guard = EnvGuard::new("CADENCE_API_URL");
+        let warp_db_guard = EnvGuard::new("WARP_DB_PATH");
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
+        )
+        .await;
+
+        let warp_db_path = home.path().join("warp.sqlite");
+        let conn = create_warp_fixture_db(&warp_db_path);
+        conn.execute(
+            "INSERT INTO ai_queries (exchange_id, conversation_id, start_ts, input, output_status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "ex-recoverable",
+                "warp-block-recovery",
+                current_unix_epoch(),
+                serde_json::json!({"prompt": "Recover from blocks"}).to_string(),
+                "Succeeded"
+            ],
+        )
+        .expect("insert recoverable warp row");
+        conn.execute(
+            "INSERT INTO blocks (ai_metadata, pwd) VALUES (?1, ?2)",
+            rusqlite::params![
+                serde_json::json!({"conversation_id": "warp-block-recovery"}).to_string(),
+                repo.path().to_string_lossy().to_string()
+            ],
+        )
+        .expect("insert recoverable warp block");
+        conn.execute(
+            "INSERT INTO ai_queries (exchange_id, conversation_id, start_ts, input, output_status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "ex-missing",
+                "warp-unrecoverable",
+                current_unix_epoch(),
+                serde_json::json!({"prompt": "No cwd anywhere"}).to_string(),
+                "Succeeded"
+            ],
+        )
+        .expect("insert missing warp row");
+        warp_db_guard.set_path(&warp_db_path);
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        api_url_guard.set_str(server.base_url.as_str());
+
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let files =
+            agents::discover_recent_sessions_for_backfill(current_unix_epoch(), 86_400).await;
+        let warp_files = files
+            .into_iter()
+            .filter(|log| log.agent_type == scanner::AgentType::Warp)
+            .collect::<Vec<_>>();
+        assert_eq!(warp_files.len(), 2);
+        let parsed_logs = parse_session_logs_bounded(warp_files).await;
+        assert_eq!(parsed_logs.len(), 2);
+        let mut recoverable = None;
+        let mut missing = None;
+        for parsed in parsed_logs {
+            match parsed.metadata.session_id.as_deref() {
+                Some("warp-block-recovery") => recoverable = Some(parsed),
+                Some("warp-unrecoverable") => missing = Some(parsed),
+                _ => {}
+            }
+        }
+        let recoverable = recoverable.expect("recoverable warp session");
+        let missing = missing.expect("missing warp session");
+        assert!(missing.metadata.cwd.is_none());
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let outcome = upload_session_from_log(
+            &upload_context,
+            &recoverable,
+            repo.path(),
+            &repo.path().to_string_lossy(),
+            PublicationMode::Backfill,
+        )
+        .await;
+        assert!(matches!(outcome, UploadFromLogOutcome::Uploaded));
+
+        let uploads = server.upload_requests();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].body.contains("Recover from blocks"));
+        assert!(!uploads[0].body.contains("No cwd anywhere"));
     }
 
     // -----------------------------------------------------------------------
