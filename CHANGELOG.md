@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.4.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.4.0...v2.4.1) (2026-04-02)
+
+
+### Bug Fixes
+
+* **discovery:** resolve Claude desktop sessions with parent-directory CWD ([99f4fcd](https://github.com/TeamCadenceAI/cadence-cli/commit/99f4fcda5237b41b2812785ee0e8207fd5396ef2))
+* **discovery:** resolve Claude desktop sessions with parent-directory CWD ([c03aae2](https://github.com/TeamCadenceAI/cadence-cli/commit/c03aae2b95f27b5d6b9abcf76d7af92c6c159916))
+
 ## [2.4.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.3.6...v2.4.0) (2026-04-02)
 
 
