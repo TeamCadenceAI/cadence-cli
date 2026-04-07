@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.5.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.4.1...v2.5.0) (2026-04-07)
+
+
+### Features
+
+* **warp:** preserve raw warp rows in uploaded sessions ([9c40565](https://github.com/TeamCadenceAI/cadence-cli/commit/9c405657cbea632ec6b55471c13b815364775995))
+* **warp:** preserve raw warp rows in uploaded sessions ([f14be48](https://github.com/TeamCadenceAI/cadence-cli/commit/f14be488350cb5f44d74f1b5bc70916d8acde368))
+
 ## [2.4.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.4.0...v2.4.1) (2026-04-02)
 
 
