@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.6.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.5.0...v2.6.0) (2026-04-09)
+
+
+### Features
+
+* **opencode:** stitch child sessions into root uploads ([965019e](https://github.com/TeamCadenceAI/cadence-cli/commit/965019e26b9095bb1567ba98ce73845ad957fde6))
+* **opencode:** stitch child sessions into root uploads ([bc332d4](https://github.com/TeamCadenceAI/cadence-cli/commit/bc332d4327d20c5cc82c57738cea7e69ea26d5ef))
+
+
+### Bug Fixes
+
+* **opencode:** load parent file sessions outside cutoff ([36652cb](https://github.com/TeamCadenceAI/cadence-cli/commit/36652cb7688ff411bc610232efaf0c7377b304da))
+* **opencode:** satisfy CI lint rules ([621f9c7](https://github.com/TeamCadenceAI/cadence-cli/commit/621f9c70c037bc616b805619381170050224cca5))
+
 ## [2.5.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.4.1...v2.5.0) (2026-04-07)
 
 
