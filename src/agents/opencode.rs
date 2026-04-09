@@ -539,8 +539,7 @@ fn build_session_clusters(
 
     let mut clusters = Vec::new();
     for (root_session_id, mut cluster_session_ids) in root_to_sessions {
-        cluster_session_ids
-            .sort_by(|a, b| session_sort_tuple(a, sessions).cmp(&session_sort_tuple(b, sessions)));
+        cluster_session_ids.sort_by_key(|session_id| session_sort_tuple(session_id, sessions));
         if let Some(root_idx) = cluster_session_ids
             .iter()
             .position(|id| id == &root_session_id)
@@ -790,6 +789,16 @@ struct DbRecords {
     parts: Vec<PartRecord>,
 }
 
+struct DbSessionRowData {
+    session_id: String,
+    parent_session_id: Option<String>,
+    directory: Option<String>,
+    title: Option<String>,
+    time_created: Option<i64>,
+    time_updated: Option<i64>,
+    raw_json: Option<String>,
+}
+
 fn query_recent_db_records(root: &Path, cutoff: i64) -> Option<DbRecords> {
     let db_path = root.join("opencode.db");
     if !db_path.exists() {
@@ -908,13 +917,15 @@ fn fetch_db_sessions(
                 |(session_id, parent_session_id, directory, title, time_created, time_updated, raw_json)| {
                     build_db_session_record(
                         db_path,
-                        session_id,
-                        parent_session_id,
-                        directory,
-                        title,
-                        time_created,
-                        time_updated,
-                        raw_json,
+                        DbSessionRowData {
+                            session_id,
+                            parent_session_id,
+                            directory,
+                            title,
+                            time_created,
+                            time_updated,
+                            raw_json,
+                        },
                     )
                 },
             )
@@ -943,13 +954,15 @@ fn fetch_db_sessions(
                 |(session_id, directory, title, time_created, time_updated, raw_json)| {
                     build_db_session_record(
                         db_path,
-                        session_id,
-                        None,
-                        directory,
-                        title,
-                        time_created,
-                        time_updated,
-                        raw_json,
+                        DbSessionRowData {
+                            session_id,
+                            parent_session_id: None,
+                            directory,
+                            title,
+                            time_created,
+                            time_updated,
+                            raw_json,
+                        },
                     )
                 },
             )
@@ -978,13 +991,15 @@ fn fetch_db_sessions(
                 |(session_id, parent_session_id, directory, title, time_created, time_updated)| {
                     build_db_session_record(
                         db_path,
-                        session_id,
-                        parent_session_id,
-                        directory,
-                        title,
-                        time_created,
-                        time_updated,
-                        None,
+                        DbSessionRowData {
+                            session_id,
+                            parent_session_id,
+                            directory,
+                            title,
+                            time_created,
+                            time_updated,
+                            raw_json: None,
+                        },
                     )
                 },
             )
@@ -1014,29 +1029,32 @@ fn fetch_db_sessions(
             |(session_id, directory, title, time_created, time_updated)| {
                 build_db_session_record(
                     db_path,
-                    session_id,
-                    None,
-                    directory,
-                    title,
-                    time_created,
-                    time_updated,
-                    None,
+                    DbSessionRowData {
+                        session_id,
+                        parent_session_id: None,
+                        directory,
+                        title,
+                        time_created,
+                        time_updated,
+                        raw_json: None,
+                    },
                 )
             },
         )
         .collect()
 }
 
-fn build_db_session_record(
-    db_path: &Path,
-    session_id: String,
-    parent_session_id: Option<String>,
-    directory: Option<String>,
-    title: Option<String>,
-    time_created: Option<i64>,
-    time_updated: Option<i64>,
-    raw_json: Option<String>,
-) -> (String, SessionRecord) {
+fn build_db_session_record(db_path: &Path, row: DbSessionRowData) -> (String, SessionRecord) {
+    let DbSessionRowData {
+        session_id,
+        parent_session_id,
+        directory,
+        title,
+        time_created,
+        time_updated,
+        raw_json,
+    } = row;
+
     let raw = raw_json
         .as_deref()
         .and_then(parse_json)
