@@ -120,67 +120,23 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
         let message_dir = root.join("storage").join("message");
         let part_dir = root.join("storage").join("part");
 
+        let mut recent_file_session_ids = HashSet::new();
+
         for candidate in collect_recent_json_files(&session_dir, cutoff).await {
             let path = candidate.path;
             let Some(value) = read_json(&path).await else {
                 continue;
             };
-            let Some(session_id) = value
-                .get("id")
-                .or_else(|| value.get("sessionID"))
-                .and_then(Value::as_str)
+            let Some((session_id, record)) =
+                parse_session_record(value, path, candidate.mtime_epoch)
             else {
                 continue;
             };
-            let session_id = session_id.to_string();
-
-            let created_at = value
-                .pointer("/time/created")
-                .and_then(parse_epoch_from_json_value);
-            let updated_at = value
-                .pointer("/time/updated")
-                .and_then(parse_epoch_from_json_value)
-                .or(created_at);
-
-            let record = SessionRecord {
-                directory: value
-                    .get("directory")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                title: value
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                parent_session_id: value
-                    .get("parentID")
-                    .or_else(|| value.get("parentSessionID"))
-                    .or_else(|| value.get("parent_id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                source_file: path.to_string_lossy().to_string(),
-                created_at,
-                updated_at,
-                file_mtime: candidate.mtime_epoch,
-                raw: value,
-            };
-
-            match sessions.get(&session_id) {
-                None => {
-                    sessions.insert(session_id, record);
-                }
-                Some(existing) => {
-                    let record_recency =
-                        record.updated_at.or(record.file_mtime).unwrap_or_default();
-                    let existing_recency = existing
-                        .updated_at
-                        .or(existing.file_mtime)
-                        .unwrap_or_default();
-                    if record_recency > existing_recency {
-                        sessions.insert(session_id, record);
-                    }
-                }
-            }
+            recent_file_session_ids.insert(session_id.clone());
+            merge_session_records(&mut sessions, vec![(session_id, record)]);
         }
+
+        load_session_file_ancestors(&session_dir, &mut sessions, &recent_file_session_ids).await;
 
         for candidate in collect_recent_json_files(&message_dir, cutoff).await {
             let path = candidate.path;
@@ -279,6 +235,93 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
     }
 
     render_session_logs(cutoff, sessions, messages_by_session, parts_by_session)
+}
+
+fn parse_session_record(
+    value: Value,
+    path: PathBuf,
+    file_mtime: Option<i64>,
+) -> Option<(String, SessionRecord)> {
+    let session_id = value
+        .get("id")
+        .or_else(|| value.get("sessionID"))
+        .and_then(Value::as_str)?
+        .to_string();
+
+    let created_at = value
+        .pointer("/time/created")
+        .and_then(parse_epoch_from_json_value);
+    let updated_at = value
+        .pointer("/time/updated")
+        .and_then(parse_epoch_from_json_value)
+        .or(created_at);
+
+    Some((
+        session_id,
+        SessionRecord {
+            directory: value
+                .get("directory")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            title: value
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            parent_session_id: value
+                .get("parentID")
+                .or_else(|| value.get("parentSessionID"))
+                .or_else(|| value.get("parent_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            source_file: path.to_string_lossy().to_string(),
+            created_at,
+            updated_at,
+            file_mtime,
+            raw: value,
+        },
+    ))
+}
+
+async fn load_session_file_ancestors(
+    session_dir: &Path,
+    sessions: &mut HashMap<String, SessionRecord>,
+    initial_session_ids: &HashSet<String>,
+) {
+    let mut pending: Vec<String> = initial_session_ids.iter().cloned().collect();
+    let mut seen = HashSet::new();
+
+    while let Some(session_id) = pending.pop() {
+        if !seen.insert(session_id.clone()) {
+            continue;
+        }
+
+        let Some(parent_session_id) = sessions
+            .get(&session_id)
+            .and_then(session_parent_link)
+            .filter(|parent| !sessions.contains_key(parent))
+        else {
+            continue;
+        };
+
+        let Some(path) = find_session_json_file(session_dir, &parent_session_id).await else {
+            continue;
+        };
+        let mtime_epoch = file_mtime_epoch(&path).await;
+        let Some(value) = read_json(&path).await else {
+            continue;
+        };
+        let Some((loaded_session_id, record)) = parse_session_record(value, path, mtime_epoch)
+        else {
+            continue;
+        };
+
+        if loaded_session_id != parent_session_id {
+            continue;
+        }
+
+        merge_session_records(sessions, vec![(loaded_session_id.clone(), record)]);
+        pending.push(loaded_session_id);
+    }
 }
 
 fn render_session_logs(
@@ -1281,6 +1324,36 @@ async fn collect_recent_json_files(root: &Path, cutoff: i64) -> Vec<JsonCandidat
     out
 }
 
+async fn find_session_json_file(root: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    let expected_file_name = format!("{session_id}.json");
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if file_type.is_file()
+                && path.file_name().and_then(|name| name.to_str()) == Some(&expected_file_name)
+            {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
 async fn read_json(path: &Path) -> Option<Value> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
     serde_json::from_str::<Value>(&content).ok()
@@ -1494,6 +1567,44 @@ mod tests {
         set_file_mtime(&session_file, 9_950);
         let logs = discover_recent_in(&[root.to_path_buf()], 10_000, 100).await;
         assert_eq!(logs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_opencode_loads_older_file_backed_root_for_recent_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let root_file = root
+            .join("storage")
+            .join("session")
+            .join("global")
+            .join("ses_root.json");
+        write_json(&root_file, r#"{"id":"ses_root","directory":"/repo"}"#).await;
+        set_file_mtime(&root_file, 100);
+
+        let child_file = root
+            .join("storage")
+            .join("session")
+            .join("global")
+            .join("ses_child.json");
+        write_json(
+            &child_file,
+            r#"{"id":"ses_child","parentID":"ses_root","directory":"/repo"}"#,
+        )
+        .await;
+        set_file_mtime(&child_file, 9_950);
+
+        let logs = discover_recent_in(&[root.to_path_buf()], 10_000, 100).await;
+        assert_eq!(logs.len(), 1);
+
+        match &logs[0].source {
+            SessionSource::Inline { label, content } => {
+                assert_eq!(label, "opencode:ses_root");
+                assert!(content.contains("\"originSessionID\":\"ses_child\""));
+                assert!(content.contains("\"parentSessionID\":\"ses_root\""));
+            }
+            SessionSource::File(_) => panic!("expected inline session"),
+        }
     }
 
     #[tokio::test]
