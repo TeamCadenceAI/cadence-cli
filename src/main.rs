@@ -402,6 +402,7 @@ async fn run_hook_post_commit() -> Result<()> {
 }
 
 const MONITOR_DEFAULT_CURSOR_WINDOW_SECS: i64 = 30 * 86_400;
+const MONITOR_DISCOVERY_LOOKBACK_SECS: i64 = 300;
 
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
@@ -445,6 +446,44 @@ impl IncrementalCursor {
             last_scanned_mtime_epoch,
             last_scanned_source_label,
         }
+    }
+}
+
+fn selection_cursor_with_lookback(cursor: &IncrementalCursor) -> IncrementalCursor {
+    IncrementalCursor {
+        last_scanned_mtime_epoch: cursor
+            .last_scanned_mtime_epoch
+            .saturating_sub(MONITOR_DISCOVERY_LOOKBACK_SECS),
+        last_scanned_source_label: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MonitorSessionDedupeKey {
+    agent: String,
+    session_identity: String,
+    repo_root: String,
+}
+
+fn monitor_session_dedupe_key(
+    parsed: &ParsedSessionLog,
+    resolved_repo: &std::path::Path,
+) -> MonitorSessionDedupeKey {
+    let agent = parsed
+        .metadata
+        .agent_type
+        .clone()
+        .unwrap_or_else(|| parsed.log.agent_type.clone())
+        .to_string();
+    let session_identity = parsed
+        .metadata
+        .session_id
+        .clone()
+        .unwrap_or_else(|| parsed.log.source_label());
+    MonitorSessionDedupeKey {
+        agent,
+        session_identity,
+        repo_root: resolved_repo.to_string_lossy().to_string(),
     }
 }
 
@@ -1829,9 +1868,10 @@ async fn upload_incremental_sessions_globally(
         ),
         None => IncrementalCursor::from_position(now - MONITOR_DEFAULT_CURSOR_WINDOW_SECS, None),
     };
-    let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
+    let selection_cursor = selection_cursor_with_lookback(&initial_cursor);
+    let since_secs = (now - selection_cursor.last_scanned_mtime_epoch).max(0);
     let files = agents::discover_recent_sessions_for_monitor(now, since_secs).await;
-    let candidates = select_incremental_candidates(files, &initial_cursor, usize::MAX);
+    let candidates = select_incremental_candidates(files, &selection_cursor, usize::MAX);
     let parsed_logs = parse_session_logs_bounded(candidates).await;
 
     let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
@@ -1840,6 +1880,8 @@ async fn upload_incremental_sessions_globally(
         std::collections::HashMap::new();
     let mut repo_org_cache: std::collections::HashMap<std::path::PathBuf, bool> =
         std::collections::HashMap::new();
+    let mut seen_sessions: std::collections::HashSet<MonitorSessionDedupeKey> =
+        std::collections::HashSet::new();
     let mut stats = MonitorTickSummary {
         discovered: parsed_logs.len(),
         ..MonitorTickSummary::default()
@@ -1930,6 +1972,14 @@ async fn upload_incremental_sessions_globally(
             matches
         };
         if !repo_matches_org {
+            cursor_advance =
+                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            continue;
+        }
+
+        let dedupe_key = monitor_session_dedupe_key(&parsed, &resolved_repo);
+        if !seen_sessions.insert(dedupe_key) {
+            stats.skipped += 1;
             cursor_advance =
                 advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
@@ -3968,6 +4018,18 @@ mod tests {
     #[test]
     fn monitor_default_cursor_window_defaults_are_stable() {
         assert_eq!(MONITOR_DEFAULT_CURSOR_WINDOW_SECS, 30 * 86_400);
+        assert_eq!(MONITOR_DISCOVERY_LOOKBACK_SECS, 300);
+    }
+
+    #[test]
+    fn selection_cursor_with_lookback_rewinds_mtime_and_clears_label() {
+        let rewound = selection_cursor_with_lookback(&IncrementalCursor {
+            last_scanned_mtime_epoch: 500,
+            last_scanned_source_label: Some("session-z".to_string()),
+        });
+
+        assert_eq!(rewound.last_scanned_mtime_epoch, 200);
+        assert_eq!(rewound.last_scanned_source_label, None);
     }
 
     #[test]
@@ -4147,6 +4209,128 @@ mod tests {
                 user_org_requests: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_incremental_sessions_globally_uses_lookback_to_recover_older_sessions() {
+        let home = TempDir::new().expect("home tempdir");
+        let env = DiscoveryTestEnv::install(home.path());
+        env.codex_home.set_path(&home.path().join(".codex"));
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo_a = init_repo().await;
+        run_git(
+            repo_a.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/repo-a.git",
+            ],
+        )
+        .await;
+
+        let repo_b = init_repo().await;
+        run_git(
+            repo_b.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/repo-b.git",
+            ],
+        )
+        .await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current epoch")
+            .as_secs() as i64;
+        let newer_session_updated_at = now - 60;
+        let newer_session_path = write_codex_session_log(
+            home.path(),
+            "session-repo-b-newer",
+            repo_b.path(),
+            newer_session_updated_at,
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let first_summary = upload_incremental_sessions_globally(&upload_context)
+            .await
+            .expect("first incremental upload");
+        assert_eq!(first_summary.uploaded, 1);
+
+        let older_session_updated_at = newer_session_updated_at - 120;
+        let older_session_path = write_codex_session_log(
+            home.path(),
+            "session-repo-a-older",
+            repo_a.path(),
+            older_session_updated_at,
+        )
+        .await;
+
+        let second_summary = upload_incremental_sessions_globally(&upload_context)
+            .await
+            .expect("second incremental upload");
+
+        assert_eq!(second_summary.discovered, 2);
+        assert_eq!(second_summary.uploaded, 1);
+        assert_eq!(second_summary.skipped, 1);
+        assert_eq!(second_summary.queued, 0);
+        assert_eq!(second_summary.issues, 0);
+
+        let cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor")
+            .expect("cursor record");
+        assert_eq!(cursor.last_scanned_mtime_epoch, newer_session_updated_at);
+        assert_eq!(
+            cursor.last_scanned_source_label.as_deref(),
+            Some(newer_session_path.to_string_lossy().as_ref())
+        );
+
+        let requests = server.create_requests();
+        assert_eq!(requests.len(), 2);
+        let upload_bodies = server
+            .upload_requests()
+            .into_iter()
+            .map(|request| request.body)
+            .collect::<Vec<_>>();
+        assert_eq!(upload_bodies.len(), 2);
+        assert!(
+            upload_bodies
+                .iter()
+                .any(|body| body.contains("session-repo-a-older"))
+        );
+        assert!(
+            upload_bodies
+                .iter()
+                .any(|body| body.contains("session-repo-b-newer"))
+        );
+
+        let older_label = older_session_path.to_string_lossy().to_string();
+        assert_ne!(older_label, newer_session_path.to_string_lossy());
     }
 
     #[test]
