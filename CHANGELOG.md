@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.6.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.6.0...v2.6.1) (2026-04-17)
+
+
+### Bug Fixes
+
+* **bootstrap:** widen recovery backfill window ([c2d1bec](https://github.com/TeamCadenceAI/cadence-cli/commit/c2d1bec2494ecd8f9885de44138eb3308376928f))
+* **monitor:** ignore irrelevant sessions when advancing cursor ([ea6b861](https://github.com/TeamCadenceAI/cadence-cli/commit/ea6b861d9cc96b438cb8aa75cbdb574e6efedcf4))
+* **monitor:** recover sessions hidden behind the global cursor ([7d52321](https://github.com/TeamCadenceAI/cadence-cli/commit/7d523218776552666d60b0f75328b2fdb9360b17))
+* **monitor:** recover sessions hidden behind the global cursor ([7208782](https://github.com/TeamCadenceAI/cadence-cli/commit/720878282c80028419881d9edbb1295aeb6d652c))
+* **monitor:** throttle repeated filtered session discovery ([35b8535](https://github.com/TeamCadenceAI/cadence-cli/commit/35b85355b54f0773c7a4154008645b78594c2d00))
+
 ## [2.6.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.5.0...v2.6.0) (2026-04-09)
 
 
