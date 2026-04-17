@@ -402,7 +402,7 @@ async fn run_hook_post_commit() -> Result<()> {
 }
 
 const MONITOR_DEFAULT_CURSOR_WINDOW_SECS: i64 = 30 * 86_400;
-const MONITOR_DISCOVERY_LOOKBACK_SECS: i64 = 300;
+const MONITOR_DISCOVERY_LOOKBACK_SECS: i64 = 60 * 60;
 
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
@@ -451,9 +451,9 @@ impl IncrementalCursor {
 
 fn selection_cursor_with_lookback(cursor: &IncrementalCursor) -> IncrementalCursor {
     IncrementalCursor {
-        last_scanned_mtime_epoch: cursor
-            .last_scanned_mtime_epoch
-            .saturating_sub(MONITOR_DISCOVERY_LOOKBACK_SECS),
+        last_scanned_mtime_epoch: (cursor.last_scanned_mtime_epoch
+            - MONITOR_DISCOVERY_LOOKBACK_SECS)
+            .max(0),
         last_scanned_source_label: None,
     }
 }
@@ -560,12 +560,11 @@ fn apply_monitor_incremental_upload_outcome(
 
 fn apply_monitor_org_filter_error(
     stats: &mut MonitorTickSummary,
-    cursor_advance: &mut IncrementalCursor,
-    log_mtime: Option<i64>,
-    log_source_label: &str,
+    _cursor_advance: &mut IncrementalCursor,
+    _log_mtime: Option<i64>,
+    _log_source_label: &str,
 ) {
     stats.issues += 1;
-    *cursor_advance = advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
 }
 
 fn select_incremental_candidates(
@@ -1892,8 +1891,6 @@ async fn upload_incremental_sessions_globally(
         let log_mtime = parsed.log.updated_at;
         let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -1923,8 +1920,6 @@ async fn upload_incremental_sessions_globally(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
 
@@ -1936,8 +1931,6 @@ async fn upload_incremental_sessions_globally(
             enabled
         };
         if !repo_enabled {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         }
 
@@ -1972,8 +1965,6 @@ async fn upload_incremental_sessions_globally(
             matches
         };
         if !repo_matches_org {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         }
 
@@ -4018,7 +4009,7 @@ mod tests {
     #[test]
     fn monitor_default_cursor_window_defaults_are_stable() {
         assert_eq!(MONITOR_DEFAULT_CURSOR_WINDOW_SECS, 30 * 86_400);
-        assert_eq!(MONITOR_DISCOVERY_LOOKBACK_SECS, 300);
+        assert_eq!(MONITOR_DISCOVERY_LOOKBACK_SECS, 60 * 60);
     }
 
     #[test]
@@ -4028,7 +4019,7 @@ mod tests {
             last_scanned_source_label: Some("session-z".to_string()),
         });
 
-        assert_eq!(rewound.last_scanned_mtime_epoch, 200);
+        assert_eq!(rewound.last_scanned_mtime_epoch, 0);
         assert_eq!(rewound.last_scanned_source_label, None);
     }
 
@@ -4213,7 +4204,8 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn upload_incremental_sessions_globally_uses_lookback_to_recover_older_sessions() {
+    async fn upload_incremental_sessions_globally_skips_irrelevant_sessions_without_advancing_cursor()
+     {
         let home = TempDir::new().expect("home tempdir");
         let env = DiscoveryTestEnv::install(home.path());
         env.codex_home.set_path(&home.path().join(".codex"));
@@ -4248,6 +4240,7 @@ mod tests {
             ],
         )
         .await;
+        run_git(repo_b.path(), &["config", "ai.cadence.enabled", "false"]).await;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4279,7 +4272,17 @@ mod tests {
         let first_summary = upload_incremental_sessions_globally(&upload_context)
             .await
             .expect("first incremental upload");
-        assert_eq!(first_summary.uploaded, 1);
+
+        assert_eq!(first_summary.discovered, 1);
+        assert_eq!(first_summary.uploaded, 0);
+        assert_eq!(first_summary.skipped, 0);
+        assert_eq!(first_summary.queued, 0);
+        assert_eq!(first_summary.issues, 0);
+
+        let first_cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor after first run");
+        assert!(first_cursor.is_none());
 
         let older_session_updated_at = newer_session_updated_at - 120;
         let older_session_path = write_codex_session_log(
@@ -4296,7 +4299,7 @@ mod tests {
 
         assert_eq!(second_summary.discovered, 2);
         assert_eq!(second_summary.uploaded, 1);
-        assert_eq!(second_summary.skipped, 1);
+        assert_eq!(second_summary.skipped, 0);
         assert_eq!(second_summary.queued, 0);
         assert_eq!(second_summary.issues, 0);
 
@@ -4304,29 +4307,24 @@ mod tests {
             .await
             .expect("load discovery cursor")
             .expect("cursor record");
-        assert_eq!(cursor.last_scanned_mtime_epoch, newer_session_updated_at);
+        assert_eq!(cursor.last_scanned_mtime_epoch, older_session_updated_at);
         assert_eq!(
             cursor.last_scanned_source_label.as_deref(),
-            Some(newer_session_path.to_string_lossy().as_ref())
+            Some(older_session_path.to_string_lossy().as_ref())
         );
 
         let requests = server.create_requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         let upload_bodies = server
             .upload_requests()
             .into_iter()
             .map(|request| request.body)
             .collect::<Vec<_>>();
-        assert_eq!(upload_bodies.len(), 2);
+        assert_eq!(upload_bodies.len(), 1);
         assert!(
             upload_bodies
                 .iter()
                 .any(|body| body.contains("session-repo-a-older"))
-        );
-        assert!(
-            upload_bodies
-                .iter()
-                .any(|body| body.contains("session-repo-b-newer"))
         );
 
         let older_label = older_session_path.to_string_lossy().to_string();
@@ -4367,7 +4365,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_org_filter_error_advances_cursor() {
+    fn monitor_org_filter_error_does_not_advance_cursor() {
         let mut stats = MonitorTickSummary::default();
         let mut cursor = IncrementalCursor {
             last_scanned_mtime_epoch: 100,
@@ -4377,8 +4375,8 @@ mod tests {
         apply_monitor_org_filter_error(&mut stats, &mut cursor, Some(200), "b");
 
         assert_eq!(stats.issues, 1);
-        assert_eq!(cursor.last_scanned_mtime_epoch, 200);
-        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("b"));
+        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
     }
 
     #[tokio::test]
