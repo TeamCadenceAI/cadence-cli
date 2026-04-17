@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::{agents, git, monitor, output, state_files, update};
 
-pub(crate) const VERSION_BOOTSTRAP_BACKFILL_SINCE: &str = "7d";
+pub(crate) const VERSION_BOOTSTRAP_BACKFILL_SINCE: &str = "30d";
 const VERSION_BOOTSTRAP_MARKER_FILE: &str = "last-version-bootstrap";
 const VERSION_BOOTSTRAP_BACKFILL_MARKER_FILE: &str = "last-version-recovery-backfill";
 const VERSION_BOOTSTRAP_LOCK_FILE: &str = "current-version-bootstrap.lock";

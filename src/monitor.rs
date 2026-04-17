@@ -5,6 +5,7 @@ use crate::state_files;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Output;
@@ -37,6 +38,24 @@ pub struct MonitorState {
     pub last_pending_attempted: usize,
     #[serde(default)]
     pub last_pending_uploaded: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub filtered_session_throttle: BTreeMap<String, FilteredSessionThrottleEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilteredSessionReason {
+    UnresolvedRepo,
+    RepoDisabled,
+    OrgMismatch,
+    OrgFilterError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilteredSessionThrottleEntry {
+    pub updated_at_epoch: i64,
+    pub reason: FilteredSessionReason,
+    pub next_recheck_at_epoch: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -970,6 +989,14 @@ mod tests {
             last_issues: 0,
             last_pending_attempted: 3,
             last_pending_uploaded: 2,
+            filtered_session_throttle: BTreeMap::from([(
+                "alpha".to_string(),
+                FilteredSessionThrottleEntry {
+                    updated_at_epoch: 123,
+                    reason: FilteredSessionReason::RepoDisabled,
+                    next_recheck_at_epoch: 456,
+                },
+            )]),
         };
         save_state(&state).await.expect("save state");
 
@@ -977,6 +1004,15 @@ mod tests {
         assert!(loaded.enabled);
         assert_eq!(loaded.last_uploaded, 2);
         assert_eq!(loaded.last_pending_attempted, 3);
+        assert_eq!(loaded.filtered_session_throttle.len(), 1);
+        assert_eq!(
+            loaded
+                .filtered_session_throttle
+                .get("alpha")
+                .expect("throttle entry")
+                .reason,
+            FilteredSessionReason::RepoDisabled
+        );
     }
 
     #[tokio::test]

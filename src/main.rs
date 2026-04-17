@@ -402,6 +402,12 @@ async fn run_hook_post_commit() -> Result<()> {
 }
 
 const MONITOR_DEFAULT_CURSOR_WINDOW_SECS: i64 = 30 * 86_400;
+const MONITOR_DISCOVERY_LOOKBACK_SECS: i64 = 60 * 60;
+const FILTERED_SESSION_THROTTLE_MAX_ENTRIES: usize = 1000;
+const FILTERED_SESSION_UNRESOLVED_REPO_THROTTLE_SECS: i64 = 5 * 60;
+const FILTERED_SESSION_REPO_DISABLED_THROTTLE_SECS: i64 = 60 * 60;
+const FILTERED_SESSION_ORG_MISMATCH_THROTTLE_SECS: i64 = 60 * 60;
+const FILTERED_SESSION_ORG_FILTER_ERROR_THROTTLE_SECS: i64 = 10 * 60;
 
 async fn git_ref_for_repo(repo: &std::path::Path) -> Option<String> {
     let branch = git::current_branch_at(repo).await.ok().flatten()?;
@@ -445,6 +451,124 @@ impl IncrementalCursor {
             last_scanned_mtime_epoch,
             last_scanned_source_label,
         }
+    }
+}
+
+fn selection_cursor_with_lookback(cursor: &IncrementalCursor) -> IncrementalCursor {
+    IncrementalCursor {
+        last_scanned_mtime_epoch: (cursor.last_scanned_mtime_epoch
+            - MONITOR_DISCOVERY_LOOKBACK_SECS)
+            .max(0),
+        last_scanned_source_label: None,
+    }
+}
+
+fn filtered_session_throttle_secs(reason: &monitor::FilteredSessionReason) -> i64 {
+    match reason {
+        monitor::FilteredSessionReason::UnresolvedRepo => {
+            FILTERED_SESSION_UNRESOLVED_REPO_THROTTLE_SECS
+        }
+        monitor::FilteredSessionReason::RepoDisabled => {
+            FILTERED_SESSION_REPO_DISABLED_THROTTLE_SECS
+        }
+        monitor::FilteredSessionReason::OrgMismatch => FILTERED_SESSION_ORG_MISMATCH_THROTTLE_SECS,
+        monitor::FilteredSessionReason::OrgFilterError => {
+            FILTERED_SESSION_ORG_FILTER_ERROR_THROTTLE_SECS
+        }
+    }
+}
+
+fn should_throttle_filtered_session(
+    entries: &std::collections::BTreeMap<String, monitor::FilteredSessionThrottleEntry>,
+    source_label: &str,
+    updated_at_epoch: Option<i64>,
+    now_epoch: i64,
+) -> bool {
+    let Some(updated_at_epoch) = updated_at_epoch else {
+        return false;
+    };
+    entries.get(source_label).is_some_and(|entry| {
+        entry.updated_at_epoch == updated_at_epoch && entry.next_recheck_at_epoch > now_epoch
+    })
+}
+
+fn record_filtered_session_throttle(
+    entries: &mut std::collections::BTreeMap<String, monitor::FilteredSessionThrottleEntry>,
+    source_label: &str,
+    updated_at_epoch: Option<i64>,
+    reason: monitor::FilteredSessionReason,
+    now_epoch: i64,
+) {
+    let Some(updated_at_epoch) = updated_at_epoch else {
+        return;
+    };
+    let next_recheck_at_epoch = now_epoch + filtered_session_throttle_secs(&reason);
+    entries.insert(
+        source_label.to_string(),
+        monitor::FilteredSessionThrottleEntry {
+            updated_at_epoch,
+            reason,
+            next_recheck_at_epoch,
+        },
+    );
+}
+
+fn clear_filtered_session_throttle(
+    entries: &mut std::collections::BTreeMap<String, monitor::FilteredSessionThrottleEntry>,
+    source_label: &str,
+) {
+    entries.remove(source_label);
+}
+
+fn prune_filtered_session_throttle(
+    entries: &mut std::collections::BTreeMap<String, monitor::FilteredSessionThrottleEntry>,
+    now_epoch: i64,
+) {
+    entries.retain(|_, entry| entry.next_recheck_at_epoch > now_epoch);
+    if entries.len() <= FILTERED_SESSION_THROTTLE_MAX_ENTRIES {
+        return;
+    }
+    let mut retained: Vec<_> = entries.iter().collect();
+    retained.sort_by(|(left_label, left), (right_label, right)| {
+        right
+            .next_recheck_at_epoch
+            .cmp(&left.next_recheck_at_epoch)
+            .then_with(|| left_label.cmp(right_label))
+    });
+    retained.truncate(FILTERED_SESSION_THROTTLE_MAX_ENTRIES);
+    let retained_labels: std::collections::BTreeSet<_> = retained
+        .into_iter()
+        .map(|(label, _)| label.clone())
+        .collect();
+    entries.retain(|label, _| retained_labels.contains(label));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MonitorSessionDedupeKey {
+    agent: String,
+    session_identity: String,
+    repo_root: String,
+}
+
+fn monitor_session_dedupe_key(
+    parsed: &ParsedSessionLog,
+    resolved_repo: &std::path::Path,
+) -> MonitorSessionDedupeKey {
+    let agent = parsed
+        .metadata
+        .agent_type
+        .clone()
+        .unwrap_or_else(|| parsed.log.agent_type.clone())
+        .to_string();
+    let session_identity = parsed
+        .metadata
+        .session_id
+        .clone()
+        .unwrap_or_else(|| parsed.log.source_label());
+    MonitorSessionDedupeKey {
+        agent,
+        session_identity,
+        repo_root: resolved_repo.to_string_lossy().to_string(),
     }
 }
 
@@ -521,12 +645,11 @@ fn apply_monitor_incremental_upload_outcome(
 
 fn apply_monitor_org_filter_error(
     stats: &mut MonitorTickSummary,
-    cursor_advance: &mut IncrementalCursor,
-    log_mtime: Option<i64>,
-    log_source_label: &str,
+    _cursor_advance: &mut IncrementalCursor,
+    _log_mtime: Option<i64>,
+    _log_source_label: &str,
 ) {
     stats.issues += 1;
-    *cursor_advance = advance_cursor_for_disposition(cursor_advance, log_mtime, log_source_label);
 }
 
 fn select_incremental_candidates(
@@ -1816,6 +1939,7 @@ async fn write_publication_auth_status_line(w: &mut dyn std::io::Write) {
 
 async fn upload_incremental_sessions_globally(
     context: &upload::UploadContext,
+    state: &mut monitor::MonitorState,
 ) -> Result<MonitorTickSummary> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1829,10 +1953,10 @@ async fn upload_incremental_sessions_globally(
         ),
         None => IncrementalCursor::from_position(now - MONITOR_DEFAULT_CURSOR_WINDOW_SECS, None),
     };
-    let since_secs = (now - initial_cursor.last_scanned_mtime_epoch).max(0);
+    let selection_cursor = selection_cursor_with_lookback(&initial_cursor);
+    let since_secs = (now - selection_cursor.last_scanned_mtime_epoch).max(0);
     let files = agents::discover_recent_sessions_for_monitor(now, since_secs).await;
-    let candidates = select_incremental_candidates(files, &initial_cursor, usize::MAX);
-    let parsed_logs = parse_session_logs_bounded(candidates).await;
+    let candidates = select_incremental_candidates(files, &selection_cursor, usize::MAX);
 
     let mut repo_root_cache: std::collections::HashMap<String, Option<std::path::PathBuf>> =
         std::collections::HashMap::new();
@@ -1840,18 +1964,37 @@ async fn upload_incremental_sessions_globally(
         std::collections::HashMap::new();
     let mut repo_org_cache: std::collections::HashMap<std::path::PathBuf, bool> =
         std::collections::HashMap::new();
+    let mut seen_sessions: std::collections::HashSet<MonitorSessionDedupeKey> =
+        std::collections::HashSet::new();
     let mut stats = MonitorTickSummary {
-        discovered: parsed_logs.len(),
         ..MonitorTickSummary::default()
     };
     let mut cursor_advance = initial_cursor.clone();
+    prune_filtered_session_throttle(&mut state.filtered_session_throttle, now);
+    let mut throttled_skips = 0usize;
+    let parse_candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|log| {
+            let throttled = should_throttle_filtered_session(
+                &state.filtered_session_throttle,
+                &log.source_label(),
+                log.updated_at,
+                now,
+            );
+            if throttled {
+                throttled_skips += 1;
+            }
+            !throttled
+        })
+        .collect();
+    let parsed_logs = parse_session_logs_bounded(parse_candidates).await;
+    stats.discovered = parsed_logs.len();
+    stats.skipped = throttled_skips;
 
     for parsed in parsed_logs {
         let log_mtime = parsed.log.updated_at;
         let log_source_label = parsed.log.source_label();
         let Some(cwd) = parsed.metadata.cwd.clone() else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
         };
         let resolved_repo = if let Some(cached) = repo_root_cache.get(&cwd) {
@@ -1881,8 +2024,13 @@ async fn upload_incremental_sessions_globally(
             resolved
         };
         let Some(resolved_repo) = resolved_repo else {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            record_filtered_session_throttle(
+                &mut state.filtered_session_throttle,
+                &log_source_label,
+                log_mtime,
+                monitor::FilteredSessionReason::UnresolvedRepo,
+                now,
+            );
             continue;
         };
 
@@ -1894,8 +2042,13 @@ async fn upload_incremental_sessions_globally(
             enabled
         };
         if !repo_enabled {
-            cursor_advance =
-                advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
+            record_filtered_session_throttle(
+                &mut state.filtered_session_throttle,
+                &log_source_label,
+                log_mtime,
+                monitor::FilteredSessionReason::RepoDisabled,
+                now,
+            );
             continue;
         }
 
@@ -1923,6 +2076,13 @@ async fn upload_incremental_sessions_globally(
                         log_mtime,
                         &log_source_label,
                     );
+                    record_filtered_session_throttle(
+                        &mut state.filtered_session_throttle,
+                        &log_source_label,
+                        log_mtime,
+                        monitor::FilteredSessionReason::OrgFilterError,
+                        now,
+                    );
                     continue;
                 }
             };
@@ -1930,6 +2090,21 @@ async fn upload_incremental_sessions_globally(
             matches
         };
         if !repo_matches_org {
+            record_filtered_session_throttle(
+                &mut state.filtered_session_throttle,
+                &log_source_label,
+                log_mtime,
+                monitor::FilteredSessionReason::OrgMismatch,
+                now,
+            );
+            continue;
+        }
+
+        clear_filtered_session_throttle(&mut state.filtered_session_throttle, &log_source_label);
+
+        let dedupe_key = monitor_session_dedupe_key(&parsed, &resolved_repo);
+        if !seen_sessions.insert(dedupe_key) {
+            stats.skipped += 1;
             cursor_advance =
                 advance_cursor_for_disposition(&cursor_advance, log_mtime, &log_source_label);
             continue;
@@ -1960,6 +2135,7 @@ async fn upload_incremental_sessions_globally(
         )
         .await?;
     }
+    prune_filtered_session_throttle(&mut state.filtered_session_throttle, now);
 
     Ok(stats)
 }
@@ -2011,7 +2187,7 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
         } else {
             upload::PendingUploadSummary::default()
         };
-        let mut summary = upload_incremental_sessions_globally(&upload_context).await?;
+        let mut summary = upload_incremental_sessions_globally(&upload_context, &mut state).await?;
         summary.pending_attempted = pending_summary.attempted;
         summary.pending_uploaded = pending_summary.uploaded + pending_summary.already_existed;
         if options.run_auto_update {
@@ -3968,6 +4144,75 @@ mod tests {
     #[test]
     fn monitor_default_cursor_window_defaults_are_stable() {
         assert_eq!(MONITOR_DEFAULT_CURSOR_WINDOW_SECS, 30 * 86_400);
+        assert_eq!(MONITOR_DISCOVERY_LOOKBACK_SECS, 60 * 60);
+    }
+
+    #[test]
+    fn prune_filtered_session_throttle_removes_expired_and_caps_entries() {
+        let mut entries = std::collections::BTreeMap::from([(
+            "expired".to_string(),
+            monitor::FilteredSessionThrottleEntry {
+                updated_at_epoch: 1,
+                reason: monitor::FilteredSessionReason::RepoDisabled,
+                next_recheck_at_epoch: 10,
+            },
+        )]);
+        entries.extend((0..(FILTERED_SESSION_THROTTLE_MAX_ENTRIES + 5)).map(|idx| {
+            (
+                format!("entry-{idx}"),
+                monitor::FilteredSessionThrottleEntry {
+                    updated_at_epoch: idx as i64,
+                    reason: monitor::FilteredSessionReason::RepoDisabled,
+                    next_recheck_at_epoch: 100 + idx as i64,
+                },
+            )
+        }));
+
+        prune_filtered_session_throttle(&mut entries, 50);
+
+        assert_eq!(entries.len(), FILTERED_SESSION_THROTTLE_MAX_ENTRIES);
+        assert!(!entries.contains_key("expired"));
+        assert!(
+            entries
+                .values()
+                .all(|entry| entry.next_recheck_at_epoch > 50)
+        );
+    }
+
+    #[test]
+    fn changed_filtered_session_bypasses_throttle() {
+        let entries = std::collections::BTreeMap::from([(
+            "session-a".to_string(),
+            monitor::FilteredSessionThrottleEntry {
+                updated_at_epoch: 100,
+                reason: monitor::FilteredSessionReason::RepoDisabled,
+                next_recheck_at_epoch: 500,
+            },
+        )]);
+
+        assert!(should_throttle_filtered_session(
+            &entries,
+            "session-a",
+            Some(100),
+            200
+        ));
+        assert!(!should_throttle_filtered_session(
+            &entries,
+            "session-a",
+            Some(101),
+            200
+        ));
+    }
+
+    #[test]
+    fn selection_cursor_with_lookback_rewinds_mtime_and_clears_label() {
+        let rewound = selection_cursor_with_lookback(&IncrementalCursor {
+            last_scanned_mtime_epoch: 500,
+            last_scanned_source_label: Some("session-z".to_string()),
+        });
+
+        assert_eq!(rewound.last_scanned_mtime_epoch, 0);
+        assert_eq!(rewound.last_scanned_source_label, None);
     }
 
     #[test]
@@ -4119,7 +4364,8 @@ mod tests {
         let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
             .await
             .expect("resolve upload context");
-        let summary = upload_incremental_sessions_globally(&upload_context)
+        let mut state = monitor::MonitorState::default();
+        let summary = upload_incremental_sessions_globally(&upload_context, &mut state)
             .await
             .expect("upload incremental sessions globally");
 
@@ -4146,6 +4392,224 @@ mod tests {
                 confirms: 1,
                 user_org_requests: 1,
             }
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_incremental_sessions_globally_skips_irrelevant_sessions_without_advancing_cursor()
+     {
+        let home = TempDir::new().expect("home tempdir");
+        let env = DiscoveryTestEnv::install(home.path());
+        env.codex_home.set_path(&home.path().join(".codex"));
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo_a = init_repo().await;
+        run_git(
+            repo_a.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/repo-a.git",
+            ],
+        )
+        .await;
+
+        let repo_b = init_repo().await;
+        run_git(
+            repo_b.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/repo-b.git",
+            ],
+        )
+        .await;
+        run_git(repo_b.path(), &["config", "ai.cadence.enabled", "false"]).await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current epoch")
+            .as_secs() as i64;
+        let newer_session_updated_at = now - 60;
+        let newer_session_path = write_codex_session_log(
+            home.path(),
+            "session-repo-b-newer",
+            repo_b.path(),
+            newer_session_updated_at,
+        )
+        .await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let mut state = monitor::MonitorState::default();
+        let first_summary = upload_incremental_sessions_globally(&upload_context, &mut state)
+            .await
+            .expect("first incremental upload");
+
+        assert_eq!(first_summary.discovered, 1);
+        assert_eq!(first_summary.uploaded, 0);
+        assert_eq!(first_summary.skipped, 0);
+        assert_eq!(first_summary.queued, 0);
+        assert_eq!(first_summary.issues, 0);
+        assert_eq!(state.filtered_session_throttle.len(), 1);
+        assert_eq!(
+            state
+                .filtered_session_throttle
+                .values()
+                .next()
+                .expect("throttle entry")
+                .reason,
+            monitor::FilteredSessionReason::RepoDisabled
+        );
+
+        let first_cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor after first run");
+        assert!(first_cursor.is_none());
+
+        let older_session_updated_at = newer_session_updated_at - 120;
+        let older_session_path = write_codex_session_log(
+            home.path(),
+            "session-repo-a-older",
+            repo_a.path(),
+            older_session_updated_at,
+        )
+        .await;
+
+        let second_summary = upload_incremental_sessions_globally(&upload_context, &mut state)
+            .await
+            .expect("second incremental upload");
+
+        assert_eq!(second_summary.discovered, 1);
+        assert_eq!(second_summary.uploaded, 1);
+        assert_eq!(second_summary.skipped, 1);
+        assert_eq!(second_summary.queued, 0);
+        assert_eq!(second_summary.issues, 0);
+        assert_eq!(state.filtered_session_throttle.len(), 1);
+
+        let cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor")
+            .expect("cursor record");
+        assert_eq!(cursor.last_scanned_mtime_epoch, older_session_updated_at);
+        assert_eq!(
+            cursor.last_scanned_source_label.as_deref(),
+            Some(older_session_path.to_string_lossy().as_ref())
+        );
+
+        let requests = server.create_requests();
+        assert_eq!(requests.len(), 1);
+        let upload_bodies = server
+            .upload_requests()
+            .into_iter()
+            .map(|request| request.body)
+            .collect::<Vec<_>>();
+        assert_eq!(upload_bodies.len(), 1);
+        assert!(
+            upload_bodies
+                .iter()
+                .any(|body| body.contains("session-repo-a-older"))
+        );
+
+        let older_label = older_session_path.to_string_lossy().to_string();
+        assert_ne!(older_label, newer_session_path.to_string_lossy());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eligible_session_clears_filtered_session_throttle_entry() {
+        let home = TempDir::new().expect("home tempdir");
+        let env = DiscoveryTestEnv::install(home.path());
+        env.codex_home.set_path(&home.path().join(".codex"));
+
+        let global_config = home.path().join("global.gitconfig");
+        tokio::fs::write(&global_config, "")
+            .await
+            .expect("write empty global gitconfig");
+        let global_guard = EnvGuard::new("GIT_CONFIG_GLOBAL");
+        global_guard.set_path(&global_config);
+
+        let repo = init_repo().await;
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:test-org/example.git",
+            ],
+        )
+        .await;
+        run_git(repo.path(), &["config", "ai.cadence.enabled", "false"]).await;
+
+        let now = current_unix_epoch();
+        let session_id = "session-throttle-clear";
+        let _initial_path =
+            write_codex_session_log(home.path(), session_id, repo.path(), now - 60).await;
+
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig::default(),
+        )
+        .await
+        .expect("spawn upload test server");
+        let cfg = config::CliConfig {
+            token: Some("test-token".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.expect("save config");
+
+        let upload_context = upload::resolve_upload_context(Some(server.base_url.as_str()))
+            .await
+            .expect("resolve upload context");
+        let mut state = monitor::MonitorState::default();
+        let first_summary = upload_incremental_sessions_globally(&upload_context, &mut state)
+            .await
+            .expect("first incremental upload");
+
+        assert_eq!(first_summary.uploaded, 0);
+        assert_eq!(state.filtered_session_throttle.len(), 1);
+
+        run_git(repo.path(), &["config", "--unset", "ai.cadence.enabled"]).await;
+        let updated_at = now + 60;
+        let session_path =
+            write_codex_session_log(home.path(), session_id, repo.path(), updated_at).await;
+
+        let second_summary = upload_incremental_sessions_globally(&upload_context, &mut state)
+            .await
+            .expect("second incremental upload");
+
+        assert_eq!(second_summary.uploaded, 1);
+        assert!(state.filtered_session_throttle.is_empty());
+
+        let cursor = monitor::load_discovery_cursor()
+            .await
+            .expect("load discovery cursor")
+            .expect("cursor record");
+        assert_eq!(cursor.last_scanned_mtime_epoch, updated_at);
+        assert_eq!(
+            cursor.last_scanned_source_label.as_deref(),
+            Some(session_path.to_string_lossy().as_ref())
         );
     }
 
@@ -4183,7 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_org_filter_error_advances_cursor() {
+    fn monitor_org_filter_error_does_not_advance_cursor() {
         let mut stats = MonitorTickSummary::default();
         let mut cursor = IncrementalCursor {
             last_scanned_mtime_epoch: 100,
@@ -4193,8 +4657,8 @@ mod tests {
         apply_monitor_org_filter_error(&mut stats, &mut cursor, Some(200), "b");
 
         assert_eq!(stats.issues, 1);
-        assert_eq!(cursor.last_scanned_mtime_epoch, 200);
-        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("b"));
+        assert_eq!(cursor.last_scanned_mtime_epoch, 100);
+        assert_eq!(cursor.last_scanned_source_label.as_deref(), Some("a"));
     }
 
     #[tokio::test]
