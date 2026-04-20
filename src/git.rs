@@ -436,15 +436,27 @@ async fn candidate_owner_repo_roots(cwd: &Path, repo_names: &[String]) -> Vec<Pa
         return Vec::new();
     };
 
+    // Only probe `~/Desktop` once the user has been explicitly asked for that
+    // permission (either on first install or via `cadence permissions
+    // request-desktop`). This prevents re-runs on existing machines from
+    // surfacing an unexpected macOS TCC prompt.
+    let include_desktop = crate::permissions::desktop_access_requested().await;
+
+    let mut parents: Vec<PathBuf> = vec![
+        home.join("dev"),
+        home.join("Documents").join("GitHub"),
+        home.join("src"),
+        home.join("code"),
+        home.join("Projects"),
+        home.join("workspaces"),
+    ];
+    if include_desktop {
+        parents.push(home.join("Desktop"));
+        parents.push(home.join("Desktop").join("GitHub"));
+    }
+
     for repo_name in repo_names {
-        for parent in [
-            home.join("dev"),
-            home.join("Documents").join("GitHub"),
-            home.join("src"),
-            home.join("code"),
-            home.join("Projects"),
-            home.join("workspaces"),
-        ] {
+        for parent in &parents {
             let candidate = parent.join(repo_name);
             if tokio::fs::try_exists(candidate.join(".git"))
                 .await
@@ -2078,5 +2090,61 @@ mod tests {
                 None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // candidate_owner_repo_roots — Desktop gating
+    //
+    // On macOS, Desktop scanning is gated by a marker file written after the
+    // user has been prompted for TCC access. On Linux/Windows there is no
+    // TCC equivalent, so Desktop is always scanned — the `without marker`
+    // test is macOS-only.
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[serial]
+    async fn candidate_owner_repo_roots_excludes_desktop_without_marker() {
+        let home = TempDir::new().expect("home tempdir");
+        let canonical_home = canonical_test_path(home.path()).await;
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(&canonical_home);
+
+        let desktop_repo = canonical_home.join("Desktop").join("demo");
+        tokio::fs::create_dir_all(desktop_repo.join(".git"))
+            .await
+            .expect("create desktop repo stub");
+
+        let candidates = candidate_owner_repo_roots(&canonical_home, &["demo".to_string()]).await;
+
+        assert!(
+            !candidates.contains(&desktop_repo),
+            "Desktop should not be probed before marker is written: {candidates:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn candidate_owner_repo_roots_includes_desktop_once_marker_present() {
+        let home = TempDir::new().expect("home tempdir");
+        let canonical_home = canonical_test_path(home.path()).await;
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(&canonical_home);
+
+        crate::permissions::prompt_first_install_folder_access()
+            .await
+            .expect("first install folder access probe should write marker");
+
+        let desktop_repo = canonical_home.join("Desktop").join("demo");
+        tokio::fs::create_dir_all(desktop_repo.join(".git"))
+            .await
+            .expect("create desktop repo stub");
+
+        let candidates = candidate_owner_repo_roots(&canonical_home, &["demo".to_string()]).await;
+
+        assert!(
+            candidates.contains(&desktop_repo),
+            "Desktop repo should be detected once marker is present: {candidates:?}"
+        );
     }
 }

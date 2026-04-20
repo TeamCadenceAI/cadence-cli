@@ -7,6 +7,7 @@ mod git;
 mod login;
 mod monitor;
 mod output;
+mod permissions;
 mod publication;
 mod publication_state;
 mod scanner;
@@ -167,6 +168,12 @@ enum Command {
         config_command: Option<ConfigCommand>,
     },
 
+    /// Manage folder-access preferences (Documents, Desktop). Only meaningful on macOS.
+    Permissions {
+        #[command(subcommand)]
+        command: PermissionsCommand,
+    },
+
     /// Remove Cadence CLI hooks, configuration, scheduler, and state.
     #[command(alias = "reset")]
     Uninstall {
@@ -174,6 +181,13 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum PermissionsCommand {
+    /// Opt in to scanning ~/Desktop for Git repositories. On macOS this surfaces
+    /// the system permission prompt; on other platforms it is a no-op.
+    RequestDesktop,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3129,6 +3143,7 @@ fn activity_lock_purpose_for_command(command: &Command) -> &'static str {
             }
         }
         Command::AutoUpdate { .. } => "auto-update",
+        Command::Permissions { .. } => "permissions",
         Command::Uninstall { .. } => "uninstall",
     }
 }
@@ -3214,6 +3229,9 @@ async fn main() {
             Err(err) => Err(err),
         },
         Command::AutoUpdate { command } => run_auto_update(command).await,
+        Command::Permissions { command } => match command {
+            PermissionsCommand::RequestDesktop => permissions::request_desktop_access().await,
+        },
         Command::Uninstall { yes } => run_uninstall(yes).await,
     };
 
@@ -3887,6 +3905,17 @@ mod tests {
                 assert!(matches!(command, Some(MonitorCommand::Uninstall)));
             }
             _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_permissions_request_desktop() {
+        let cli = Cli::parse_from(["cadence", "permissions", "request-desktop"]);
+        match cli.command {
+            Command::Permissions { command } => {
+                assert!(matches!(command, PermissionsCommand::RequestDesktop));
+            }
+            _ => panic!("expected Permissions command"),
         }
     }
 
