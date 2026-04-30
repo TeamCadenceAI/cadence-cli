@@ -17,6 +17,7 @@ use crate::publication_state::{
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -28,7 +29,7 @@ const RETRY_DELAYS_SECS: &[i64] = &[0, 1, 2, 4, 8, 16, 32, 60, 120, 300, 600];
 #[derive(Debug)]
 pub struct UploadContext {
     client: ApiClient,
-    token: Option<String>,
+    token: StdMutex<Option<String>>,
     user_orgs: Mutex<Option<Vec<UserOrgInfo>>>,
 }
 
@@ -43,7 +44,15 @@ pub enum PublicationAuthState {
 impl UploadContext {
     /// Returns whether the current context has an auth token available.
     pub fn has_token(&self) -> bool {
-        self.token.is_some()
+        self.token.lock().expect("upload token state").is_some()
+    }
+
+    fn current_token(&self) -> Option<String> {
+        self.token.lock().expect("upload token state").clone()
+    }
+
+    fn set_token(&self, token: String) {
+        *self.token.lock().expect("upload token state") = Some(token);
     }
 }
 
@@ -120,19 +129,22 @@ pub async fn resolve_upload_context(api_url_override: Option<&str>) -> Result<Up
     let token = resolve_cli_auth_token(&cfg);
     Ok(UploadContext {
         client: ApiClient::new(&resolved.url).await?,
-        token,
+        token: StdMutex::new(token),
         user_orgs: Mutex::new(None),
     })
 }
 
 pub async fn publication_auth_state(context: &UploadContext) -> PublicationAuthState {
-    if context.token.is_none() {
+    if !context.has_token() {
         return PublicationAuthState::MissingToken;
     }
 
     match fetch_user_orgs_authenticated(context).await {
         Ok(_) => PublicationAuthState::Ready,
-        Err(AuthenticatedRequestError::Unauthorized) => PublicationAuthState::Rejected,
+        Err(
+            AuthenticatedRequestError::Unauthorized
+            | AuthenticatedRequestError::TokenUpgradeRequired(_),
+        ) => PublicationAuthState::Rejected,
         Err(err) => PublicationAuthState::CheckFailed(err.to_string()),
     }
 }
@@ -210,7 +222,7 @@ async fn process_pending_uploads_matching(
     repo_filter: Option<&Path>,
 ) -> Result<PendingUploadSummary> {
     let records = pending_records(repo_filter).await?;
-    if context.token.is_none() {
+    if !context.has_token() {
         return Ok(PendingUploadSummary {
             auth_required: !records.is_empty(),
             ..PendingUploadSummary::default()
@@ -407,7 +419,7 @@ async fn prepare_state_and_attempt(
     )
     .await?;
 
-    let Some(token) = context.token.as_deref() else {
+    if !context.has_token() {
         persist_state(
             current,
             &prepared.prepared,
@@ -423,8 +435,7 @@ async fn prepare_state_and_attempt(
     };
 
     match attempt_upload(
-        &context.client,
-        token,
+        context,
         target_org_id.as_deref().expect("target org"),
         &prepared.prepared,
         &publish_uid,
@@ -624,14 +635,17 @@ async fn resolve_target_org(
         .into_iter()
         .filter(|org| org.org_id.is_some())
         .filter(|org| {
-            owners
-                .iter()
-                .any(|owner| owner.eq_ignore_ascii_case(&org.github_org_login))
+            org.github_org_login
+                .as_deref()
+                .is_some_and(|login| owners.iter().any(|owner| owner.eq_ignore_ascii_case(login)))
         })
         .filter(|org| {
+            let Some(login) = org.github_org_login.as_deref() else {
+                return false;
+            };
             configured_org
                 .as_ref()
-                .map(|configured| configured.eq_ignore_ascii_case(&org.github_org_login))
+                .map(|configured| configured.eq_ignore_ascii_case(login))
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
@@ -659,55 +673,48 @@ async fn fetch_user_orgs(context: &UploadContext) -> Result<Vec<UserOrgInfo>> {
 async fn fetch_user_orgs_authenticated(
     context: &UploadContext,
 ) -> std::result::Result<Vec<UserOrgInfo>, AuthenticatedRequestError> {
-    let mut guard = context.user_orgs.lock().await;
-    if let Some(cached) = guard.as_ref() {
-        return Ok(cached.clone());
+    if let Some(cached) = context.user_orgs.lock().await.as_ref().cloned() {
+        return Ok(cached);
     }
-    let token = context.token.as_deref().ok_or_else(|| {
-        AuthenticatedRequestError::Unexpected("missing Cadence CLI auth token".to_string())
-    })?;
-    let response = context
-        .client
-        .list_user_orgs(token, Duration::from_secs(API_TIMEOUT_SECS))
-        .await?;
+
+    let response = list_user_orgs_with_upgrade(context).await?;
+    let mut guard = context.user_orgs.lock().await;
     *guard = Some(response.orgs.clone());
     Ok(response.orgs)
 }
 
 async fn attempt_upload(
-    client: &ApiClient,
-    token: &str,
+    context: &UploadContext,
     org_id: &str,
     prepared: &PreparedPublication,
     publish_uid: &str,
 ) -> std::result::Result<(), PublishAttemptError> {
-    let create = client
-        .create_session_publication(
-            token,
-            org_id,
-            &CreateSessionPublicationRequest {
-                agent: prepared.logical_session.agent.clone(),
-                agent_session_id: prepared.logical_session.agent_session_id.clone(),
-                publish_uid: publish_uid.to_string(),
-                upload_sha256: prepared.upload_sha256.clone(),
-                metadata_sha256: prepared.metadata_sha256.clone(),
-                canonical_remote_url: prepared.observations.canonical_remote_url.clone(),
-                remote_urls: prepared.observations.remote_urls.clone(),
-                canonical_repo_root: prepared.observations.canonical_repo_root.clone(),
-                worktree_roots: prepared.observations.worktree_roots.clone(),
-                cwd: prepared.observations.cwd.clone(),
-                git_ref: prepared.observations.git_ref.clone(),
-                head_commit_sha: prepared.observations.head_commit_sha.clone(),
-                git_user_email: prepared.observations.git_user_email.clone(),
-                git_user_name: prepared.observations.git_user_name.clone(),
-                cli_version: prepared.observations.cli_version.clone(),
-            },
-            Duration::from_secs(API_TIMEOUT_SECS),
-        )
-        .await
-        .map_err(map_request_error)?;
+    let create = create_session_publication_with_upgrade(
+        context,
+        org_id,
+        &CreateSessionPublicationRequest {
+            agent: prepared.logical_session.agent.clone(),
+            agent_session_id: prepared.logical_session.agent_session_id.clone(),
+            publish_uid: publish_uid.to_string(),
+            upload_sha256: prepared.upload_sha256.clone(),
+            metadata_sha256: prepared.metadata_sha256.clone(),
+            canonical_remote_url: prepared.observations.canonical_remote_url.clone(),
+            remote_urls: prepared.observations.remote_urls.clone(),
+            canonical_repo_root: prepared.observations.canonical_repo_root.clone(),
+            worktree_roots: prepared.observations.worktree_roots.clone(),
+            cwd: prepared.observations.cwd.clone(),
+            git_ref: prepared.observations.git_ref.clone(),
+            head_commit_sha: prepared.observations.head_commit_sha.clone(),
+            git_user_email: prepared.observations.git_user_email.clone(),
+            git_user_name: prepared.observations.git_user_name.clone(),
+            cli_version: prepared.observations.cli_version.clone(),
+        },
+    )
+    .await
+    .map_err(map_request_error)?;
 
-    client
+    context
+        .client
         .upload_presigned(
             &create.upload_url,
             "application/jsonl",
@@ -717,22 +724,139 @@ async fn attempt_upload(
         .await
         .map_err(map_request_error)?;
 
-    let _confirm: SessionUploadConfirmResponse = client
-        .confirm_session_upload(
-            token,
-            &create.publication_id,
-            org_id,
-            Duration::from_secs(API_TIMEOUT_SECS),
-        )
-        .await
-        .map_err(map_request_error)?;
+    let _confirm: SessionUploadConfirmResponse =
+        confirm_session_upload_with_upgrade(context, &create.publication_id, org_id)
+            .await
+            .map_err(map_request_error)?;
 
     Ok(())
 }
 
+async fn list_user_orgs_with_upgrade(
+    context: &UploadContext,
+) -> std::result::Result<crate::api_client::UserOrgsResponse, AuthenticatedRequestError> {
+    let token = current_context_token(context)?;
+    match context
+        .client
+        .list_user_orgs(&token, Duration::from_secs(API_TIMEOUT_SECS))
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(AuthenticatedRequestError::TokenUpgradeRequired(_)) => {
+            let upgraded = upgrade_context_token(context, &token).await?;
+            context
+                .client
+                .list_user_orgs(&upgraded, Duration::from_secs(API_TIMEOUT_SECS))
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn create_session_publication_with_upgrade(
+    context: &UploadContext,
+    org_id: &str,
+    request: &CreateSessionPublicationRequest,
+) -> std::result::Result<
+    crate::api_client::CreateSessionPublicationResponse,
+    AuthenticatedRequestError,
+> {
+    let token = current_context_token(context)?;
+    match context
+        .client
+        .create_session_publication(
+            &token,
+            org_id,
+            request,
+            Duration::from_secs(API_TIMEOUT_SECS),
+        )
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(AuthenticatedRequestError::TokenUpgradeRequired(_)) => {
+            let upgraded = upgrade_context_token(context, &token).await?;
+            context
+                .client
+                .create_session_publication(
+                    &upgraded,
+                    org_id,
+                    request,
+                    Duration::from_secs(API_TIMEOUT_SECS),
+                )
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn confirm_session_upload_with_upgrade(
+    context: &UploadContext,
+    publication_id: &str,
+    org_id: &str,
+) -> std::result::Result<SessionUploadConfirmResponse, AuthenticatedRequestError> {
+    let token = current_context_token(context)?;
+    match context
+        .client
+        .confirm_session_upload(
+            &token,
+            publication_id,
+            org_id,
+            Duration::from_secs(API_TIMEOUT_SECS),
+        )
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(AuthenticatedRequestError::TokenUpgradeRequired(_)) => {
+            let upgraded = upgrade_context_token(context, &token).await?;
+            context
+                .client
+                .confirm_session_upload(
+                    &upgraded,
+                    publication_id,
+                    org_id,
+                    Duration::from_secs(API_TIMEOUT_SECS),
+                )
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn current_context_token(
+    context: &UploadContext,
+) -> std::result::Result<String, AuthenticatedRequestError> {
+    context.current_token().ok_or_else(|| {
+        AuthenticatedRequestError::Unexpected("missing Cadence CLI auth token".to_string())
+    })
+}
+
+async fn upgrade_context_token(
+    context: &UploadContext,
+    stale_token: &str,
+) -> std::result::Result<String, AuthenticatedRequestError> {
+    let exchanged = context
+        .client
+        .upgrade_cli_token(stale_token, Duration::from_secs(API_TIMEOUT_SECS))
+        .await?;
+    let mut cfg = config::CliConfig::load().await.map_err(|err| {
+        AuthenticatedRequestError::Unexpected(format!("failed to load CLI config: {err}"))
+    })?;
+    cfg.replace_auth_token(exchanged.token.clone(), exchanged.expires_at.clone())
+        .await
+        .map_err(|err| {
+            AuthenticatedRequestError::Unexpected(format!(
+                "failed to persist upgraded CLI token: {err}"
+            ))
+        })?;
+    context.set_token(exchanged.token.clone());
+    *context.user_orgs.lock().await = None;
+    Ok(exchanged.token)
+}
+
 fn map_request_error(error: AuthenticatedRequestError) -> PublishAttemptError {
     match error {
-        AuthenticatedRequestError::Unauthorized => PublishAttemptError::Unauthorized,
+        AuthenticatedRequestError::Unauthorized
+        | AuthenticatedRequestError::TokenUpgradeRequired(_) => PublishAttemptError::Unauthorized,
         other => PublishAttemptError::Retryable(other.to_string()),
     }
 }
@@ -764,6 +888,14 @@ pub(crate) mod test_support {
         pub upload_statuses: Vec<u16>,
         pub confirm_statuses: Vec<u16>,
         pub user_org_statuses: Vec<u16>,
+        pub upgrade_statuses: Vec<u16>,
+        pub revoke_statuses: Vec<u16>,
+        pub create_error_code: Option<String>,
+        pub confirm_error_code: Option<String>,
+        pub user_org_error_code: Option<String>,
+        pub revoke_error_code: Option<String>,
+        pub upgrade_token: Option<String>,
+        pub upgrade_expires_at: Option<String>,
         pub user_orgs: Vec<Value>,
         pub upload_response_delay_ms: u64,
     }
@@ -774,6 +906,8 @@ pub(crate) mod test_support {
         pub uploads: usize,
         pub confirms: usize,
         pub user_org_requests: usize,
+        pub upgrades: usize,
+        pub revokes: usize,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +931,14 @@ pub(crate) mod test_support {
         upload_statuses: VecDeque<u16>,
         confirm_statuses: VecDeque<u16>,
         user_org_statuses: VecDeque<u16>,
+        upgrade_statuses: VecDeque<u16>,
+        revoke_statuses: VecDeque<u16>,
+        create_error_code: Option<String>,
+        confirm_error_code: Option<String>,
+        user_org_error_code: Option<String>,
+        revoke_error_code: Option<String>,
+        upgrade_token: Option<String>,
+        upgrade_expires_at: Option<String>,
         user_orgs: Vec<Value>,
         upload_response_delay_ms: u64,
     }
@@ -840,10 +982,18 @@ pub(crate) mod test_support {
             upload_statuses: config.upload_statuses.into(),
             confirm_statuses: config.confirm_statuses.into(),
             user_org_statuses: config.user_org_statuses.into(),
+            upgrade_statuses: config.upgrade_statuses.into(),
+            revoke_statuses: config.revoke_statuses.into(),
+            create_error_code: config.create_error_code,
+            confirm_error_code: config.confirm_error_code,
+            user_org_error_code: config.user_org_error_code,
+            revoke_error_code: config.revoke_error_code,
+            upgrade_token: config.upgrade_token,
+            upgrade_expires_at: config.upgrade_expires_at,
             user_orgs: if config.user_orgs.is_empty() {
                 vec![serde_json::json!({
-                    "github_org_id": 1,
-                    "github_org_login": "test-org",
+                    "org_slug": "test-org",
+                    "provider": "github",
                     "display_name": "Test Org",
                     "is_personal": false,
                     "is_onboarded": true,
@@ -894,14 +1044,83 @@ pub(crate) mod test_support {
                                         .to_string(),
                                 )
                             } else {
+                                let error =
+                                    guard.user_org_error_code.clone().unwrap_or_else(|| {
+                                        if status == 401 {
+                                            "unauthorized".to_string()
+                                        } else {
+                                            "request_failed".to_string()
+                                        }
+                                    });
                                 (
                                     status,
                                     serde_json::json!({
-                                        "error": if status == 401 { "unauthorized" } else { "request_failed" },
+                                        "error": error,
                                         "message": if status == 401 {
                                             "Authentication required"
                                         } else {
                                             "user org request failed"
+                                        }
+                                    })
+                                    .to_string(),
+                                )
+                            }
+                        }
+                        ("DELETE", "/api/auth") => {
+                            let mut guard = state.lock().expect("server state");
+                            guard.counts.revokes += 1;
+                            let status = guard.revoke_statuses.pop_front().unwrap_or(204);
+                            if status == 204 {
+                                (204, String::new())
+                            } else {
+                                let error = guard.revoke_error_code.clone().unwrap_or_else(|| {
+                                    if status == 401 {
+                                        "unauthorized".to_string()
+                                    } else {
+                                        "request_failed".to_string()
+                                    }
+                                });
+                                (
+                                    status,
+                                    serde_json::json!({
+                                        "error": error,
+                                        "message": if status == 401 {
+                                            "Authentication required"
+                                        } else {
+                                            "revoke failed"
+                                        }
+                                    })
+                                    .to_string(),
+                                )
+                            }
+                        }
+                        ("POST", "/api/auth/token/upgrade") => {
+                            let mut guard = state.lock().expect("server state");
+                            guard.counts.upgrades += 1;
+                            let status = guard.upgrade_statuses.pop_front().unwrap_or(200);
+                            if status == 200 {
+                                (
+                                    200,
+                                    serde_json::json!({
+                                        "data": {
+                                            "token": guard.upgrade_token.as_deref().unwrap_or("upgraded-token"),
+                                            "expires_at": guard
+                                                .upgrade_expires_at
+                                                .as_deref()
+                                                .unwrap_or("2099-01-01T00:00:00Z")
+                                        }
+                                    })
+                                    .to_string(),
+                                )
+                            } else {
+                                (
+                                    status,
+                                    serde_json::json!({
+                                        "error": if status == 401 { "unauthorized" } else { "upgrade_failed" },
+                                        "message": if status == 401 {
+                                            "Authentication required"
+                                        } else {
+                                            "token upgrade failed"
                                         }
                                     })
                                     .to_string(),
@@ -928,7 +1147,17 @@ pub(crate) mod test_support {
                                     .to_string(),
                                 )
                             } else {
-                                (status, format!("create failed with {status}"))
+                                (
+                                    status,
+                                    serde_json::json!({
+                                        "error": guard
+                                            .create_error_code
+                                            .as_deref()
+                                            .unwrap_or("request_failed"),
+                                        "message": format!("create failed with {status}")
+                                    })
+                                    .to_string(),
+                                )
                             }
                         }
                         ("PUT", path) if path.starts_with("/uploads/") => {
@@ -963,7 +1192,17 @@ pub(crate) mod test_support {
                             if status == 200 {
                                 (200, serde_json::json!({ "status": "enqueued" }).to_string())
                             } else {
-                                (status, format!("confirm failed with {status}"))
+                                (
+                                    status,
+                                    serde_json::json!({
+                                        "error": guard
+                                            .confirm_error_code
+                                            .as_deref()
+                                            .unwrap_or("request_failed"),
+                                        "message": format!("confirm failed with {status}")
+                                    })
+                                    .to_string(),
+                                )
                             }
                         }
                         _ => (404, "not found".to_string()),
@@ -1118,7 +1357,7 @@ mod tests {
         let _home = EnvGuard::set_path("HOME", home.path());
         let context = UploadContext {
             client: ApiClient::new_for_test("http://127.0.0.1:9"),
-            token: None,
+            token: StdMutex::new(None),
             user_orgs: Mutex::new(None),
         };
         let prepared = prepare_session_upload(ObservedSessionUpload {
@@ -1154,7 +1393,7 @@ mod tests {
     async fn publication_auth_state_reports_missing_token() {
         let context = UploadContext {
             client: ApiClient::new_for_test("http://127.0.0.1:9"),
-            token: None,
+            token: StdMutex::new(None),
             user_orgs: Mutex::new(None),
         };
 
@@ -1174,7 +1413,7 @@ mod tests {
         .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
 
@@ -1183,6 +1422,47 @@ mod tests {
         assert_eq!(state, PublicationAuthState::Rejected);
         assert!(state.blocks_background_publication());
         assert_eq!(server.counts().user_org_requests, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn publication_auth_state_upgrades_token_and_preserves_legacy_login() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let cfg = config::CliConfig {
+            api_url: Some("http://api.example.test".to_string()),
+            token: Some("legacy-token".to_string()),
+            github_login: Some("legacy-login".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.unwrap();
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            user_org_statuses: vec![422, 200],
+            user_org_error_code: Some("cli_token_upgrade_required".to_string()),
+            upgrade_token: Some("current-token".to_string()),
+            upgrade_expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: StdMutex::new(Some("legacy-token".to_string())),
+            user_orgs: Mutex::new(None),
+        };
+
+        let state = publication_auth_state(&context).await;
+
+        assert_eq!(state, PublicationAuthState::Ready);
+        assert_eq!(context.current_token().as_deref(), Some("current-token"));
+        assert_eq!(server.counts().user_org_requests, 2);
+        assert_eq!(server.counts().upgrades, 1);
+        let updated = config::CliConfig::load().await.unwrap();
+        assert_eq!(updated.token.as_deref(), Some("current-token"));
+        assert_eq!(updated.expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(updated.github_login.as_deref(), Some("legacy-login"));
+        assert_eq!(updated.api_url.as_deref(), Some("http://api.example.test"));
     }
 
     #[tokio::test]
@@ -1241,7 +1521,7 @@ mod tests {
                 .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
         let prepared = prepare_session_upload(sample_observed(
@@ -1267,6 +1547,246 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn upload_or_queue_prepared_session_upgrades_on_create_and_retries() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let cfg = config::CliConfig {
+            token: Some("legacy-token".to_string()),
+            github_login: Some("legacy-login".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.unwrap();
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            create_statuses: vec![422, 200],
+            create_error_code: Some("cli_token_upgrade_required".to_string()),
+            upgrade_token: Some("current-token".to_string()),
+            upgrade_expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: StdMutex::new(Some("legacy-token".to_string())),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+        let counts = server.counts();
+        assert_eq!(counts.create_requests, 2);
+        assert_eq!(counts.upgrades, 1);
+        assert_eq!(counts.uploads, 1);
+        assert_eq!(counts.confirms, 1);
+        assert_eq!(context.current_token().as_deref(), Some("current-token"));
+        let updated = config::CliConfig::load().await.unwrap();
+        assert_eq!(updated.token.as_deref(), Some("current-token"));
+        assert_eq!(updated.expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(updated.github_login.as_deref(), Some("legacy-login"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_upgrades_on_confirm_and_retries() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let cfg = config::CliConfig {
+            token: Some("legacy-token".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.unwrap();
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            confirm_statuses: vec![422, 200],
+            confirm_error_code: Some("cli_token_upgrade_required".to_string()),
+            upgrade_token: Some("current-token".to_string()),
+            upgrade_expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: StdMutex::new(Some("legacy-token".to_string())),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, LiveUploadOutcome::Uploaded);
+        let counts = server.counts();
+        assert_eq!(counts.create_requests, 1);
+        assert_eq!(counts.upgrades, 1);
+        assert_eq!(counts.uploads, 1);
+        assert_eq!(counts.confirms, 2);
+        let updated = config::CliConfig::load().await.unwrap();
+        assert_eq!(updated.token.as_deref(), Some("current-token"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_does_not_upgrade_for_unrelated_422() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let cfg = config::CliConfig {
+            token: Some("legacy-token".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.unwrap();
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            create_statuses: vec![422],
+            create_error_code: Some("validation_failed".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: StdMutex::new(Some("legacy-token".to_string())),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "session publication will retry later".to_string(),
+            }
+        );
+        let counts = server.counts();
+        assert_eq!(counts.create_requests, 1);
+        assert_eq!(counts.upgrades, 0);
+        assert_eq!(counts.uploads, 0);
+        assert_eq!(counts.confirms, 0);
+        let updated = config::CliConfig::load().await.unwrap();
+        assert_eq!(updated.token.as_deref(), Some("legacy-token"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_caps_upgrade_retry() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let cfg = config::CliConfig {
+            token: Some("legacy-token".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.unwrap();
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            create_statuses: vec![422, 422],
+            create_error_code: Some("cli_token_upgrade_required".to_string()),
+            upgrade_token: Some("current-token".to_string()),
+            upgrade_expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: StdMutex::new(Some("legacy-token".to_string())),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "Cadence CLI auth token was rejected".to_string(),
+            }
+        );
+        let counts = server.counts();
+        assert_eq!(counts.create_requests, 2);
+        assert_eq!(counts.upgrades, 1);
+        assert_eq!(counts.uploads, 0);
+        assert_eq!(counts.confirms, 0);
+        assert_eq!(context.current_token().as_deref(), Some("current-token"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn upload_or_queue_prepared_session_queues_when_upgrade_fails() {
+        let home = TempDir::new().unwrap();
+        let _home = EnvGuard::set_path("HOME", home.path());
+        let cfg = config::CliConfig {
+            token: Some("legacy-token".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            ..config::CliConfig::default()
+        };
+        cfg.save().await.unwrap();
+        let server = test_support::spawn_test_upload_server(test_support::TestUploadServerConfig {
+            create_statuses: vec![422],
+            create_error_code: Some("cli_token_upgrade_required".to_string()),
+            upgrade_statuses: vec![401],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let context = UploadContext {
+            client: ApiClient::new_for_test(&server.base_url),
+            token: StdMutex::new(Some("legacy-token".to_string())),
+            user_orgs: Mutex::new(None),
+        };
+        let prepared = prepare_session_upload(sample_observed(
+            Path::new("/tmp/repo"),
+            "git@github.com:test-org/repo.git",
+        ))
+        .unwrap();
+
+        let outcome = upload_or_queue_prepared_session(&context, &prepared)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            LiveUploadOutcome::Queued {
+                reason: "Cadence CLI auth token was rejected".to_string(),
+            }
+        );
+        let counts = server.counts();
+        assert_eq!(counts.create_requests, 1);
+        assert_eq!(counts.upgrades, 1);
+        assert_eq!(counts.uploads, 0);
+        assert_eq!(counts.confirms, 0);
+        let updated = config::CliConfig::load().await.unwrap();
+        assert_eq!(updated.token.as_deref(), Some("legacy-token"));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn upload_or_queue_prepared_session_skips_when_only_head_or_ref_changes() {
         let home = TempDir::new().unwrap();
         let _home = EnvGuard::set_path("HOME", home.path());
@@ -1276,7 +1796,7 @@ mod tests {
                 .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
 
@@ -1315,7 +1835,7 @@ mod tests {
                 .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
 
@@ -1366,7 +1886,7 @@ mod tests {
                 .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
 
@@ -1443,11 +1963,12 @@ mod tests {
         let _home = EnvGuard::set_path("HOME", home.path());
         let context = UploadContext {
             client: ApiClient::new_for_test("http://127.0.0.1:9"),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(Some(vec![
                 UserOrgInfo {
-                    github_org_id: 1,
-                    github_org_login: "test-org".to_string(),
+                    github_org_id: Some(1),
+                    github_org_login: Some("test-org".to_string()),
+                    provider: Some("github".to_string()),
                     display_name: Some("Test Org".to_string()),
                     is_personal: false,
                     is_onboarded: true,
@@ -1455,8 +1976,9 @@ mod tests {
                     org_id: Some("org-1".to_string()),
                 },
                 UserOrgInfo {
-                    github_org_id: 2,
-                    github_org_login: "TEST-ORG".to_string(),
+                    github_org_id: Some(2),
+                    github_org_login: Some("TEST-ORG".to_string()),
+                    provider: Some("github".to_string()),
                     display_name: Some("Duplicate Org".to_string()),
                     is_personal: false,
                     is_onboarded: true,
@@ -1491,7 +2013,7 @@ mod tests {
 
         let queued_context = UploadContext {
             client: ApiClient::new_for_test("http://127.0.0.1:9"),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
         let prepared = prepare_session_upload(ObservedSessionUpload {
@@ -1534,7 +2056,7 @@ mod tests {
                 .unwrap();
         let retry_context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
 
@@ -1575,7 +2097,7 @@ mod tests {
         .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
         let prepared = prepare_session_upload(sample_observed(
@@ -1608,7 +2130,7 @@ mod tests {
         let _home = EnvGuard::set_path("HOME", home.path());
         let queued_context = UploadContext {
             client: ApiClient::new_for_test("http://127.0.0.1:9"),
-            token: None,
+            token: StdMutex::new(None),
             user_orgs: Mutex::new(None),
         };
         let prepared = prepare_session_upload(ObservedSessionUpload {
@@ -1643,7 +2165,7 @@ mod tests {
 
         let retry_context = UploadContext {
             client: ApiClient::new_for_test("http://127.0.0.1:9"),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
         let summary = process_pending_uploads(&retry_context, 1).await.unwrap();
@@ -1664,7 +2186,7 @@ mod tests {
                 .unwrap();
         let context = UploadContext {
             client: ApiClient::new_for_test(&server.base_url),
-            token: Some("token".to_string()),
+            token: StdMutex::new(Some("token".to_string())),
             user_orgs: Mutex::new(None),
         };
         let large_body = "line\n".repeat(10_000);

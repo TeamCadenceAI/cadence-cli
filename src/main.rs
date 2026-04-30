@@ -274,11 +274,15 @@ async fn run_login() -> Result<()> {
 
     cfg.api_url = Some(resolved.url.clone());
     cfg.token = Some(exchanged.token.clone());
-    cfg.github_login = Some(exchanged.login.clone());
     cfg.expires_at = Some(exchanged.expires_at.clone());
+    cfg.github_login = exchanged.login.clone();
     cfg.save().await?;
 
-    output::success("Login", &format!("authenticated as {}", exchanged.login));
+    if let Some(login) = exchanged.login.as_deref() {
+        output::success("Login", &format!("authenticated as {login}"));
+    } else {
+        output::success("Login", "authenticated");
+    }
     output::detail(&format!("Token expires at {}", exchanged.expires_at));
     Ok(())
 }
@@ -289,10 +293,7 @@ async fn run_logout() -> Result<()> {
 
     if let Some(token) = resolve_cli_auth_token(&cfg) {
         let client = api_client::ApiClient::new(&resolved.url).await?;
-        match client
-            .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
-            .await
-        {
+        match revoke_token_with_optional_upgrade(&client, &token).await {
             Ok(()) => output::detail("Revoked token on server."),
             Err(api_client::AuthenticatedRequestError::Unauthorized) => {
                 output::note("Token was already invalid or expired.");
@@ -310,6 +311,27 @@ async fn run_logout() -> Result<()> {
     Ok(())
 }
 
+async fn revoke_token_with_optional_upgrade(
+    client: &api_client::ApiClient,
+    token: &str,
+) -> std::result::Result<(), api_client::AuthenticatedRequestError> {
+    match client
+        .revoke_token(token, Duration::from_secs(API_TIMEOUT_SECS))
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(api_client::AuthenticatedRequestError::TokenUpgradeRequired(_)) => {
+            let exchanged = client
+                .upgrade_cli_token(token, Duration::from_secs(API_TIMEOUT_SECS))
+                .await?;
+            client
+                .revoke_token(&exchanged.token, Duration::from_secs(API_TIMEOUT_SECS))
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BackfillSyncStats {
     notes_attached: i64,
@@ -323,12 +345,12 @@ fn resolve_cli_auth_token(cfg: &config::CliConfig) -> Option<String> {
 }
 
 async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) {
-    let cfg = match config::CliConfig::load().await {
+    let mut cfg = match config::CliConfig::load().await {
         Ok(cfg) => cfg,
         Err(_) => return,
     };
 
-    let token = match resolve_cli_auth_token(&cfg) {
+    let mut token = match resolve_cli_auth_token(&cfg) {
         Some(token) => token,
         None => {
             output::note("Run `cadence login` to sync results");
@@ -360,33 +382,74 @@ async fn report_backfill_completion(window_days: i32, stats: BackfillSyncStats) 
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    match client
+    let result = client
         .report_backfill_complete(&token, &request, Duration::from_secs(API_TIMEOUT_SECS))
-        .await
-    {
-        Ok(response) => {
-            if response.recorded {
-                output::detail(&format!(
-                    "Backfill results synced to Cadence onboarding at {}.",
-                    response.backfill_completed_at
-                ));
-            } else {
-                output::detail("Backfill sync already recorded.");
+        .await;
+
+    match result {
+        Ok(response) => report_backfill_sync_success(response),
+        Err(api_client::AuthenticatedRequestError::TokenUpgradeRequired(_)) => {
+            match client
+                .upgrade_cli_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
+                .await
+            {
+                Ok(exchanged) => {
+                    if let Err(err) = cfg
+                        .replace_auth_token(exchanged.token.clone(), exchanged.expires_at)
+                        .await
+                    {
+                        output::detail(&format!("Backfill sync skipped: {err}"));
+                        return;
+                    }
+                    token = exchanged.token;
+                    match client
+                        .report_backfill_complete(
+                            &token,
+                            &request,
+                            Duration::from_secs(API_TIMEOUT_SECS),
+                        )
+                        .await
+                    {
+                        Ok(response) => report_backfill_sync_success(response),
+                        Err(err) => report_backfill_sync_error(err),
+                    }
+                }
+                Err(err) => report_backfill_sync_error(err),
             }
         }
-        Err(api_client::AuthenticatedRequestError::Unauthorized) => {
+        Err(err) => report_backfill_sync_error(err),
+    }
+}
+
+fn report_backfill_sync_success(response: api_client::BackfillCompleteResponse) {
+    if response.recorded {
+        output::detail(&format!(
+            "Backfill results synced to Cadence onboarding at {}.",
+            response.backfill_completed_at
+        ));
+    } else {
+        output::detail("Backfill sync already recorded.");
+    }
+}
+
+fn report_backfill_sync_error(err: api_client::AuthenticatedRequestError) {
+    match err {
+        api_client::AuthenticatedRequestError::Unauthorized => {
             output::note("Run `cadence login` to re-authenticate");
         }
-        Err(api_client::AuthenticatedRequestError::Network(_)) => {
+        api_client::AuthenticatedRequestError::TokenUpgradeRequired(_) => {
+            output::note("Run `cadence login` to re-authenticate");
+        }
+        api_client::AuthenticatedRequestError::Network(_) => {
             output::note("Notes are safely stored locally");
         }
-        Err(api_client::AuthenticatedRequestError::NotFound) => {
+        api_client::AuthenticatedRequestError::NotFound => {
             output::note("API does not support this yet");
         }
-        Err(api_client::AuthenticatedRequestError::Server(_)) => {
+        api_client::AuthenticatedRequestError::Server(_) => {
             output::note("API returned an error");
         }
-        Err(other) => {
+        other => {
             output::detail(&format!("Backfill sync skipped: {other}"));
         }
     }
@@ -2956,10 +3019,7 @@ async fn revoke_token_for_uninstall() -> Result<()> {
 
     let resolved = cfg.resolve_api_url(api_url_override());
     let client = api_client::ApiClient::new(&resolved.url).await?;
-    match client
-        .revoke_token(&token, Duration::from_secs(API_TIMEOUT_SECS))
-        .await
-    {
+    match revoke_token_with_optional_upgrade(&client, &token).await {
         Ok(()) => {
             output::success("Revoked", "API token on server");
         }
@@ -3696,6 +3756,30 @@ mod tests {
         assert!(matches!(cli.command, Command::Logout));
     }
 
+    #[tokio::test]
+    async fn revoke_token_with_optional_upgrade_retries_revoke_after_token_upgrade() {
+        let server = crate::upload::test_support::spawn_test_upload_server(
+            crate::upload::test_support::TestUploadServerConfig {
+                revoke_statuses: vec![422, 204],
+                revoke_error_code: Some("cli_token_upgrade_required".to_string()),
+                upgrade_token: Some("upgraded-token".to_string()),
+                upgrade_expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn upload test server");
+        let client = api_client::ApiClient::new_for_test(&server.base_url);
+
+        revoke_token_with_optional_upgrade(&client, "legacy-token")
+            .await
+            .expect("revoke after upgrade");
+
+        let counts = server.counts();
+        assert_eq!(counts.revokes, 2);
+        assert_eq!(counts.upgrades, 1);
+    }
+
     #[test]
     fn cli_parses_backfill_command() {
         let cli = Cli::parse_from(["cadence", "backfill", "--since", "30d"]);
@@ -4391,6 +4475,8 @@ mod tests {
                 uploads: 1,
                 confirms: 1,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
     }
@@ -4791,6 +4877,8 @@ mod tests {
                 uploads: 1,
                 confirms: 1,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
     }
@@ -4876,6 +4964,8 @@ mod tests {
                 uploads: 0,
                 confirms: 0,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
     }
@@ -5172,6 +5262,8 @@ mod tests {
                 uploads: 1,
                 confirms: 1,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
     }
@@ -5308,6 +5400,8 @@ mod tests {
                 uploads: 1,
                 confirms: 1,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
 
@@ -5391,6 +5485,8 @@ mod tests {
                 uploads: 0,
                 confirms: 0,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
     }
@@ -5475,6 +5571,8 @@ mod tests {
                 uploads: 0,
                 confirms: 0,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
     }
@@ -5563,6 +5661,8 @@ mod tests {
                 uploads: 1,
                 confirms: 1,
                 user_org_requests: 1,
+                upgrades: 0,
+                revokes: 0,
             }
         );
         let requests = server.create_requests();
