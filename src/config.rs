@@ -143,6 +143,22 @@ impl CliConfig {
         self.save().await
     }
 
+    /// Replace the auth token lifecycle fields and save.
+    ///
+    /// Preserves `api_url`, legacy `github_login`, and non-auth settings. The
+    /// login field is retained only as legacy local display metadata because
+    /// current API tokens are tied to Cadence user IDs, not provider logins.
+    pub async fn replace_auth_token(&mut self, token: String, expires_at: String) -> Result<()> {
+        self.replace_auth_token_fields(token, expires_at);
+        self.save().await
+    }
+
+    /// Replace in-memory token lifecycle fields without saving.
+    pub(crate) fn replace_auth_token_fields(&mut self, token: String, expires_at: String) {
+        self.token = Some(token);
+        self.expires_at = Some(expires_at);
+    }
+
     /// Returns the persisted auth token when present and non-empty.
     pub fn auth_token(&self) -> Option<String> {
         non_empty_trimmed(self.token.clone())
@@ -462,6 +478,17 @@ impl CliConfig {
         self.expires_at = None;
         self.save_to(path).await
     }
+
+    /// Replace token lifecycle fields and save to a specific path.
+    async fn replace_auth_token_to(
+        &mut self,
+        path: &Path,
+        token: String,
+        expires_at: String,
+    ) -> Result<()> {
+        self.replace_auth_token_fields(token, expires_at);
+        self.save_to(path).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +769,36 @@ mod tests {
         cfg.clear_token_to(&path).await.unwrap();
         assert_eq!(cfg.api_url, Some("https://api.example.com".to_string()));
         assert_eq!(cfg.token, None);
+    }
+
+    #[tokio::test]
+    async fn test_replace_auth_token_preserves_api_url_and_legacy_login() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_path_in(tmp.path());
+
+        let mut cfg = CliConfig {
+            api_url: Some("https://api.example.com".to_string()),
+            token: Some("old-token".to_string()),
+            github_login: Some("legacy-login".to_string()),
+            expires_at: Some("2025-01-01T00:00:00Z".to_string()),
+            update_check_interval: Some("8h".to_string()),
+            ..Default::default()
+        };
+
+        cfg.replace_auth_token_to(
+            &path,
+            "new-token".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let loaded = CliConfig::load_from(&path).await.unwrap();
+        assert_eq!(loaded.api_url, Some("https://api.example.com".to_string()));
+        assert_eq!(loaded.token, Some("new-token".to_string()));
+        assert_eq!(loaded.github_login, Some("legacy-login".to_string()));
+        assert_eq!(loaded.expires_at, Some("2026-01-01T00:00:00Z".to_string()));
+        assert_eq!(loaded.update_check_interval, Some("8h".to_string()));
     }
 
     #[tokio::test]

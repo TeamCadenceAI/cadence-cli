@@ -16,10 +16,12 @@ use crate::transport;
 // ---------------------------------------------------------------------------
 
 const AUTH_EXCHANGE_PATH: &str = "/api/auth/exchange";
+const AUTH_TOKEN_UPGRADE_PATH: &str = "/api/auth/token/upgrade";
 const AUTH_REVOKE_PATH: &str = "/api/auth";
 const BACKFILL_COMPLETE_PATH: &str = "/api/onboarding/backfill-complete";
 const USER_ORGS_PATH: &str = "/api/user/orgs";
 const SESSION_PUBLICATION_CREATE_PATH: &str = "/api/v2/session-publications";
+const TOKEN_UPGRADE_REQUIRED_ERROR: &str = "cli_token_upgrade_required";
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -36,8 +38,9 @@ struct ExchangeRequest<'a> {
 pub struct CliTokenExchangeResult {
     /// Bearer token used by the CLI for authenticated API calls.
     pub token: String,
-    /// GitHub login associated with the authenticated user.
-    pub login: String,
+    /// Legacy GitHub login, returned by older API versions.
+    #[serde(default)]
+    pub login: Option<String>,
     /// RFC 3339 expiration timestamp for the token.
     pub expires_at: String,
 }
@@ -73,10 +76,15 @@ pub struct BackfillCompleteResponse {
 /// Minimal org info from `GET /api/user/orgs`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UserOrgInfo {
-    /// GitHub organization id for the account.
-    pub github_org_id: i64,
-    /// GitHub login for the org or personal account.
-    pub github_org_login: String,
+    /// Legacy GitHub organization id for the account, returned by older API versions.
+    #[serde(default)]
+    pub github_org_id: Option<i64>,
+    /// Provider-specific slug for the org or personal account.
+    #[serde(default, alias = "org_slug")]
+    pub github_org_login: Option<String>,
+    /// Provider that owns this org slug. Missing means legacy GitHub-shaped API response.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Display name shown to the user, when available.
     pub display_name: Option<String>,
     /// Whether this record represents the user's personal account.
@@ -164,6 +172,8 @@ struct ApiResponseEnvelope<T> {
 pub enum AuthenticatedRequestError {
     /// Authentication failed or the token has expired.
     Unauthorized,
+    /// The API requires this CLI token to be upgraded before retrying.
+    TokenUpgradeRequired(String),
     /// The request conflicted with current server state.
     Conflict(String),
     /// The target resource could not be found.
@@ -186,6 +196,7 @@ impl std::fmt::Display for AuthenticatedRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized => write!(f, "unauthorized"),
+            Self::TokenUpgradeRequired(msg) => write!(f, "token_upgrade_required: {msg}"),
             Self::Conflict(msg) => write!(f, "conflict: {msg}"),
             Self::NotFound => write!(f, "not_found"),
             Self::Unprocessable(msg) => write!(f, "unprocessable: {msg}"),
@@ -268,6 +279,34 @@ impl ApiClient {
         let body = map_http_error(resp).await?;
         let envelope: ApiResponseEnvelope<CliTokenExchangeResult> =
             serde_json::from_str(&body).context("failed to parse auth exchange response")?;
+        Ok(envelope.data)
+    }
+
+    /// Upgrade an existing CLI token to the current API JWT shape.
+    pub async fn upgrade_cli_token(
+        &self,
+        token: &str,
+        timeout: Duration,
+    ) -> std::result::Result<CliTokenExchangeResult, AuthenticatedRequestError> {
+        let url = self.url(AUTH_TOKEN_UPGRADE_PATH);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(map_network_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_authenticated_http_error(status, &body));
+        }
+
+        let body = resp.text().await.map_err(map_network_error)?;
+        let envelope: ApiResponseEnvelope<CliTokenExchangeResult> = serde_json::from_str(&body)
+            .map_err(|e| AuthenticatedRequestError::Parse(e.to_string()))?;
         Ok(envelope.data)
     }
 
@@ -505,6 +544,9 @@ fn map_authenticated_http_error(status: u16, body: &str) -> AuthenticatedRequest
         400 => AuthenticatedRequestError::BadRequest(detail),
         404 => AuthenticatedRequestError::NotFound,
         409 => AuthenticatedRequestError::Conflict(detail),
+        422 if extract_error_code(body).as_deref() == Some(TOKEN_UPGRADE_REQUIRED_ERROR) => {
+            AuthenticatedRequestError::TokenUpgradeRequired(detail)
+        }
         422 => AuthenticatedRequestError::Unprocessable(detail),
         500..=599 => AuthenticatedRequestError::Server(detail),
         _ => AuthenticatedRequestError::Unexpected(format!("HTTP {status}: {detail}")),
@@ -565,6 +607,12 @@ fn extract_error_message(body: &str) -> String {
     }
 }
 
+fn extract_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(ToString::to_string))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -597,6 +645,13 @@ mod tests {
             AuthenticatedRequestError::Unprocessable(_)
         ));
         assert!(matches!(
+            map_authenticated_http_error(
+                422,
+                r#"{"error":"cli_token_upgrade_required","message":"upgrade me"}"#
+            ),
+            AuthenticatedRequestError::TokenUpgradeRequired(_)
+        ));
+        assert!(matches!(
             map_authenticated_http_error(404, ""),
             AuthenticatedRequestError::NotFound
         ));
@@ -604,6 +659,44 @@ mod tests {
             map_authenticated_http_error(503, "{\"error\":\"bad\"}"),
             AuthenticatedRequestError::Server(_)
         ));
+    }
+
+    #[test]
+    fn cli_token_exchange_result_allows_missing_legacy_login() {
+        let envelope: ApiResponseEnvelope<CliTokenExchangeResult> = serde_json::from_str(
+            r#"{"data":{"token":"token","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .expect("parse token exchange envelope");
+
+        assert_eq!(envelope.data.token, "token");
+        assert_eq!(envelope.data.login, None);
+        assert_eq!(envelope.data.expires_at, "2099-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn user_orgs_response_allows_current_api_org_slug_shape() {
+        let envelope: ApiResponseEnvelope<UserOrgsResponse> = serde_json::from_str(
+            r#"{"data":{"orgs":[{
+                "org_slug":"cadence-org",
+                "provider":"github",
+                "display_name":"Cadence Org",
+                "avatar_url":"https://example.test/avatar.png",
+                "is_personal":false,
+                "is_onboarded":true,
+                "has_active_installation":true,
+                "org_id":"org-1",
+                "role":"manager",
+                "onboarding_hint":"ready"
+            }]}}"#,
+        )
+        .expect("parse current user orgs envelope");
+
+        let org = &envelope.data.orgs[0];
+        assert_eq!(org.github_org_id, None);
+        assert_eq!(org.github_org_login.as_deref(), Some("cadence-org"));
+        assert_eq!(org.provider.as_deref(), Some("github"));
+        assert_eq!(org.org_id.as_deref(), Some("org-1"));
+        assert!(org.has_active_installation);
     }
 
     #[test]
