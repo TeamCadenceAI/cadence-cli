@@ -1,6 +1,6 @@
 [package]
 name = "cadence-cli"
-version = "2.6.2"
+version = "3.0.0"
 edition = "2024"
 default-run = "cadence"
 
