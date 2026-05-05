@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::{agents, git, monitor, output, state_files, update};
+use crate::{agents, git, monitor, output, permissions, state_files, update};
 
 pub(crate) const VERSION_BOOTSTRAP_BACKFILL_SINCE: &str = "30d";
 const VERSION_BOOTSTRAP_MARKER_FILE: &str = "last-version-bootstrap";
@@ -241,6 +241,16 @@ pub(crate) async fn mark_current_version_bootstrap_complete() -> Result<()> {
         return Ok(());
     };
     write_version_bootstrap_marker(&path, update::current_version()).await
+}
+
+/// Returns true when the bootstrap marker is absent, i.e. this machine has
+/// never completed a Cadence install before. Used to scope first-run-only
+/// behaviour such as the macOS folder permission prompts.
+async fn is_first_install() -> Result<bool> {
+    let Some(path) = version_bootstrap_marker_path() else {
+        return Ok(false);
+    };
+    Ok(!tokio::fs::try_exists(&path).await.unwrap_or(false))
 }
 
 async fn mark_current_version_recovery_backfill_complete() -> Result<()> {
@@ -517,6 +527,14 @@ pub(crate) async fn run_install(org: Option<String>, preserve_disable_state: boo
     let install_start = std::time::Instant::now();
     let _bootstrap_lock =
         acquire_bootstrap_execution_lock_blocking(VERSION_BOOTSTRAP_LOCK_WAIT_TIMEOUT).await?;
+
+    if is_first_install().await.unwrap_or(false)
+        && let Err(err) = permissions::prompt_first_install_folder_access().await
+    {
+        output::note(&format!(
+            "Could not record folder access preference ({err})"
+        ));
+    }
 
     let include_recovery_backfill = should_run_current_version_recovery_backfill(true).await?;
     let outcome = execute_bootstrap(BootstrapOptions {
@@ -863,6 +881,40 @@ mod tests {
             .await
             .expect("skip bootstrap");
         assert!(!ran);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn is_first_install_true_before_bootstrap_marker() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        assert!(
+            is_first_install()
+                .await
+                .expect("is_first_install without marker"),
+            "fresh home should be first install"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn is_first_install_false_once_bootstrap_marker_present() {
+        let home = TempDir::new().expect("home tempdir");
+        let home_guard = EnvGuard::new("HOME");
+        home_guard.set_path(home.path());
+
+        mark_current_version_bootstrap_complete()
+            .await
+            .expect("mark version bootstrap");
+
+        assert!(
+            !is_first_install()
+                .await
+                .expect("is_first_install with marker"),
+            "existing user should not be first install"
+        );
     }
 
     #[tokio::test]
