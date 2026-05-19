@@ -11,6 +11,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod kiro;
+pub mod kiro_cli;
 pub mod opencode;
 pub mod roo_code;
 pub mod warp;
@@ -250,6 +251,7 @@ pub async fn discover_recent_sessions_for_backfill(now: i64, since_secs: i64) ->
         roo_logs,
         opencode_logs,
         kiro_logs,
+        kiro_cli_logs,
         amp_logs,
         antigravity_logs,
         windsurf_logs,
@@ -263,6 +265,7 @@ pub async fn discover_recent_sessions_for_backfill(now: i64, since_secs: i64) ->
         roo_code::RooCodeExplorer.discover_recent(now, since_secs),
         opencode::OpenCodeExplorer.discover_recent(now, since_secs),
         kiro::KiroExplorer.discover_recent(now, since_secs),
+        kiro_cli::KiroCliExplorer.discover_recent(now, since_secs),
         amp_code::AmpCodeExplorer.discover_recent(now, since_secs),
         antigravity::AntigravityExplorer.discover_recent(now, since_secs),
         windsurf::WindsurfExplorer.discover_recent(now, since_secs),
@@ -280,6 +283,7 @@ pub async fn discover_recent_sessions_for_backfill(now: i64, since_secs: i64) ->
             roo_logs,
             opencode_logs,
             kiro_logs,
+            kiro_cli_logs,
             amp_logs,
             antigravity_logs,
             windsurf_logs,
@@ -303,6 +307,7 @@ pub async fn discover_recent_sessions_for_monitor(now: i64, since_secs: i64) -> 
         roo_logs,
         opencode_logs,
         kiro_logs,
+        kiro_cli_logs,
         amp_logs,
         antigravity_logs,
         windsurf_logs,
@@ -315,6 +320,7 @@ pub async fn discover_recent_sessions_for_monitor(now: i64, since_secs: i64) -> 
         roo_code::RooCodeExplorer.discover_recent(now, since_secs),
         opencode::OpenCodeExplorer.discover_recent(now, since_secs),
         kiro::KiroExplorer.discover_recent(now, since_secs),
+        kiro_cli::KiroCliExplorer.discover_recent(now, since_secs),
         amp_code::AmpCodeExplorer.discover_recent(now, since_secs),
         antigravity::AntigravityExplorer.discover_recent(now, since_secs),
         windsurf::WindsurfExplorer.discover_recent(now, since_secs),
@@ -331,6 +337,7 @@ pub async fn discover_recent_sessions_for_monitor(now: i64, since_secs: i64) -> 
             roo_logs,
             opencode_logs,
             kiro_logs,
+            kiro_cli_logs,
             amp_logs,
             antigravity_logs,
             windsurf_logs,
