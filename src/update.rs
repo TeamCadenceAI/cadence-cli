@@ -2516,6 +2516,23 @@ pub(crate) fn should_defer_legacy_auto_update_scheduler_cleanup() -> bool {
     false
 }
 
+pub async fn schedule_active_auto_update_launch_agent_removal() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if should_defer_legacy_auto_update_scheduler_cleanup() {
+        Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 1; /bin/launchctl remove ai.teamcadence.cadence.autoupdate",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to schedule deferred legacy updater LaunchAgent removal")?;
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub async fn cleanup_legacy_auto_update_scheduler_for_monitor_runtime()
 -> Result<LegacyAutoUpdateCleanupDisposition> {
@@ -2773,14 +2790,16 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
         let plist_path = macos_launch_agent_path()?;
         let existed = tokio::fs::try_exists(&plist_path).await.unwrap_or(false);
         if existed {
-            let output = launchctl_file_operation("unload", &plist_path).await?;
-            if !output.status.success() {
-                let detail = command_failure_detail(&output);
-                if !launchctl_reports_missing_service(&detail) {
-                    bail!(
-                        "launchctl unload failed for {}: {detail}",
-                        plist_path.display()
-                    );
+            if !should_defer_legacy_auto_update_scheduler_cleanup() {
+                let output = launchctl_file_operation("unload", &plist_path).await?;
+                if !output.status.success() {
+                    let detail = command_failure_detail(&output);
+                    if !launchctl_reports_missing_service(&detail) {
+                        bail!(
+                            "launchctl unload failed for {}: {detail}",
+                            plist_path.display()
+                        );
+                    }
                 }
             }
             tokio::fs::remove_file(&plist_path)
@@ -2795,16 +2814,24 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
         let (service_path, timer_path) = linux_systemd_paths()?;
         let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
         let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
-        let disabled = Command::new("systemctl")
+        let mut cleanup_errors = Vec::new();
+        match Command::new("systemctl")
             .args(["--user", "disable", "--now", "cadence-autoupdate.timer"])
             .output()
             .await
-            .context("failed to run systemctl disable for legacy Cadence updater")?;
-        if !disabled.status.success() {
-            let detail = command_failure_detail(&disabled);
-            if !legacy_systemd_unit_missing(&detail) {
-                bail!("systemctl failed to disable cadence-autoupdate.timer: {detail}");
+        {
+            Ok(disabled) if !disabled.status.success() => {
+                let detail = command_failure_detail(&disabled);
+                if !legacy_systemd_unit_missing(&detail) {
+                    cleanup_errors.push(format!(
+                        "systemctl failed to disable cadence-autoupdate.timer: {detail}"
+                    ));
+                }
             }
+            Err(err) => cleanup_errors.push(format!(
+                "failed to run systemctl disable for legacy Cadence updater: {err}"
+            )),
+            Ok(_) => {}
         }
         if service_exists {
             tokio::fs::remove_file(&service_path).await?;
@@ -2812,16 +2839,22 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
         if timer_exists {
             tokio::fs::remove_file(&timer_path).await?;
         }
-        let reloaded = Command::new("systemctl")
+        match Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .output()
             .await
-            .context("failed to reload systemd after legacy Cadence updater removal")?;
-        if !reloaded.status.success() {
-            bail!(
+        {
+            Ok(reloaded) if !reloaded.status.success() => cleanup_errors.push(format!(
                 "systemctl daemon-reload failed after legacy updater removal: {}",
                 command_failure_detail(&reloaded)
-            );
+            )),
+            Err(err) => cleanup_errors.push(format!(
+                "failed to reload systemd after legacy updater removal: {err}"
+            )),
+            Ok(_) => {}
+        }
+        if !cleanup_errors.is_empty() {
+            bail!(cleanup_errors.join("; "));
         }
         return Ok(());
     }
@@ -3185,6 +3218,28 @@ mod tests {
         guard.set(MACOS_LAUNCH_AGENT_LABEL);
 
         assert!(should_defer_legacy_auto_update_scheduler_cleanup());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[serial]
+    async fn active_legacy_launch_agent_cleanup_removes_plist_before_deferred_unload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().expect("home path"));
+        let xpc = EnvGuard::new("XPC_SERVICE_NAME");
+        xpc.set(MACOS_LAUNCH_AGENT_LABEL);
+        let plist = macos_launch_agent_path().expect("launch agent path");
+        tokio::fs::create_dir_all(plist.parent().expect("plist parent"))
+            .await
+            .expect("create LaunchAgents");
+        tokio::fs::write(&plist, "test").await.expect("write plist");
+
+        uninstall_auto_update_scheduler()
+            .await
+            .expect("remove legacy plist");
+
+        assert!(!tokio::fs::try_exists(&plist).await.expect("check plist"));
     }
 
     #[tokio::test]

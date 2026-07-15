@@ -2204,12 +2204,24 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
     let eol_phase = eol::phase();
     if matches!(eol_phase, eol::Phase::SelfDisabled) {
         let _ = eol::maybe_open_goodbye().await;
-        if !eol::scheduler_cleanup_complete().await.unwrap_or(false) {
+        let cleanup_complete = eol::scheduler_cleanup_complete().await.unwrap_or(false);
+        if !cleanup_complete {
             let monitor_cleanup = monitor::uninstall_monitor().await;
             let updater_cleanup = update::uninstall_auto_update_scheduler().await;
-            if monitor_cleanup.is_ok() && updater_cleanup.is_ok() {
+            let deferred_removal = if monitor_cleanup.is_ok() && updater_cleanup.is_ok() {
+                let monitor_removal = monitor::schedule_active_launch_agent_removal().await;
+                let updater_removal =
+                    update::schedule_active_auto_update_launch_agent_removal().await;
+                monitor_removal.and(updater_removal)
+            } else {
+                Ok(())
+            };
+            if monitor_cleanup.is_ok() && updater_cleanup.is_ok() && deferred_removal.is_ok() {
                 eol::mark_scheduler_cleanup_complete().await?;
             }
+        } else {
+            let _ = monitor::schedule_active_launch_agent_removal().await;
+            let _ = update::schedule_active_auto_update_launch_agent_removal().await;
         }
         return Ok(MonitorTickSummary::default());
     }
