@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Output;
 use tokio::process::Command;
 
@@ -210,7 +210,7 @@ fn parent_pid_for_logs() -> u32 {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -218,6 +218,14 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_unit_missing(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("unit file") && detail.contains("does not exist")
+        || detail.contains("unit cadence-monitor.timer not loaded")
+        || detail.contains("unit cadence-monitor.timer could not be found")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -591,14 +599,15 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
         let (service_path, timer_path) = linux_systemd_paths()?;
         let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
         let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
-        if service_exists || timer_exists {
-            let disabled = Command::new("systemctl")
-                .args(["--user", "disable", "--now", "cadence-monitor.timer"])
-                .status()
-                .await
-                .context("failed to run systemctl disable for cadence monitor")?;
-            if !disabled.success() {
-                anyhow::bail!("systemctl failed to disable cadence-monitor.timer");
+        let disabled = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "cadence-monitor.timer"])
+            .output()
+            .await
+            .context("failed to run systemctl disable for cadence monitor")?;
+        if !disabled.status.success() {
+            let detail = command_failure_detail(&disabled);
+            if !systemd_unit_missing(&detail) {
+                anyhow::bail!("systemctl failed to disable cadence-monitor.timer: {detail}");
             }
         }
         if service_exists {
@@ -607,15 +616,16 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
         if timer_exists {
             tokio::fs::remove_file(&timer_path).await?;
         }
-        if service_exists || timer_exists {
-            let reloaded = Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status()
-                .await
-                .context("failed to reload systemd after cadence monitor removal")?;
-            if !reloaded.success() {
-                anyhow::bail!("systemctl daemon-reload failed after cadence monitor removal");
-            }
+        let reloaded = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output()
+            .await
+            .context("failed to reload systemd after cadence monitor removal")?;
+        if !reloaded.status.success() {
+            anyhow::bail!(
+                "systemctl daemon-reload failed after cadence monitor removal: {}",
+                command_failure_detail(&reloaded)
+            );
         }
         return Ok(SchedulerUninstallResult {
             removed: service_exists || timer_exists,
@@ -945,6 +955,19 @@ async fn scheduler_health_macos() -> SchedulerHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_missing_unit_detection_is_specific() {
+        assert!(systemd_unit_missing(
+            "Failed to disable unit: Unit file cadence-monitor.timer does not exist."
+        ));
+        assert!(systemd_unit_missing(
+            "Unit cadence-monitor.timer not loaded."
+        ));
+        assert!(!systemd_unit_missing(
+            "Failed to connect to bus: No medium found"
+        ));
+    }
     use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;

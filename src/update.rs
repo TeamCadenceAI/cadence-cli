@@ -2669,6 +2669,14 @@ fn command_failure_detail(output: &Output) -> String {
         .unwrap_or_else(|| format!("exit status {}", output.status))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn legacy_systemd_unit_missing(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("unit file") && detail.contains("does not exist")
+        || detail.contains("unit cadence-autoupdate.timer not loaded")
+        || detail.contains("unit cadence-autoupdate.timer could not be found")
+}
+
 fn install_handoff_error(err: anyhow::Error) -> anyhow::Error {
     err.context(
         "cadence updated, but the new version could not finish runtime bootstrap automatically",
@@ -2787,14 +2795,15 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
         let (service_path, timer_path) = linux_systemd_paths()?;
         let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
         let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
-        if service_exists || timer_exists {
-            let disabled = Command::new("systemctl")
-                .args(["--user", "disable", "--now", "cadence-autoupdate.timer"])
-                .status()
-                .await
-                .context("failed to run systemctl disable for legacy Cadence updater")?;
-            if !disabled.success() {
-                bail!("systemctl failed to disable cadence-autoupdate.timer");
+        let disabled = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "cadence-autoupdate.timer"])
+            .output()
+            .await
+            .context("failed to run systemctl disable for legacy Cadence updater")?;
+        if !disabled.status.success() {
+            let detail = command_failure_detail(&disabled);
+            if !legacy_systemd_unit_missing(&detail) {
+                bail!("systemctl failed to disable cadence-autoupdate.timer: {detail}");
             }
         }
         if service_exists {
@@ -2803,15 +2812,16 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
         if timer_exists {
             tokio::fs::remove_file(&timer_path).await?;
         }
-        if service_exists || timer_exists {
-            let reloaded = Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status()
-                .await
-                .context("failed to reload systemd after legacy Cadence updater removal")?;
-            if !reloaded.success() {
-                bail!("systemctl daemon-reload failed after legacy updater removal");
-            }
+        let reloaded = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output()
+            .await
+            .context("failed to reload systemd after legacy Cadence updater removal")?;
+        if !reloaded.status.success() {
+            bail!(
+                "systemctl daemon-reload failed after legacy updater removal: {}",
+                command_failure_detail(&reloaded)
+            );
         }
         return Ok(());
     }
@@ -3141,6 +3151,19 @@ mod tests {
                 None => unsafe { std::env::remove_var(&self.key) },
             }
         }
+    }
+
+    #[test]
+    fn legacy_systemd_missing_unit_detection_is_specific() {
+        assert!(legacy_systemd_unit_missing(
+            "Failed to disable unit: Unit file cadence-autoupdate.timer does not exist."
+        ));
+        assert!(legacy_systemd_unit_missing(
+            "Unit cadence-autoupdate.timer could not be found."
+        ));
+        assert!(!legacy_systemd_unit_missing(
+            "Failed to connect to bus: No medium found"
+        ));
     }
 
     // -- normalize_version_tag -----------------------------------------------
@@ -5030,6 +5053,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = EnvGuard::new("HOME");
         home.set(tmp.path().to_str().unwrap());
+
+        #[cfg(target_os = "linux")]
+        let _path = {
+            let bin = tmp.path().join("bin");
+            tokio::fs::create_dir_all(&bin)
+                .await
+                .expect("create fake bin");
+            let systemctl = bin.join("systemctl");
+            tokio::fs::write(&systemctl, "#!/bin/sh\nexit 0\n")
+                .await
+                .expect("write fake systemctl");
+            set_executable_permissions(&systemctl)
+                .await
+                .expect("chmod fake systemctl");
+            let path = EnvGuard::new("PATH");
+            path.set(bin.to_str().expect("fake bin path"));
+            path
+        };
 
         uninstall_auto_update_scheduler()
             .await
