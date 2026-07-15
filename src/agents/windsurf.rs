@@ -553,10 +553,7 @@ fn parse_port_from_lsof_line(line: &str) -> Option<u16> {
 
 #[cfg(any(unix, test))]
 fn parse_port_from_lsof_field(field: &str) -> Option<u16> {
-    let port_str = match field.rfind(':') {
-        Some(idx) => &field[idx + 1..],
-        None => return None,
-    };
+    let port_str = &field[field.rfind(':')? + 1..];
     let port_str = port_str.trim_matches(|c: char| c == ')' || c == ']');
     port_str.parse::<u16>().ok()
 }

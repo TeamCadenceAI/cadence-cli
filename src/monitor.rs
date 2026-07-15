@@ -634,6 +634,7 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
                     ));
                 }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => cleanup_errors.push(format!(
                 "failed to run systemctl disable for cadence monitor: {err}"
             )),
@@ -654,6 +655,7 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
                 "systemctl daemon-reload failed after cadence monitor removal: {}",
                 command_failure_detail(&reloaded)
             )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => cleanup_errors.push(format!(
                 "failed to reload systemd after cadence monitor removal: {err}"
             )),
@@ -1006,6 +1008,35 @@ mod tests {
     use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    async fn uninstall_scheduler_succeeds_without_systemctl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().expect("home path"));
+        let path = EnvGuard::new("PATH");
+        path.set(tmp.path().to_str().expect("empty path"));
+        let (service_path, timer_path) = linux_systemd_paths().expect("systemd paths");
+        tokio::fs::create_dir_all(service_path.parent().expect("systemd user directory"))
+            .await
+            .expect("create systemd user directory");
+        tokio::fs::write(&service_path, "test")
+            .await
+            .expect("write service");
+        tokio::fs::write(&timer_path, "test")
+            .await
+            .expect("write timer");
+
+        let result = uninstall_scheduler()
+            .await
+            .expect("uninstall without systemctl");
+
+        assert!(result.removed);
+        assert!(!tokio::fs::try_exists(service_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(timer_path).await.unwrap());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

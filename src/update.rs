@@ -2828,6 +2828,7 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
                     ));
                 }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => cleanup_errors.push(format!(
                 "failed to run systemctl disable for legacy Cadence updater: {err}"
             )),
@@ -2848,6 +2849,7 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
                 "systemctl daemon-reload failed after legacy updater removal: {}",
                 command_failure_detail(&reloaded)
             )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => cleanup_errors.push(format!(
                 "failed to reload systemd after legacy updater removal: {err}"
             )),
@@ -5133,6 +5135,34 @@ mod tests {
         uninstall_auto_update_scheduler()
             .await
             .expect("second uninstall");
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    async fn uninstall_scheduler_succeeds_without_systemctl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = EnvGuard::new("HOME");
+        home.set(tmp.path().to_str().unwrap());
+        let path = EnvGuard::new("PATH");
+        path.set(tmp.path().to_str().unwrap());
+        let (service_path, timer_path) = linux_systemd_paths().expect("systemd paths");
+        tokio::fs::create_dir_all(service_path.parent().expect("systemd user directory"))
+            .await
+            .expect("create systemd user directory");
+        tokio::fs::write(&service_path, "test")
+            .await
+            .expect("write service");
+        tokio::fs::write(&timer_path, "test")
+            .await
+            .expect("write timer");
+
+        uninstall_auto_update_scheduler()
+            .await
+            .expect("uninstall without systemctl");
+
+        assert!(!tokio::fs::try_exists(service_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(timer_path).await.unwrap());
     }
 
     #[tokio::test]

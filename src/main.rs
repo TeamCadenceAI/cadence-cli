@@ -3370,7 +3370,7 @@ async fn main() {
     };
     let use_monitor_diagnostics = uses_monitor_diagnostics_session(&cli.command);
     let monitor_diagnostics_command = if use_monitor_diagnostics {
-        Some(format!("{:?}", &cli.command))
+        Some(format!("{:?}", cli.command))
     } else {
         None
     };
