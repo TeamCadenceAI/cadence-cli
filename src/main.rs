@@ -19,7 +19,7 @@ mod upload;
 mod test_support;
 
 use anyhow::Result;
-use cadence_cli::{config, update};
+use cadence_cli::{config, eol, update};
 use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::process;
@@ -78,10 +78,7 @@ impl std::fmt::Display for AlreadyReportedCliError {
 
 impl std::error::Error for AlreadyReportedCliError {}
 
-/// Cadence CLI: upload AI coding agent sessions directly to Cadence.
-///
-/// Provides provenance and measurement of AI-assisted development
-/// without polluting commit history.
+/// Retired Cadence CLI. Move to the Cadence App: https://teamcadence.ai/cli-eol
 #[derive(Parser, Debug)]
 #[command(name = "cadence", version, about)]
 struct Cli {
@@ -99,7 +96,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Install Cadence CLI and enable background monitoring.
+    /// Retired: install is unavailable after the cleanup cutoff.
     Install {
         /// Optional GitHub org filter for push scoping.
         #[arg(long)]
@@ -2204,6 +2201,28 @@ async fn upload_incremental_sessions_globally(
 }
 
 async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<MonitorTickSummary> {
+    match eol::phase() {
+        eol::Phase::SelfDisabled => {
+            let _ = eol::maybe_open_goodbye().await;
+            if !eol::scheduler_cleanup_complete().await.unwrap_or(false) {
+                let monitor_cleanup = monitor::uninstall_monitor().await;
+                let updater_cleanup = update::uninstall_auto_update_scheduler().await;
+                if monitor_cleanup.is_ok() && updater_cleanup.is_ok() {
+                    eol::mark_scheduler_cleanup_complete().await?;
+                }
+            }
+            return Ok(MonitorTickSummary::default());
+        }
+        eol::Phase::CleanupOnly => {
+            let _ = eol::maybe_open_nudge().await;
+            if options.run_auto_update {
+                update::run_background_auto_update_for_monitor_tick().await?;
+            }
+            return Ok(MonitorTickSummary::default());
+        }
+        eol::Phase::Active => {}
+    }
+
     let mut state = monitor::load_state().await.unwrap_or_default();
     if !options.force && !state.enabled {
         return Ok(MonitorTickSummary::default());
@@ -2227,6 +2246,7 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
     monitor::save_state(&state).await?;
 
     let run_result: Result<MonitorTickOutcome> = async {
+        let _ = eol::maybe_open_nudge().await;
         let upload_context = upload::resolve_upload_context(api_url_override()).await?;
         let publication_auth = upload::publication_auth_state(&upload_context).await;
         if publication_auth.blocks_background_publication()
@@ -3135,6 +3155,72 @@ fn should_run_automatic_current_version_bootstrap(command: &Command) -> bool {
     )
 }
 
+fn is_internal_update_handoff() -> bool {
+    std::env::var("CADENCE_INTERNAL_ALLOW_UPDATE_IN_PROGRESS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn command_allowed_during_eol(command: &Command, phase: eol::Phase) -> bool {
+    if matches!(phase, eol::Phase::Active) {
+        return true;
+    }
+
+    let cleanup_or_diagnostic = matches!(
+        command,
+        Command::Logout
+            | Command::Status
+            | Command::Doctor { repair: false }
+            | Command::Config {
+                config_command: None | Some(ConfigCommand::Get { .. } | ConfigCommand::List)
+            }
+            | Command::Update { .. }
+            | Command::Uninstall { .. }
+            | Command::Monitor {
+                command: None
+                    | Some(
+                        MonitorCommand::Status
+                            | MonitorCommand::Disable
+                            | MonitorCommand::Uninstall
+                            | MonitorCommand::Tick
+                    )
+            }
+            | Command::AutoUpdate {
+                command: None
+                    | Some(
+                        AutoUpdateCommand::Status
+                            | AutoUpdateCommand::Disable
+                            | AutoUpdateCommand::Uninstall
+                    )
+            }
+    );
+
+    match phase {
+        eol::Phase::Active => true,
+        eol::Phase::CleanupOnly => {
+            cleanup_or_diagnostic
+                || (matches!(command, Command::Install { .. }) && is_internal_update_handoff())
+        }
+        eol::Phase::SelfDisabled => matches!(
+            command,
+            Command::Uninstall { .. }
+                | Command::Monitor {
+                    command: Some(
+                        MonitorCommand::Disable | MonitorCommand::Uninstall | MonitorCommand::Tick
+                    )
+                }
+                | Command::AutoUpdate {
+                    command: Some(AutoUpdateCommand::Disable | AutoUpdateCommand::Uninstall)
+                }
+        ),
+    }
+}
+
+fn should_print_eol_notice_for_args() -> bool {
+    !std::env::args().skip(1).any(|arg| arg == "tick")
+}
+
 fn automatic_bootstrap_includes_recovery_backfill(command: &Command) -> bool {
     !matches!(command, Command::Backfill { .. })
 }
@@ -3195,10 +3281,33 @@ fn activity_lock_purpose_for_command(command: &Command) -> &'static str {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if should_print_eol_notice_for_args() {
+                eprintln!("{}", eol::notice());
+            }
+            err.exit();
+        }
+    };
     output::set_verbose(cli.verbose);
     if let Some(url) = cli.api_url.clone() {
         let _ = API_URL_OVERRIDE.set(url);
+    }
+    let eol_phase = eol::phase();
+    if should_print_eol_notice_for_args() {
+        eprintln!(
+            "{}",
+            if matches!(eol_phase, eol::Phase::Active) {
+                eol::notice()
+            } else {
+                eol::retired_notice()
+            }
+        );
+    }
+    if !command_allowed_during_eol(&cli.command, eol_phase) {
+        report_error(&anyhow::anyhow!(eol::retired_notice()));
+        process::exit(1);
     }
     let _activity_lock = match update::acquire_command_activity_lock(
         activity_lock_purpose_for_command(&cli.command),
@@ -3279,7 +3388,12 @@ async fn main() {
 
     // Passive background version check: run after successful command execution
     // on all non-Update commands. Failures are silently ignored.
-    if result.is_ok() && !is_update_command && !is_hook_command && !is_monitor_tick_command {
+    if result.is_ok()
+        && matches!(eol_phase, eol::Phase::Active)
+        && !is_update_command
+        && !is_hook_command
+        && !is_monitor_tick_command
+    {
         update::passive_version_check().await;
     }
 
@@ -6060,5 +6174,55 @@ mod tests {
             }
             _ => panic!("expected Uninstall command via reset alias"),
         }
+    }
+
+    #[test]
+    fn cleanup_phase_allows_diagnostics_but_blocks_capture() {
+        assert!(command_allowed_during_eol(
+            &Command::Doctor { repair: false },
+            eol::Phase::CleanupOnly
+        ));
+        assert!(command_allowed_during_eol(
+            &Command::Update {
+                check: true,
+                yes: false
+            },
+            eol::Phase::CleanupOnly
+        ));
+        assert!(!command_allowed_during_eol(
+            &Command::Login,
+            eol::Phase::CleanupOnly
+        ));
+        assert!(!command_allowed_during_eol(
+            &Command::Monitor {
+                command: Some(MonitorCommand::Enable)
+            },
+            eol::Phase::CleanupOnly
+        ));
+    }
+
+    #[test]
+    fn self_disabled_phase_allows_only_removal() {
+        assert!(command_allowed_during_eol(
+            &Command::Uninstall { yes: true },
+            eol::Phase::SelfDisabled
+        ));
+        assert!(command_allowed_during_eol(
+            &Command::Monitor {
+                command: Some(MonitorCommand::Uninstall)
+            },
+            eol::Phase::SelfDisabled
+        ));
+        assert!(!command_allowed_during_eol(
+            &Command::Status,
+            eol::Phase::SelfDisabled
+        ));
+        assert!(!command_allowed_during_eol(
+            &Command::Update {
+                check: true,
+                yes: false
+            },
+            eol::Phase::SelfDisabled
+        ));
     }
 }

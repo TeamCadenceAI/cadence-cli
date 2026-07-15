@@ -331,6 +331,12 @@ pub(crate) async fn maybe_run_current_version_bootstrap(
 }
 
 async fn desired_monitor_enabled(preserve_disable_state: bool) -> Result<bool> {
+    if matches!(
+        cadence_cli::eol::phase(),
+        cadence_cli::eol::Phase::SelfDisabled
+    ) {
+        return Ok(false);
+    }
     if !preserve_disable_state {
         return Ok(true);
     }

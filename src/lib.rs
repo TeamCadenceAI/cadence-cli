@@ -4,6 +4,7 @@
 //! expose internal modules to integration tests and future spec consumers.
 
 pub mod config;
+pub mod eol;
 pub mod monitor;
 pub mod publication;
 pub mod publication_state;

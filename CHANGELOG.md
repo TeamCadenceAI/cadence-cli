@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.7.0] (2026-07-15)
+
+### Retirement
+
+* **eol:** final standalone CLI release in favor of the Cadence App.
+* **eol:** opens the migration page at most once every 48 hours while active.
+* **eol:** stops client-side upload work and limits commands to cleanup and diagnostics from 24 July 2026 AEST.
+* **eol:** opens a final goodbye page and removes monitor and legacy updater schedulers from 31 July 2026 AEST.
+
+
 ## [2.6.1](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.6.0...v2.6.1) (2026-04-17)
 
 
