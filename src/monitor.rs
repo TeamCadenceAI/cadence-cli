@@ -640,21 +640,17 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
             )),
             Ok(_) => {}
         }
-        if service_exists {
-            if let Err(err) = tokio::fs::remove_file(&service_path).await {
-                cleanup_errors.push(format!(
-                    "failed to remove cadence monitor service {}: {err}",
-                    service_path.display()
-                ));
-            }
+        if service_exists && let Err(err) = tokio::fs::remove_file(&service_path).await {
+            cleanup_errors.push(format!(
+                "failed to remove cadence monitor service {}: {err}",
+                service_path.display()
+            ));
         }
-        if timer_exists {
-            if let Err(err) = tokio::fs::remove_file(&timer_path).await {
-                cleanup_errors.push(format!(
-                    "failed to remove cadence monitor timer {}: {err}",
-                    timer_path.display()
-                ));
-            }
+        if timer_exists && let Err(err) = tokio::fs::remove_file(&timer_path).await {
+            cleanup_errors.push(format!(
+                "failed to remove cadence monitor timer {}: {err}",
+                timer_path.display()
+            ));
         }
         match Command::new("systemctl")
             .args(["--user", "daemon-reload"])

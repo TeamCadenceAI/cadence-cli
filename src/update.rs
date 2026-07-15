@@ -2834,21 +2834,17 @@ pub async fn uninstall_auto_update_scheduler() -> Result<()> {
             )),
             Ok(_) => {}
         }
-        if service_exists {
-            if let Err(err) = tokio::fs::remove_file(&service_path).await {
-                cleanup_errors.push(format!(
-                    "failed to remove legacy Cadence updater service {}: {err}",
-                    service_path.display()
-                ));
-            }
+        if service_exists && let Err(err) = tokio::fs::remove_file(&service_path).await {
+            cleanup_errors.push(format!(
+                "failed to remove legacy Cadence updater service {}: {err}",
+                service_path.display()
+            ));
         }
-        if timer_exists {
-            if let Err(err) = tokio::fs::remove_file(&timer_path).await {
-                cleanup_errors.push(format!(
-                    "failed to remove legacy Cadence updater timer {}: {err}",
-                    timer_path.display()
-                ));
-            }
+        if timer_exists && let Err(err) = tokio::fs::remove_file(&timer_path).await {
+            cleanup_errors.push(format!(
+                "failed to remove legacy Cadence updater timer {}: {err}",
+                timer_path.display()
+            ));
         }
         match Command::new("systemctl")
             .args(["--user", "daemon-reload"])
@@ -5153,9 +5149,9 @@ mod tests {
     async fn uninstall_scheduler_succeeds_without_systemctl() {
         let tmp = tempfile::tempdir().unwrap();
         let home = EnvGuard::new("HOME");
-        home.set_path(tmp.path());
+        home.set(tmp.path().to_str().unwrap());
         let path = EnvGuard::new("PATH");
-        path.set_path(tmp.path());
+        path.set(tmp.path().to_str().unwrap());
         let (service_path, timer_path) = linux_systemd_paths().expect("systemd paths");
         tokio::fs::create_dir_all(service_path.parent().expect("systemd user directory"))
             .await
