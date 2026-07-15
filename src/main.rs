@@ -2861,10 +2861,12 @@ async fn run_auto_update_disable() -> Result<()> {
 }
 
 async fn run_auto_update_uninstall() -> Result<()> {
-    output::note(
-        "`cadence auto-update uninstall` now maps to `cadence monitor uninstall` because the scheduler is shared with background monitoring.",
-    );
-    run_monitor_uninstall().await?;
+    output::note("Removing monitor and legacy auto-update scheduler artifacts.");
+    let monitor_result = run_monitor_uninstall().await;
+    let legacy_result = update::uninstall_auto_update_scheduler().await;
+    monitor_result?;
+    legacy_result?;
+    output::success("Auto-update", "legacy scheduler artifacts removed.");
     Ok(())
 }
 
@@ -3060,7 +3062,10 @@ async fn revoke_token_for_uninstall() -> Result<()> {
 
 /// Disable background monitoring and remove scheduler artifacts.
 async fn uninstall_scheduler() -> Result<()> {
-    let removed = monitor::uninstall_monitor().await?;
+    let monitor_result = monitor::uninstall_monitor().await;
+    let legacy_result = update::uninstall_auto_update_scheduler().await;
+    let removed = monitor_result?;
+    legacy_result?;
     if removed.removed {
         output::success("Removed", &format!("scheduler ({})", removed.description));
     } else {
@@ -3203,6 +3208,9 @@ fn command_allowed_during_eol_with_handoff(
                             | AutoUpdateCommand::Uninstall
                     )
             }
+            | Command::Hook {
+                hook_command: HookCommand::AutoUpdate
+            }
     );
 
     match phase {
@@ -3217,16 +3225,13 @@ fn command_allowed_during_eol_with_handoff(
                     command,
                     Command::Uninstall { .. }
                         | Command::Monitor {
-                            command: Some(
-                                MonitorCommand::Disable
-                                    | MonitorCommand::Uninstall
-                                    | MonitorCommand::Tick
-                            )
+                            command: Some(MonitorCommand::Uninstall | MonitorCommand::Tick)
                         }
                         | Command::AutoUpdate {
-                            command: Some(
-                                AutoUpdateCommand::Disable | AutoUpdateCommand::Uninstall
-                            )
+                            command: Some(AutoUpdateCommand::Uninstall)
+                        }
+                        | Command::Hook {
+                            hook_command: HookCommand::AutoUpdate
                         }
                 )
         }
@@ -3238,7 +3243,15 @@ fn command_allowed_during_eol(command: &Command, phase: eol::Phase) -> bool {
 }
 
 fn should_print_eol_notice_for_args() -> bool {
-    !std::env::args().skip(1).any(|arg| arg == "tick")
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    !args.windows(2).any(|pair| {
+        matches!(
+            pair,
+            [group, command]
+                if (group == "monitor" && command == "tick")
+                    || (group == "hook" && command == "auto-update")
+        )
+    })
 }
 
 fn automatic_bootstrap_includes_recovery_backfill(command: &Command) -> bool {
@@ -6224,6 +6237,12 @@ mod tests {
             },
             eol::Phase::CleanupOnly
         ));
+        assert!(command_allowed_during_eol(
+            &Command::Hook {
+                hook_command: HookCommand::AutoUpdate
+            },
+            eol::Phase::CleanupOnly
+        ));
     }
 
     #[test]
@@ -6256,6 +6275,30 @@ mod tests {
             },
             eol::Phase::SelfDisabled,
             true
+        ));
+        assert!(command_allowed_during_eol(
+            &Command::Hook {
+                hook_command: HookCommand::AutoUpdate
+            },
+            eol::Phase::SelfDisabled
+        ));
+        assert!(command_allowed_during_eol(
+            &Command::AutoUpdate {
+                command: Some(AutoUpdateCommand::Uninstall)
+            },
+            eol::Phase::SelfDisabled
+        ));
+        assert!(!command_allowed_during_eol(
+            &Command::Monitor {
+                command: Some(MonitorCommand::Disable)
+            },
+            eol::Phase::SelfDisabled
+        ));
+        assert!(!command_allowed_during_eol(
+            &Command::AutoUpdate {
+                command: Some(AutoUpdateCommand::Disable)
+            },
+            eol::Phase::SelfDisabled
         ));
     }
 }
