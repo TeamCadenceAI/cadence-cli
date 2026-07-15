@@ -641,10 +641,20 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
             Ok(_) => {}
         }
         if service_exists {
-            tokio::fs::remove_file(&service_path).await?;
+            if let Err(err) = tokio::fs::remove_file(&service_path).await {
+                cleanup_errors.push(format!(
+                    "failed to remove cadence monitor service {}: {err}",
+                    service_path.display()
+                ));
+            }
         }
         if timer_exists {
-            tokio::fs::remove_file(&timer_path).await?;
+            if let Err(err) = tokio::fs::remove_file(&timer_path).await {
+                cleanup_errors.push(format!(
+                    "failed to remove cadence monitor timer {}: {err}",
+                    timer_path.display()
+                ));
+            }
         }
         match Command::new("systemctl")
             .args(["--user", "daemon-reload"])
@@ -1015,9 +1025,9 @@ mod tests {
     async fn uninstall_scheduler_succeeds_without_systemctl() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = EnvGuard::new("HOME");
-        home.set(tmp.path().to_str().expect("home path"));
+        home.set_path(tmp.path());
         let path = EnvGuard::new("PATH");
-        path.set(tmp.path().to_str().expect("empty path"));
+        path.set_path(tmp.path());
         let (service_path, timer_path) = linux_systemd_paths().expect("systemd paths");
         tokio::fs::create_dir_all(service_path.parent().expect("systemd user directory"))
             .await
