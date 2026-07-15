@@ -565,21 +565,20 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     {
         let plist_path = macos_launch_agent_path()?;
         let existed = tokio::fs::try_exists(&plist_path).await.unwrap_or(false);
-        if existed
-            && let Ok(output) = launchctl_file_operation("unload", &plist_path).await
-            && !output.status.success()
-        {
-            let detail = command_failure_detail(&output);
-            if !launchctl_reports_missing_service(&detail) {
-                ::tracing::warn!(
-                    event = "launchctl_unload_failed",
-                    plist = plist_path.display().to_string(),
-                    error = detail
-                );
-            }
-        }
         if existed {
-            let _ = tokio::fs::remove_file(&plist_path).await;
+            let output = launchctl_file_operation("unload", &plist_path).await?;
+            if !output.status.success() {
+                let detail = command_failure_detail(&output);
+                if !launchctl_reports_missing_service(&detail) {
+                    bail!(
+                        "launchctl unload failed for {}: {detail}",
+                        plist_path.display()
+                    );
+                }
+            }
+            tokio::fs::remove_file(&plist_path)
+                .await
+                .with_context(|| format!("failed to remove {}", plist_path.display()))?;
         }
         return Ok(SchedulerUninstallResult {
             removed: existed,
@@ -590,22 +589,33 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     #[cfg(target_os = "linux")]
     {
         let (service_path, timer_path) = linux_systemd_paths()?;
-        let _ = Command::new("systemctl")
-            .args(["--user", "disable", "--now", "cadence-monitor.timer"])
-            .status()
-            .await;
-        let _ = Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .await;
-
         let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
         let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
+        if service_exists || timer_exists {
+            let disabled = Command::new("systemctl")
+                .args(["--user", "disable", "--now", "cadence-monitor.timer"])
+                .status()
+                .await
+                .context("failed to run systemctl disable for cadence monitor")?;
+            if !disabled.success() {
+                anyhow::bail!("systemctl failed to disable cadence-monitor.timer");
+            }
+        }
         if service_exists {
-            let _ = tokio::fs::remove_file(&service_path).await;
+            tokio::fs::remove_file(&service_path).await?;
         }
         if timer_exists {
-            let _ = tokio::fs::remove_file(&timer_path).await;
+            tokio::fs::remove_file(&timer_path).await?;
+        }
+        if service_exists || timer_exists {
+            let reloaded = Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .await
+                .context("failed to reload systemd after cadence monitor removal")?;
+            if !reloaded.success() {
+                anyhow::bail!("systemctl daemon-reload failed after cadence monitor removal");
+            }
         }
         return Ok(SchedulerUninstallResult {
             removed: service_exists || timer_exists,
@@ -621,10 +631,17 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     {
         let out = Command::new("schtasks")
             .args(["/Delete", "/F", "/TN", WINDOWS_TASK_NAME])
-            .status()
-            .await;
+            .output()
+            .await
+            .context("failed to delete Cadence CLI Monitor task")?;
+        if !out.status.success() {
+            let detail = command_failure_detail(&out);
+            if !windows_task_query_reports_missing(&detail) {
+                anyhow::bail!("failed to delete {WINDOWS_TASK_NAME}: {detail}");
+            }
+        }
         return Ok(SchedulerUninstallResult {
-            removed: out.as_ref().is_ok_and(|status| status.success()),
+            removed: out.status.success(),
             description: WINDOWS_TASK_NAME.to_string(),
         });
     }

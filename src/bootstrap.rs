@@ -344,6 +344,10 @@ async fn desired_monitor_enabled(preserve_disable_state: bool) -> Result<bool> {
     Ok(monitor::configured_enabled_state().await?.unwrap_or(true))
 }
 
+fn recovery_backfill_allowed_for_phase(phase: cadence_cli::eol::Phase) -> bool {
+    matches!(phase, cadence_cli::eol::Phase::Active)
+}
+
 fn log_bootstrap_stage(stage: impl std::fmt::Display) {
     let stage = stage.to_string();
     output::detail(&format!("Bootstrap stage: {stage}"));
@@ -468,7 +472,10 @@ async fn run_bootstrap(options: BootstrapOptions<'_>) -> Result<BootstrapOutcome
         );
     }
 
-    if monitor_enabled && options.include_recovery_backfill {
+    if monitor_enabled
+        && options.include_recovery_backfill
+        && recovery_backfill_allowed_for_phase(cadence_cli::eol::phase())
+    {
         log_bootstrap_stage(format!(
             "starting automatic recovery backfill (since {})",
             VERSION_BOOTSTRAP_BACKFILL_SINCE
@@ -853,6 +860,19 @@ mod tests {
     use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn recovery_backfill_stops_at_cleanup_cutoff() {
+        assert!(recovery_backfill_allowed_for_phase(
+            cadence_cli::eol::Phase::Active
+        ));
+        assert!(!recovery_backfill_allowed_for_phase(
+            cadence_cli::eol::Phase::CleanupOnly
+        ));
+        assert!(!recovery_backfill_allowed_for_phase(
+            cadence_cli::eol::Phase::SelfDisabled
+        ));
+    }
 
     #[tokio::test]
     #[serial]

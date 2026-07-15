@@ -2201,17 +2201,27 @@ async fn upload_incremental_sessions_globally(
 }
 
 async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<MonitorTickSummary> {
-    match eol::phase() {
-        eol::Phase::SelfDisabled => {
-            let _ = eol::maybe_open_goodbye().await;
-            if !eol::scheduler_cleanup_complete().await.unwrap_or(false) {
-                let monitor_cleanup = monitor::uninstall_monitor().await;
-                let updater_cleanup = update::uninstall_auto_update_scheduler().await;
-                if monitor_cleanup.is_ok() && updater_cleanup.is_ok() {
-                    eol::mark_scheduler_cleanup_complete().await?;
-                }
+    let eol_phase = eol::phase();
+    if matches!(eol_phase, eol::Phase::SelfDisabled) {
+        let _ = eol::maybe_open_goodbye().await;
+        if !eol::scheduler_cleanup_complete().await.unwrap_or(false) {
+            let monitor_cleanup = monitor::uninstall_monitor().await;
+            let updater_cleanup = update::uninstall_auto_update_scheduler().await;
+            if monitor_cleanup.is_ok() && updater_cleanup.is_ok() {
+                eol::mark_scheduler_cleanup_complete().await?;
             }
-            return Ok(MonitorTickSummary::default());
+        }
+        return Ok(MonitorTickSummary::default());
+    }
+
+    let mut state = monitor::load_state().await.unwrap_or_default();
+    if !options.force && !state.enabled {
+        return Ok(MonitorTickSummary::default());
+    }
+
+    match eol_phase {
+        eol::Phase::SelfDisabled => {
+            unreachable!("self-disabled ticks return before loading monitor state")
         }
         eol::Phase::CleanupOnly => {
             let _ = eol::maybe_open_nudge().await;
@@ -2221,11 +2231,6 @@ async fn run_monitor_tick_internal(options: MonitorTickOptions) -> Result<Monito
             return Ok(MonitorTickSummary::default());
         }
         eol::Phase::Active => {}
-    }
-
-    let mut state = monitor::load_state().await.unwrap_or_default();
-    if !options.force && !state.enabled {
-        return Ok(MonitorTickSummary::default());
     }
 
     let Some(_activity_lock) =
@@ -3162,7 +3167,11 @@ fn is_internal_update_handoff() -> bool {
         == Some("1")
 }
 
-fn command_allowed_during_eol(command: &Command, phase: eol::Phase) -> bool {
+fn command_allowed_during_eol_with_handoff(
+    command: &Command,
+    phase: eol::Phase,
+    internal_update_handoff: bool,
+) -> bool {
     if matches!(phase, eol::Phase::Active) {
         return true;
     }
@@ -3200,21 +3209,32 @@ fn command_allowed_during_eol(command: &Command, phase: eol::Phase) -> bool {
         eol::Phase::Active => true,
         eol::Phase::CleanupOnly => {
             cleanup_or_diagnostic
-                || (matches!(command, Command::Install { .. }) && is_internal_update_handoff())
+                || (matches!(command, Command::Install { .. }) && internal_update_handoff)
         }
-        eol::Phase::SelfDisabled => matches!(
-            command,
-            Command::Uninstall { .. }
-                | Command::Monitor {
-                    command: Some(
-                        MonitorCommand::Disable | MonitorCommand::Uninstall | MonitorCommand::Tick
-                    )
-                }
-                | Command::AutoUpdate {
-                    command: Some(AutoUpdateCommand::Disable | AutoUpdateCommand::Uninstall)
-                }
-        ),
+        eol::Phase::SelfDisabled => {
+            (matches!(command, Command::Install { .. }) && internal_update_handoff)
+                || matches!(
+                    command,
+                    Command::Uninstall { .. }
+                        | Command::Monitor {
+                            command: Some(
+                                MonitorCommand::Disable
+                                    | MonitorCommand::Uninstall
+                                    | MonitorCommand::Tick
+                            )
+                        }
+                        | Command::AutoUpdate {
+                            command: Some(
+                                AutoUpdateCommand::Disable | AutoUpdateCommand::Uninstall
+                            )
+                        }
+                )
+        }
     }
+}
+
+fn command_allowed_during_eol(command: &Command, phase: eol::Phase) -> bool {
+    command_allowed_during_eol_with_handoff(command, phase, is_internal_update_handoff())
 }
 
 fn should_print_eol_notice_for_args() -> bool {
@@ -3308,6 +3328,9 @@ async fn main() {
     if !command_allowed_during_eol(&cli.command, eol_phase) {
         report_error(&anyhow::anyhow!(eol::retired_notice()));
         process::exit(1);
+    }
+    if matches!(eol_phase, eol::Phase::SelfDisabled) && is_internal_update_handoff() {
+        let _ = eol::maybe_open_goodbye().await;
     }
     let _activity_lock = match update::acquire_command_activity_lock(
         activity_lock_purpose_for_command(&cli.command),
@@ -3463,6 +3486,7 @@ mod tests {
         codex_home: EnvGuard,
         _xdg_config_home: EnvGuard,
         _xdg_data_home: EnvGuard,
+        _browser_open: eol::BrowserOpenTestGuard,
     }
 
     impl DiscoveryTestEnv {
@@ -3504,6 +3528,7 @@ mod tests {
                 codex_home: codex_home_guard,
                 _xdg_config_home: xdg_config_home_guard,
                 _xdg_data_home: xdg_data_home_guard,
+                _browser_open: eol::install_browser_open_test_hook(),
             }
         }
     }
@@ -6223,6 +6248,14 @@ mod tests {
                 yes: false
             },
             eol::Phase::SelfDisabled
+        ));
+        assert!(command_allowed_during_eol_with_handoff(
+            &Command::Install {
+                org: None,
+                preserve_disable_state: true
+            },
+            eol::Phase::SelfDisabled,
+            true
         ));
     }
 }

@@ -13,6 +13,49 @@ pub const SELF_DISABLE_AT: i64 = 1_785_420_000; // 2026-07-31T00:00:00+10:00
 const NUDGE_INTERVAL_SECS: i64 = 48 * 60 * 60;
 const STATE_FILE: &str = "eol-state.json";
 
+#[cfg(any(test, debug_assertions))]
+fn browser_open_test_hook() -> &'static std::sync::Mutex<Option<Vec<String>>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(any(test, debug_assertions))]
+pub struct BrowserOpenTestGuard;
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for BrowserOpenTestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut hook) = browser_open_test_hook().lock() {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+pub fn install_browser_open_test_hook() -> BrowserOpenTestGuard {
+    let mut hook = browser_open_test_hook()
+        .lock()
+        .expect("browser open test hook lock");
+    *hook = Some(Vec::new());
+    BrowserOpenTestGuard
+}
+
+fn open_url(url: &str) -> std::result::Result<(), String> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        let mut hook = browser_open_test_hook()
+            .lock()
+            .expect("browser open test hook lock");
+        if let Some(calls) = hook.as_mut() {
+            calls.push(url.to_string());
+            return Ok(());
+        }
+    }
+
+    open::that(url).map_err(|err| err.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Active,
@@ -84,7 +127,7 @@ pub async fn maybe_open_nudge() -> Result<bool> {
     }
     state.last_nudge_attempt_at = Some(now);
     save_state(&state).await?;
-    if let Err(err) = open::that(BENEFITS_URL) {
+    if let Err(err) = open_url(BENEFITS_URL) {
         ::tracing::warn!(event = "eol_nudge_browser_open_failed", error = %err);
     }
     Ok(true)
@@ -97,7 +140,7 @@ pub async fn maybe_open_goodbye() -> Result<bool> {
     }
     state.goodbye_attempted = true;
     save_state(&state).await?;
-    if let Err(err) = open::that(GOODBYE_URL) {
+    if let Err(err) = open_url(GOODBYE_URL) {
         ::tracing::warn!(event = "eol_goodbye_browser_open_failed", error = %err);
     }
     Ok(true)
