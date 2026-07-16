@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Output;
 use tokio::process::Command;
 
@@ -210,7 +210,7 @@ fn parent_pid_for_logs() -> u32 {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn command_failure_detail(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -218,6 +218,14 @@ fn command_failure_detail(output: &Output) -> String {
         .into_iter()
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| format!("exit status {}", output.status))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_unit_missing(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("unit file") && detail.contains("does not exist")
+        || detail.contains("unit cadence-monitor.timer not loaded")
+        || detail.contains("unit cadence-monitor.timer could not be found")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -316,8 +324,27 @@ async fn macos_launch_agent_disabled(label: &str) -> Result<Option<bool>> {
 }
 
 #[cfg(target_os = "macos")]
-fn running_under_monitor_launch_agent() -> bool {
+pub(crate) fn running_under_monitor_launch_agent() -> bool {
     std::env::var("XPC_SERVICE_NAME").ok().as_deref() == Some(MACOS_LAUNCH_AGENT_LABEL)
+}
+
+pub async fn schedule_active_launch_agent_removal() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if running_under_monitor_launch_agent() {
+        use std::process::Stdio;
+
+        Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 1; /bin/launchctl remove ai.teamcadence.cadence.monitor",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to schedule deferred monitor LaunchAgent removal")?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -565,21 +592,22 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     {
         let plist_path = macos_launch_agent_path()?;
         let existed = tokio::fs::try_exists(&plist_path).await.unwrap_or(false);
-        if existed
-            && let Ok(output) = launchctl_file_operation("unload", &plist_path).await
-            && !output.status.success()
-        {
-            let detail = command_failure_detail(&output);
-            if !launchctl_reports_missing_service(&detail) {
-                ::tracing::warn!(
-                    event = "launchctl_unload_failed",
-                    plist = plist_path.display().to_string(),
-                    error = detail
-                );
-            }
-        }
         if existed {
-            let _ = tokio::fs::remove_file(&plist_path).await;
+            if !running_under_monitor_launch_agent() {
+                let output = launchctl_file_operation("unload", &plist_path).await?;
+                if !output.status.success() {
+                    let detail = command_failure_detail(&output);
+                    if !launchctl_reports_missing_service(&detail) {
+                        bail!(
+                            "launchctl unload failed for {}: {detail}",
+                            plist_path.display()
+                        );
+                    }
+                }
+            }
+            tokio::fs::remove_file(&plist_path)
+                .await
+                .with_context(|| format!("failed to remove {}", plist_path.display()))?;
         }
         return Ok(SchedulerUninstallResult {
             removed: existed,
@@ -590,22 +618,57 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     #[cfg(target_os = "linux")]
     {
         let (service_path, timer_path) = linux_systemd_paths()?;
-        let _ = Command::new("systemctl")
-            .args(["--user", "disable", "--now", "cadence-monitor.timer"])
-            .status()
-            .await;
-        let _ = Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .await;
-
         let service_exists = tokio::fs::try_exists(&service_path).await.unwrap_or(false);
         let timer_exists = tokio::fs::try_exists(&timer_path).await.unwrap_or(false);
-        if service_exists {
-            let _ = tokio::fs::remove_file(&service_path).await;
+        let mut cleanup_errors = Vec::new();
+        match Command::new("systemctl")
+            .args(["--user", "disable", "--now", "cadence-monitor.timer"])
+            .output()
+            .await
+        {
+            Ok(disabled) if !disabled.status.success() => {
+                let detail = command_failure_detail(&disabled);
+                if !systemd_unit_missing(&detail) {
+                    cleanup_errors.push(format!(
+                        "systemctl failed to disable cadence-monitor.timer: {detail}"
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => cleanup_errors.push(format!(
+                "failed to run systemctl disable for cadence monitor: {err}"
+            )),
+            Ok(_) => {}
         }
-        if timer_exists {
-            let _ = tokio::fs::remove_file(&timer_path).await;
+        if service_exists && let Err(err) = tokio::fs::remove_file(&service_path).await {
+            cleanup_errors.push(format!(
+                "failed to remove cadence monitor service {}: {err}",
+                service_path.display()
+            ));
+        }
+        if timer_exists && let Err(err) = tokio::fs::remove_file(&timer_path).await {
+            cleanup_errors.push(format!(
+                "failed to remove cadence monitor timer {}: {err}",
+                timer_path.display()
+            ));
+        }
+        match Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output()
+            .await
+        {
+            Ok(reloaded) if !reloaded.status.success() => cleanup_errors.push(format!(
+                "systemctl daemon-reload failed after cadence monitor removal: {}",
+                command_failure_detail(&reloaded)
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => cleanup_errors.push(format!(
+                "failed to reload systemd after cadence monitor removal: {err}"
+            )),
+            Ok(_) => {}
+        }
+        if !cleanup_errors.is_empty() {
+            anyhow::bail!(cleanup_errors.join("; "));
         }
         return Ok(SchedulerUninstallResult {
             removed: service_exists || timer_exists,
@@ -621,10 +684,17 @@ pub async fn uninstall_scheduler() -> Result<SchedulerUninstallResult> {
     {
         let out = Command::new("schtasks")
             .args(["/Delete", "/F", "/TN", WINDOWS_TASK_NAME])
-            .status()
-            .await;
+            .output()
+            .await
+            .context("failed to delete Cadence CLI Monitor task")?;
+        if !out.status.success() {
+            let detail = command_failure_detail(&out);
+            if !windows_task_query_reports_missing(&detail) {
+                anyhow::bail!("failed to delete {WINDOWS_TASK_NAME}: {detail}");
+            }
+        }
         return Ok(SchedulerUninstallResult {
-            removed: out.as_ref().is_ok_and(|status| status.success()),
+            removed: out.status.success(),
             description: WINDOWS_TASK_NAME.to_string(),
         });
     }
@@ -928,9 +998,51 @@ async fn scheduler_health_macos() -> SchedulerHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_missing_unit_detection_is_specific() {
+        assert!(systemd_unit_missing(
+            "Failed to disable unit: Unit file cadence-monitor.timer does not exist."
+        ));
+        assert!(systemd_unit_missing(
+            "Unit cadence-monitor.timer not loaded."
+        ));
+        assert!(!systemd_unit_missing(
+            "Failed to connect to bus: No medium found"
+        ));
+    }
     use crate::test_support::EnvGuard;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    async fn uninstall_scheduler_succeeds_without_systemctl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(tmp.path());
+        let path = EnvGuard::new("PATH");
+        path.set_path(tmp.path());
+        let (service_path, timer_path) = linux_systemd_paths().expect("systemd paths");
+        tokio::fs::create_dir_all(service_path.parent().expect("systemd user directory"))
+            .await
+            .expect("create systemd user directory");
+        tokio::fs::write(&service_path, "test")
+            .await
+            .expect("write service");
+        tokio::fs::write(&timer_path, "test")
+            .await
+            .expect("write timer");
+
+        let result = uninstall_scheduler()
+            .await
+            .expect("uninstall without systemctl");
+
+        assert!(result.removed);
+        assert!(!tokio::fs::try_exists(service_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(timer_path).await.unwrap());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -968,6 +1080,26 @@ mod tests {
 
         guard.set_str("some.other.label");
         assert!(!running_under_monitor_launch_agent());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[serial]
+    async fn active_launch_agent_cleanup_removes_plist_before_deferred_unload() {
+        let dir = TempDir::new().expect("tempdir");
+        let home = EnvGuard::new("HOME");
+        home.set_path(dir.path());
+        let xpc = EnvGuard::new("XPC_SERVICE_NAME");
+        xpc.set_str(MACOS_LAUNCH_AGENT_LABEL);
+        let plist = macos_launch_agent_path().expect("launch agent path");
+        tokio::fs::create_dir_all(plist.parent().expect("plist parent"))
+            .await
+            .expect("create LaunchAgents");
+        tokio::fs::write(&plist, "test").await.expect("write plist");
+
+        uninstall_scheduler().await.expect("remove plist");
+
+        assert!(!tokio::fs::try_exists(&plist).await.expect("check plist"));
     }
 
     #[tokio::test]

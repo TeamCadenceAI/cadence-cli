@@ -1,10 +1,31 @@
 # Cadence CLI
 
+> **Retired:** Cadence CLI is being replaced by the Cadence App. Install and
+> learn about the App at https://teamcadence.ai/cli-eol. This final CLI release
+> opens the migration page every 48 hours while its monitor remains active. On
+> 24 July 2026 (AEST) it stops local upload work and permits cleanup and
+> diagnostic commands only. On 31 July 2026 (AEST) it opens a final goodbye
+> page and removes its background scheduler jobs. Local credentials and queued
+> publication data remain until you explicitly run `cadence uninstall`.
+
 Cadence CLI uploads AI coding agent session logs to Cadence from a scheduled
 background monitor. It adds provenance for AI-assisted development without
 taking ownership of your normal Git workflow.
 
-## Install
+## Migration
+
+New installations are no longer supported. Use the Cadence App instead:
+
+https://teamcadence.ai/cli-eol
+
+Existing CLI users can inspect state or remove the CLI:
+
+```sh
+cadence status
+cadence uninstall -y
+```
+
+## Historical Installation
 
 Prerequisites:
 - Git
@@ -32,7 +53,7 @@ cargo build --release
 The release binary is written to `target/release/cadence` on macOS/Linux and
 `target\\release\\cadence.exe` on Windows.
 
-## Quick Start
+## Historical Quick Start
 
 1. Install Cadence.
 
