@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.7.0](https://github.com/TeamCadenceAI/cadence-cli/compare/v2.6.2...v2.7.0) (2026-07-16)
+
+
+### Features
+
+* **eol:** retire CLI in favor of Cadence App ([b71c672](https://github.com/TeamCadenceAI/cadence-cli/commit/b71c672315c78e41821451d8b332ec5f1081ca06))
+* **eol:** retire standalone CLI in favor of Cadence App ([d3adbd0](https://github.com/TeamCadenceAI/cadence-cli/commit/d3adbd04586c07af469595c1e42264b7f35f324e))
+
+
+### Bug Fixes
+
+* **ci:** satisfy Linux scheduler lint checks ([b7b204b](https://github.com/TeamCadenceAI/cadence-cli/commit/b7b204b0bb863077bb4237d9bc94bf4c2da4b1e5))
+* **eol:** finish platform scheduler shutdown ([71c1cba](https://github.com/TeamCadenceAI/cadence-cli/commit/71c1cbac7f789b20297af79e6c28dfbdccc00584))
+* **eol:** make shutdown lifecycle reliable ([4dfa32a](https://github.com/TeamCadenceAI/cadence-cli/commit/4dfa32a58c820a63e3c5f4ade8ea58c54d330dd8))
+* **eol:** preserve legacy scheduler cleanup ([3ad774d](https://github.com/TeamCadenceAI/cadence-cli/commit/3ad774dff57c4671363b3703403d465e21c5ac12))
+* **eol:** report all Linux cleanup failures ([bff42dd](https://github.com/TeamCadenceAI/cadence-cli/commit/bff42dd19d72e4aa85b2056ed5e55ce035d16f68))
+* **eol:** stop loaded systemd timers ([7bae099](https://github.com/TeamCadenceAI/cadence-cli/commit/7bae099ac07b2cd24488ee07c45129b862e6c132))
+* **eol:** tolerate missing systemd tools ([65aab65](https://github.com/TeamCadenceAI/cadence-cli/commit/65aab653e21c433dc19359d13f392e981080110b))
+
 ## [2.7.0] (2026-07-15)
 
 ### Retirement
