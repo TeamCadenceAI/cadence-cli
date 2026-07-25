@@ -25,6 +25,7 @@ pub enum AgentType {
     RooCode,
     OpenCode,
     Kiro,
+    KiroCli,
     AmpCode,
     Antigravity,
     Windsurf,
@@ -42,6 +43,7 @@ impl std::fmt::Display for AgentType {
             AgentType::RooCode => write!(f, "roo-code"),
             AgentType::OpenCode => write!(f, "opencode"),
             AgentType::Kiro => write!(f, "kiro"),
+            AgentType::KiroCli => write!(f, "kiro-cli"),
             AgentType::AmpCode => write!(f, "amp-code"),
             AgentType::Antigravity => write!(f, "antigravity"),
             AgentType::Windsurf => write!(f, "windsurf"),
@@ -196,6 +198,14 @@ fn infer_agent_type(path: &Path) -> AgentType {
         || path_lower.contains("/roocode.roo-code/")
     {
         AgentType::RooCode
+    } else if path_lower.contains("/.kiro/sessions/cli/")
+        || path_lower.contains("/kiro/sessions/cli/")
+    {
+        // kiro-cli v2 stores sessions in `$KIRO_HOME/sessions/cli/`,
+        // defaulting to `~/.kiro/sessions/cli/`. The second pattern handles
+        // the `KIRO_HOME` override even when the override path doesn't
+        // start with a leading dot.
+        AgentType::KiroCli
     } else if path_lower
         .contains("/library/application support/kiro/user/globalstorage/kiro.kiroagent/")
         || path_lower.contains("/.config/kiro/user/globalstorage/kiro.kiroagent/")
@@ -885,6 +895,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_infer_agent_type_kiro_cli_default_home() {
+        let path =
+            Path::new("/Users/foo/.kiro/sessions/cli/fdde89ef-92ca-445a-b601-d25a1bbbef4f.jsonl");
+        assert_eq!(infer_agent_type(path), AgentType::KiroCli);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_kiro_cli_custom_kiro_home() {
+        // KIRO_HOME-relocated session directory: matches the looser
+        // `kiro/sessions/cli/` substring rule.
+        let path = Path::new("/opt/teams/shared/kiro/sessions/cli/abc.jsonl");
+        assert_eq!(infer_agent_type(path), AgentType::KiroCli);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_kiro_cli_does_not_misclassify_kiro_ide() {
+        // The IDE path does not contain `/sessions/cli/`, so it must still
+        // be classified as the IDE variant.
+        let path = Path::new(
+            "/Users/foo/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/abc/session.json",
+        );
+        assert_eq!(infer_agent_type(path), AgentType::Kiro);
+    }
+
+    #[tokio::test]
     async fn test_infer_agent_type_amp_code() {
         let path = Path::new("/Users/foo/.local/share/amp/threads/T-abc.json");
         assert_eq!(infer_agent_type(path), AgentType::AmpCode);
@@ -1012,6 +1047,11 @@ mod tests {
     #[tokio::test]
     async fn test_agent_type_display_kiro() {
         assert_eq!(AgentType::Kiro.to_string(), "kiro");
+    }
+
+    #[tokio::test]
+    async fn test_agent_type_display_kiro_cli() {
+        assert_eq!(AgentType::KiroCli.to_string(), "kiro-cli");
     }
 
     #[tokio::test]

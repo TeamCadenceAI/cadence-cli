@@ -187,6 +187,7 @@ cadence doctor --repair
 - Roo Code
 - OpenCode
 - Kiro
+- Kiro CLI (v2)
 - Amp Code
 - Cursor
 - GitHub Copilot
@@ -197,7 +198,11 @@ Note: Warp stores sessions in a local SQLite database. In some local-only
 cases the assistant output may be missing, so Cadence stores prompts/context
 without responses. OpenCode sessions are normalized from fragmented storage
 (`session`, `message`, `part`) into one synthetic session log per session ID
-before ingestion.
+before ingestion. Kiro CLI v2 sessions (`<id>.json` + `<id>.jsonl` pairs in
+`$KIRO_HOME/sessions/cli/`, default `~/.kiro/sessions/cli/`) are normalized
+into one synthetic session log per session ID; the legacy v1 SQLite store
+under `~/Library/Application Support/kiro-cli/data.sqlite3` is intentionally
+not scanned.
 
 ## Uninstall
 
